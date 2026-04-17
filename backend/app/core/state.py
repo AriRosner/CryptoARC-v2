@@ -24,7 +24,7 @@ from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
 from app.core.storage import Storage
-from app.core.sources import normalize_pumpportal_new_token
+from app.core.sources import LaunchEvent, normalize_pumpportal_new_token
 from app.core.strategy import DecisionPipeline
 
 
@@ -82,17 +82,49 @@ class BotState:
         self.events.appendleft(event)
         self.storage.save_event(event)
 
-    def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "") -> None:
+    def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> None:
         event = SourceEvent(
             id=new_id("src"),
             source=source,
             received_at=utc_now(),
             raw_payload=raw_payload,
             normalized_token_id=token.id if token else None,
-            status="normalized" if token else "raw",
+            status=status or ("normalized" if token else "raw"),
             message=message,
         )
         self.storage.save_source_event(event)
+
+    def ingest_source_event(self, event: LaunchEvent) -> None:
+        if event.kind == "trade":
+            self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
+            self.apply_observed_trade(event)
+            return
+        self.record_source_event(event.source, event.raw_payload, event.token, event.message)
+        if event.token:
+            self.ingest_launch(event.token)
+
+    def apply_observed_trade(self, event: LaunchEvent) -> None:
+        if not self.settings.use_observed_prices or not event.mint or not event.observed_price:
+            return
+        for token in self.tokens:
+            if token.mint != event.mint:
+                continue
+            old_price = token.current_price or event.observed_price
+            token.current_price = event.observed_price
+            token.price_source = "observed"
+            token.observed_price_updates += 1
+            token.last_observed_trade_at = event.received_at
+            if event.trade_side == "buy":
+                token.buy_velocity = min(1.0, round(token.buy_velocity + 0.04, 3))
+            if event.trade_side == "sell":
+                token.sell_pressure = min(1.0, round(token.sell_pressure + 0.05, 3))
+            if token.entry_price:
+                move_pct = ((token.current_price - token.entry_price) / token.entry_price) * 100
+                token.unrealized_pct = round(move_pct, 2)
+                token.pnl_sol = round((token.amount_sol or self.settings.trade_size_sol) * (move_pct / 100), 6)
+            token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {event.observed_price:.8f}")
+            self.storage.save_token(token)
+            break
 
     def tick(self) -> BotSnapshot:
         for token in list(self.tokens):
@@ -101,7 +133,7 @@ class BotState:
                 self.storage.save_token(token)
                 continue
 
-            delta_pct = self.simulator.price_delta_pct(token, self.settings.paper_price_volatility_pct)
+            delta_pct = 0.0 if self.settings.use_observed_prices and token.price_source == "observed" else self.simulator.price_delta_pct(token, self.settings.paper_price_volatility_pct)
             closed = self.paper.tick(token, self.settings, delta_pct)
             self.storage.save_token(token)
             if closed:
@@ -208,7 +240,14 @@ class BotState:
             decision_log=token.decision_log,
         )
 
-    def replay_backtest(self, limit: int | None = None, profile: str | None = None) -> BacktestRun:
+    def replay_backtest(
+        self,
+        limit: int | None = None,
+        profile: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        replay_speed: float = 50,
+    ) -> BacktestRun:
         limit = limit or self.settings.backtest_replay_limit
         settings = self._settings_for_profile(profile)
         candidates = [
@@ -216,6 +255,7 @@ class BotState:
             for token in list(self.tokens)[:limit]
             if token.status in {TokenStatus.SKIPPED, TokenStatus.PAPER_SOLD, TokenStatus.DETECTED, TokenStatus.ANALYZING}
         ]
+        candidates = self._filter_tokens_by_date(candidates, date_from, date_to)
         replay_stats = BotStats()
         buys = 0
         skips = 0
@@ -280,14 +320,22 @@ class BotState:
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
             pnl_curve=pnl_curve[-80:],
             trades=trades[:80],
+            comparison=[{"date_from": date_from or "any", "date_to": date_to or "any", "replay_speed": replay_speed}],
         )
         self.backtest_runs.appendleft(run)
         self.storage.save_backtest_run(run)
         return run
 
-    def replay_raw_source_events(self, limit: int | None = None, profile: str | None = None) -> BacktestRun:
+    def replay_raw_source_events(
+        self,
+        limit: int | None = None,
+        profile: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        replay_speed: float = 50,
+    ) -> BacktestRun:
         limit = limit or self.settings.raw_replay_limit
-        source_events = self.storage.load_source_events(limit)
+        source_events = self._filter_source_events_by_date(self.storage.load_source_events(limit), date_from, date_to)
         candidates: list[TokenSignal] = []
         failures = 0
         for event in source_events:
@@ -312,7 +360,7 @@ class BotState:
                 )
                 candidates.append(token)
         run = self._run_backtest(candidates[:limit], replay_source="raw_source_events", settings=self._settings_for_profile(profile))
-        run.comparison = [{"raw_events": len(source_events), "normalized": len(candidates), "normalization_failures": failures}]
+        run.comparison = [{"raw_events": len(source_events), "normalized": len(candidates), "normalization_failures": failures, "date_from": date_from or "any", "date_to": date_to or "any", "replay_speed": replay_speed}]
         self.storage.save_backtest_run(run)
         return run
 
@@ -374,7 +422,7 @@ class BotState:
         for token in candidates:
             if not token.score:
                 self.enrich_token_intelligence(token)
-                score = self.scoring.score(token)
+                score = self.scoring.score(token, settings)
                 token.score = score.score
                 token.reason = score.reason
                 token.score_breakdown = score.breakdown
@@ -429,7 +477,7 @@ class BotState:
     def source_health(self) -> dict[str, object]:
         events = self.storage.load_source_events(300)
         normalized = [event for event in events if event.status == "normalized"]
-        failures = len(events) - len(normalized)
+        failures = len([event for event in events if event.status == "raw"])
         last_age = None
         if self.source_status.last_event_at:
             last_age = max(0, int((utc_now() - self.source_status.last_event_at).total_seconds()))
@@ -443,7 +491,7 @@ class BotState:
         if ratio < 0.35:
             health -= 20
         health -= min(20, max(0, self.source_status.reconnect_attempts - self.settings.source_max_reconnects) * 4)
-        newest = events[0] if events else None
+        newest_normalized = normalized[0] if normalized else None
         cutoff = utc_now() - timedelta(minutes=1)
         recent_events = [event for event in events if event.received_at >= cutoff]
         recent_normalized = [event for event in recent_events if event.status == "normalized"]
@@ -462,8 +510,10 @@ class BotState:
             "reconnect_attempts": self.source_status.reconnect_attempts,
             "health_score": max(0, min(100, health)),
             "status_message": status_message,
-            "last_valid_token_id": newest.normalized_token_id if newest else None,
+            "last_valid_token_id": newest_normalized.normalized_token_id if newest_normalized else None,
             "last_source_message": self.source_status.message,
+            "trade_events": len([event for event in events if event.status == "trade"]),
+            "reliability_note": "Using one PumpPortal WebSocket for launch and token trade subscriptions.",
         }
 
     def _settings_for_profile(self, profile: str | None) -> BotSettings:
@@ -486,6 +536,25 @@ class BotState:
         fee_drag = (settings.paper_fee_bps / 10000) * settings.trade_size_sol * 2
         impact_drag = settings.trade_size_sol * (settings.paper_price_impact_pct / 100)
         return round(edge + flow - fee_drag - impact_drag, 6)
+
+    def _filter_tokens_by_date(self, tokens: list[TokenSignal], date_from: str | None, date_to: str | None) -> list[TokenSignal]:
+        start = self._parse_date(date_from)
+        end = self._parse_date(date_to)
+        return [token for token in tokens if (start is None or token.detected_at >= start) and (end is None or token.detected_at <= end)]
+
+    def _filter_source_events_by_date(self, events: list[SourceEvent], date_from: str | None, date_to: str | None) -> list[SourceEvent]:
+        start = self._parse_date(date_from)
+        end = self._parse_date(date_to)
+        return [event for event in events if (start is None or event.received_at >= start) and (end is None or event.received_at <= end)]
+
+    def _parse_date(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=utc_now().tzinfo)
 
     def export_data(self, target: str) -> dict[str, object]:
         if target == "tokens":

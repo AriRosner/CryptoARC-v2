@@ -35,6 +35,7 @@ import {
   fetchSecurityStatus,
   fetchTrades,
   login,
+  logout,
   openSnapshotSocket,
   patchSettings,
   runRawReplayBacktest,
@@ -88,7 +89,13 @@ const fallbackSnapshot: BotSnapshot = {
     paper_price_impact_pct: 0.15,
     paper_failed_fill_pct: 0,
     duplicate_symbol_penalty: true,
-    strict_metadata_checks: false
+    strict_metadata_checks: false,
+    use_observed_prices: true,
+    max_trade_subscriptions: 60,
+    strategy_weight_metadata: 1,
+    strategy_weight_momentum: 1,
+    strategy_weight_pressure: 1,
+    strategy_weight_creator: 1
   },
   tokens: [],
   events: [],
@@ -262,6 +269,12 @@ function App() {
   const [securityStatus, setSecurityStatus] = React.useState<SecurityStatus | null>(null);
   const [backtestLimit, setBacktestLimit] = React.useState(80);
   const [backtestProfile, setBacktestProfile] = React.useState<BotSettings["strategy_profile"]>("balanced");
+  const [backtestDateFrom, setBacktestDateFrom] = React.useState("");
+  const [backtestDateTo, setBacktestDateTo] = React.useState("");
+  const [backtestSpeed, setBacktestSpeed] = React.useState(50);
+  const [tokenSearch, setTokenSearch] = React.useState("");
+  const [showWatchlistOnly, setShowWatchlistOnly] = React.useState(false);
+  const [watchlist, setWatchlist] = React.useState<string[]>(() => JSON.parse(window.localStorage.getItem("cryptoarc_watchlist") || "[]"));
   const [apiError, setApiError] = React.useState("");
   const [authRequired, setAuthRequired] = React.useState(false);
   const [authed, setAuthed] = React.useState(false);
@@ -343,11 +356,24 @@ function App() {
   const stats = snapshot.stats;
   const running = snapshot.status === "running";
   const selectedToken = snapshot.tokens.find((token) => token.id === selectedTokenId) ?? null;
+  const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const timeframeTrades = React.useMemo(() => timeframeClosedTrades(snapshot.tokens, pnlTimeframe), [pnlTimeframe, snapshot.tokens]);
   const timeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
   const pnlHistory = React.useMemo(() => buildPnlHistory(snapshot.tokens, pnlTimeframe), [snapshot.tokens, pnlTimeframe]);
   const filteredTokens = React.useMemo(() => {
     let tokens = snapshot.tokens;
+    const query = tokenSearch.trim().toLowerCase();
+    if (query) {
+      tokens = tokens.filter((token) =>
+        [token.symbol, token.name, token.mint, token.creator, token.reason, ...(token.intelligence_tags || [])]
+          .join(" ")
+          .toLowerCase()
+          .includes(query)
+      );
+    }
+    if (showWatchlistOnly) {
+      tokens = tokens.filter((token) => watchSet.has(token.mint));
+    }
     if (queueFilter === "profitable") {
       tokens = tokens.filter((token) => (token.pnl_sol || 0) > 0);
     }
@@ -360,7 +386,13 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [queueFilter, queueSort, snapshot.tokens]);
+  }, [queueFilter, queueSort, snapshot.tokens, tokenSearch, showWatchlistOnly, watchSet]);
+
+  function toggleWatchlist(token: TokenSignal) {
+    const next = watchSet.has(token.mint) ? watchlist.filter((mint) => mint !== token.mint) : [...watchlist, token.mint];
+    setWatchlist(next);
+    window.localStorage.setItem("cryptoarc_watchlist", JSON.stringify(next));
+  }
 
   async function saveSettings(nextSettings: BotSettings) {
     try {
@@ -375,7 +407,7 @@ function App() {
 
   async function replayBacktest() {
     try {
-      const result = await runReplayBacktest({ limit: backtestLimit, profile: backtestProfile });
+      const result = await runReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: backtestDateFrom || undefined, date_to: backtestDateTo || undefined, replay_speed: backtestSpeed });
       setBacktestResult(result);
       setBacktests(await fetchBacktests());
       setSnapshot(await fetchSnapshot());
@@ -386,7 +418,7 @@ function App() {
 
   async function rawReplayBacktest() {
     try {
-      const result = await runRawReplayBacktest({ limit: backtestLimit, profile: backtestProfile });
+      const result = await runRawReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: backtestDateFrom || undefined, date_to: backtestDateTo || undefined, replay_speed: backtestSpeed });
       setBacktestResult(result);
       setBacktests(await fetchBacktests());
     } catch (error) {
@@ -565,8 +597,13 @@ function App() {
             </nav>
             <div className="mode-banner">
               <Activity size={16} />
-              Preview and paper mode only
+              {securityStatus?.auth_enabled === false ? "Auth disabled / paper mode" : "Preview and paper mode only"}
             </div>
+            {authRequired ? (
+              <button className="settings-button" onClick={() => { logout(); setAuthed(false); }}>
+                Logout
+              </button>
+            ) : null}
             <button className="settings-button" onClick={() => setSettingsOpen(true)}>
               <SlidersHorizontal size={16} />
               Settings
@@ -596,6 +633,13 @@ function App() {
                 <p>Every paper decision includes a reason.</p>
               </div>
               <div className="queue-tools">
+                <label className="queue-search">
+                  <Search size={14} />
+                  <input value={tokenSearch} onChange={(event) => setTokenSearch(event.target.value)} placeholder="Search tokens" />
+                </label>
+                <button className={showWatchlistOnly ? "queue-filter active" : "queue-filter"} onClick={() => setShowWatchlistOnly((value) => !value)}>
+                  watchlist
+                </button>
                 <Filter size={15} />
                 {(["all", "profitable", "losses"] as QueueFilter[]).map((filter) => (
                   <button
@@ -614,7 +658,7 @@ function App() {
                 </select>
               </div>
             </div>
-            <TokenTable tokens={filteredTokens} onSelect={setSelectedTokenId} compact={settings.compact_table_mode} />
+            <TokenTable tokens={filteredTokens} onSelect={setSelectedTokenId} compact={settings.compact_table_mode} watchlist={watchSet} onToggleWatch={toggleWatchlist} />
           </div>
 
           <aside className="events">
@@ -640,8 +684,14 @@ function App() {
             latest={backtestResult}
             limit={backtestLimit}
             profile={backtestProfile}
+            dateFrom={backtestDateFrom}
+            dateTo={backtestDateTo}
+            speed={backtestSpeed}
             onLimitChange={setBacktestLimit}
             onProfileChange={setBacktestProfile}
+            onDateFromChange={setBacktestDateFrom}
+            onDateToChange={setBacktestDateTo}
+            onSpeedChange={setBacktestSpeed}
             onRun={replayBacktest}
             onRawReplay={rawReplayBacktest}
             onCompare={compareStrategies}
@@ -784,7 +834,19 @@ function ToastStack({ toasts, onDismiss }: { toasts: TradeEvent[]; onDismiss: (i
   );
 }
 
-function TokenTable({ tokens, onSelect, compact }: { tokens: TokenSignal[]; onSelect: (id: string) => void; compact: boolean }) {
+function TokenTable({
+  tokens,
+  onSelect,
+  compact,
+  watchlist,
+  onToggleWatch
+}: {
+  tokens: TokenSignal[];
+  onSelect: (id: string) => void;
+  compact: boolean;
+  watchlist: Set<string>;
+  onToggleWatch: (token: TokenSignal) => void;
+}) {
   if (tokens.length === 0) {
     return <div className="empty">Start the bot to generate paper launch events.</div>;
   }
@@ -794,6 +856,7 @@ function TokenTable({ tokens, onSelect, compact }: { tokens: TokenSignal[]; onSe
       <thead>
         <tr>
           <th>Token</th>
+          <th>Watch</th>
           <th>Age</th>
           <th>Time</th>
           <th>Status</th>
@@ -810,6 +873,17 @@ function TokenTable({ tokens, onSelect, compact }: { tokens: TokenSignal[]; onSe
             <td>
               <strong>{token.symbol}</strong>
               <span>{token.name}</span>
+            </td>
+            <td>
+              <button
+                className={watchlist.has(token.mint) ? "watch-button active" : "watch-button"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onToggleWatch(token);
+                }}
+              >
+                {watchlist.has(token.mint) ? "Pinned" : "Pin"}
+              </button>
             </td>
             <td>{token.age_seconds}s</td>
             <td>{new Date(token.detected_at).toLocaleTimeString()}</td>
@@ -828,7 +902,7 @@ function TokenTable({ tokens, onSelect, compact }: { tokens: TokenSignal[]; onSe
             <td>
               {token.reason}
               {(token.intelligence_tags ?? []).length ? <span>{token.intelligence_tags.join(" / ")}</span> : null}
-              <span>{token.unrealized_pct.toFixed(2)}% unrealized</span>
+              <span>{token.unrealized_pct.toFixed(2)}% unrealized / {token.price_source}</span>
             </td>
           </tr>
         ))}
@@ -842,8 +916,14 @@ function BacktestDashboard({
   latest,
   limit,
   profile,
+  dateFrom,
+  dateTo,
+  speed,
   onLimitChange,
   onProfileChange,
+  onDateFromChange,
+  onDateToChange,
+  onSpeedChange,
   onRun,
   onRawReplay,
   onCompare
@@ -852,8 +932,14 @@ function BacktestDashboard({
   latest: BacktestResult | null;
   limit: number;
   profile: BotSettings["strategy_profile"];
+  dateFrom: string;
+  dateTo: string;
+  speed: number;
   onLimitChange: (limit: number) => void;
   onProfileChange: (profile: BotSettings["strategy_profile"]) => void;
+  onDateFromChange: (value: string) => void;
+  onDateToChange: (value: string) => void;
+  onSpeedChange: (speed: number) => void;
   onRun: () => Promise<void>;
   onRawReplay: () => Promise<void>;
   onCompare: () => Promise<void>;
@@ -880,6 +966,18 @@ function BacktestDashboard({
               <option value="scalper">Scalper</option>
               <option value="custom">Current custom</option>
             </select>
+          </label>
+          <label className="inline-field">
+            From
+            <input value={dateFrom} type="datetime-local" onChange={(event) => onDateFromChange(event.target.value)} />
+          </label>
+          <label className="inline-field">
+            To
+            <input value={dateTo} type="datetime-local" onChange={(event) => onDateToChange(event.target.value)} />
+          </label>
+          <label className="inline-field">
+            Speed
+            <input value={speed} type="number" min={1} max={1000} onChange={(event) => onSpeedChange(Number(event.target.value) || 1)} />
           </label>
           <button className="secondary-action compact-action" onClick={onRun}>
             <RotateCcw size={15} /> Token replay
@@ -1305,7 +1403,7 @@ function SettingsModal({
     risk: "risk tolerance score creator hold daily loss honeypot rug buy velocity sell pressure metadata token age",
     exits: "exit take profit stop loss max hold time position ticks sell close",
     simulation: "simulation safety launch interval paper volatility wallet cap live unlock toasts compact table",
-    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata"
+    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata observed subscriptions"
   };
   const searchQuery = settingsSearch.trim().toLowerCase();
   const pageVisible = (page: SettingsPage) => !searchQuery || sectionKeywords[page].includes(searchQuery) || page.includes(searchQuery);
@@ -1407,6 +1505,13 @@ function SettingsModal({
                   </select>
                 </label>
                 <SettingInput label="Max open positions" value={draft.max_open_positions} onChange={(v) => updateNumber("max_open_positions", v)} />
+                <div className="strategy-builder-box">
+                  <strong>Strategy Builder Weights</strong>
+                  <SettingInput label="Metadata weight" value={draft.strategy_weight_metadata} step="0.1" onChange={(v) => updateNumber("strategy_weight_metadata", v)} />
+                  <SettingInput label="Momentum weight" value={draft.strategy_weight_momentum} step="0.1" onChange={(v) => updateNumber("strategy_weight_momentum", v)} />
+                  <SettingInput label="Sell pressure weight" value={draft.strategy_weight_pressure} step="0.1" onChange={(v) => updateNumber("strategy_weight_pressure", v)} />
+                  <SettingInput label="Creator weight" value={draft.strategy_weight_creator} step="0.1" onChange={(v) => updateNumber("strategy_weight_creator", v)} />
+                </div>
                 <div className="preset-box">
                   <label>
                     Saved preset
@@ -1525,10 +1630,19 @@ function SettingsModal({
                 <SettingInput label="Source max reconnects" value={draft.source_max_reconnects} onChange={(v) => updateNumber("source_max_reconnects", v)} />
                 <SettingInput label="Backtest replay limit" value={draft.backtest_replay_limit} onChange={(v) => updateNumber("backtest_replay_limit", v)} />
                 <SettingInput label="Raw replay limit" value={draft.raw_replay_limit} onChange={(v) => updateNumber("raw_replay_limit", v)} />
+                <SettingInput label="Max trade subscriptions" value={draft.max_trade_subscriptions} onChange={(v) => updateNumber("max_trade_subscriptions", v)} />
                 <SettingInput label="Paper fill delay ticks" value={draft.paper_fill_delay_ticks} onChange={(v) => updateNumber("paper_fill_delay_ticks", v)} />
                 <SettingInput label="Paper fee bps" value={draft.paper_fee_bps} step="1" onChange={(v) => updateNumber("paper_fee_bps", v)} />
                 <SettingInput label="Paper price impact %" value={draft.paper_price_impact_pct} step="0.01" onChange={(v) => updateNumber("paper_price_impact_pct", v)} />
                 <SettingInput label="Paper failed fill %" value={draft.paper_failed_fill_pct} step="0.1" onChange={(v) => updateNumber("paper_failed_fill_pct", v)} />
+                <label className="toggle-line">
+                  <input
+                    type="checkbox"
+                    checked={draft.use_observed_prices}
+                    onChange={(event) => updateDraft("use_observed_prices", event.target.checked)}
+                  />
+                  Use observed PumpPortal trade prices
+                </label>
                 <p className="settings-note">Higher replay limits can make local backtests slower on large event stores.</p>
               </SettingsSection>
             )}
@@ -1587,6 +1701,8 @@ function TokenDetail({ token, onClose }: { token: TokenSignal; onClose: () => vo
           <Metric label="Slippage" value={`${(token.slippage_paid_pct || 0).toFixed(2)}%`} />
           <Metric label="Price impact" value={`${(token.price_impact_pct || 0).toFixed(2)}%`} />
           <Metric label="Fees" value={`${(token.fee_paid_sol || 0).toFixed(6)} SOL`} />
+          <Metric label="Market cap" value={`${(token.market_cap_sol || 0).toFixed(2)} SOL`} />
+          <Metric label="Observed ticks" value={(token.observed_price_updates || 0).toString()} />
         </div>
         <div className="detail-block">
           <h4>Decision</h4>
@@ -1679,6 +1795,14 @@ function TokenDetail({ token, onClose }: { token: TokenSignal; onClose: () => vo
           <code>{token.sell_pressure.toFixed(2)}</code>
           <span>Metadata score</span>
           <code>{token.metadata_score.toFixed(2)}</code>
+          <span>Initial buy</span>
+          <code>{(token.initial_buy_sol || 0).toFixed(4)} SOL</code>
+          <span>Bonding curve</span>
+          <code>{token.bonding_curve || "-"}</code>
+          <span>Metadata URI</span>
+          <code>{token.metadata_uri || "-"}</code>
+          <span>Price source</span>
+          <code>{token.price_source} / {token.last_observed_trade_at ? new Date(token.last_observed_trade_at).toLocaleTimeString() : "no trade ticks"}</code>
         </div>
       </section>
     </div>

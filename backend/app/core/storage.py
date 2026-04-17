@@ -229,6 +229,7 @@ class Storage:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
         payload["closed_at"] = datetime.fromisoformat(payload["closed_at"]) if payload.get("closed_at") else None
+        payload["last_observed_trade_at"] = datetime.fromisoformat(payload["last_observed_trade_at"]) if payload.get("last_observed_trade_at") else None
         payload["status"] = TokenStatus(payload["status"])
         allowed = set(TokenSignal.__dataclass_fields__.keys())
         return TokenSignal(**{key: value for key, value in payload.items() if key in allowed})

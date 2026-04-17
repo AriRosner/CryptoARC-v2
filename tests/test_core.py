@@ -6,7 +6,7 @@ from app.core.models import BacktestRun, BotSettings, BotStats, SourceEvent, Tok
 from app.core.paper_trader import PaperTrader
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
-from app.core.sources import normalize_pumpportal_new_token
+from app.core.sources import normalize_pumpportal_new_token, normalize_pumpportal_trade
 from app.core.storage import Storage
 
 
@@ -157,6 +157,18 @@ class CoreLogicTests(unittest.TestCase):
     def test_pumpportal_normalization_rejects_missing_mint(self) -> None:
         token = normalize_pumpportal_new_token({"txType": "create", "symbol": "ARC"}, utc_now())
         self.assertIsNone(token)
+
+    def test_pumpportal_trade_normalization_updates_observed_price(self) -> None:
+        event = normalize_pumpportal_trade(
+            {"txType": "buy", "mint": "Mint111", "marketCapSol": 50, "solAmount": 0.4},
+            utc_now(),
+        )
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.kind, "trade")
+        self.assertEqual(event.mint, "Mint111")
+        self.assertGreater(event.observed_price or 0, 0)
 
 
 if __name__ == "__main__":

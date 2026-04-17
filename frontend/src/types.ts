@@ -42,6 +42,12 @@ export interface BotSettings {
   paper_failed_fill_pct: number;
   duplicate_symbol_penalty: boolean;
   strict_metadata_checks: boolean;
+  use_observed_prices: boolean;
+  max_trade_subscriptions: number;
+  strategy_weight_metadata: number;
+  strategy_weight_momentum: number;
+  strategy_weight_pressure: number;
+  strategy_weight_creator: number;
 }
 
 export interface TokenSignal {
@@ -89,6 +95,13 @@ export interface TokenSignal {
   fee_paid_sol: number;
   price_impact_pct: number;
   fill_failed: boolean;
+  market_cap_sol: number;
+  initial_buy_sol: number;
+  bonding_curve: string;
+  metadata_uri: string;
+  price_source: string;
+  observed_price_updates: number;
+  last_observed_trade_at: string | null;
 }
 
 export interface TradeEvent {
@@ -197,6 +210,8 @@ export interface SourceHealth {
   status_message: string;
   last_valid_token_id: string | null;
   last_source_message: string;
+  trade_events: number;
+  reliability_note: string;
 }
 
 export interface SecurityStatus {

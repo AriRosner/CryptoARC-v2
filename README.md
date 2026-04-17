@@ -77,6 +77,20 @@ py -m unittest discover -s tests
 - Put the app behind HTTPS if it is reachable outside your machine.
 - Use the Data & Safety page to confirm auth, 2FA, source health, and the paper-only boundary.
 
+## Docker Compose
+
+```powershell
+copy .env.example .env
+docker compose up --build
+```
+
+The compose setup keeps backend data in the `cryptoarc-data` volume and exposes:
+
+- Frontend: `http://127.0.0.1:5173`
+- Backend: `http://127.0.0.1:8000`
+
+Run `.\scripts\healthcheck.ps1` after startup to verify the frontend, backend, and source state.
+
 ## MVP Behavior
 
 The backend generates mock Pump.fun-style token launches. The scoring engine analyzes each launch, the risk engine decides whether a paper trade is allowed, and the paper trader simulates buy/monitor/sell behavior. The dashboard receives live updates over WebSocket.

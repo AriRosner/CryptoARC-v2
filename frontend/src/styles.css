@@ -847,6 +847,27 @@ select:focus {
   gap: 7px;
 }
 
+.queue-search {
+  display: inline-grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #242632;
+  border-radius: 8px;
+  background: #0b0d15;
+  min-height: 30px;
+  padding: 0 8px;
+}
+
+.queue-search input {
+  width: 160px;
+  border: 0;
+  background: transparent;
+  color: #eef1f7;
+  outline: 0;
+  font-size: 11px;
+}
+
 .queue-tools svg {
   color: #8d95a7;
 }
@@ -890,6 +911,22 @@ select:focus {
   border-color: #e89a4a;
   background: #22180f;
   color: #f7ead7;
+}
+
+.watch-button {
+  width: auto;
+  min-height: 28px;
+  border: 1px solid #303544;
+  background: #151824;
+  color: #9ba3b5;
+  font-size: 11px;
+  padding: 0 8px;
+}
+
+.watch-button.active {
+  border-color: #e89a4a;
+  color: #f7ead7;
+  background: #22180f;
 }
 
 table {
@@ -1236,6 +1273,23 @@ td span {
   border-radius: 8px;
   background: #0b0d15;
   padding: 12px;
+}
+
+.strategy-builder-box {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  border: 1px solid #242632;
+  border-radius: 8px;
+  background: #0b0d15;
+  padding: 12px;
+}
+
+.strategy-builder-box > strong {
+  grid-column: 1 / -1;
+  color: #f7ead7;
+  font-size: 12px;
 }
 
 .settings-section {

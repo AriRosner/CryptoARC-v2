@@ -55,12 +55,21 @@ class SettingsPatch(BaseModel):
     paper_failed_fill_pct: float | None = Field(default=None, ge=0, le=100)
     duplicate_symbol_penalty: bool | None = None
     strict_metadata_checks: bool | None = None
+    use_observed_prices: bool | None = None
+    max_trade_subscriptions: int | None = Field(default=None, ge=0, le=5000)
+    strategy_weight_metadata: float | None = Field(default=None, ge=0, le=3)
+    strategy_weight_momentum: float | None = Field(default=None, ge=0, le=3)
+    strategy_weight_pressure: float | None = Field(default=None, ge=0, le=3)
+    strategy_weight_creator: float | None = Field(default=None, ge=0, le=3)
 
 
 class BacktestRequest(BaseModel):
     limit: int | None = Field(default=None, ge=1, le=5000)
     profile: Literal["conservative", "balanced", "aggressive", "scalper", "custom"] | None = None
     replay_source: Literal["tokens", "raw"] = "tokens"
+    date_from: str | None = None
+    date_to: str | None = None
+    replay_speed: float = Field(default=50, ge=1, le=1000)
 
 
 class LoginRequest(BaseModel):
@@ -84,7 +93,7 @@ state = BotState(database_path=config.database_path, default_source=config.pumpf
 clients: set[WebSocket] = set()
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 source_task: asyncio.Task | None = None
-source_key: tuple[str, float] | None = None
+source_key: tuple[str, float, int] | None = None
 
 
 async def broadcast_snapshot() -> None:
@@ -142,7 +151,7 @@ async def ensure_source_task() -> None:
         state.source_status.message = "Source is idle"
         return
 
-    desired_key = (state.settings.launch_source, state.settings.launch_interval_seconds)
+    desired_key = (state.settings.launch_source, state.settings.launch_interval_seconds, state.settings.max_trade_subscriptions)
     if source_task and source_key == desired_key and not source_task.done():
         return
 
@@ -154,6 +163,7 @@ async def ensure_source_task() -> None:
         name=state.settings.launch_source,
         launch_interval_seconds=state.settings.launch_interval_seconds,
         pumpportal_ws_url=config.pumpportal_ws_url,
+        max_trade_subscriptions=state.settings.max_trade_subscriptions,
     )
     source_key = desired_key
     source_task = asyncio.create_task(source.run(launch_queue, state.source_status))
@@ -162,9 +172,7 @@ async def ensure_source_task() -> None:
 async def drain_launch_queue() -> None:
     while not launch_queue.empty():
         event = await launch_queue.get()
-        state.record_source_event(event.source, event.raw_payload, event.token, event.message)
-        if event.token:
-            state.ingest_launch(event.token)
+        state.ingest_source_event(event)
 
 
 @asynccontextmanager
@@ -263,7 +271,7 @@ async def update_settings(patch: SettingsPatch) -> dict:
 @app.post("/api/backtest/replay", dependencies=[Depends(require_auth)])
 async def replay_backtest(payload: BacktestRequest | None = None) -> dict:
     payload = payload or BacktestRequest()
-    result = state.replay_backtest(limit=payload.limit, profile=payload.profile)
+    result = state.replay_backtest(limit=payload.limit, profile=payload.profile, date_from=payload.date_from, date_to=payload.date_to, replay_speed=payload.replay_speed)
     state.add_event("info", f"Replay backtest finished: {result.paper_buys} buys, {result.skips} skips")
     await broadcast_snapshot()
     return result.to_dict()
@@ -272,7 +280,7 @@ async def replay_backtest(payload: BacktestRequest | None = None) -> dict:
 @app.post("/api/backtest/raw-replay", dependencies=[Depends(require_auth)])
 async def raw_replay_backtest(payload: BacktestRequest | None = None) -> dict:
     payload = payload or BacktestRequest(replay_source="raw")
-    result = state.replay_raw_source_events(limit=payload.limit, profile=payload.profile)
+    result = state.replay_raw_source_events(limit=payload.limit, profile=payload.profile, date_from=payload.date_from, date_to=payload.date_to, replay_speed=payload.replay_speed)
     state.add_event("info", f"Raw replay finished: {result.paper_buys} buys, {result.skips} skips")
     await broadcast_snapshot()
     return result.to_dict()

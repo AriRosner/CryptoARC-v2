@@ -71,6 +71,12 @@ class BotSettings:
     paper_failed_fill_pct: float = 0.0
     duplicate_symbol_penalty: bool = True
     strict_metadata_checks: bool = False
+    use_observed_prices: bool = True
+    max_trade_subscriptions: int = 60
+    strategy_weight_metadata: float = 1.0
+    strategy_weight_momentum: float = 1.0
+    strategy_weight_pressure: float = 1.0
+    strategy_weight_creator: float = 1.0
 
 
 @dataclass(slots=True)
@@ -119,12 +125,20 @@ class TokenSignal:
     fee_paid_sol: float = 0.0
     price_impact_pct: float = 0.0
     fill_failed: bool = False
+    market_cap_sol: float = 0.0
+    initial_buy_sol: float = 0.0
+    bonding_curve: str = ""
+    metadata_uri: str = ""
+    price_source: str = "simulated"
+    observed_price_updates: int = 0
+    last_observed_trade_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["detected_at"] = self.detected_at.isoformat()
         payload["opened_at"] = self.opened_at.isoformat() if self.opened_at else None
         payload["closed_at"] = self.closed_at.isoformat() if self.closed_at else None
+        payload["last_observed_trade_at"] = self.last_observed_trade_at.isoformat() if self.last_observed_trade_at else None
         return payload
 
 

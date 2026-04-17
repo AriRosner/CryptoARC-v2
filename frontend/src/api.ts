@@ -29,6 +29,11 @@ export async function login(password: string, code: string): Promise<void> {
   window.localStorage.setItem("cryptoarc_token", authToken);
 }
 
+export function logout(): void {
+  authToken = "";
+  window.localStorage.removeItem("cryptoarc_token");
+}
+
 export async function fetchSnapshot(): Promise<BotSnapshot> {
   return request("/api/snapshot");
 }
@@ -49,7 +54,15 @@ export async function patchSettings(patch: Record<string, number | boolean | str
   });
 }
 
-export async function runReplayBacktest(options?: { limit?: number; profile?: string }): Promise<BacktestResult> {
+export interface BacktestOptions {
+  limit?: number;
+  profile?: string;
+  date_from?: string;
+  date_to?: string;
+  replay_speed?: number;
+}
+
+export async function runReplayBacktest(options?: BacktestOptions): Promise<BacktestResult> {
   return request("/api/backtest/replay", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -57,7 +70,7 @@ export async function runReplayBacktest(options?: { limit?: number; profile?: st
   });
 }
 
-export async function runRawReplayBacktest(options?: { limit?: number; profile?: string }): Promise<BacktestResult> {
+export async function runRawReplayBacktest(options?: BacktestOptions): Promise<BacktestResult> {
   return request("/api/backtest/raw-replay", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

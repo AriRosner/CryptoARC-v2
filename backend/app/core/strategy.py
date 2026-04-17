@@ -30,7 +30,7 @@ class DecisionPipeline:
         open_positions: int,
     ) -> StrategyDecision:
         log = ["Detected", "Analyzing launch profile"]
-        score = self.scoring.score(token)
+        score = self.scoring.score(token, settings)
         token.score = score.score
         token.success_rate_pct = score.success_rate_pct
         token.reason = score.reason
