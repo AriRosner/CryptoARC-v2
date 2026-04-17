@@ -25,26 +25,38 @@ import {
 } from "lucide-react";
 import {
   clearData,
+  disableTotp,
   authStatus,
   exportUrl,
   fetchBacktests,
   fetchDataSummary,
+  fetchPerformanceAnalytics,
+  fetchPriceObservations,
+  fetchReplayTimeline,
   fetchSnapshot,
   fetchSourceEvents,
   fetchSourceHealth,
   fetchSecurityStatus,
+  fetchSettingsVersions,
+  fetchStrategyDecisions,
   fetchTrades,
+  fetchTradeSessions,
+  fetchTuningSuggestions,
   login,
   logout,
   openSnapshotSocket,
   patchSettings,
+  runABStrategyReplay,
   runRawReplayBacktest,
   runReplayBacktest,
   runStrategyComparison,
   startBot,
-  stopBot
+  stopBot,
+  setupTotp,
+  updatePassword,
+  verifyTotp
 } from "./api";
-import type { BacktestResult, BotSnapshot, BotSettings, DataSummary, SecurityStatus, SourceEvent, SourceHealth, TokenSignal, TradeEvent, TradeRecord } from "./types";
+import type { BacktestResult, BotSnapshot, BotSettings, DataSummary, PerformanceAnalytics, PriceObservation, ReplayTimelineEvent, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TokenSignal, TradeEvent, TradeRecord, TradeSession, TuningSuggestion } from "./types";
 import "./styles.css";
 
 const fallbackSnapshot: BotSnapshot = {
@@ -62,6 +74,7 @@ const fallbackSnapshot: BotSnapshot = {
     max_creator_hold_pct: 10,
     trading_speed: "normal",
     max_hold_time_seconds: 600,
+    minimum_hold_time_seconds: 0,
     risk_tolerance: "medium",
     score_threshold: 62,
     max_open_positions: 3,
@@ -92,10 +105,35 @@ const fallbackSnapshot: BotSnapshot = {
     strict_metadata_checks: false,
     use_observed_prices: true,
     max_trade_subscriptions: 60,
+    min_price_confidence: 0.45,
+    max_first_observed_move_pct: 500,
+    prefer_market_cap_price: true,
+    trailing_stop_enabled: false,
+    trailing_stop_pct: 18,
+    partial_take_profit_enabled: false,
+    partial_take_profit_pct: 25,
+    partial_take_profit_fraction: 0.5,
+    cooldown_after_loss_enabled: false,
+    cooldown_after_loss_seconds: 0,
+    max_trades_per_hour_enabled: true,
+    max_trades_per_hour: 30,
+    velocity_slippage_enabled: true,
+    max_same_creator_buys_enabled: true,
+    max_same_creator_buys: 3,
+    stop_on_source_degraded: false,
+    max_rejected_price_streak_enabled: true,
+    max_rejected_price_streak: 5,
     strategy_weight_metadata: 1,
     strategy_weight_momentum: 1,
     strategy_weight_pressure: 1,
-    strategy_weight_creator: 1
+    strategy_weight_creator: 1,
+    break_even_stop_enabled: false,
+    break_even_after_profit_pct: 15,
+    stalled_trade_exit_enabled: false,
+    stalled_trade_seconds: 90,
+    stalled_trade_min_move_pct: 3,
+    sell_pressure_exit_enabled: false,
+    sell_pressure_exit_threshold: 0.65
   },
   tokens: [],
   events: [],
@@ -117,7 +155,8 @@ const fallbackSnapshot: BotSnapshot = {
     average_win_sol: 0,
     average_loss_sol: 0,
     profit_factor: 0,
-    max_drawdown_sol: 0
+    max_drawdown_sol: 0,
+    avg_hold_seconds: 0
   },
   source_status: {
     source: "mock",
@@ -131,7 +170,12 @@ const fallbackSnapshot: BotSnapshot = {
     normalization_failures: 0,
     events_per_minute: 0,
     last_event_age_seconds: null,
-    health_score: 0
+    health_score: 0,
+    launch_events_seen: 0,
+    trade_events_seen: 0,
+    status_events_seen: 0,
+    active_trade_subscriptions: 0,
+    dropped_trade_subscriptions: 0
   }
 };
 
@@ -139,11 +183,35 @@ function statusLabel(status: TokenSignal["status"]): string {
   return status.replace("_", " ");
 }
 
+function formatDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ${minutes % 60}m`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ${hours % 24}h`;
+}
+
+function dateTimeLocalToIso(value: string): string | undefined {
+  if (!value) return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function pnlClass(pnl: number | null | undefined, scratchThreshold = 0.001): "profit" | "loss" | "scratch" {
+  const value = pnl || 0;
+  if (value > scratchThreshold) return "profit";
+  if (value < -scratchThreshold) return "loss";
+  return "scratch";
+}
+
 type PnlTimeframe = "5m" | "15m" | "1h" | "24h" | "all";
-type QueueFilter = "all" | "profitable" | "losses";
+type QueueFilter = "all" | "open" | "profitable" | "losses";
 type QueueSort = "newest" | "score" | "pnl" | "creator";
-type WorkspacePage = "monitor" | "analysis" | "backtests" | "data";
-type SettingsPage = "source" | "strategy" | "risk" | "exits" | "simulation" | "advanced";
+type WorkspacePage = "monitor" | "analysis" | "backtests" | "review" | "data";
+type SettingsPage = "source" | "strategy" | "risk" | "exits" | "simulation" | "advanced" | "security";
 
 const pnlTimeframes: Array<{ label: string; value: PnlTimeframe; millis: number | null }> = [
   { label: "5m", value: "5m", millis: 5 * 60 * 1000 },
@@ -221,37 +289,43 @@ function validateSettings(settings: BotSettings): string[] {
   if (settings.paper_failed_fill_pct > 20) {
     warnings.push("Failed fill rate above 20% can heavily skew replay results.");
   }
+  if (settings.min_price_confidence < 0.45) {
+    warnings.push("Low price confidence can allow weaker PumpPortal price hints into P&L.");
+  }
+  if (settings.max_first_observed_move_pct > 1000) {
+    warnings.push("Very high first-move limits can let unit mismatches distort P&L.");
+  }
   if (settings.live_trading_enabled) {
     warnings.push("Live trading request is set, but backend execution remains blocked unless explicitly enabled by environment.");
   }
   return warnings;
 }
 
-function buildPnlHistory(tokens: TokenSignal[], timeframe: PnlTimeframe): number[] {
+function buildPnlHistory(trades: TradeRecord[], timeframe: PnlTimeframe): number[] {
   const selectedFrame = pnlTimeframes.find((item) => item.value === timeframe) ?? pnlTimeframes[pnlTimeframes.length - 1];
   const cutoff = selectedFrame.millis === null ? null : Date.now() - selectedFrame.millis;
-  const closedTrades = tokens
-    .filter((token) => token.status === "paper_sold" && token.closed_at && token.pnl_sol !== null)
-    .filter((token) => cutoff === null || new Date(token.closed_at || "").getTime() >= cutoff)
+  const closedTrades = trades
+    .filter((trade) => trade.lifecycle_status === "closed" && trade.closed_at && trade.pnl_sol !== null)
+    .filter((trade) => cutoff === null || new Date(trade.closed_at || "").getTime() >= cutoff)
     .sort((left, right) => new Date(left.closed_at || "").getTime() - new Date(right.closed_at || "").getTime());
 
   let cumulative = 0;
   const history = [0];
-  closedTrades.forEach((token) => {
-    cumulative = Number((cumulative + (token.pnl_sol || 0)).toFixed(6));
+  closedTrades.forEach((trade) => {
+    cumulative = Number((cumulative + (trade.pnl_sol || 0)).toFixed(6));
     history.push(cumulative);
   });
   return history.slice(-40);
 }
 
-function timeframeClosedTrades(tokens: TokenSignal[], timeframe: PnlTimeframe): TokenSignal[] {
+function timeframeClosedTrades(trades: TradeRecord[], timeframe: PnlTimeframe): TradeRecord[] {
   const selectedFrame = pnlTimeframes.find((item) => item.value === timeframe) ?? pnlTimeframes[pnlTimeframes.length - 1];
   const cutoff = selectedFrame.millis === null ? null : Date.now() - selectedFrame.millis;
-  return tokens.filter((token) => {
-    if (token.status !== "paper_sold" || !token.closed_at || token.pnl_sol === null) {
+  return trades.filter((trade) => {
+    if (trade.lifecycle_status !== "closed" || !trade.closed_at || trade.pnl_sol === null) {
       return false;
     }
-    return cutoff === null || new Date(token.closed_at).getTime() >= cutoff;
+    return cutoff === null || new Date(trade.closed_at).getTime() >= cutoff;
   });
 }
 
@@ -270,6 +344,14 @@ function App() {
   const [sourceEvents, setSourceEvents] = React.useState<SourceEvent[]>([]);
   const [dataSummary, setDataSummary] = React.useState<DataSummary | null>(null);
   const [trades, setTrades] = React.useState<TradeRecord[]>([]);
+  const [priceObservations, setPriceObservations] = React.useState<PriceObservation[]>([]);
+  const [strategyDecisions, setStrategyDecisions] = React.useState<StrategyDecisionRecord[]>([]);
+  const [tradeSessions, setTradeSessions] = React.useState<TradeSession[]>([]);
+  const [settingsVersions, setSettingsVersions] = React.useState<SettingsVersion[]>([]);
+  const [performanceAnalytics, setPerformanceAnalytics] = React.useState<PerformanceAnalytics | null>(null);
+  const [tuningSuggestions, setTuningSuggestions] = React.useState<TuningSuggestion[]>([]);
+  const [selectedReviewTradeId, setSelectedReviewTradeId] = React.useState<string | null>(null);
+  const [replayTimeline, setReplayTimeline] = React.useState<ReplayTimelineEvent[]>([]);
   const [sourceHealth, setSourceHealth] = React.useState<SourceHealth | null>(null);
   const [securityStatus, setSecurityStatus] = React.useState<SecurityStatus | null>(null);
   const [backtestLimit, setBacktestLimit] = React.useState(80);
@@ -328,6 +410,7 @@ function App() {
           .slice(0, 3);
         if (tradeEvents.length) {
           tradeEvents.forEach((event) => seenToastIds.current.add(event.id));
+          refreshResearchData().catch(() => undefined);
           if (data.settings.enable_trade_toasts) {
             setToasts((current) => [...tradeEvents, ...current].slice(0, 4));
           }
@@ -362,9 +445,9 @@ function App() {
   const running = snapshot.status === "running";
   const selectedToken = snapshot.tokens.find((token) => token.id === selectedTokenId) ?? null;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
-  const timeframeTrades = React.useMemo(() => timeframeClosedTrades(snapshot.tokens, pnlTimeframe), [pnlTimeframe, snapshot.tokens]);
+  const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
   const timeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
-  const pnlHistory = React.useMemo(() => buildPnlHistory(snapshot.tokens, pnlTimeframe), [snapshot.tokens, pnlTimeframe]);
+  const pnlHistory = React.useMemo(() => buildPnlHistory(trades, pnlTimeframe), [trades, pnlTimeframe]);
   const filteredTokens = React.useMemo(() => {
     let tokens = snapshot.tokens;
     const query = tokenSearch.trim().toLowerCase();
@@ -379,11 +462,15 @@ function App() {
     if (showWatchlistOnly) {
       tokens = tokens.filter((token) => watchSet.has(token.mint));
     }
+    if (queueFilter === "open") {
+      tokens = tokens.filter((token) => ["buying", "paper_bought", "monitoring"].includes(token.status));
+    }
+    const scratchThreshold = snapshot.stats.scratch_threshold_sol ?? 0.001;
     if (queueFilter === "profitable") {
-      tokens = tokens.filter((token) => (token.pnl_sol || 0) > 0);
+      tokens = tokens.filter((token) => (token.pnl_sol || 0) > scratchThreshold);
     }
     if (queueFilter === "losses") {
-      tokens = tokens.filter((token) => (token.pnl_sol || 0) < 0);
+      tokens = tokens.filter((token) => (token.pnl_sol || 0) < -scratchThreshold);
     }
     return [...tokens].sort((left, right) => {
       if (queueSort === "score") return right.score - left.score;
@@ -391,7 +478,7 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [queueFilter, queueSort, snapshot.tokens, tokenSearch, showWatchlistOnly, watchSet]);
+  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, snapshot.tokens, tokenSearch, showWatchlistOnly, watchSet]);
 
   function toggleWatchlist(token: TokenSignal) {
     const next = watchSet.has(token.mint) ? watchlist.filter((mint) => mint !== token.mint) : [...watchlist, token.mint];
@@ -412,7 +499,7 @@ function App() {
 
   async function replayBacktest() {
     try {
-      const result = await runReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: backtestDateFrom || undefined, date_to: backtestDateTo || undefined, replay_speed: backtestSpeed });
+      const result = await runReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: dateTimeLocalToIso(backtestDateFrom), date_to: dateTimeLocalToIso(backtestDateTo), replay_speed: backtestSpeed });
       setBacktestResult(result);
       setBacktests(await fetchBacktests());
       setSnapshot(await fetchSnapshot());
@@ -423,7 +510,7 @@ function App() {
 
   async function rawReplayBacktest() {
     try {
-      const result = await runRawReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: backtestDateFrom || undefined, date_to: backtestDateTo || undefined, replay_speed: backtestSpeed });
+      const result = await runRawReplayBacktest({ limit: backtestLimit, profile: backtestProfile, date_from: dateTimeLocalToIso(backtestDateFrom), date_to: dateTimeLocalToIso(backtestDateTo), replay_speed: backtestSpeed });
       setBacktestResult(result);
       setBacktests(await fetchBacktests());
     } catch (error) {
@@ -441,14 +528,31 @@ function App() {
     }
   }
 
+  async function abReplayStrategies() {
+    try {
+      const result = await runABStrategyReplay({ limit: backtestLimit, profile: backtestProfile, date_from: dateTimeLocalToIso(backtestDateFrom), date_to: dateTimeLocalToIso(backtestDateTo), replay_speed: backtestSpeed });
+      setBacktestResult(result);
+      setBacktests(await fetchBacktests());
+      setPerformanceAnalytics(await fetchPerformanceAnalytics());
+    } catch (error) {
+      setApiError(`A/B replay failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
       fetchTrades(),
       fetchSourceHealth(),
-      fetchSecurityStatus()
+      fetchSecurityStatus(),
+      fetchPriceObservations(),
+      fetchStrategyDecisions(),
+      fetchTradeSessions(),
+      fetchSettingsVersions(),
+      fetchPerformanceAnalytics(),
+      fetchTuningSuggestions()
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -456,9 +560,24 @@ function App() {
     setTrades(tradeRows);
     setSourceHealth(health);
     setSecurityStatus(security);
+    setPriceObservations(observations);
+    setStrategyDecisions(decisions);
+    setTradeSessions(sessions);
+    setSettingsVersions(versions);
+    setPerformanceAnalytics(analytics);
+    setTuningSuggestions(suggestions);
   }
 
-  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "all") {
+  async function loadReplayTimeline(tokenId: string) {
+    setSelectedReviewTradeId(tokenId);
+    try {
+      setReplayTimeline(await fetchReplayTimeline(tokenId));
+    } catch (error) {
+      setApiError(`Timeline failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all") {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
@@ -595,7 +714,7 @@ function App() {
           </div>
           <div className="top-actions">
             <nav className="page-tabs">
-              {(["monitor", "analysis", "backtests", "data"] as WorkspacePage[]).map((page) => (
+              {(["monitor", "analysis", "backtests", "review", "data"] as WorkspacePage[]).map((page) => (
                 <button key={page} className={workspacePage === page ? "active" : ""} onClick={() => setWorkspacePage(page)}>
                   {page}
                 </button>
@@ -647,7 +766,7 @@ function App() {
                   watchlist
                 </button>
                 <Filter size={15} />
-                {(["all", "profitable", "losses"] as QueueFilter[]).map((filter) => (
+                {(["all", "open", "profitable", "losses"] as QueueFilter[]).map((filter) => (
                   <button
                     key={filter}
                     className={queueFilter === filter ? "queue-filter active" : "queue-filter"}
@@ -664,7 +783,14 @@ function App() {
                 </select>
               </div>
             </div>
-            <TokenTable tokens={filteredTokens} onSelect={setSelectedTokenId} compact={settings.compact_table_mode} watchlist={watchSet} onToggleWatch={toggleWatchlist} />
+            <TokenTable
+              tokens={filteredTokens}
+              onSelect={setSelectedTokenId}
+              compact={settings.compact_table_mode}
+              watchlist={watchSet}
+              onToggleWatch={toggleWatchlist}
+              scratchThreshold={stats.scratch_threshold_sol ?? 0.001}
+            />
           </div>
 
           <aside className="events">
@@ -701,11 +827,24 @@ function App() {
             onRun={replayBacktest}
             onRawReplay={rawReplayBacktest}
             onCompare={compareStrategies}
+            onABReplay={abReplayStrategies}
           />
         )}
 
         {workspacePage === "analysis" && (
-          <AnalysisDashboard tokens={snapshot.tokens} stats={stats} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
+          <AnalysisDashboard tokens={snapshot.tokens} trades={trades} stats={stats} analytics={performanceAnalytics} suggestions={tuningSuggestions} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
+        )}
+
+        {workspacePage === "review" && (
+          <TradeReviewPage
+            trades={trades}
+            versions={settingsVersions}
+            analytics={performanceAnalytics}
+            suggestions={tuningSuggestions}
+            selectedTradeId={selectedReviewTradeId}
+            timeline={replayTimeline}
+            onSelectTrade={loadReplayTimeline}
+          />
         )}
 
         {workspacePage === "data" && (
@@ -715,6 +854,10 @@ function App() {
             sourceHealth={sourceHealth}
             securityStatus={securityStatus}
             trades={trades}
+            priceObservations={priceObservations}
+            strategyDecisions={strategyDecisions}
+            tradeSessions={tradeSessions}
+            settingsVersions={settingsVersions}
             auditEvents={snapshot.events}
             onRefresh={refreshResearchData}
             onClear={clearProjectData}
@@ -845,13 +988,15 @@ function TokenTable({
   onSelect,
   compact,
   watchlist,
-  onToggleWatch
+  onToggleWatch,
+  scratchThreshold
 }: {
   tokens: TokenSignal[];
   onSelect: (id: string) => void;
   compact: boolean;
   watchlist: Set<string>;
   onToggleWatch: (token: TokenSignal) => void;
+  scratchThreshold: number;
 }) {
   if (tokens.length === 0) {
     return <div className="empty">Start the bot to generate paper launch events.</div>;
@@ -891,7 +1036,7 @@ function TokenTable({
                 {watchlist.has(token.mint) ? "Pinned" : "Pin"}
               </button>
             </td>
-            <td>{token.age_seconds}s</td>
+            <td title={`${token.age_seconds}s`}>{formatDuration(token.age_seconds)}</td>
             <td>{new Date(token.detected_at).toLocaleTimeString()}</td>
             <td>
               <span className={`status ${token.status}`}>{statusLabel(token.status)}</span>
@@ -902,13 +1047,13 @@ function TokenTable({
               <span>{token.creator_launch_count ?? 0} launches</span>
             </td>
             <td>{token.amount_sol ? `${token.amount_sol.toFixed(3)} SOL` : "-"}</td>
-            <td className={(token.pnl_sol || 0) >= 0 ? "profit" : "loss"}>
+            <td className={pnlClass(token.pnl_sol, scratchThreshold)}>
               {token.pnl_sol === null ? "-" : `${token.pnl_sol.toFixed(4)} SOL`}
             </td>
             <td>
               {token.reason}
               {(token.intelligence_tags ?? []).length ? <span>{token.intelligence_tags.join(" / ")}</span> : null}
-              <span>{token.unrealized_pct.toFixed(2)}% unrealized / {token.price_source}</span>
+              <span>{token.unrealized_pct.toFixed(2)}% unrealized / {token.price_source} / confidence {(token.price_confidence ?? 0).toFixed(2)}</span>
             </td>
           </tr>
         ))}
@@ -932,7 +1077,8 @@ function BacktestDashboard({
   onSpeedChange,
   onRun,
   onRawReplay,
-  onCompare
+  onCompare,
+  onABReplay
 }: {
   runs: BacktestResult[];
   latest: BacktestResult | null;
@@ -949,6 +1095,7 @@ function BacktestDashboard({
   onRun: () => Promise<void>;
   onRawReplay: () => Promise<void>;
   onCompare: () => Promise<void>;
+  onABReplay: () => Promise<void>;
 }) {
   const active = latest ?? runs[0] ?? null;
   return (
@@ -994,15 +1141,23 @@ function BacktestDashboard({
           <button className="secondary-action compact-action" onClick={onCompare}>
             <Sparkles size={15} /> Compare
           </button>
+          <button className="secondary-action compact-action" onClick={onABReplay}>
+            <BarChart3 size={15} /> A/B replay
+          </button>
         </div>
       </div>
       {active ? (
         <>
           <div className="hero-metrics wide">
             <Metric label="Replay P&L" value={`${active.estimated_pnl_sol.toFixed(4)} SOL`} />
-            <Metric label="Win rate" value={`${active.win_rate_pct}%`} />
+            <Metric label="Net win" value={`${active.win_rate_pct}%`} />
+            <Metric label="Gross win" value={`${active.gross_win_rate_pct ?? 0}%`} />
+            <Metric label="Scratch" value={`${active.scratch_rate_pct ?? 0}%`} />
             <Metric label="Buys / skips" value={`${active.paper_buys} / ${active.skips}`} />
             <Metric label="Profit factor" value={active.profit_factor.toFixed(2)} />
+            <Metric label="Drawdown" value={`${active.max_drawdown_sol.toFixed(4)} SOL`} />
+            <Metric label="Best / worst" value={`${(active.best_trade_sol ?? 0).toFixed(4)} / ${(active.worst_trade_sol ?? 0).toFixed(4)}`} />
+            <Metric label="Avg hold" value={formatDuration(active.avg_hold_seconds ?? 0)} />
           </div>
           {active.comparison?.length ? (
             <section className="research-card">
@@ -1017,7 +1172,7 @@ function BacktestDashboard({
                 {active.comparison.map((item) => (
                   <article key={String(item.profile)}>
                     <strong>{item.profile}</strong>
-                    <span>{item.buys} buys / {item.skips} skips / {Number(item.estimated_pnl_sol || 0).toFixed(4)} SOL</span>
+                    <span>{item.buys} buys / {item.skips} skips / {item.wins ?? 0} W / {item.losses ?? 0} L / {item.scratches ?? 0} S / {Number(item.estimated_pnl_sol || 0).toFixed(4)} SOL</span>
                   </article>
                 ))}
               </div>
@@ -1080,17 +1235,23 @@ function BacktestDashboard({
 
 function AnalysisDashboard({
   tokens,
+  trades,
   stats,
+  analytics,
+  suggestions,
   pnlTimeframe,
   onTimeframeChange
 }: {
   tokens: TokenSignal[];
+  trades: TradeRecord[];
   stats: BotSnapshot["stats"];
+  analytics: PerformanceAnalytics | null;
+  suggestions: TuningSuggestion[];
   pnlTimeframe: PnlTimeframe;
   onTimeframeChange: (timeframe: PnlTimeframe) => void;
 }) {
-  const history = React.useMemo(() => buildPnlHistory(tokens, pnlTimeframe), [tokens, pnlTimeframe]);
-  const closed = timeframeClosedTrades(tokens, pnlTimeframe);
+  const history = React.useMemo(() => buildPnlHistory(trades, pnlTimeframe), [trades, pnlTimeframe]);
+  const closed = timeframeClosedTrades(trades, pnlTimeframe);
   const pnl = closed.reduce((total, token) => total + (token.pnl_sol || 0), 0);
   const scratchThreshold = stats.scratch_threshold_sol ?? 0.001;
   const wins = closed.filter((token) => (token.pnl_sol || 0) > scratchThreshold).length;
@@ -1099,6 +1260,17 @@ function AnalysisDashboard({
   const detected = tokens.filter((token) => token.status === "detected").length;
   const analyzing = tokens.filter((token) => token.status === "analyzing").length;
   const riskFlags = tokens.filter((token) => token.honeypot_risk || token.rug_risk).length;
+  const observedTokens = tokens.filter((token) => (token.observed_price_updates || 0) > 0);
+  const avgConfidence = observedTokens.length
+    ? observedTokens.reduce((total, token) => total + (token.price_confidence || 0), 0) / observedTokens.length
+    : 0;
+  const avgHold = closed.length
+    ? closed.reduce((total, token) => total + (token.hold_duration_seconds || 0), 0) / closed.length
+    : 0;
+  const priceSources = tokens.reduce<Record<string, number>>((counts, token) => {
+    counts[token.price_source || "unknown"] = (counts[token.price_source || "unknown"] || 0) + 1;
+    return counts;
+  }, {});
 
   return (
     <section className="dashboard-page">
@@ -1123,9 +1295,45 @@ function AnalysisDashboard({
         <Metric label="Range P&L" value={`${pnl.toFixed(4)} SOL`} />
         <Metric label="Range trades" value={closed.length.toString()} />
         <Metric label="W / L / S" value={`${wins} / ${losses} / ${scratches}`} />
+        <Metric label="Avg hold" value={formatDuration(avgHold)} />
+        <Metric label="Price confidence" value={`${Math.round(avgConfidence * 100)}%`} />
         <Metric label="All-time P&L" value={`${stats.total_pnl_sol.toFixed(4)} SOL`} />
       </div>
       <div className="analysis-grid">
+        {analytics ? (
+          <section className="research-card">
+            <div className="section-heading">
+              <div>
+                <h3>Strategy Performance</h3>
+                <p>Persistent trade records, not the live queue.</p>
+              </div>
+              <Target size={18} />
+            </div>
+            <div className="bar-list">
+              {analytics.by_strategy.slice(0, 4).map((item) => (
+                <BarMetric key={item.label} label={`${item.label} ${item.pnl_sol.toFixed(3)} SOL`} value={Math.max(0, item.win_rate_pct)} max={100} />
+              ))}
+            </div>
+          </section>
+        ) : null}
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Auto-Tuning</h3>
+              <p>Suggested paper-only tuning experiments.</p>
+            </div>
+            <Sparkles size={18} />
+          </div>
+          <div className="mini-list">
+            {suggestions.slice(0, 3).map((item) => (
+              <article key={`${item.setting}-${item.title}`}>
+                <strong>{item.title}</strong>
+                <span>{item.setting}: {String(item.suggested_value ?? "review")} / {Math.round(item.confidence * 100)}%</span>
+                <p>{item.reason}</p>
+              </article>
+            ))}
+          </div>
+        </section>
         <section className="research-card analysis-card-large">
           <div className="section-heading">
             <div>
@@ -1153,6 +1361,36 @@ function AnalysisDashboard({
             <BarMetric label="Risk flags" value={riskFlags} max={tokens.length || 1} />
           </div>
         </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Price Sources</h3>
+              <p>How paper positions are being marked.</p>
+            </div>
+            <Gauge size={18} />
+          </div>
+          <div className="bar-list">
+            {Object.entries(priceSources).map(([source, count]) => (
+              <BarMetric key={source} label={source} value={count} max={tokens.length || 1} />
+            ))}
+            <BarMetric label="Observed tokens" value={observedTokens.length} max={tokens.length || 1} />
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Trade Quality</h3>
+              <p>Range outcomes and holding behavior.</p>
+            </div>
+            <Clock size={18} />
+          </div>
+          <div className="bar-list">
+            <BarMetric label="Wins" value={wins} max={closed.length || 1} />
+            <BarMetric label="Losses" value={losses} max={closed.length || 1} />
+            <BarMetric label="Scratches" value={scratches} max={closed.length || 1} />
+            <BarMetric label="Confidence %" value={Math.round(avgConfidence * 100)} max={100} />
+          </div>
+        </section>
       </div>
     </section>
   );
@@ -1169,12 +1407,145 @@ function BarMetric({ label, value, max }: { label: string; value: number; max: n
   );
 }
 
+function TradeReviewPage({
+  trades,
+  versions,
+  analytics,
+  suggestions,
+  selectedTradeId,
+  timeline,
+  onSelectTrade
+}: {
+  trades: TradeRecord[];
+  versions: SettingsVersion[];
+  analytics: PerformanceAnalytics | null;
+  suggestions: TuningSuggestion[];
+  selectedTradeId: string | null;
+  timeline: ReplayTimelineEvent[];
+  onSelectTrade: (tokenId: string) => Promise<void>;
+}) {
+  const [filter, setFilter] = React.useState<"all" | "wins" | "losses" | "scratch">("all");
+  const scratch = 0.001;
+  const closed = trades.filter((trade) => trade.lifecycle_status === "closed" && trade.pnl_sol !== null);
+  const visible = closed.filter((trade) => {
+    const pnl = trade.pnl_sol || 0;
+    if (filter === "wins") return pnl > scratch;
+    if (filter === "losses") return pnl < -scratch;
+    if (filter === "scratch") return Math.abs(pnl) <= scratch;
+    return true;
+  });
+  const versionLabel = React.useMemo(() => {
+    const lookup = new Map(versions.map((version) => [version.id, `${version.label || "settings"} ${new Date(version.created_at).toLocaleTimeString()}`]));
+    return (id: string) => lookup.get(id) || (id ? id.slice(0, 10) : "legacy");
+  }, [versions]);
+
+  return (
+    <section className="dashboard-page">
+      <div className="page-heading">
+        <div>
+          <h2>Trade Review</h2>
+          <p>Closed paper trades, settings versions, and replay timeline.</p>
+        </div>
+        <div className="button-row fit-row">
+          {(["all", "wins", "losses", "scratch"] as const).map((item) => (
+            <button key={item} className={filter === item ? "secondary-action compact-action active" : "secondary-action compact-action"} onClick={() => setFilter(item)}>
+              {item}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="hero-metrics wide">
+        <Metric label="Reviewed trades" value={visible.length.toString()} />
+        <Metric label="Closed P&L" value={`${visible.reduce((total, trade) => total + (trade.pnl_sol || 0), 0).toFixed(4)} SOL`} />
+        <Metric label="Settings versions" value={versions.length.toString()} />
+        <Metric label="All win rate" value={`${analytics?.summary.win_rate_pct ?? 0}%`} />
+      </div>
+      <section className="content-grid">
+        <div className="token-table-wrap">
+          <div className="section-heading">
+            <div>
+              <h3>Trade Records</h3>
+              <p>Select a trade to load source, decision, price, and execution events.</p>
+            </div>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Strategy</th>
+                <th>P&L</th>
+                <th>Exit</th>
+                <th>Hold</th>
+                <th>Version</th>
+              </tr>
+            </thead>
+            <tbody>
+              {visible.slice(0, 120).map((trade) => (
+                <tr key={trade.id} className={selectedTradeId === trade.token_id ? "selected-row" : ""} onClick={() => onSelectTrade(trade.token_id)}>
+                  <td>{trade.closed_at ? new Date(trade.closed_at).toLocaleTimeString() : "-"}</td>
+                  <td>{trade.strategy_profile}</td>
+                  <td className={pnlClass(trade.pnl_sol)}>{(trade.pnl_sol || 0).toFixed(6)} SOL</td>
+                  <td>{trade.exit_reason || "-"}</td>
+                  <td>{formatDuration(trade.hold_duration_seconds || 0)}</td>
+                  <td>{versionLabel(trade.settings_version_id)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <aside className="side-stack">
+          <section className="research-card">
+            <div className="section-heading">
+              <div>
+                <h3>Replay Timeline</h3>
+                <p>{selectedTradeId ? selectedTradeId : "Select a trade."}</p>
+              </div>
+              <Clock size={18} />
+            </div>
+            <div className="timeline-list">
+              {timeline.length ? timeline.map((event, index) => (
+                <article key={`${event.at}-${index}`}>
+                  <span>{new Date(event.at).toLocaleTimeString()} / {event.type}</span>
+                  <strong>{event.title}</strong>
+                  <p>{event.detail || "-"}</p>
+                </article>
+              )) : <p>No timeline loaded yet.</p>}
+            </div>
+          </section>
+          <section className="research-card">
+            <div className="section-heading">
+              <div>
+                <h3>Suggestions</h3>
+                <p>Use these as paper experiments.</p>
+              </div>
+              <Sparkles size={18} />
+            </div>
+            <div className="mini-list">
+              {suggestions.map((item) => (
+                <article key={`${item.title}-${item.setting}`}>
+                  <strong>{item.title}</strong>
+                  <span>{item.setting}: {String(item.suggested_value ?? "review")}</span>
+                  <p>{item.reason}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+        </aside>
+      </section>
+    </section>
+  );
+}
+
 function DataDashboard({
   summary,
   sourceEvents,
   sourceHealth,
   securityStatus,
   trades,
+  priceObservations,
+  strategyDecisions,
+  tradeSessions,
+  settingsVersions,
   auditEvents,
   onRefresh,
   onClear
@@ -1184,9 +1555,13 @@ function DataDashboard({
   sourceHealth: SourceHealth | null;
   securityStatus: SecurityStatus | null;
   trades: TradeRecord[];
+  priceObservations: PriceObservation[];
+  strategyDecisions: StrategyDecisionRecord[];
+  tradeSessions: TradeSession[];
+  settingsVersions: SettingsVersion[];
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
-  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "all") => Promise<void>;
+  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all") => Promise<void>;
 }) {
   return (
     <section className="dashboard-page">
@@ -1205,18 +1580,22 @@ function DataDashboard({
         <Metric label="Source events" value={(summary?.source_events ?? 0).toString()} />
         <Metric label="Backtests" value={(summary?.backtests ?? 0).toString()} />
         <Metric label="Trades" value={(summary?.trades ?? 0).toString()} />
+        <Metric label="Sessions" value={(summary?.trade_sessions ?? 0).toString()} />
+        <Metric label="Prices" value={(summary?.price_observations ?? 0).toString()} />
+        <Metric label="Decisions" value={(summary?.strategy_decisions ?? 0).toString()} />
+        <Metric label="Settings versions" value={(summary?.settings_versions ?? settingsVersions.length).toString()} />
         <Metric label="Source health" value={`${sourceHealth?.health_score ?? 0}%`} />
         <Metric label="Safety boundary" value={securityStatus?.paper_only_boundary ? "paper only" : "live enabled"} />
       </div>
       <div className="maintenance-row">
-        {(["tokens", "events", "source_events", "backtests", "trades"] as const).map((target) => (
+        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions"] as const).map((target) => (
           <button key={target} className="danger outline" onClick={() => onClear(target)}>
             <Trash2 size={14} /> Clear {target.replace("_", " ")}
           </button>
         ))}
       </div>
       <div className="maintenance-row">
-        {(["tokens", "source_events", "backtests", "trades", "all"] as const).map((target) => (
+        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"] as const).map((target) => (
           <a key={target} className="export-button" href={exportUrl(target)} target="_blank" rel="noreferrer">
             <Download size={14} /> Export {target.replace("_", " ")}
           </a>
@@ -1237,10 +1616,13 @@ function DataDashboard({
             <BarMetric label="Recent normalized %" value={Math.round((sourceHealth?.recent_normalized_ratio ?? 0) * 100)} max={100} />
             <BarMetric label="Failures" value={sourceHealth?.normalization_failures ?? 0} max={Math.max(1, sourceEvents.length)} />
             <BarMetric label="Reconnects" value={sourceHealth?.reconnect_attempts ?? 0} max={10} />
+            <BarMetric label="Active subs" value={sourceHealth?.active_trade_subscriptions ?? 0} max={100} />
+            <BarMetric label="Dropped subs" value={sourceHealth?.dropped_trade_subscriptions ?? 0} max={100} />
           </div>
           <div className="source-diagnostics">
             <span>{sourceHealth?.status_message ?? "unknown"} / {sourceHealth?.events_per_minute ?? 0} events per minute</span>
             <span>Last event age: {sourceHealth?.last_event_age_seconds ?? "-"}s</span>
+            <span>Launch / trade / status: {sourceHealth?.launch_events ?? 0} / {sourceHealth?.trade_events ?? 0} / {sourceHealth?.status_events ?? 0}</span>
             <span>Last valid token: {sourceHealth?.last_valid_token_id ?? "-"}</span>
             <span>{sourceHealth?.last_source_message ?? ""}</span>
           </div>
@@ -1275,6 +1657,60 @@ function DataDashboard({
                 <strong>{trade.strategy_profile} / {trade.pnl_sol === null ? "-" : `${trade.pnl_sol.toFixed(4)} SOL`}</strong>
                 <span>{trade.opened_at ? new Date(trade.opened_at).toLocaleString() : "-"} / {trade.exit_reason || "open"}</span>
                 <p>{trade.entry_reason || "No entry reason recorded."}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Trade Sessions</h3>
+              <p>Signal-to-close paper lifecycle records.</p>
+            </div>
+            <Clock size={18} />
+          </div>
+          <div className="mini-list">
+            {tradeSessions.slice(0, 14).map((session) => (
+              <article key={session.id}>
+                <strong>{session.symbol} / {session.status} / {session.pnl_sol === null ? "-" : `${session.pnl_sol.toFixed(4)} SOL`}</strong>
+                <span>{session.opened_at ? new Date(session.opened_at).toLocaleString() : "-"} / remaining {(session.remaining_fraction * 100).toFixed(0)}%</span>
+                <p>{session.exit_reason || session.strategy_profile}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Price Observations</h3>
+              <p>Accepted and rejected source price ticks.</p>
+            </div>
+            <Gauge size={18} />
+          </div>
+          <div className="mini-list">
+            {priceObservations.slice(0, 14).map((observation) => (
+              <article key={observation.id}>
+                <strong>{observation.price_source} / {(observation.confidence * 100).toFixed(0)}% / {observation.accepted ? "accepted" : "rejected"}</strong>
+                <span>{new Date(observation.observed_at).toLocaleTimeString()} / {observation.trade_side || "-"}</span>
+                <p>{observation.reason}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Strategy Decisions</h3>
+              <p>Persistent decision records with strategy versions.</p>
+            </div>
+            <Sparkles size={18} />
+          </div>
+          <div className="mini-list">
+            {strategyDecisions.slice(0, 14).map((decision) => (
+              <article key={decision.id}>
+                <strong>{decision.action} / score {decision.score} / {decision.engine_version}</strong>
+                <span>{new Date(decision.created_at).toLocaleString()} / {decision.profile}</span>
+                <p>{decision.reason || decision.risk_reason}</p>
               </article>
             ))}
           </div>
@@ -1343,6 +1779,11 @@ function SettingsModal({
     }
   });
   const [saving, setSaving] = React.useState(false);
+  const [currentPassword, setCurrentPassword] = React.useState("");
+  const [newPassword, setNewPassword] = React.useState("");
+  const [totpSetup, setTotpSetup] = React.useState<{ secret: string; otpauth_url: string } | null>(null);
+  const [totpCode, setTotpCode] = React.useState("");
+  const [securityMessage, setSecurityMessage] = React.useState("");
   const dirty = JSON.stringify(draft) !== JSON.stringify(settings);
   const warnings = validateSettings(draft);
 
@@ -1403,15 +1844,17 @@ function SettingsModal({
     { id: "risk", label: "Risk", icon: <Shield size={15} /> },
     { id: "exits", label: "Exits", icon: <Clock size={15} /> },
     { id: "simulation", label: "Sim", icon: <Gauge size={15} /> },
-    { id: "advanced", label: "Advanced", icon: <SlidersHorizontal size={15} /> }
+    { id: "advanced", label: "Advanced", icon: <SlidersHorizontal size={15} /> },
+    { id: "security", label: "Security", icon: <Shield size={15} /> }
   ];
   const sectionKeywords: Record<SettingsPage, string> = {
     source: "source launch pumpportal mock token detect connection status normalized raw reconnect",
     strategy: "strategy profile trade size slippage trading speed max open positions entry buy",
     risk: "risk tolerance score creator hold daily loss honeypot rug buy velocity sell pressure metadata token age",
-    exits: "exit take profit stop loss max hold time position ticks sell close",
+    exits: "exit take profit stop loss max hold time position ticks sell close trailing partial break even stalled sell pressure",
     simulation: "simulation safety launch interval paper volatility wallet cap live unlock toasts compact table",
-    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata observed subscriptions"
+    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata observed subscriptions confidence first move market cap toasts",
+    security: "security password 2fa totp authenticator qr code deployment auth"
   };
   const searchQuery = settingsSearch.trim().toLowerCase();
   const pageVisible = (page: SettingsPage) => !searchQuery || sectionKeywords[page].includes(searchQuery) || page.includes(searchQuery);
@@ -1556,6 +1999,21 @@ function SettingsModal({
                 <SettingInput label="Min metadata score" value={draft.min_metadata_score} step="0.01" onChange={(v) => updateNumber("min_metadata_score", v)} />
                 <SettingInput label="Max token age seconds" value={draft.max_token_age_seconds} onChange={(v) => updateNumber("max_token_age_seconds", v)} />
                 <label className="toggle-line">
+                  <input type="checkbox" checked={draft.max_trades_per_hour_enabled} onChange={(event) => updateDraft("max_trades_per_hour_enabled", event.target.checked)} />
+                  Enable max trades per hour
+                </label>
+                <SettingInput label="Max trades per hour" value={draft.max_trades_per_hour} onChange={(v) => updateNumber("max_trades_per_hour", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.cooldown_after_loss_enabled} onChange={(event) => updateDraft("cooldown_after_loss_enabled", event.target.checked)} />
+                  Enable cooldown after loss
+                </label>
+                <SettingInput label="Cooldown after loss seconds" value={draft.cooldown_after_loss_seconds} onChange={(v) => updateNumber("cooldown_after_loss_seconds", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.max_same_creator_buys_enabled} onChange={(event) => updateDraft("max_same_creator_buys_enabled", event.target.checked)} />
+                  Enable same-creator buy cap
+                </label>
+                <SettingInput label="Max same-creator buys" value={draft.max_same_creator_buys} onChange={(v) => updateNumber("max_same_creator_buys", v)} />
+                <label className="toggle-line">
                   <input
                     type="checkbox"
                     checked={draft.filter_honeypots}
@@ -1587,6 +2045,10 @@ function SettingsModal({
                   />
                   Strict metadata checks
                 </label>
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.stop_on_source_degraded} onChange={(event) => updateDraft("stop_on_source_degraded", event.target.checked)} />
+                  Stop entries when source health is degraded
+                </label>
               </SettingsSection>
             )}
 
@@ -1594,8 +2056,36 @@ function SettingsModal({
               <SettingsSection title="Exits" description="Paper position exit controls.">
                 <SettingInput label="Take profit %" value={draft.take_profit_pct} onChange={(v) => updateNumber("take_profit_pct", v)} />
                 <SettingInput label="Stop loss %" value={draft.stop_loss_pct} onChange={(v) => updateNumber("stop_loss_pct", v)} />
+                <SettingInput label="Minimum hold seconds" value={draft.minimum_hold_time_seconds} onChange={(v) => updateNumber("minimum_hold_time_seconds", v)} />
                 <SettingInput label="Max hold time seconds" value={draft.max_hold_time_seconds} onChange={(v) => updateNumber("max_hold_time_seconds", v)} />
                 <SettingInput label="Max position ticks" value={draft.max_position_ticks} onChange={(v) => updateNumber("max_position_ticks", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.trailing_stop_enabled} onChange={(event) => updateDraft("trailing_stop_enabled", event.target.checked)} />
+                  Enable trailing stop
+                </label>
+                <SettingInput label="Trailing stop %" value={draft.trailing_stop_pct} step="0.5" onChange={(v) => updateNumber("trailing_stop_pct", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.partial_take_profit_enabled} onChange={(event) => updateDraft("partial_take_profit_enabled", event.target.checked)} />
+                  Enable partial take profit
+                </label>
+                <SettingInput label="Partial TP trigger %" value={draft.partial_take_profit_pct} step="0.5" onChange={(v) => updateNumber("partial_take_profit_pct", v)} />
+                <SettingInput label="Partial TP fraction" value={draft.partial_take_profit_fraction} step="0.05" onChange={(v) => updateNumber("partial_take_profit_fraction", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.break_even_stop_enabled} onChange={(event) => updateDraft("break_even_stop_enabled", event.target.checked)} />
+                  Enable break-even stop
+                </label>
+                <SettingInput label="Break-even after profit %" value={draft.break_even_after_profit_pct} step="0.5" onChange={(v) => updateNumber("break_even_after_profit_pct", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.stalled_trade_exit_enabled} onChange={(event) => updateDraft("stalled_trade_exit_enabled", event.target.checked)} />
+                  Enable stalled-trade exit
+                </label>
+                <SettingInput label="Stalled seconds" value={draft.stalled_trade_seconds} onChange={(v) => updateNumber("stalled_trade_seconds", v)} />
+                <SettingInput label="Stalled max move %" value={draft.stalled_trade_min_move_pct} step="0.5" onChange={(v) => updateNumber("stalled_trade_min_move_pct", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.sell_pressure_exit_enabled} onChange={(event) => updateDraft("sell_pressure_exit_enabled", event.target.checked)} />
+                  Enable sell-pressure exit
+                </label>
+                <SettingInput label="Sell-pressure threshold" value={draft.sell_pressure_exit_threshold} step="0.01" onChange={(v) => updateNumber("sell_pressure_exit_threshold", v)} />
               </SettingsSection>
             )}
 
@@ -1639,10 +2129,21 @@ function SettingsModal({
                 <SettingInput label="Backtest replay limit" value={draft.backtest_replay_limit} onChange={(v) => updateNumber("backtest_replay_limit", v)} />
                 <SettingInput label="Raw replay limit" value={draft.raw_replay_limit} onChange={(v) => updateNumber("raw_replay_limit", v)} />
                 <SettingInput label="Max trade subscriptions" value={draft.max_trade_subscriptions} onChange={(v) => updateNumber("max_trade_subscriptions", v)} />
+                <SettingInput label="Minimum price confidence" value={draft.min_price_confidence} step="0.05" onChange={(v) => updateNumber("min_price_confidence", v)} />
+                <SettingInput label="Max first observed move %" value={draft.max_first_observed_move_pct} step="10" onChange={(v) => updateNumber("max_first_observed_move_pct", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.max_rejected_price_streak_enabled} onChange={(event) => updateDraft("max_rejected_price_streak_enabled", event.target.checked)} />
+                  Enable rejected price streak guard
+                </label>
+                <SettingInput label="Max rejected price streak" value={draft.max_rejected_price_streak} onChange={(v) => updateNumber("max_rejected_price_streak", v)} />
                 <SettingInput label="Paper fill delay ticks" value={draft.paper_fill_delay_ticks} onChange={(v) => updateNumber("paper_fill_delay_ticks", v)} />
                 <SettingInput label="Paper fee bps" value={draft.paper_fee_bps} step="1" onChange={(v) => updateNumber("paper_fee_bps", v)} />
                 <SettingInput label="Paper price impact %" value={draft.paper_price_impact_pct} step="0.01" onChange={(v) => updateNumber("paper_price_impact_pct", v)} />
                 <SettingInput label="Paper failed fill %" value={draft.paper_failed_fill_pct} step="0.1" onChange={(v) => updateNumber("paper_failed_fill_pct", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.velocity_slippage_enabled} onChange={(event) => updateDraft("velocity_slippage_enabled", event.target.checked)} />
+                  Add slippage from buy velocity
+                </label>
                 <label className="toggle-line">
                   <input
                     type="checkbox"
@@ -1651,7 +2152,82 @@ function SettingsModal({
                   />
                   Use observed PumpPortal trade prices
                 </label>
+                <label className="toggle-line">
+                  <input
+                    type="checkbox"
+                    checked={draft.prefer_market_cap_price}
+                    onChange={(event) => updateDraft("prefer_market_cap_price", event.target.checked)}
+                  />
+                  Prefer market-cap normalized prices
+                </label>
                 <p className="settings-note">Higher replay limits can make local backtests slower on large event stores.</p>
+              </SettingsSection>
+            )}
+
+            {shouldRender("security") && (
+              <SettingsSection title="Security" description="Dashboard password and authenticator setup.">
+                <label>
+                  Current password
+                  <input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} placeholder="Current dashboard password" />
+                </label>
+                <label>
+                  New password
+                  <input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} placeholder="At least 8 characters" />
+                </label>
+                <button
+                  className="secondary-action"
+                  onClick={async () => {
+                    try {
+                      await updatePassword(currentPassword, newPassword);
+                      setSecurityMessage("Password changed. Log in again with the new password.");
+                    } catch (error) {
+                      setSecurityMessage(`Password update failed: ${error instanceof Error ? error.message : "unknown error"}`);
+                    }
+                  }}
+                >
+                  Update password
+                </button>
+                <button
+                  className="secondary-action"
+                  onClick={async () => {
+                    try {
+                      setTotpSetup(await setupTotp());
+                      setSecurityMessage("Scan the QR code, then enter a code to enable 2FA.");
+                    } catch (error) {
+                      setSecurityMessage(`2FA setup failed: ${error instanceof Error ? error.message : "unknown error"}`);
+                    }
+                  }}
+                >
+                  Start 2FA setup
+                </button>
+                {totpSetup ? (
+                  <div className="source-status-box inline">
+                    <span>Authenticator QR</span>
+                    <img alt="Authenticator QR code" className="qr-code" src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(totpSetup.otpauth_url)}`} />
+                    <p>Secret: {totpSetup.secret}</p>
+                    <label>
+                      2FA code
+                      <input value={totpCode} onChange={(event) => setTotpCode(event.target.value)} placeholder="123456" />
+                    </label>
+                    <button className="secondary-action" onClick={async () => {
+                      try {
+                        await verifyTotp(totpSetup.secret, totpCode);
+                        setSecurityMessage("2FA enabled. Log in again with your authenticator code.");
+                      } catch (error) {
+                        setSecurityMessage(`2FA verification failed: ${error instanceof Error ? error.message : "unknown error"}`);
+                      }
+                    }}>Enable 2FA</button>
+                  </div>
+                ) : null}
+                <button className="danger outline" onClick={async () => {
+                  try {
+                    await disableTotp();
+                    setSecurityMessage("2FA disabled. Log in again.");
+                  } catch (error) {
+                    setSecurityMessage(`Disable 2FA failed: ${error instanceof Error ? error.message : "unknown error"}`);
+                  }
+                }}>Disable 2FA</button>
+                <p className="settings-note">{securityMessage || "For deployment, keep secrets in environment variables when possible."}</p>
               </SettingsSection>
             )}
           </div>
@@ -1711,6 +2287,8 @@ function TokenDetail({ token, onClose }: { token: TokenSignal; onClose: () => vo
           <Metric label="Fees" value={`${(token.fee_paid_sol || 0).toFixed(6)} SOL`} />
           <Metric label="Market cap" value={`${(token.market_cap_sol || 0).toFixed(2)} SOL`} />
           <Metric label="Observed ticks" value={(token.observed_price_updates || 0).toString()} />
+          <Metric label="Price confidence" value={`${Math.round((token.price_confidence || 0) * 100)}%`} />
+          <Metric label="Age" value={formatDuration(token.age_seconds || 0)} />
         </div>
         <div className="detail-block">
           <h4>Decision</h4>
@@ -1721,6 +2299,8 @@ function TokenDetail({ token, onClose }: { token: TokenSignal; onClose: () => vo
           <h4>Position Detail</h4>
           <p>Strategy: {token.entry_strategy_profile || "-"}</p>
           <p>Best / worst unrealized: {(token.highest_unrealized_pct || 0).toFixed(2)}% / {(token.lowest_unrealized_pct || 0).toFixed(2)}%</p>
+          <p>Price source: {token.price_source || "-"} / confidence {(token.price_confidence || 0).toFixed(2)}</p>
+          {token.price_reject_reason ? <p>Last price rejection: {token.price_reject_reason}</p> : null}
           <p>Risk filters: {(token.entry_risk_filters || []).join(", ") || "-"}</p>
         </div>
         <div className="detail-block">

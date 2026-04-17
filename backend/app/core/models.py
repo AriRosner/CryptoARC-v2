@@ -43,6 +43,7 @@ class BotSettings:
     max_creator_hold_pct: float = 10.0
     trading_speed: str = "normal"
     max_hold_time_seconds: int = 600
+    minimum_hold_time_seconds: int = 0
     risk_tolerance: str = "medium"
     score_threshold: int = 62
     max_open_positions: int = 3
@@ -73,10 +74,35 @@ class BotSettings:
     strict_metadata_checks: bool = False
     use_observed_prices: bool = True
     max_trade_subscriptions: int = 60
+    min_price_confidence: float = 0.45
+    max_first_observed_move_pct: float = 500.0
+    prefer_market_cap_price: bool = True
+    trailing_stop_enabled: bool = False
+    trailing_stop_pct: float = 18.0
+    partial_take_profit_enabled: bool = False
+    partial_take_profit_pct: float = 25.0
+    partial_take_profit_fraction: float = 0.5
+    cooldown_after_loss_enabled: bool = False
+    cooldown_after_loss_seconds: int = 0
+    max_trades_per_hour_enabled: bool = True
+    max_trades_per_hour: int = 30
+    velocity_slippage_enabled: bool = True
+    max_same_creator_buys_enabled: bool = True
+    max_same_creator_buys: int = 3
+    stop_on_source_degraded: bool = False
+    max_rejected_price_streak_enabled: bool = True
+    max_rejected_price_streak: int = 5
     strategy_weight_metadata: float = 1.0
     strategy_weight_momentum: float = 1.0
     strategy_weight_pressure: float = 1.0
     strategy_weight_creator: float = 1.0
+    break_even_stop_enabled: bool = False
+    break_even_after_profit_pct: float = 15.0
+    stalled_trade_exit_enabled: bool = False
+    stalled_trade_seconds: int = 90
+    stalled_trade_min_move_pct: float = 3.0
+    sell_pressure_exit_enabled: bool = False
+    sell_pressure_exit_threshold: float = 0.65
 
 
 @dataclass(slots=True)
@@ -125,13 +151,20 @@ class TokenSignal:
     fee_paid_sol: float = 0.0
     price_impact_pct: float = 0.0
     fill_failed: bool = False
+    partial_take_profit_taken: bool = False
+    realized_pnl_sol: float = 0.0
+    remaining_fraction: float = 1.0
+    rejected_price_streak: int = 0
     market_cap_sol: float = 0.0
     initial_buy_sol: float = 0.0
     bonding_curve: str = ""
     metadata_uri: str = ""
     price_source: str = "simulated"
+    price_confidence: float = 0.0
+    price_reject_reason: str = ""
     observed_price_updates: int = 0
     last_observed_trade_at: datetime | None = None
+    settings_version_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -173,6 +206,83 @@ class SourceEvent:
 
 
 @dataclass(slots=True)
+class PriceObservation:
+    id: str
+    source: str
+    mint: str
+    observed_at: datetime
+    price: float | None
+    price_source: str
+    confidence: float
+    accepted: bool
+    reason: str = ""
+    market_cap_sol: float | None = None
+    sol_amount: float | None = None
+    trade_side: str | None = None
+    token_id: str | None = None
+    direct_price: float | None = None
+    market_cap_price: float | None = None
+    virtual_reserve_price: float | None = None
+    selected_price: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["observed_at"] = self.observed_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class StrategyDecisionRecord:
+    id: str
+    token_id: str
+    mint: str
+    created_at: datetime
+    engine_version: str
+    profile: str
+    score: int
+    allowed: bool
+    action: str
+    reason: str
+    risk_reason: str
+    snapshot: dict[str, Any] = field(default_factory=dict)
+    score_breakdown: list[str] = field(default_factory=list)
+    decision_log: list[str] = field(default_factory=list)
+    settings_version_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class TradeSession:
+    id: str
+    token_id: str
+    mint: str
+    symbol: str
+    strategy_profile: str
+    status: str
+    opened_at: datetime | None = None
+    closed_at: datetime | None = None
+    amount_sol: float | None = None
+    entry_price: float | None = None
+    exit_price: float | None = None
+    pnl_sol: float | None = None
+    realized_pnl_sol: float = 0.0
+    remaining_fraction: float = 1.0
+    exit_reason: str | None = None
+    lifecycle: list[dict[str, Any]] = field(default_factory=list)
+    settings_version_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["opened_at"] = self.opened_at.isoformat() if self.opened_at else None
+        payload["closed_at"] = self.closed_at.isoformat() if self.closed_at else None
+        return payload
+
+
+@dataclass(slots=True)
 class BacktestRun:
     id: str
     created_at: datetime
@@ -187,6 +297,12 @@ class BacktestRun:
     estimated_pnl_sol: float
     max_drawdown_sol: float
     profit_factor: float
+    scratches: int = 0
+    gross_win_rate_pct: int = 0
+    scratch_rate_pct: int = 0
+    avg_hold_seconds: int = 0
+    best_trade_sol: float = 0.0
+    worst_trade_sol: float = 0.0
     pnl_curve: list[float] = field(default_factory=list)
     trades: list[dict[str, Any]] = field(default_factory=list)
     comparison: list[dict[str, Any]] = field(default_factory=list)
@@ -218,6 +334,7 @@ class BotStats:
     average_loss_sol: float = 0.0
     profit_factor: float = 0.0
     max_drawdown_sol: float = 0.0
+    avg_hold_seconds: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -237,6 +354,11 @@ class SourceStatus:
     events_per_minute: float = 0.0
     last_event_age_seconds: int | None = None
     health_score: int = 0
+    launch_events_seen: int = 0
+    trade_events_seen: int = 0
+    status_events_seen: int = 0
+    active_trade_subscriptions: int = 0
+    dropped_trade_subscriptions: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -259,12 +381,33 @@ class TradeRecord:
     opened_at: datetime | None
     closed_at: datetime | None
     hold_duration_seconds: int = 0
+    lifecycle_status: str = "closed"
+    entry_fee_sol: float = 0.0
+    exit_fee_sol: float = 0.0
+    price_impact_pct: float = 0.0
+    slippage_paid_pct: float = 0.0
+    source_price_confidence: float = 0.0
     decision_log: list[str] = field(default_factory=list)
+    settings_version_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["opened_at"] = self.opened_at.isoformat() if self.opened_at else None
         payload["closed_at"] = self.closed_at.isoformat() if self.closed_at else None
+        return payload
+
+
+@dataclass(slots=True)
+class SettingsVersion:
+    id: str
+    created_at: datetime
+    settings: dict[str, Any]
+    label: str = ""
+    changed_keys: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
         return payload
 
 

@@ -756,6 +756,45 @@ select:focus {
   margin-top: 6px;
 }
 
+.selected-row {
+  outline: 1px solid #e2a35b;
+  background: rgba(226, 163, 91, 0.08);
+}
+
+.timeline-list {
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.timeline-list article {
+  border-left: 2px solid #e2a35b;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 6px;
+}
+
+.timeline-list span {
+  display: block;
+  color: #8d95a7;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.timeline-list strong {
+  display: block;
+  color: #fff4de;
+  margin-top: 4px;
+}
+
+.timeline-list p {
+  color: #cbd2df;
+  font-size: 12px;
+  margin-top: 5px;
+}
+
 .maintenance-row {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1037,6 +1076,10 @@ td span {
 
 .loss {
   color: #ff7d86;
+}
+
+.scratch {
+  color: #ffca7a;
 }
 
 .events {
@@ -1403,6 +1446,15 @@ td span {
   color: #aeb5c4;
   font-size: 12px;
   margin-top: 4px;
+}
+
+.qr-code {
+  width: 160px;
+  height: 160px;
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px;
+  margin: 8px 0;
 }
 
 .detail-block {

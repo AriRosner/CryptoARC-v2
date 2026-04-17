@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
 
@@ -9,7 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.auth import AuthManager
+from app.auth import AuthManager, random_totp_secret, verify_totp
 from app.config import get_config
 from app.core.models import SourceStatus
 from app.core.sources import LaunchEvent, make_source
@@ -28,6 +29,7 @@ class SettingsPatch(BaseModel):
     max_creator_hold_pct: float | None = Field(default=None, ge=0, le=100)
     trading_speed: Literal["slow", "normal", "fast", "turbo"] | None = None
     max_hold_time_seconds: int | None = Field(default=None, ge=5, le=86400)
+    minimum_hold_time_seconds: int | None = Field(default=None, ge=0, le=86400)
     risk_tolerance: Literal["low", "medium", "high", "degen"] | None = None
     score_threshold: int | None = Field(default=None, ge=0, le=100)
     max_open_positions: int | None = Field(default=None, ge=1, le=25)
@@ -57,10 +59,35 @@ class SettingsPatch(BaseModel):
     strict_metadata_checks: bool | None = None
     use_observed_prices: bool | None = None
     max_trade_subscriptions: int | None = Field(default=None, ge=0, le=5000)
+    min_price_confidence: float | None = Field(default=None, ge=0, le=1)
+    max_first_observed_move_pct: float | None = Field(default=None, ge=10, le=100000)
+    prefer_market_cap_price: bool | None = None
+    trailing_stop_enabled: bool | None = None
+    trailing_stop_pct: float | None = Field(default=None, ge=1, le=1000)
+    partial_take_profit_enabled: bool | None = None
+    partial_take_profit_pct: float | None = Field(default=None, ge=1, le=1000)
+    partial_take_profit_fraction: float | None = Field(default=None, ge=0.05, le=1)
+    cooldown_after_loss_enabled: bool | None = None
+    cooldown_after_loss_seconds: int | None = Field(default=None, ge=0, le=86400)
+    max_trades_per_hour_enabled: bool | None = None
+    max_trades_per_hour: int | None = Field(default=None, ge=1, le=10000)
+    velocity_slippage_enabled: bool | None = None
+    max_same_creator_buys_enabled: bool | None = None
+    max_same_creator_buys: int | None = Field(default=None, ge=1, le=1000)
+    stop_on_source_degraded: bool | None = None
+    max_rejected_price_streak_enabled: bool | None = None
+    max_rejected_price_streak: int | None = Field(default=None, ge=0, le=1000)
     strategy_weight_metadata: float | None = Field(default=None, ge=0, le=3)
     strategy_weight_momentum: float | None = Field(default=None, ge=0, le=3)
     strategy_weight_pressure: float | None = Field(default=None, ge=0, le=3)
     strategy_weight_creator: float | None = Field(default=None, ge=0, le=3)
+    break_even_stop_enabled: bool | None = None
+    break_even_after_profit_pct: float | None = Field(default=None, ge=0, le=1000)
+    stalled_trade_exit_enabled: bool | None = None
+    stalled_trade_seconds: int | None = Field(default=None, ge=1, le=86400)
+    stalled_trade_min_move_pct: float | None = Field(default=None, ge=0, le=1000)
+    sell_pressure_exit_enabled: bool | None = None
+    sell_pressure_exit_threshold: float | None = Field(default=None, ge=0, le=1)
 
 
 class BacktestRequest(BaseModel):
@@ -75,6 +102,16 @@ class BacktestRequest(BaseModel):
 class LoginRequest(BaseModel):
     password: str = ""
     code: str = ""
+
+
+class PasswordUpdateRequest(BaseModel):
+    current_password: str = ""
+    new_password: str = Field(min_length=8)
+
+
+class TotpVerifyRequest(BaseModel):
+    secret: str
+    code: str
 
 
 def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
@@ -240,7 +277,39 @@ async def security_status() -> dict:
         "effective_live_trading_enabled": config.live_trading_enabled and state.settings.live_trading_enabled,
         "allowed_origins": [origin.strip() for origin in config.allowed_origins.split(",") if origin.strip()],
         "paper_only_boundary": not (config.live_trading_enabled and state.settings.live_trading_enabled),
+        "runtime_password_configurable": True,
     }
+
+
+@app.post("/api/security/password", dependencies=[Depends(require_auth)])
+async def update_password(payload: PasswordUpdateRequest) -> dict:
+    if auth.enabled and not hmac.compare_digest(payload.current_password, auth.password):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    auth.set_password(payload.new_password)
+    return {"updated": True, "requires_login": True}
+
+
+@app.post("/api/security/totp/setup", dependencies=[Depends(require_auth)])
+async def setup_totp() -> dict:
+    secret = random_totp_secret()
+    issuer = "CryptoARC v2"
+    account = "dashboard"
+    otpauth_url = f"otpauth://totp/{issuer}:{account}?secret={secret}&issuer={issuer.replace(' ', '%20')}"
+    return {"secret": secret, "otpauth_url": otpauth_url}
+
+
+@app.post("/api/security/totp/verify", dependencies=[Depends(require_auth)])
+async def verify_totp_setup(payload: TotpVerifyRequest) -> dict:
+    if not verify_totp(payload.secret, payload.code):
+        raise HTTPException(status_code=400, detail="Invalid authenticator code")
+    auth.set_totp_secret(payload.secret)
+    return {"enabled": True, "requires_login": True}
+
+
+@app.post("/api/security/totp/disable", dependencies=[Depends(require_auth)])
+async def disable_totp() -> dict:
+    auth.disable_totp()
+    return {"enabled": False, "requires_login": True}
 
 
 @app.get("/api/snapshot", dependencies=[Depends(require_auth)])
@@ -294,6 +363,15 @@ async def compare_strategies() -> dict:
     return result.to_dict()
 
 
+@app.post("/api/backtest/ab-replay", dependencies=[Depends(require_auth)])
+async def ab_strategy_replay(payload: BacktestRequest | None = None) -> dict:
+    payload = payload or BacktestRequest()
+    result = state.ab_strategy_replay(limit=payload.limit or state.settings.raw_replay_limit)
+    state.add_event("info", "A/B strategy replay finished")
+    await broadcast_snapshot()
+    return result.to_dict()
+
+
 @app.get("/api/backtests", dependencies=[Depends(require_auth)])
 async def backtests() -> list[dict]:
     return state.backtests()
@@ -309,6 +387,41 @@ async def trades() -> list[dict]:
     return state.trades()
 
 
+@app.get("/api/price-observations", dependencies=[Depends(require_auth)])
+async def price_observations() -> list[dict]:
+    return state.price_observations()
+
+
+@app.get("/api/strategy-decisions", dependencies=[Depends(require_auth)])
+async def strategy_decisions() -> list[dict]:
+    return state.strategy_decisions()
+
+
+@app.get("/api/trade-sessions", dependencies=[Depends(require_auth)])
+async def trade_sessions() -> list[dict]:
+    return state.trade_sessions()
+
+
+@app.get("/api/settings/versions", dependencies=[Depends(require_auth)])
+async def settings_versions() -> list[dict]:
+    return state.settings_versions()
+
+
+@app.get("/api/analytics/performance", dependencies=[Depends(require_auth)])
+async def performance_analytics() -> dict:
+    return state.performance_analytics()
+
+
+@app.get("/api/analytics/suggestions", dependencies=[Depends(require_auth)])
+async def tuning_suggestions() -> list[dict]:
+    return state.tuning_suggestions()
+
+
+@app.get("/api/replay/timeline/{token_id}", dependencies=[Depends(require_auth)])
+async def replay_timeline(token_id: str) -> list[dict]:
+    return state.replay_timeline(token_id)
+
+
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])
 async def source_health() -> dict:
     return state.source_health()
@@ -320,14 +433,14 @@ async def data_summary() -> dict:
 
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
-async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "all"]) -> dict:
+async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"]) -> dict:
     result = state.clear_data(target)
     await broadcast_snapshot()
     return result
 
 
 @app.get("/api/export/{target}", dependencies=[Depends(require_auth)])
-async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "all"]) -> JSONResponse:
+async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"]) -> JSONResponse:
     return JSONResponse(
         content=state.export_data(target),
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-{target}.json"'},

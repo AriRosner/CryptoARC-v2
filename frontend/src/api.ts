@@ -1,6 +1,8 @@
-import type { BacktestResult, BotSnapshot, DataSummary, SecurityStatus, SourceEvent, SourceHealth, TradeRecord } from "./types";
+import type { BacktestResult, BotSnapshot, DataSummary, PerformanceAnalytics, PriceObservation, ReplayTimelineEvent, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TradeRecord, TradeSession, TuningSuggestion } from "./types";
 
-const API_BASE = "http://127.0.0.1:8000";
+const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
+const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
+const API_BASE = configuredApiBase ?? (window.location.port === "5173" ? localDevApiBase : "");
 let authToken = window.localStorage.getItem("cryptoarc_token") || "";
 
 function headers(extra?: HeadersInit): HeadersInit {
@@ -82,6 +84,14 @@ export async function runStrategyComparison(): Promise<BacktestResult> {
   return request("/api/backtest/compare", { method: "POST" });
 }
 
+export async function runABStrategyReplay(options?: BacktestOptions): Promise<BacktestResult> {
+  return request("/api/backtest/ab-replay", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options ?? {})
+  });
+}
+
 export async function fetchBacktests(): Promise<BacktestResult[]> {
   return request("/api/backtests");
 }
@@ -94,6 +104,34 @@ export async function fetchTrades(): Promise<TradeRecord[]> {
   return request("/api/trades");
 }
 
+export async function fetchPriceObservations(): Promise<PriceObservation[]> {
+  return request("/api/price-observations");
+}
+
+export async function fetchStrategyDecisions(): Promise<StrategyDecisionRecord[]> {
+  return request("/api/strategy-decisions");
+}
+
+export async function fetchTradeSessions(): Promise<TradeSession[]> {
+  return request("/api/trade-sessions");
+}
+
+export async function fetchSettingsVersions(): Promise<SettingsVersion[]> {
+  return request("/api/settings/versions");
+}
+
+export async function fetchPerformanceAnalytics(): Promise<PerformanceAnalytics> {
+  return request("/api/analytics/performance");
+}
+
+export async function fetchTuningSuggestions(): Promise<TuningSuggestion[]> {
+  return request("/api/analytics/suggestions");
+}
+
+export async function fetchReplayTimeline(tokenId: string): Promise<ReplayTimelineEvent[]> {
+  return request(`/api/replay/timeline/${encodeURIComponent(tokenId)}`);
+}
+
 export async function fetchSourceHealth(): Promise<SourceHealth> {
   return request("/api/source-health");
 }
@@ -102,20 +140,51 @@ export async function fetchSecurityStatus(): Promise<SecurityStatus> {
   return request("/api/security/status");
 }
 
+export async function updatePassword(current_password: string, new_password: string): Promise<void> {
+  await request("/api/security/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_password, new_password })
+  });
+  logout();
+}
+
+export async function setupTotp(): Promise<{ secret: string; otpauth_url: string }> {
+  return request("/api/security/totp/setup", { method: "POST" });
+}
+
+export async function verifyTotp(secret: string, code: string): Promise<void> {
+  await request("/api/security/totp/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ secret, code })
+  });
+  logout();
+}
+
+export async function disableTotp(): Promise<void> {
+  await request("/api/security/totp/disable", { method: "POST" });
+  logout();
+}
+
 export async function fetchDataSummary(): Promise<DataSummary> {
   return request("/api/data/summary");
 }
 
-export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "all"): Promise<DataSummary> {
+export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all"): Promise<DataSummary> {
   return request(`/api/data/clear/${target}`, { method: "POST" });
 }
 
-export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "all"): string {
+export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all"): string {
   return `${API_BASE}/api/export/${target}${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`;
 }
 
 export function openSnapshotSocket(onSnapshot: (snapshot: BotSnapshot) => void): WebSocket {
-  const socket = new WebSocket(`ws://127.0.0.1:8000/ws${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`);
+  const apiUrl = API_BASE ? new URL(API_BASE, window.location.origin) : new URL(window.location.origin);
+  apiUrl.protocol = apiUrl.protocol === "https:" ? "wss:" : "ws:";
+  apiUrl.pathname = "/ws";
+  apiUrl.search = authToken ? `?token=${encodeURIComponent(authToken)}` : "";
+  const socket = new WebSocket(apiUrl.toString());
   socket.addEventListener("message", (event) => {
     onSnapshot(JSON.parse(event.data));
   });

@@ -42,6 +42,18 @@ class AuthManager:
     def valid(self, token: str | None) -> bool:
         return not self.enabled or bool(token and token in self.sessions)
 
+    def set_password(self, password: str) -> None:
+        self.password = password
+        self.sessions.clear()
+
+    def set_totp_secret(self, secret: str) -> None:
+        self.totp_secret = secret
+        self.sessions.clear()
+
+    def disable_totp(self) -> None:
+        self.totp_secret = ""
+        self.sessions.clear()
+
 
 def verify_totp(secret: str, code: str, window: int = 1) -> bool:
     if not code:

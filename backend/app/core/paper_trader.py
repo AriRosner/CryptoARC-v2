@@ -24,7 +24,8 @@ class PaperTrader:
 
         token.amount_sol = settings.trade_size_sol
         speed_impact = {"slow": 0.0, "normal": 0.05, "fast": 0.12, "turbo": 0.25}.get(settings.trading_speed, 0.05)
-        token.price_impact_pct = round(settings.paper_price_impact_pct + speed_impact + (token.buy_velocity * 0.08), 4)
+        velocity_impact = token.buy_velocity * 0.08 if settings.velocity_slippage_enabled else 0.0
+        token.price_impact_pct = round(settings.paper_price_impact_pct + speed_impact + velocity_impact, 4)
         slippage_multiplier = 1 + ((settings.slippage_tolerance_pct + token.price_impact_pct) / 100)
         token.entry_price = max(0.000001, (token.current_price or 0.00001) * slippage_multiplier)
         token.slippage_paid_pct = settings.slippage_tolerance_pct
@@ -70,37 +71,80 @@ class PaperTrader:
         token.lowest_unrealized_pct = min(token.lowest_unrealized_pct, token.unrealized_pct)
         if token.opened_at:
             token.hold_duration_seconds = max(0, int((utc_now() - token.opened_at).total_seconds()))
-        gross_pnl = settings.trade_size_sol * (move_pct / 100)
-        exit_fee = settings.trade_size_sol * (settings.paper_fee_bps / 10000)
-        token.pnl_sol = round(gross_pnl - token.fee_paid_sol - exit_fee, 6)
+        self.mark_to_market(token, settings)
+        can_exit = token.hold_duration_seconds >= settings.minimum_hold_time_seconds
+
+        if settings.partial_take_profit_enabled and not token.partial_take_profit_taken and move_pct >= settings.partial_take_profit_pct:
+            fraction = max(0.0, min(1.0, settings.partial_take_profit_fraction))
+            token.realized_pnl_sol = round(token.realized_pnl_sol + ((token.pnl_sol or 0.0) * fraction), 6)
+            token.remaining_fraction = round(max(0.0, token.remaining_fraction - fraction), 4)
+            token.partial_take_profit_taken = True
+            token.decision_log.append(f"Partial take profit filled: {fraction * 100:.0f}% at {move_pct:.2f}% move")
+
+        if not can_exit:
+            return False
 
         if move_pct >= settings.take_profit_pct:
-            self.close(token, "take profit")
+            self.close(token, settings, "take profit")
+            return True
+
+        if settings.trailing_stop_enabled and token.highest_unrealized_pct >= settings.partial_take_profit_pct:
+            trail_trigger = token.highest_unrealized_pct - settings.trailing_stop_pct
+            if move_pct <= trail_trigger:
+                self.close(token, settings, "trailing stop")
+                return True
+
+        if settings.break_even_stop_enabled and token.highest_unrealized_pct >= settings.break_even_after_profit_pct and move_pct <= 0:
+            self.close(token, settings, "break-even stop")
+            return True
+
+        if settings.stalled_trade_exit_enabled and token.hold_duration_seconds >= settings.stalled_trade_seconds and abs(move_pct) <= settings.stalled_trade_min_move_pct:
+            self.close(token, settings, "stalled trade")
+            return True
+
+        if settings.sell_pressure_exit_enabled and token.sell_pressure >= settings.sell_pressure_exit_threshold:
+            self.close(token, settings, "sell pressure exit")
             return True
 
         if move_pct <= -settings.stop_loss_pct:
-            self.close(token, "stop loss")
+            self.close(token, settings, "stop loss")
             return True
 
         if token.opened_at and utc_now() - token.opened_at >= timedelta(seconds=settings.max_hold_time_seconds):
-            self.close(token, "max hold time")
+            self.close(token, settings, "max hold time")
             return True
 
         if token.ticks_held >= settings.max_position_ticks:
-            self.close(token, "max position ticks")
+            self.close(token, settings, "max position ticks")
             return True
 
         return False
 
-    def close(self, token: TokenSignal, reason: str = "manual") -> None:
+    def mark_to_market(self, token: TokenSignal, settings: BotSettings) -> None:
+        if token.entry_price is None or token.current_price is None:
+            return
+        move_pct = ((token.current_price - token.entry_price) / token.entry_price) * 100
+        token.unrealized_pct = round(move_pct, 2)
+        token.highest_unrealized_pct = max(token.highest_unrealized_pct, token.unrealized_pct)
+        token.lowest_unrealized_pct = min(token.lowest_unrealized_pct, token.unrealized_pct)
+        if token.opened_at:
+            token.hold_duration_seconds = max(0, int((utc_now() - token.opened_at).total_seconds()))
+        amount = token.amount_sol or settings.trade_size_sol
+        gross_pnl = amount * (move_pct / 100)
+        exit_fee = amount * (settings.paper_fee_bps / 10000)
+        open_pnl = (gross_pnl - token.fee_paid_sol - exit_fee) * max(0.0, token.remaining_fraction)
+        token.pnl_sol = round(token.realized_pnl_sol + open_pnl, 6)
+
+    def close(self, token: TokenSignal, settings: BotSettings, reason: str = "manual") -> None:
         token.status = TokenStatus.SELLING
+        self.mark_to_market(token, settings)
         token.status = TokenStatus.PAPER_SOLD
         token.exit_price = token.current_price
         token.closed_at = utc_now()
         token.exit_reason = reason
         if token.opened_at:
             token.hold_duration_seconds = max(0, int((token.closed_at - token.opened_at).total_seconds()))
-        token.decision_log.append(f"Paper sell filled: {reason}")
+        token.decision_log.append(f"Paper sell filled: {reason}; final P&L {token.pnl_sol or 0.0:+.6f} SOL")
 
     def _fill_failed(self, token: TokenSignal, settings: BotSettings) -> bool:
         if settings.paper_failed_fill_pct <= 0:

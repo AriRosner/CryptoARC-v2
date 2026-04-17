@@ -10,16 +10,20 @@ from app.core.models import (
     BotSnapshot,
     BotStats,
     BotStatus,
+    SettingsVersion,
     SourceStatus,
     SourceEvent,
+    StrategyDecisionRecord,
     TokenSignal,
     TokenStatus,
     TradeEvent,
     TradeRecord,
+    TradeSession,
     new_id,
     utc_now,
 )
 from app.core.paper_trader import PaperTrader
+from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
@@ -50,8 +54,10 @@ class BotState:
         self.risk = RiskEngine()
         self.strategy = DecisionPipeline(self.scoring, self.risk)
         self.paper = PaperTrader()
+        self.price_pipeline = PricePipeline()
         self.simulator = LaunchSimulator()
-        self.creator_history = Counter(token.creator for token in self.tokens)
+        self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
+        self.current_settings_version_id = self.ensure_settings_version("startup", [])
         self.recalculate_stats()
 
     def start(self) -> BotSnapshot:
@@ -66,13 +72,31 @@ class BotState:
 
     def update_settings(self, patch: dict[str, object]) -> BotSnapshot:
         current = asdict(self.settings)
-        current.update({key: value for key, value in patch.items() if key in current})
+        clean_patch = {key: value for key, value in patch.items() if key in current}
+        changed_keys = sorted([key for key, value in clean_patch.items() if current.get(key) != value])
+        current.update(clean_patch)
         self.settings = BotSettings(**current)
         self.source_status.source = self.settings.launch_source
         self.storage.save_settings(self.settings)
-        changed = ", ".join(sorted(patch.keys()))
+        self.current_settings_version_id = self.ensure_settings_version("settings save", changed_keys)
+        changed = ", ".join(changed_keys or sorted(clean_patch.keys()))
         self.add_event("info", f"Settings saved: {changed}")
         return self.snapshot()
+
+    def ensure_settings_version(self, label: str, changed_keys: list[str]) -> str:
+        latest = self.storage.load_settings_versions(1)
+        current_settings = asdict(self.settings)
+        if latest and latest[0].settings == current_settings and not changed_keys:
+            return latest[0].id
+        version = SettingsVersion(
+            id=new_id("set"),
+            created_at=utc_now(),
+            settings=current_settings,
+            label=label,
+            changed_keys=changed_keys,
+        )
+        self.storage.save_settings_version(version)
+        return version.id
 
     def add_event(self, level: str, message: str, token_id: str | None = None) -> None:
         event = TradeEvent(
@@ -102,28 +126,53 @@ class BotState:
             self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
             self.apply_observed_trade(event)
             return
-        self.record_source_event(event.source, event.raw_payload, event.token, event.message)
+        event_status = "status" if event.message and event.token is None else None
+        self.record_source_event(event.source, event.raw_payload, event.token, event.message, status=event_status)
         if event.token:
             self.ingest_launch(event.token)
 
     def apply_observed_trade(self, event: LaunchEvent) -> None:
-        if not self.settings.use_observed_prices or not event.mint or not event.observed_price:
+        if not self.settings.use_observed_prices or not event.mint:
+            return
+        observation = self.price_pipeline.observe(
+            event.raw_payload,
+            mint=event.mint,
+            settings=self.settings,
+            source=event.source,
+            trade_side=event.trade_side,
+            sol_amount=event.sol_amount,
+        )
+        if not observation.accepted or not observation.price:
+            for token in self.tokens:
+                if token.mint == event.mint and token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
+                    observation.token_id = token.id
+                    self.storage.save_price_observation(observation)
+                    token.rejected_price_streak += 1
+                    token.price_reject_reason = observation.reason
+                    token.decision_log.append(f"Price observation rejected: {observation.reason}")
+                    self.storage.save_token(token)
+                    break
             return
         for token in self.tokens:
             if token.mint != event.mint:
                 continue
             if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
                 continue
-            old_price = token.current_price or event.observed_price
+            observation.token_id = token.id
+            observed_price = observation.price
+            old_price = token.current_price or observed_price
             if token.entry_price and token.observed_price_updates == 0:
-                ratio = event.observed_price / max(token.entry_price, 0.000000001)
+                ratio = observed_price / max(token.entry_price, 0.000000001)
                 if ratio > 5 and token.entry_price <= 0.0000011:
-                    token.entry_price = event.observed_price
-                    token.current_price = event.observed_price
-                    token.exit_price = event.observed_price if token.exit_price else None
-                    token.peak_price = event.observed_price
-                    token.trough_price = event.observed_price
+                    token.entry_price = observed_price
+                    token.current_price = observed_price
+                    token.exit_price = observed_price if token.exit_price else None
+                    token.peak_price = observed_price
+                    token.trough_price = observed_price
                     token.price_source = "observed_rebased"
+                    token.price_confidence = observation.confidence
+                    token.price_reject_reason = ""
+                    token.rejected_price_streak = 0
                     token.observed_price_updates += 1
                     token.last_observed_trade_at = event.received_at
                     fee_drag = token.fee_paid_sol + ((token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000))
@@ -132,12 +181,25 @@ class BotState:
                     token.highest_unrealized_pct = max(token.highest_unrealized_pct, 0.0)
                     token.lowest_unrealized_pct = min(token.lowest_unrealized_pct, 0.0)
                     token.decision_log.append(
-                        f"Observed {event.trade_side} trade rebased entry to {event.observed_price:.8f}; ignored mismatched {ratio:.1f}x first tick"
+                        f"Observed {event.trade_side} trade rebased entry to {observed_price:.8f}; ignored mismatched {ratio:.1f}x first tick"
                     )
                     self.storage.save_token(token)
+                    self.storage.save_price_observation(observation)
                     break
-            token.current_price = event.observed_price
-            token.price_source = "observed"
+            observation = self.price_pipeline.validate_first_tick(token, observation, self.settings)
+            if not observation.accepted or not observation.price:
+                token.price_reject_reason = observation.reason
+                token.rejected_price_streak += 1
+                token.decision_log.append(f"Price observation rejected: {observation.reason}")
+                self.storage.save_token(token)
+                self.storage.save_price_observation(observation)
+                break
+            observed_price = observation.price
+            token.current_price = observed_price
+            token.price_source = observation.price_source
+            token.price_confidence = observation.confidence
+            token.price_reject_reason = ""
+            token.rejected_price_streak = 0
             token.observed_price_updates += 1
             token.last_observed_trade_at = event.received_at
             if event.trade_side == "buy":
@@ -150,8 +212,9 @@ class BotState:
                 gross_pnl = (token.amount_sol or self.settings.trade_size_sol) * (move_pct / 100)
                 exit_fee = (token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000)
                 token.pnl_sol = round(gross_pnl - token.fee_paid_sol - exit_fee, 6)
-            token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {event.observed_price:.8f}")
+            token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {observed_price:.8f} ({observation.price_source}, {observation.confidence:.2f})")
             self.storage.save_token(token)
+            self.storage.save_price_observation(observation)
             break
 
     def tick(self) -> BotSnapshot:
@@ -161,15 +224,23 @@ class BotState:
                 self.storage.save_token(token)
                 continue
 
-            delta_pct = 0.0 if self.settings.use_observed_prices and token.price_source == "observed" else self.simulator.price_delta_pct(token, self.settings.paper_price_volatility_pct)
-            closed = self.paper.tick(token, self.settings, delta_pct)
+            uses_observed_price = self.settings.use_observed_prices and token.observed_price_updates > 0
+            delta_pct = 0.0 if uses_observed_price else self.simulator.price_delta_pct(token, self.settings.paper_price_volatility_pct)
+            if self.settings.max_rejected_price_streak_enabled and self.settings.max_rejected_price_streak and token.rejected_price_streak >= self.settings.max_rejected_price_streak:
+                self.paper.close(token, self.settings, "price quality guard")
+                closed = True
+            else:
+                closed = self.paper.tick(token, self.settings, delta_pct)
             self.storage.save_token(token)
             if closed:
                 pnl = token.pnl_sol or 0.0
-                level = "success" if pnl > 0 else "danger"
+                outcome = self._classify_pnl(pnl)
+                level = "success" if outcome == "win" else "danger" if outcome == "loss" else "warning"
                 reason = f" ({token.exit_reason})" if token.exit_reason else ""
-                self.add_event(level, f"Paper sold {token.symbol} at {pnl:+.4f} SOL{reason}", token.id)
+                label = "scratch " if outcome == "scratch" else ""
+                self.add_event(level, f"Paper sold {token.symbol} at {pnl:+.4f} SOL {label}{reason}".replace("  ", " "), token.id)
                 self.storage.save_trade(self.trade_from_token(token))
+                self.storage.save_trade_session(self.session_from_token(token, "closed"))
 
         self.recalculate_stats()
         return self.snapshot()
@@ -178,12 +249,25 @@ class BotState:
         if self.status != BotStatus.RUNNING or not self.settings.detect_new_tokens:
             return
 
+        token.settings_version_id = self.current_settings_version_id
         token.status = TokenStatus.ANALYZING
         self.enrich_token_intelligence(token)
 
         open_positions = self.open_position_count()
+        guard_reason = self.evaluate_session_guards(token)
+        if guard_reason:
+            token.status = TokenStatus.SKIPPED
+            token.reason = guard_reason
+            token.decision_log.append(f"Skipped: {guard_reason}")
+            self.add_event("warning", f"Skipped {token.symbol}: {guard_reason}", token.id)
+            self.tokens.appendleft(token)
+            self.creator_history[token.creator] += 1
+            self.storage.save_token(token)
+            self.recalculate_stats()
+            return
         decision = self.strategy.evaluate(token, self.settings, self.stats, open_positions)
         token.decision_log.extend(decision.log)
+        self.storage.save_strategy_decision(self.decision_record_from_token(token, decision))
         if decision.allowed:
             token.status = TokenStatus.BUYING
             token.entry_reason = f"score {token.score}: {token.reason}"
@@ -193,6 +277,7 @@ class BotState:
                 self.add_event("warning", f"Paper buy failed {token.symbol}: simulated fill miss", token.id)
             else:
                 self.storage.save_trade(self.trade_from_token(token))
+                self.storage.save_trade_session(self.session_from_token(token, "opened"))
                 fill_note = "queued" if token.status == TokenStatus.BUYING else "filled"
                 self.add_event(
                     "success",
@@ -247,6 +332,20 @@ class BotState:
             tags.append("honeypot risk")
         if token.rug_risk:
             tags.append("rug-pull risk")
+        if token.initial_buy_sol >= 2:
+            tags.append("large initial buy")
+        elif token.initial_buy_sol > 0:
+            tags.append("seed buy present")
+        if token.market_cap_sol >= 80:
+            tags.append("high launch market cap")
+        if token.bonding_curve:
+            tags.append("bonding curve present")
+        if token.metadata_uri.startswith("ipfs://") or "ipfs" in token.metadata_uri:
+            tags.append("ipfs metadata")
+        if token.price_confidence >= self.settings.min_price_confidence:
+            tags.append(f"price confidence {token.price_confidence:.2f}")
+        elif token.price_confidence > 0:
+            tags.append("weak price confidence")
 
         token.intelligence_tags = tags
 
@@ -266,7 +365,71 @@ class BotState:
             closed_at=token.closed_at,
             hold_duration_seconds=token.hold_duration_seconds,
             decision_log=token.decision_log,
+            lifecycle_status="closed" if token.closed_at else "open",
+            entry_fee_sol=token.fee_paid_sol,
+            exit_fee_sol=(token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000) if token.closed_at else 0.0,
+            price_impact_pct=token.price_impact_pct,
+            slippage_paid_pct=token.slippage_paid_pct,
+            source_price_confidence=token.price_confidence,
+            settings_version_id=token.settings_version_id or self.current_settings_version_id,
         )
+
+    def decision_record_from_token(self, token: TokenSignal, decision) -> StrategyDecisionRecord:
+        return StrategyDecisionRecord(
+            id=new_id("dec"),
+            token_id=token.id,
+            mint=token.mint,
+            created_at=utc_now(),
+            engine_version=str(decision.snapshot.get("engine_version", "strategy-v2")),
+            profile=self.settings.strategy_profile,
+            score=token.score,
+            allowed=decision.allowed,
+            action=decision.action,
+            reason=decision.reason,
+            risk_reason=decision.risk.reason,
+            snapshot=decision.snapshot,
+            score_breakdown=token.score_breakdown,
+            decision_log=decision.log,
+            settings_version_id=token.settings_version_id or self.current_settings_version_id,
+        )
+
+    def session_from_token(self, token: TokenSignal, status: str) -> TradeSession:
+        return TradeSession(
+            id=f"ses_{token.id}",
+            token_id=token.id,
+            mint=token.mint,
+            symbol=token.symbol,
+            strategy_profile=token.entry_strategy_profile or self.settings.strategy_profile,
+            status=status,
+            opened_at=token.opened_at,
+            closed_at=token.closed_at,
+            amount_sol=token.amount_sol,
+            entry_price=token.entry_price,
+            exit_price=token.exit_price,
+            pnl_sol=token.pnl_sol,
+            realized_pnl_sol=token.realized_pnl_sol,
+            remaining_fraction=token.remaining_fraction,
+            exit_reason=token.exit_reason,
+            lifecycle=[{"at": utc_now().isoformat(), "status": status, "pnl_sol": token.pnl_sol, "reason": token.exit_reason or token.entry_reason or token.reason}],
+            settings_version_id=token.settings_version_id or self.current_settings_version_id,
+        )
+
+    def evaluate_session_guards(self, token: TokenSignal) -> str | None:
+        now = utc_now()
+        closed_trades = self.storage.load_trades(500)
+        recent_trades = [trade for trade in closed_trades if trade.opened_at and (now - trade.opened_at) <= timedelta(hours=1)]
+        if self.settings.max_trades_per_hour_enabled and len(recent_trades) >= self.settings.max_trades_per_hour:
+            return f"max trades per hour reached ({self.settings.max_trades_per_hour})"
+        if self.settings.cooldown_after_loss_enabled and self.settings.cooldown_after_loss_seconds > 0:
+            losses = [trade for trade in closed_trades if trade.closed_at and (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001)]
+            if losses and (now - losses[0].closed_at).total_seconds() < self.settings.cooldown_after_loss_seconds:
+                return "cooldown after loss active"
+        same_creator_buys = sum(1 for existing in self.tokens if existing.creator == token.creator and existing.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING, TokenStatus.PAPER_SOLD})
+        if self.settings.max_same_creator_buys_enabled and same_creator_buys >= self.settings.max_same_creator_buys:
+            return f"same creator buy cap reached ({self.settings.max_same_creator_buys})"
+        if self.settings.stop_on_source_degraded and self.source_health().get("health_score", 100) < 50:
+            return "source health degraded"
+        return None
 
     def replay_backtest(
         self,
@@ -290,6 +453,8 @@ class BotState:
         simulated_pnl = 0.0
         wins = 0
         losses = 0
+        scratches = 0
+        gross_wins = 0
         gross_win = 0.0
         gross_loss = 0.0
         pnl_curve = [0.0]
@@ -299,16 +464,21 @@ class BotState:
             decision = self.risk.evaluate(token, settings, replay_stats, open_positions=0)
             if decision.allowed:
                 buys += 1
-                pnl = token.pnl_sol if token.pnl_sol is not None else self._estimated_replay_pnl(token, settings)
+                pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
                 trough = min(trough, simulated_pnl)
+                outcome = self._classify_pnl(pnl)
                 if pnl > 0:
+                    gross_wins += 1
+                if outcome == "win":
                     wins += 1
                     gross_win += pnl
-                elif pnl < 0:
+                elif outcome == "loss":
                     losses += 1
                     gross_loss += abs(pnl)
+                else:
+                    scratches += 1
                 trades.append(
                     {
                         "token_id": token.id,
@@ -342,10 +512,16 @@ class BotState:
             skips=skips,
             wins=wins,
             losses=losses,
+            scratches=scratches,
             win_rate_pct=int((wins / buys) * 100) if buys else 0,
+            gross_win_rate_pct=int((gross_wins / buys) * 100) if buys else 0,
+            scratch_rate_pct=int((scratches / buys) * 100) if buys else 0,
             estimated_pnl_sol=round(simulated_pnl, 6),
             max_drawdown_sol=round(trough, 6),
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
+            avg_hold_seconds=int(sum((token.hold_duration_seconds or 0) for token in candidates) / max(1, len(candidates))),
+            best_trade_sol=round(max([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
+            worst_trade_sol=round(min([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
             pnl_curve=pnl_curve[-80:],
             trades=trades[:80],
             comparison=[{"date_from": date_from or "any", "date_to": date_to or "any", "replay_speed": replay_speed}],
@@ -367,6 +543,8 @@ class BotState:
         candidates: list[TokenSignal] = []
         failures = 0
         for event in source_events:
+            if event.status in {"trade", "status"}:
+                continue
             if event.source == "pumpportal":
                 token = normalize_pumpportal_new_token(event.raw_payload, event.received_at)
                 if token:
@@ -408,15 +586,20 @@ class BotState:
             pnl = 0.0
             wins = 0
             losses = 0
+            scratches = 0
+            gross_wins = 0
             drawdown = 0.0
             for token in candidates:
                 decision = self.risk.evaluate(token, settings, BotStats(), open_positions=0)
                 if decision.allowed:
                     buys += 1
-                    trade_pnl = token.pnl_sol if token.pnl_sol is not None else self._estimated_replay_pnl(token, settings) + abs(offset) / 2000
+                    trade_pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings) + abs(offset) / 2000
                     pnl += trade_pnl
-                    wins += 1 if trade_pnl > 0 else 0
-                    losses += 1 if trade_pnl < 0 else 0
+                    gross_wins += 1 if trade_pnl > 0 else 0
+                    outcome = self._classify_pnl(trade_pnl)
+                    wins += 1 if outcome == "win" else 0
+                    losses += 1 if outcome == "loss" else 0
+                    scratches += 1 if outcome == "scratch" else 0
                     drawdown = min(drawdown, pnl)
                 else:
                     skips += 1
@@ -426,7 +609,9 @@ class BotState:
                 "skips": skips,
                 "wins": wins,
                 "losses": losses,
+                "scratches": scratches,
                 "win_rate_pct": int((wins / buys) * 100) if buys else 0,
+                "gross_win_rate_pct": int((gross_wins / buys) * 100) if buys else 0,
                 "max_drawdown_sol": round(drawdown, 6),
                 "estimated_pnl_sol": round(pnl, 6),
             })
@@ -442,6 +627,8 @@ class BotState:
         simulated_pnl = 0.0
         wins = 0
         losses = 0
+        scratches = 0
+        gross_wins = 0
         gross_win = 0.0
         gross_loss = 0.0
         pnl_curve = [0.0]
@@ -457,16 +644,21 @@ class BotState:
             decision = self.risk.evaluate(token, settings, replay_stats, open_positions=0)
             if decision.allowed:
                 buys += 1
-                pnl = token.pnl_sol if token.pnl_sol is not None else self._estimated_replay_pnl(token, settings)
+                pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
                 trough = min(trough, simulated_pnl)
+                outcome = self._classify_pnl(pnl)
                 if pnl > 0:
+                    gross_wins += 1
+                if outcome == "win":
                     wins += 1
                     gross_win += pnl
-                elif pnl < 0:
+                elif outcome == "loss":
                     losses += 1
                     gross_loss += abs(pnl)
+                else:
+                    scratches += 1
                 trades.append({"token_id": token.id, "symbol": token.symbol, "decision": "buy", "reason": token.reason, "score": token.score, "pnl_sol": round(pnl, 6)})
             else:
                 skips += 1
@@ -481,10 +673,16 @@ class BotState:
             skips=skips,
             wins=wins,
             losses=losses,
+            scratches=scratches,
             win_rate_pct=int((wins / buys) * 100) if buys else 0,
+            gross_win_rate_pct=int((gross_wins / buys) * 100) if buys else 0,
+            scratch_rate_pct=int((scratches / buys) * 100) if buys else 0,
             estimated_pnl_sol=round(simulated_pnl, 6),
             max_drawdown_sol=round(trough, 6),
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
+            avg_hold_seconds=int(sum((token.hold_duration_seconds or 0) for token in candidates) / max(1, len(candidates))),
+            best_trade_sol=round(max([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
+            worst_trade_sol=round(min([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
             pnl_curve=pnl_curve[-120:],
             trades=trades[:120],
             replay_source=replay_source,
@@ -501,6 +699,15 @@ class BotState:
 
     def trades(self, limit: int = 300) -> list[dict[str, object]]:
         return [trade.to_dict() for trade in self.storage.load_trades(limit)]
+
+    def price_observations(self, limit: int = 300) -> list[dict[str, object]]:
+        return [observation.to_dict() for observation in self.storage.load_price_observations(limit)]
+
+    def strategy_decisions(self, limit: int = 300) -> list[dict[str, object]]:
+        return [decision.to_dict() for decision in self.storage.load_strategy_decisions(limit)]
+
+    def trade_sessions(self, limit: int = 300) -> list[dict[str, object]]:
+        return [session.to_dict() for session in self.storage.load_trade_sessions(limit)]
 
     def source_health(self) -> dict[str, object]:
         events = self.storage.load_source_events(300)
@@ -541,8 +748,138 @@ class BotState:
             "last_valid_token_id": newest_normalized.normalized_token_id if newest_normalized else None,
             "last_source_message": self.source_status.message,
             "trade_events": len([event for event in events if event.status == "trade"]),
-            "reliability_note": "Using one PumpPortal WebSocket for launch and token trade subscriptions.",
+            "launch_events": self.source_status.launch_events_seen,
+            "status_events": self.source_status.status_events_seen,
+            "active_trade_subscriptions": self.source_status.active_trade_subscriptions,
+            "dropped_trade_subscriptions": self.source_status.dropped_trade_subscriptions,
+            "price_observations": self.storage.count_price_observations(),
+            "strategy_decisions": self.storage.count_strategy_decisions(),
+            "trade_sessions": self.storage.count_trade_sessions(),
+            "reliability_note": "PumpPortal trade subscriptions rotate toward the newest launches.",
         }
+
+    def settings_versions(self) -> list[dict[str, object]]:
+        return [version.to_dict() for version in self.storage.load_settings_versions(50)]
+
+    def performance_analytics(self) -> dict[str, object]:
+        trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        tokens_by_id = {token.id: token for token in self.storage.load_all_tokens(5000)}
+        return {
+            "summary": self._performance_group("all trades", trades),
+            "by_exit_reason": self._group_performance(trades, lambda trade: trade.exit_reason or "unknown"),
+            "by_strategy": self._group_performance(trades, lambda trade: trade.strategy_profile or "unknown"),
+            "by_settings_version": self._group_performance(trades, lambda trade: trade.settings_version_id or "legacy"),
+            "by_score_bucket": self._group_performance(
+                trades,
+                lambda trade: self._score_bucket(tokens_by_id.get(trade.token_id).score if tokens_by_id.get(trade.token_id) else None),
+            ),
+            "by_price_confidence": self._group_performance(trades, lambda trade: self._confidence_bucket(trade.source_price_confidence)),
+            "recent_curve": self._pnl_curve(trades),
+        }
+
+    def tuning_suggestions(self) -> list[dict[str, object]]:
+        trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        suggestions: list[dict[str, object]] = []
+        if len(trades) < 8:
+            return [{"title": "Collect more samples", "reason": "Auto-tuning needs at least 8 closed trades before the suggestions are meaningful.", "setting": "backtest_replay_limit", "confidence": 0.35}]
+
+        summary = self._performance_group("all trades", trades)
+        by_exit = {item["label"]: item for item in self._group_performance(trades, lambda trade: trade.exit_reason or "unknown")}
+        if summary["win_rate_pct"] < 35 and not self.settings.cooldown_after_loss_enabled:
+            suggestions.append({"title": "Enable loss cooldown", "reason": "Recent decisive win rate is low; pausing briefly after losses can reduce clustered bad entries.", "setting": "cooldown_after_loss_enabled", "suggested_value": True, "confidence": 0.72})
+        max_tick = by_exit.get("max position ticks")
+        if max_tick and max_tick["pnl_sol"] < 0 and not self.settings.stalled_trade_exit_enabled:
+            suggestions.append({"title": "Try stalled-trade exit", "reason": "Max-tick exits are losing money; stalled exits can close flat trades earlier.", "setting": "stalled_trade_exit_enabled", "suggested_value": True, "confidence": 0.68})
+        stop_loss = by_exit.get("stop loss")
+        if stop_loss and stop_loss["count"] >= 3 and self.settings.stop_loss_pct > 20:
+            suggestions.append({"title": "Tighten stop loss", "reason": "Several trades are reaching the stop; a tighter stop may lower average loss size in paper testing.", "setting": "stop_loss_pct", "suggested_value": max(10, round(self.settings.stop_loss_pct * 0.8, 1)), "confidence": 0.61})
+        low_conf_losses = [trade for trade in trades if trade.source_price_confidence < self.settings.min_price_confidence and (trade.pnl_sol or 0) < 0]
+        if len(low_conf_losses) >= 3:
+            suggestions.append({"title": "Raise price confidence floor", "reason": "Low-confidence price marks are contributing multiple losses.", "setting": "min_price_confidence", "suggested_value": min(0.9, round(self.settings.min_price_confidence + 0.1, 2)), "confidence": 0.64})
+        if not suggestions:
+            suggestions.append({"title": "Keep current profile", "reason": "No single failure pattern dominates the closed trade set yet.", "setting": "strategy_profile", "suggested_value": self.settings.strategy_profile, "confidence": 0.52})
+        return suggestions
+
+    def ab_strategy_replay(self, limit: int = 120) -> BacktestRun:
+        return self.compare_strategies(limit=limit)
+
+    def replay_timeline(self, token_id: str) -> list[dict[str, object]]:
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.id == token_id), None)
+        mint = token.mint if token else ""
+        timeline: list[dict[str, object]] = []
+        if token:
+            timeline.append({"at": token.detected_at.isoformat(), "type": "token", "title": f"Detected {token.symbol}", "detail": token.reason})
+            if token.opened_at:
+                timeline.append({"at": token.opened_at.isoformat(), "type": "trade", "title": "Paper buy", "detail": token.entry_reason or "paper entry"})
+            if token.closed_at:
+                timeline.append({"at": token.closed_at.isoformat(), "type": "trade", "title": "Paper sell", "detail": token.exit_reason or "paper exit"})
+        for decision in self.storage.load_strategy_decisions(1000):
+            if decision.token_id == token_id:
+                timeline.append({"at": decision.created_at.isoformat(), "type": "decision", "title": decision.action, "detail": decision.reason})
+        for observation in self.storage.load_price_observations(1000, mint=mint) if mint else []:
+            timeline.append({"at": observation.observed_at.isoformat(), "type": "price", "title": observation.price_source, "detail": observation.reason})
+        for event in self.storage.load_source_events(1000):
+            raw_mint = str(event.raw_payload.get("mint") or event.raw_payload.get("mintAddress") or "")
+            if event.normalized_token_id == token_id or (mint and raw_mint == mint):
+                timeline.append({"at": event.received_at.isoformat(), "type": f"source:{event.status}", "title": event.source, "detail": event.message})
+        return sorted(timeline, key=lambda item: str(item["at"]))
+
+    def _performance_group(self, label: str, trades: list[TradeRecord]) -> dict[str, object]:
+        scratch = self.stats.scratch_threshold_sol or 0.001
+        pnls = [trade.pnl_sol or 0.0 for trade in trades]
+        wins = [pnl for pnl in pnls if pnl > scratch]
+        losses = [pnl for pnl in pnls if pnl < -scratch]
+        scratches = [pnl for pnl in pnls if abs(pnl) <= scratch]
+        decisive = len(wins) + len(losses)
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        holds = [trade.hold_duration_seconds for trade in trades if trade.hold_duration_seconds]
+        return {
+            "label": label,
+            "count": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "scratches": len(scratches),
+            "win_rate_pct": int((len(wins) / decisive) * 100) if decisive else 0,
+            "pnl_sol": round(sum(pnls), 6),
+            "avg_pnl_sol": round(sum(pnls) / len(pnls), 6) if pnls else 0.0,
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else 0.0,
+            "avg_hold_seconds": int(sum(holds) / len(holds)) if holds else 0,
+        }
+
+    def _group_performance(self, trades: list[TradeRecord], key_fn) -> list[dict[str, object]]:
+        grouped: dict[str, list[TradeRecord]] = {}
+        for trade in trades:
+            grouped.setdefault(str(key_fn(trade)), []).append(trade)
+        return sorted([self._performance_group(label, items) for label, items in grouped.items()], key=lambda item: abs(float(item["pnl_sol"])), reverse=True)
+
+    def _pnl_curve(self, trades: list[TradeRecord]) -> list[dict[str, object]]:
+        curve = []
+        total = 0.0
+        for trade in sorted(trades, key=lambda item: item.closed_at or item.opened_at or utc_now()):
+            total = round(total + (trade.pnl_sol or 0.0), 6)
+            curve.append({"at": (trade.closed_at or trade.opened_at or utc_now()).isoformat(), "pnl_sol": total, "trade_id": trade.id})
+        return curve[-500:]
+
+    def _score_bucket(self, score: int | None) -> str:
+        if score is None:
+            return "unknown"
+        if score >= 80:
+            return "80+"
+        if score >= 65:
+            return "65-79"
+        if score >= 50:
+            return "50-64"
+        return "<50"
+
+    def _confidence_bucket(self, confidence: float) -> str:
+        if confidence >= 0.8:
+            return "high confidence"
+        if confidence >= 0.5:
+            return "medium confidence"
+        if confidence > 0:
+            return "low confidence"
+        return "unknown"
 
     def _settings_for_profile(self, profile: str | None) -> BotSettings:
         if not profile or profile == self.settings.strategy_profile:
@@ -564,6 +901,25 @@ class BotState:
         fee_drag = (settings.paper_fee_bps / 10000) * settings.trade_size_sol * 2
         impact_drag = settings.trade_size_sol * (settings.paper_price_impact_pct / 100)
         return round(edge + flow - fee_drag - impact_drag, 6)
+
+    def _observed_replay_pnl(self, token: TokenSignal, settings: BotSettings) -> float:
+        observations = [item for item in self.storage.load_price_observations(500, mint=token.mint) if item.accepted and item.price]
+        if len(observations) >= 2:
+            entry = observations[0].price or token.current_price or 0.000001
+            exit_price = observations[-1].price or entry
+            move_pct = ((exit_price - entry) / max(entry, 0.000000001)) * 100
+            fee_drag = (settings.paper_fee_bps / 10000) * settings.trade_size_sol * 2
+            impact_drag = settings.trade_size_sol * (settings.paper_price_impact_pct / 100)
+            return round(settings.trade_size_sol * (move_pct / 100) - fee_drag - impact_drag, 6)
+        return self._estimated_replay_pnl(token, settings)
+
+    def _classify_pnl(self, pnl: float) -> str:
+        threshold = self.stats.scratch_threshold_sol or 0.001
+        if pnl > threshold:
+            return "win"
+        if pnl < -threshold:
+            return "loss"
+        return "scratch"
 
     def _filter_tokens_by_date(self, tokens: list[TokenSignal], date_from: str | None, date_to: str | None) -> list[TokenSignal]:
         start = self._parse_date(date_from)
@@ -593,27 +949,44 @@ class BotState:
             return {"backtests": [run.to_dict() for run in self.storage.load_backtest_runs(5000)]}
         if target == "trades":
             return {"trades": [trade.to_dict() for trade in self.storage.load_trades(5000)]}
+        if target == "price_observations":
+            return {"price_observations": [item.to_dict() for item in self.storage.load_price_observations(5000)]}
+        if target == "strategy_decisions":
+            return {"strategy_decisions": [item.to_dict() for item in self.storage.load_strategy_decisions(5000)]}
+        if target == "trade_sessions":
+            return {"trade_sessions": [item.to_dict() for item in self.storage.load_trade_sessions(5000)]}
+        if target == "settings_versions":
+            return {"settings_versions": [item.to_dict() for item in self.storage.load_settings_versions(5000)]}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
             "source_events": [event.to_dict() for event in self.storage.load_source_events(5000)],
             "backtests": [run.to_dict() for run in self.storage.load_backtest_runs(5000)],
             "trades": [trade.to_dict() for trade in self.storage.load_trades(5000)],
+            "price_observations": [item.to_dict() for item in self.storage.load_price_observations(5000)],
+            "strategy_decisions": [item.to_dict() for item in self.storage.load_strategy_decisions(5000)],
+            "trade_sessions": [item.to_dict() for item in self.storage.load_trade_sessions(5000)],
+            "settings_versions": [item.to_dict() for item in self.storage.load_settings_versions(5000)],
         }
 
     def data_summary(self) -> dict[str, int]:
         return {
-            "tokens": len(self.tokens),
-            "events": len(self.events),
-            "source_events": len(self.storage.load_source_events(10000)),
-            "backtests": len(self.backtest_runs),
-            "trades": len(self.storage.load_trades(10000)),
+            "tokens": self.storage.count_tokens(),
+            "events": self.storage.count_events(),
+            "source_events": self.storage.count_source_events(),
+            "backtests": self.storage.count_backtest_runs(),
+            "trades": self.storage.count_trades(),
+            "price_observations": self.storage.count_price_observations(),
+            "strategy_decisions": self.storage.count_strategy_decisions(),
+            "trade_sessions": self.storage.count_trade_sessions(),
+            "settings_versions": self.storage.count_settings_versions(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
         if target in {"tokens", "all"}:
             self.storage.clear_tokens()
             self.tokens.clear()
+            self.creator_history.clear()
         if target in {"events", "all"}:
             self.storage.clear_events()
             self.events.clear()
@@ -624,6 +997,15 @@ class BotState:
             self.backtest_runs.clear()
         if target in {"trades", "all"}:
             self.storage.clear_trades()
+        if target in {"price_observations", "all"}:
+            self.storage.clear_price_observations()
+        if target in {"strategy_decisions", "all"}:
+            self.storage.clear_strategy_decisions()
+        if target in {"trade_sessions", "all"}:
+            self.storage.clear_trade_sessions()
+        if target in {"settings_versions", "all"}:
+            self.storage.clear_settings_versions()
+            self.current_settings_version_id = self.ensure_settings_version("reset", [])
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()
@@ -634,15 +1016,31 @@ class BotState:
     def recalculate_stats(self) -> None:
         skipped = [token for token in self.tokens if token.status == TokenStatus.SKIPPED]
         open_tokens = [token for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}]
-        closed = [token for token in self.tokens if token.status == TokenStatus.PAPER_SOLD]
+        closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        closed_ids = {trade.token_id for trade in closed}
+        closed.extend(
+            self.trade_from_token(token)
+            for token in self.tokens
+            if token.status == TokenStatus.PAPER_SOLD and token.pnl_sol is not None and token.id not in closed_ids
+        )
         scratch_threshold = 0.001
-        wins = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) > scratch_threshold]
-        scratches = [token.pnl_sol or 0.0 for token in closed if abs(token.pnl_sol or 0.0) <= scratch_threshold]
-        losses = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) < -scratch_threshold]
-        gross_wins = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) > 0]
+        wins = [trade.pnl_sol or 0.0 for trade in closed if (trade.pnl_sol or 0.0) > scratch_threshold]
+        scratches = [trade.pnl_sol or 0.0 for trade in closed if abs(trade.pnl_sol or 0.0) <= scratch_threshold]
+        losses = [trade.pnl_sol or 0.0 for trade in closed if (trade.pnl_sol or 0.0) < -scratch_threshold]
+        gross_wins = [trade.pnl_sol or 0.0 for trade in closed if (trade.pnl_sol or 0.0) > 0]
         gross_win = sum(wins)
         gross_loss = abs(sum(losses))
         decisive = len(wins) + len(losses)
+        pnl_curve = []
+        running = 0.0
+        max_seen = 0.0
+        max_drawdown = 0.0
+        hold_durations = [trade.hold_duration_seconds for trade in closed if trade.hold_duration_seconds]
+        for trade in sorted(closed, key=lambda item: item.closed_at or item.opened_at or utc_now()):
+            running = round(running + (trade.pnl_sol or 0.0), 6)
+            max_seen = max(max_seen, running)
+            max_drawdown = min(max_drawdown, running - max_seen)
+            pnl_curve.append(running)
 
         self.stats = BotStats(
             total_trades=len(closed),
@@ -656,13 +1054,14 @@ class BotState:
             gross_win_rate_pct=int((len(gross_wins) / len(closed)) * 100) if closed else 0,
             scratch_rate_pct=int((len(scratches) / len(closed)) * 100) if closed else 0,
             scratch_threshold_sol=scratch_threshold,
-            total_pnl_sol=round(sum(token.pnl_sol or 0.0 for token in closed), 6),
-            best_trade_sol=round(max([token.pnl_sol or 0.0 for token in closed], default=0.0), 6),
-            worst_trade_sol=round(min([token.pnl_sol or 0.0 for token in closed], default=0.0), 6),
+            total_pnl_sol=round(sum(trade.pnl_sol or 0.0 for trade in closed), 6),
+            best_trade_sol=round(max([trade.pnl_sol or 0.0 for trade in closed], default=0.0), 6),
+            worst_trade_sol=round(min([trade.pnl_sol or 0.0 for trade in closed], default=0.0), 6),
             average_win_sol=round(gross_win / len(wins), 6) if wins else 0.0,
             average_loss_sol=round(sum(losses) / len(losses), 6) if losses else 0.0,
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
-            max_drawdown_sol=round(sum(losses), 6) if losses else 0.0,
+            max_drawdown_sol=round(max_drawdown, 6),
+            avg_hold_seconds=int(sum(hold_durations) / len(hold_durations)) if hold_durations else 0,
         )
 
     def snapshot(self) -> BotSnapshot:

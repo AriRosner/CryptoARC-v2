@@ -2,8 +2,9 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, SourceEvent, TokenSignal, TokenStatus, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, PriceObservation, SourceEvent, StrategyDecisionRecord, TokenSignal, TokenStatus, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
+from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.sources import normalize_pumpportal_new_token, normalize_pumpportal_trade
@@ -145,6 +146,19 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(storage.load_source_events()[0].raw_payload["mint"], "mint_test")
             self.assertEqual(storage.load_backtest_runs()[0].estimated_pnl_sol, 0.01)
 
+    def test_storage_round_trip_research_records(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+            now = utc_now()
+            storage.save_price_observation(PriceObservation(id="px_test", source="mock", mint="mint_test", observed_at=now, price=0.00003, price_source="direct", confidence=0.9, accepted=True, token_id="tok_test"))
+            storage.save_strategy_decision(StrategyDecisionRecord(id="dec_test", token_id="tok_test", mint="mint_test", created_at=now, engine_version="strategy-v2", profile="balanced", score=80, allowed=True, action="paper_buy", reason="ok", risk_reason="passed"))
+            storage.save_trade_session(TradeSession(id="ses_test", token_id="tok_test", mint="mint_test", symbol="ARC", strategy_profile="balanced", status="opened", opened_at=now))
+
+            self.assertEqual(storage.count_price_observations(), 1)
+            self.assertEqual(storage.load_price_observations()[0].token_id, "tok_test")
+            self.assertEqual(storage.count_strategy_decisions(), 1)
+            self.assertEqual(storage.count_trade_sessions(), 1)
+
     def test_pumpportal_new_token_normalization(self) -> None:
         payload = {
             "txType": "create",
@@ -243,6 +257,35 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(token.pnl_sol, 0.033)
             self.assertEqual(token.current_price, 0.00004)
             self.assertEqual(token.observed_price_updates, 0)
+
+    def test_price_pipeline_rejects_low_confidence_virtual_reserve_price(self) -> None:
+        observation = PricePipeline().observe(
+            {
+                "mint": "Mint111",
+                "vSolInBondingCurve": 30,
+                "vTokensInBondingCurve": 1_000_000_000,
+            },
+            mint="Mint111",
+            settings=BotSettings(min_price_confidence=0.45),
+        )
+
+        self.assertFalse(observation.accepted)
+        self.assertIn("confidence", observation.reason)
+
+    def test_backtest_counts_fee_only_trade_as_scratch(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.status = TokenStatus.PAPER_SOLD
+            token.score = 95
+            token.pnl_sol = -0.0005
+            state.tokens.appendleft(token)
+
+            run = state.replay_backtest(limit=1)
+
+            self.assertEqual(run.scratches, 1)
+            self.assertEqual(run.losses, 0)
+            self.assertEqual(run.win_rate_pct, 0)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 import websockets
 
 from app.core.models import SourceStatus, TokenSignal, TokenStatus, new_id, utc_now
+from app.core.price_pipeline import PricePipeline
 from app.core.simulator import LaunchSimulator
 
 
@@ -80,7 +82,8 @@ class PumpPortalLaunchSource(LaunchSource):
                 status.status = "connecting"
                 status.message = "Connecting to PumpPortal"
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
-                    subscribed_mints: set[str] = set()
+                    subscribed_mints: deque[str] = deque()
+                    subscribed_lookup: set[str] = set()
                     await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                     status.status = "connected"
                     status.message = "PumpPortal new-token stream active"
@@ -96,22 +99,33 @@ class PumpPortalLaunchSource(LaunchSource):
                             continue
                         if isinstance(payload.get("message"), str):
                             status.message = payload["message"]
+                            status.status_events_seen += 1
                             await queue.put(LaunchEvent(self.name, utc_now(), payload, None, payload["message"]))
                             continue
                         trade = normalize_pumpportal_trade(payload, utc_now())
                         if trade:
                             await queue.put(trade)
                             status.events_received += 1
+                            status.trade_events_seen += 1
                             status.last_event_at = utc_now()
                             continue
                         token = normalize_pumpportal_new_token(payload, utc_now())
                         await queue.put(LaunchEvent(self.name, utc_now(), payload, token, mint=token.mint if token else None))
                         if token is None:
+                            status.normalization_failures += 1
                             continue
-                        if len(subscribed_mints) < self.max_trade_subscriptions and token.mint not in subscribed_mints:
+                        if self.max_trade_subscriptions > 0 and token.mint not in subscribed_lookup:
+                            while len(subscribed_mints) >= self.max_trade_subscriptions:
+                                old_mint = subscribed_mints.popleft()
+                                subscribed_lookup.discard(old_mint)
+                                status.dropped_trade_subscriptions += 1
+                                await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
                             await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [token.mint]}))
-                            subscribed_mints.add(token.mint)
+                            subscribed_mints.append(token.mint)
+                            subscribed_lookup.add(token.mint)
+                            status.active_trade_subscriptions = len(subscribed_mints)
                         status.events_received += 1
+                        status.launch_events_seen += 1
                         status.normalized_events += 1
                         status.last_event_at = utc_now()
             except asyncio.CancelledError:
@@ -148,8 +162,6 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
     uri = first_string(payload, "uri", "metadataUri", "metadata_uri")
     bonding_curve = first_string(payload, "bondingCurveKey", "bondingCurve", "bonding_curve")
     initial_buy = numeric(payload, "initialBuy", "initialBuySol", "solAmount")
-    virtual_sol = numeric(payload, "vSolInBondingCurve", "virtualSolReserves")
-    virtual_tokens = numeric(payload, "vTokensInBondingCurve", "virtualTokenReserves")
     market_cap = numeric(payload, "marketCapSol", "marketCap", "market_cap")
     creator_hold = numeric(payload, "creatorHoldPct", "creator_hold_pct", "creatorHoldPercent", "devHoldPct")
     complete = bool(payload.get("complete"))
@@ -180,7 +192,8 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
 
     buy_velocity = min(1.0, max(0.05, initial_buy / 5 if initial_buy else 0.25))
     sell_pressure = 0.08
-    current_price = observed_price_from_payload(payload) or max(0.000001, (market_cap or 30.0) / 1_000_000)
+    price_candidate = PricePipeline.from_payload(payload, "pumpportal")
+    current_price = price_candidate.price or max(0.000001, (market_cap or 30.0) / 1_000_000)
 
     token = TokenSignal(
         id=new_id("tok"),
@@ -203,7 +216,8 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
     token.initial_buy_sol = round(initial_buy or 0.0, 4)
     token.bonding_curve = bonding_curve or ""
     token.metadata_uri = uri or ""
-    token.price_source = "observed" if observed_price_from_payload(payload) else "derived"
+    token.price_source = price_candidate.source if price_candidate.price else "derived"
+    token.price_confidence = price_candidate.confidence
     return token
 
 
@@ -231,17 +245,7 @@ def normalize_pumpportal_trade(payload: dict[str, Any], now: datetime) -> Launch
 
 
 def observed_price_from_payload(payload: dict[str, Any]) -> float | None:
-    direct = numeric(payload, "price", "priceSol", "tokenPriceSol")
-    if direct:
-        return max(0.000000001, direct)
-    market_cap = numeric(payload, "marketCapSol", "marketCap", "market_cap")
-    if market_cap:
-        return max(0.000000001, market_cap / 1_000_000)
-    virtual_sol = numeric(payload, "vSolInBondingCurve", "virtualSolReserves")
-    virtual_tokens = numeric(payload, "vTokensInBondingCurve", "virtualTokenReserves")
-    if virtual_sol and virtual_tokens:
-        return max(0.000000001, virtual_sol / virtual_tokens)
-    return None
+    return PricePipeline.from_payload(payload, "pumpportal").price
 
 
 def first_string(payload: dict[str, Any], *keys: str) -> str | None:
