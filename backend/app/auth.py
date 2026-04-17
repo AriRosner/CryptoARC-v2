@@ -14,7 +14,10 @@ from uuid import uuid4
 class AuthManager:
     password: str = ""
     totp_secret: str = ""
-    sessions: set[str] = field(default_factory=set)
+    sessions: dict[str, float] = field(default_factory=dict)
+    failed_attempts: int = 0
+    locked_until: float = 0.0
+    session_ttl_seconds: int = 8 * 60 * 60
 
     @property
     def enabled(self) -> bool:
@@ -25,26 +28,44 @@ class AuthManager:
         return bool(self.totp_secret)
 
     def login(self, password: str, code: str = "") -> str | None:
+        if self.locked_until and time.time() < self.locked_until:
+            return None
         if not self.enabled:
             token = self.issue()
             return token
         if not hmac.compare_digest(password, self.password):
+            self.record_failure()
             return None
         if self.totp_enabled and not verify_totp(self.totp_secret, code):
+            self.record_failure()
             return None
+        self.failed_attempts = 0
         return self.issue()
 
     def issue(self) -> str:
         token = uuid4().hex + uuid4().hex
-        self.sessions.add(token)
+        self.sessions[token] = time.time() + self.session_ttl_seconds
         return token
 
     def valid(self, token: str | None) -> bool:
-        return not self.enabled or bool(token and token in self.sessions)
+        if not self.enabled:
+            return True
+        if not token or token not in self.sessions:
+            return False
+        if self.sessions[token] < time.time():
+            self.sessions.pop(token, None)
+            return False
+        return True
+
+    def record_failure(self) -> None:
+        self.failed_attempts += 1
+        if self.failed_attempts >= 5:
+            self.locked_until = time.time() + 60
 
     def set_password(self, password: str) -> None:
         self.password = password
         self.sessions.clear()
+        self.failed_attempts = 0
 
     def set_totp_secret(self, secret: str) -> None:
         self.totp_secret = secret

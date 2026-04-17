@@ -18,6 +18,50 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Dashboard auth with optional authenticator-app 2FA.
 - Docker-ready deployment structure with a paper/live safety boundary.
 
+## Feature Map
+
+### Bot Core
+
+- Live launch monitoring from mock streams or PumpPortal.
+- Paper-only buy, monitor, and sell lifecycle.
+- Fee, slippage, price-impact, fill-delay, and failed-fill modeling.
+- Configurable take profit, stop loss, max hold, max ticks, trailing stop, partial TP, break-even stop, stalled-trade exit, and sell-pressure exit.
+
+### Research And Intelligence
+
+- Pump.fun intelligence for creator reuse, metadata coverage, bonding curve fields, market-cap presence, initial buys, and creator concentration.
+- Price Engine v4 foundations with selected-price diagnostics, confidence floors, direct/market-cap/virtual reserve candidates, rejected-observation review, and minute-level price candles.
+- Source Adapter Layer V2 with adapter capability, confidence, and status contracts.
+
+### Strategy And Risk
+
+- Strategy Engine v3 module snapshots for scoring, risk guards, position sizing, exits, and source quality.
+- Strategy Builder presets from the dashboard and persistent server-side preset storage.
+- Risk Controller V2 with manual kill switch, source-degraded halt, daily loss cap, max open positions, consecutive-loss halt, and replay-confidence halt.
+
+### Backtesting And Experiments
+
+- Token replay, raw source replay, strategy comparison, and A/B replay.
+- Backtesting v3 with deterministic fingerprints and walk-forward train/validate checks.
+- Saved experiment runs with settings version, profile, replay source, notes, and fingerprint.
+- Auto-tuning suggestions that can ignore manually labeled trades.
+
+### Trade Review
+
+- Persistent trade records with settings version context.
+- Per-trade PnL breakdown including fees, slippage, impact, and net-before-fees estimate.
+- Source, price, decision, and execution timeline.
+- Manual labels such as good entry, bad entry, bad exit, bad price data, held too long, exited too early, rug-like behavior, and ignore from tuning.
+
+### Operations And Deployment
+
+- Data integrity and replay-confidence reports.
+- SQLite schema metadata and runtime migration status.
+- Local database backup endpoint.
+- Operational monitoring for backend state, source health, storage counts, warnings, and errors.
+- Dashboard password auth, session expiry, login lockout, and optional authenticator-app 2FA.
+- GitHub Actions CI for backend tests and frontend builds.
+
 ## Safety Boundary
 
 CryptoARC v2 does not execute live trades. The backend exposes a paper-only safety boundary and refuses live execution unless a future executor is explicitly added and enabled through environment-level controls.

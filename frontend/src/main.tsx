@@ -24,12 +24,15 @@ import {
   X
 } from "lucide-react";
 import {
+  backupDatabase,
   clearData,
+  createExperiment,
   disableTotp,
   authStatus,
   exportUrl,
   fetchBacktests,
   fetchDataSummary,
+  fetchExperiments,
   fetchDataIntegrity,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
@@ -43,15 +46,19 @@ import {
   fetchSourceHealth,
   fetchSecurityStatus,
   fetchSettingsVersions,
+  fetchSourceAdapters,
   fetchStrategyDecisions,
+  fetchStrategyPresets,
   fetchTrades,
   fetchTradeSessions,
   fetchTradeReviewDetail,
+  fetchTradeLabels,
   fetchTuningSuggestions,
   login,
   logout,
   openSnapshotSocket,
   patchSettings,
+  labelTrade,
   runABStrategyReplay,
   runBacktestV3,
   runRawReplayBacktest,
@@ -60,10 +67,11 @@ import {
   startBot,
   stopBot,
   setupTotp,
+  saveStrategyPreset,
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TokenSignal, TradeEvent, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
 import "./styles.css";
 
 const fallbackSnapshot: BotSnapshot = {
@@ -140,7 +148,12 @@ const fallbackSnapshot: BotSnapshot = {
     stalled_trade_seconds: 90,
     stalled_trade_min_move_pct: 3,
     sell_pressure_exit_enabled: false,
-    sell_pressure_exit_threshold: 0.65
+    sell_pressure_exit_threshold: 0.65,
+    kill_switch_enabled: false,
+    max_consecutive_losses_enabled: false,
+    max_consecutive_losses: 5,
+    halt_on_low_replay_confidence: false,
+    min_replay_confidence: 50
   },
   tokens: [],
   events: [],
@@ -363,6 +376,10 @@ function App() {
   const [safetyStatus, setSafetyStatus] = React.useState<SafetyStatus | null>(null);
   const [opsMonitoring, setOpsMonitoring] = React.useState<OperationalMonitoring | null>(null);
   const [backtestV3Result, setBacktestV3Result] = React.useState<BacktestV3Result | null>(null);
+  const [experiments, setExperiments] = React.useState<ExperimentRun[]>([]);
+  const [tradeLabels, setTradeLabels] = React.useState<TradeLabel[]>([]);
+  const [strategyPresetsRemote, setStrategyPresetsRemote] = React.useState<StrategyPreset[]>([]);
+  const [sourceAdapters, setSourceAdapters] = React.useState<SourceAdapterStatus[]>([]);
   const [selectedReviewTradeId, setSelectedReviewTradeId] = React.useState<string | null>(null);
   const [replayTimeline, setReplayTimeline] = React.useState<ReplayTimelineEvent[]>([]);
   const [tradeReviewDetail, setTradeReviewDetail] = React.useState<TradeReviewDetail | null>(null);
@@ -564,8 +581,27 @@ function App() {
     }
   }
 
+  async function saveExperimentFromDashboard() {
+    try {
+      const experiment = await createExperiment(`Experiment ${new Date().toLocaleString()}`, backtestProfile, backtestLimit, "Saved from dashboard");
+      setExperiments((current) => [experiment, ...current].slice(0, 50));
+      setBacktestV3Result(experiment.result);
+    } catch (error) {
+      setApiError(`Experiment save failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function saveCurrentStrategyPreset() {
+    try {
+      const preset = await saveStrategyPreset(`Preset ${new Date().toLocaleTimeString()}`, "Saved from Strategy Builder");
+      setStrategyPresetsRemote((current) => [preset, ...current]);
+    } catch (error) {
+      setApiError(`Preset save failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops, experimentRows, labels, presets, adapters] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -582,7 +618,11 @@ function App() {
       fetchPriceDiagnostics(),
       fetchPumpFunReport(),
       fetchSafetyStatus(),
-      fetchOperationalMonitoring()
+      fetchOperationalMonitoring(),
+      fetchExperiments(),
+      fetchTradeLabels(),
+      fetchStrategyPresets(),
+      fetchSourceAdapters()
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -601,6 +641,10 @@ function App() {
     setPumpfunReport(pumpfun);
     setSafetyStatus(safety);
     setOpsMonitoring(ops);
+    setExperiments(experimentRows);
+    setTradeLabels(labels);
+    setStrategyPresetsRemote(presets);
+    setSourceAdapters(adapters);
   }
 
   async function loadReplayTimeline(tokenId: string) {
@@ -614,7 +658,7 @@ function App() {
     }
   }
 
-  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all") {
+  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all") {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
@@ -866,7 +910,9 @@ function App() {
             onCompare={compareStrategies}
             onABReplay={abReplayStrategies}
             onRunV3={runBacktestSuiteV3}
+            onSaveExperiment={saveExperimentFromDashboard}
             v3Result={backtestV3Result}
+            experiments={experiments}
           />
         )}
 
@@ -883,6 +929,11 @@ function App() {
             selectedTradeId={selectedReviewTradeId}
             timeline={replayTimeline}
             detail={tradeReviewDetail}
+            labels={tradeLabels}
+            onLabelTrade={async (tokenId, label) => {
+              const saved = await labelTrade(tokenId, label);
+              setTradeLabels((current) => [saved, ...current]);
+            }}
             onSelectTrade={loadReplayTimeline}
           />
         )}
@@ -903,6 +954,7 @@ function App() {
             pumpfunReport={pumpfunReport}
             safetyStatus={safetyStatus}
             opsMonitoring={opsMonitoring}
+            sourceAdapters={sourceAdapters}
             auditEvents={snapshot.events}
             onRefresh={refreshResearchData}
             onClear={clearProjectData}
@@ -914,6 +966,8 @@ function App() {
         <SettingsModal
           settings={settings}
           sourceStatus={snapshot.source_status}
+          serverStrategyPresets={strategyPresetsRemote}
+          onSaveStrategyPreset={saveCurrentStrategyPreset}
           onClose={() => setSettingsOpen(false)}
           onSave={saveSettings}
         />
@@ -1125,7 +1179,9 @@ function BacktestDashboard({
   onCompare,
   onABReplay,
   onRunV3,
-  v3Result
+  onSaveExperiment,
+  v3Result,
+  experiments
 }: {
   runs: BacktestResult[];
   latest: BacktestResult | null;
@@ -1144,7 +1200,9 @@ function BacktestDashboard({
   onCompare: () => Promise<void>;
   onABReplay: () => Promise<void>;
   onRunV3: () => Promise<void>;
+  onSaveExperiment: () => Promise<void>;
   v3Result: BacktestV3Result | null;
+  experiments: ExperimentRun[];
 }) {
   const active = latest ?? runs[0] ?? null;
   return (
@@ -1195,6 +1253,9 @@ function BacktestDashboard({
           </button>
           <button className="secondary-action compact-action" onClick={onRunV3}>
             <Shield size={15} /> Suite v3
+          </button>
+          <button className="secondary-action compact-action" onClick={onSaveExperiment}>
+            <Save size={15} /> Save experiment
           </button>
         </div>
       </div>
@@ -1303,6 +1364,23 @@ function BacktestDashboard({
             <article key={run.id}>
               <strong>{new Date(run.created_at).toLocaleString()}</strong>
               <span>{run.profile} / {run.estimated_pnl_sol.toFixed(4)} SOL / {run.win_rate_pct}% win</span>
+            </article>
+          ))}
+        </div>
+      </section>
+      <section className="research-card">
+        <div className="section-heading">
+          <div>
+            <h3>Saved Experiments</h3>
+            <p>Replay suites with settings versions and deterministic fingerprints.</p>
+          </div>
+          <Database size={18} />
+        </div>
+        <div className="run-list">
+          {experiments.slice(0, 8).map((experiment) => (
+            <article key={experiment.id}>
+              <strong>{experiment.name}</strong>
+              <span>{experiment.profile} / {experiment.fingerprint.slice(0, 10)} / {new Date(experiment.created_at).toLocaleString()}</span>
             </article>
           ))}
         </div>
@@ -1532,6 +1610,8 @@ function TradeReviewPage({
   selectedTradeId,
   timeline,
   detail,
+  labels,
+  onLabelTrade,
   onSelectTrade
 }: {
   trades: TradeRecord[];
@@ -1541,6 +1621,8 @@ function TradeReviewPage({
   selectedTradeId: string | null;
   timeline: ReplayTimelineEvent[];
   detail: TradeReviewDetail | null;
+  labels: TradeLabel[];
+  onLabelTrade: (tokenId: string, label: string) => Promise<void>;
   onSelectTrade: (tokenId: string) => Promise<void>;
 }) {
   const [filter, setFilter] = React.useState<"all" | "wins" | "losses" | "scratch">("all");
@@ -1557,6 +1639,7 @@ function TradeReviewPage({
     const lookup = new Map(versions.map((version) => [version.id, `${version.label || "settings"} ${new Date(version.created_at).toLocaleTimeString()}`]));
     return (id: string) => lookup.get(id) || (id ? id.slice(0, 10) : "legacy");
   }, [versions]);
+  const selectedLabels = labels.filter((label) => label.token_id === selectedTradeId);
 
   return (
     <section className="dashboard-page">
@@ -1626,6 +1709,18 @@ function TradeReviewPage({
               <BarMetric label="Fees x10000" value={Math.round((detail?.pnl_breakdown.fees_sol ?? 0) * 10000)} max={20} />
               <BarMetric label="Slippage %" value={Math.round(detail?.pnl_breakdown.slippage_pct ?? 0)} max={20} />
               <BarMetric label="Impact %" value={Math.round(detail?.pnl_breakdown.price_impact_pct ?? 0)} max={20} />
+            </div>
+            {selectedTradeId ? (
+              <div className="button-row fit-row">
+                {["good_entry", "bad_entry", "bad_exit", "bad_price_data", "ignore_from_tuning"].map((label) => (
+                  <button key={label} className="secondary-action compact-action" onClick={() => onLabelTrade(selectedTradeId, label)}>
+                    {label.replace(/_/g, " ")}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            <div className="tag-row">
+              {selectedLabels.map((label) => <span key={label.id}>{label.label.replace(/_/g, " ")}</span>)}
             </div>
           </section>
           <section className="research-card">
@@ -1703,6 +1798,7 @@ function DataDashboard({
   pumpfunReport,
   safetyStatus,
   opsMonitoring,
+  sourceAdapters,
   auditEvents,
   onRefresh,
   onClear
@@ -1721,9 +1817,10 @@ function DataDashboard({
   pumpfunReport: PumpFunReport | null;
   safetyStatus: SafetyStatus | null;
   opsMonitoring: OperationalMonitoring | null;
+  sourceAdapters: SourceAdapterStatus[];
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
-  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all") => Promise<void>;
+  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all") => Promise<void>;
 }) {
   return (
     <section className="dashboard-page">
@@ -1734,6 +1831,9 @@ function DataDashboard({
         </div>
         <button className="secondary-action compact-action" onClick={onRefresh}>
           <Download size={15} /> Refresh
+        </button>
+        <button className="secondary-action compact-action" onClick={() => backupDatabase()}>
+          <Save size={15} /> Backup DB
         </button>
       </div>
       <div className="hero-metrics wide">
@@ -1746,20 +1846,22 @@ function DataDashboard({
         <Metric label="Prices" value={(summary?.price_observations ?? 0).toString()} />
         <Metric label="Decisions" value={(summary?.strategy_decisions ?? 0).toString()} />
         <Metric label="Settings versions" value={(summary?.settings_versions ?? settingsVersions.length).toString()} />
+        <Metric label="Experiments" value={(summary?.experiments ?? 0).toString()} />
+        <Metric label="Labels" value={(summary?.trade_labels ?? 0).toString()} />
         <Metric label="Integrity" value={`${dataIntegrity?.score ?? 0}%`} />
         <Metric label="Replay confidence" value={`${dataIntegrity?.replay_confidence.score ?? 0}%`} />
         <Metric label="Source health" value={`${sourceHealth?.health_score ?? 0}%`} />
         <Metric label="Safety boundary" value={securityStatus?.paper_only_boundary ? "paper only" : "live enabled"} />
       </div>
       <div className="maintenance-row">
-        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions"] as const).map((target) => (
+        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets"] as const).map((target) => (
           <button key={target} className="danger outline" onClick={() => onClear(target)}>
             <Trash2 size={14} /> Clear {target.replace("_", " ")}
           </button>
         ))}
       </div>
       <div className="maintenance-row">
-        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"] as const).map((target) => (
+        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"] as const).map((target) => (
           <a key={target} className="export-button" href={exportUrl(target)} target="_blank" rel="noreferrer">
             <Download size={14} /> Export {target.replace("_", " ")}
           </a>
@@ -1801,6 +1903,23 @@ function DataDashboard({
             <BarMetric label="Open positions" value={safetyStatus?.open_positions ?? 0} max={25} />
           </div>
           <p className="settings-note">{safetyStatus?.entries_allowed ? "Risk controller allows new paper entries." : `Entries guarded: ${(safetyStatus?.stop_reasons ?? []).join(", ") || "review required"}`}</p>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Source Adapters V2</h3>
+              <p>Adapter capability and confidence contracts.</p>
+            </div>
+            <Database size={18} />
+          </div>
+          <div className="mini-list">
+            {sourceAdapters.map((adapter) => (
+              <article key={adapter.name}>
+                <strong>{adapter.name} / {adapter.status}</strong>
+                <span>{adapter.capabilities.join(", ")} / {Math.round(adapter.confidence * 100)}%</span>
+              </article>
+            ))}
+          </div>
         </section>
         <section className="research-card">
           <div className="section-heading">
@@ -1991,11 +2110,15 @@ function DataDashboard({
 function SettingsModal({
   settings,
   sourceStatus,
+  serverStrategyPresets,
+  onSaveStrategyPreset,
   onClose,
   onSave
 }: {
   settings: BotSettings;
   sourceStatus: BotSnapshot["source_status"];
+  serverStrategyPresets: StrategyPreset[];
+  onSaveStrategyPreset: () => Promise<void>;
   onClose: () => void;
   onSave: (settings: BotSettings) => Promise<void>;
 }) {
@@ -2036,9 +2159,10 @@ function SettingsModal({
   }
 
   function applyProfile(profile: BotSettings["strategy_profile"]) {
+    const preset = strategyPresets[profile] ?? {};
     setDraft((current) => ({
       ...current,
-      ...(strategyPresets[profile] ?? {}),
+      ...preset,
       strategy_profile: profile
     }));
   }
@@ -2208,6 +2332,15 @@ function SettingsModal({
                     <input value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="My safe preset" />
                   </label>
                   <button className="secondary-action" onClick={savePreset}>Save preset</button>
+                  <button className="secondary-action" onClick={onSaveStrategyPreset}>Save server preset</button>
+                </div>
+                <div className="mini-list">
+                  {serverStrategyPresets.slice(0, 4).map((preset) => (
+                    <article key={preset.id}>
+                      <strong>{preset.name}</strong>
+                      <span>{preset.description || "Strategy Builder preset"}</span>
+                    </article>
+                  ))}
                 </div>
               </SettingsSection>
             )}
@@ -2281,6 +2414,20 @@ function SettingsModal({
                   <input type="checkbox" checked={draft.stop_on_source_degraded} onChange={(event) => updateDraft("stop_on_source_degraded", event.target.checked)} />
                   Stop entries when source health is degraded
                 </label>
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.kill_switch_enabled} onChange={(event) => updateDraft("kill_switch_enabled", event.target.checked)} />
+                  Manual kill switch
+                </label>
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.max_consecutive_losses_enabled} onChange={(event) => updateDraft("max_consecutive_losses_enabled", event.target.checked)} />
+                  Enable consecutive-loss halt
+                </label>
+                <SettingInput label="Max consecutive losses" value={draft.max_consecutive_losses} onChange={(v) => updateNumber("max_consecutive_losses", v)} />
+                <label className="toggle-line">
+                  <input type="checkbox" checked={draft.halt_on_low_replay_confidence} onChange={(event) => updateDraft("halt_on_low_replay_confidence", event.target.checked)} />
+                  Halt on low replay confidence
+                </label>
+                <SettingInput label="Min replay confidence" value={draft.min_replay_confidence} onChange={(v) => updateNumber("min_replay_confidence", v)} />
               </SettingsSection>
             )}
 

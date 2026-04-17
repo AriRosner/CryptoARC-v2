@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
 
@@ -88,6 +89,11 @@ class SettingsPatch(BaseModel):
     stalled_trade_min_move_pct: float | None = Field(default=None, ge=0, le=1000)
     sell_pressure_exit_enabled: bool | None = None
     sell_pressure_exit_threshold: float | None = Field(default=None, ge=0, le=1)
+    kill_switch_enabled: bool | None = None
+    max_consecutive_losses_enabled: bool | None = None
+    max_consecutive_losses: int | None = Field(default=None, ge=1, le=100)
+    halt_on_low_replay_confidence: bool | None = None
+    min_replay_confidence: int | None = Field(default=None, ge=0, le=100)
 
 
 class BacktestRequest(BaseModel):
@@ -112,6 +118,23 @@ class PasswordUpdateRequest(BaseModel):
 class TotpVerifyRequest(BaseModel):
     secret: str
     code: str
+
+
+class ExperimentRequest(BaseModel):
+    name: str = "Replay experiment"
+    profile: str | None = None
+    limit: int | None = Field(default=None, ge=1, le=5000)
+    notes: str = ""
+
+
+class TradeLabelRequest(BaseModel):
+    label: Literal["good_entry", "bad_entry", "bad_exit", "bad_price_data", "rug_behavior", "exited_too_early", "held_too_long", "ignore_from_tuning"]
+    note: str = ""
+
+
+class StrategyPresetRequest(BaseModel):
+    name: str
+    description: str = ""
 
 
 def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
@@ -272,6 +295,9 @@ async def security_status() -> dict:
     return {
         "auth_enabled": auth.enabled,
         "totp_enabled": auth.totp_enabled,
+        "failed_attempts": auth.failed_attempts,
+        "locked": auth.locked_until > time.time(),
+        "session_ttl_seconds": auth.session_ttl_seconds,
         "live_trading_env_enabled": config.live_trading_enabled,
         "live_trading_requested": state.settings.live_trading_enabled,
         "effective_live_trading_enabled": config.live_trading_enabled and state.settings.live_trading_enabled,
@@ -426,6 +452,42 @@ async def tuning_suggestions() -> list[dict]:
     return state.tuning_suggestions()
 
 
+@app.get("/api/experiments", dependencies=[Depends(require_auth)])
+async def experiments() -> list[dict]:
+    return state.experiments()
+
+
+@app.post("/api/experiments", dependencies=[Depends(require_auth)])
+async def create_experiment(payload: ExperimentRequest) -> dict:
+    result = state.create_experiment(payload.name, payload.profile, payload.limit, payload.notes)
+    await broadcast_snapshot()
+    return result
+
+
+@app.get("/api/trade-labels", dependencies=[Depends(require_auth)])
+async def trade_labels() -> list[dict]:
+    return state.trade_labels()
+
+
+@app.post("/api/trade-labels/{token_id}", dependencies=[Depends(require_auth)])
+async def label_trade(token_id: str, payload: TradeLabelRequest) -> dict:
+    result = state.label_trade(token_id, payload.label, payload.note)
+    await broadcast_snapshot()
+    return result
+
+
+@app.get("/api/strategy-presets", dependencies=[Depends(require_auth)])
+async def strategy_presets() -> list[dict]:
+    return state.strategy_presets()
+
+
+@app.post("/api/strategy-presets", dependencies=[Depends(require_auth)])
+async def save_strategy_preset(payload: StrategyPresetRequest) -> dict:
+    result = state.save_strategy_preset(payload.name, payload.description)
+    await broadcast_snapshot()
+    return result
+
+
 @app.get("/api/replay/timeline/{token_id}", dependencies=[Depends(require_auth)])
 async def replay_timeline(token_id: str) -> list[dict]:
     return state.replay_timeline(token_id)
@@ -461,6 +523,16 @@ async def operational_monitoring() -> dict:
     return state.operational_monitoring()
 
 
+@app.get("/api/source-adapters", dependencies=[Depends(require_auth)])
+async def source_adapters() -> list[dict]:
+    return state.source_adapters()
+
+
+@app.post("/api/data/backup", dependencies=[Depends(require_auth)])
+async def backup_database() -> dict:
+    return state.storage.backup()
+
+
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])
 async def source_health() -> dict:
     return state.source_health()
@@ -472,14 +544,14 @@ async def data_summary() -> dict:
 
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
-async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"]) -> dict:
+async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"]) -> dict:
     result = state.clear_data(target)
     await broadcast_snapshot()
     return result
 
 
 @app.get("/api/export/{target}", dependencies=[Depends(require_auth)])
-async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "all"]) -> JSONResponse:
+async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"]) -> JSONResponse:
     return JSONResponse(
         content=state.export_data(target),
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-{target}.json"'},

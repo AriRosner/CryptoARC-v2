@@ -10,13 +10,16 @@ from app.core.models import (
     BotSnapshot,
     BotStats,
     BotStatus,
+    ExperimentRun,
     SettingsVersion,
     SourceStatus,
     SourceEvent,
     StrategyDecisionRecord,
+    StrategyPreset,
     TokenSignal,
     TokenStatus,
     TradeEvent,
+    TradeLabel,
     TradeRecord,
     TradeSession,
     new_id,
@@ -784,6 +787,9 @@ class BotState:
 
     def tuning_suggestions(self) -> list[dict[str, object]]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        labels = self.storage.load_trade_labels(1000)
+        ignored_tokens = {label.token_id for label in labels if label.label == "ignore_from_tuning"}
+        trades = [trade for trade in trades if trade.token_id not in ignored_tokens]
         suggestions: list[dict[str, object]] = []
         if len(trades) < 8:
             return [{"title": "Collect more samples", "reason": "Auto-tuning needs at least 8 closed trades before the suggestions are meaningful.", "setting": "backtest_replay_limit", "confidence": 0.35}]
@@ -804,6 +810,63 @@ class BotState:
         if not suggestions:
             suggestions.append({"title": "Keep current profile", "reason": "No single failure pattern dominates the closed trade set yet.", "setting": "strategy_profile", "suggested_value": self.settings.strategy_profile, "confidence": 0.52})
         return suggestions
+
+    def experiments(self) -> list[dict[str, object]]:
+        return [run.to_dict() for run in self.storage.load_experiment_runs(100)]
+
+    def create_experiment(self, name: str, profile: str | None = None, limit: int | None = None, notes: str = "") -> dict[str, object]:
+        result = self.backtest_v3(limit=limit or self.settings.backtest_replay_limit)
+        run = ExperimentRun(
+            id=new_id("exp"),
+            name=name or f"Experiment {utc_now().strftime('%H:%M:%S')}",
+            created_at=utc_now(),
+            settings_version_id=self.current_settings_version_id,
+            profile=profile or self.settings.strategy_profile,
+            replay_source="backtest_v3",
+            result=result,
+            fingerprint=str(result.get("determinism_fingerprint", "")),
+            notes=notes,
+        )
+        self.storage.save_experiment_run(run)
+        self.add_event("info", f"Experiment saved: {run.name}")
+        return run.to_dict()
+
+    def trade_labels(self) -> list[dict[str, object]]:
+        return [label.to_dict() for label in self.storage.load_trade_labels(500)]
+
+    def label_trade(self, token_id: str, label: str, note: str = "") -> dict[str, object]:
+        trade = next((item for item in self.storage.load_trades(5000) if item.token_id == token_id), None)
+        record = TradeLabel(
+            id=new_id("lbl"),
+            token_id=token_id,
+            trade_id=trade.id if trade else "",
+            label=label,
+            created_at=utc_now(),
+            note=note,
+        )
+        self.storage.save_trade_label(record)
+        self.add_event("info", f"Trade labeled {label}", token_id)
+        return record.to_dict()
+
+    def strategy_presets(self) -> list[dict[str, object]]:
+        saved = [preset.to_dict() for preset in self.storage.load_strategy_presets(50)]
+        builtins = [
+            {"id": f"builtin_{name}", "name": name, "description": "Built-in profile", "created_at": utc_now().isoformat(), "settings": asdict(self._settings_for_profile(name))}
+            for name in ("conservative", "balanced", "aggressive", "scalper")
+        ]
+        return builtins + saved
+
+    def save_strategy_preset(self, name: str, description: str = "") -> dict[str, object]:
+        preset = StrategyPreset(
+            id=new_id("strat"),
+            name=name,
+            created_at=utc_now(),
+            settings=asdict(self.settings),
+            description=description,
+        )
+        self.storage.save_strategy_preset(preset)
+        self.add_event("info", f"Strategy preset saved: {name}")
+        return preset.to_dict()
 
     def ab_strategy_replay(self, limit: int = 120) -> BacktestRun:
         return self.compare_strategies(limit=limit)
@@ -851,7 +914,22 @@ class BotState:
         )
 
     def price_diagnostics(self) -> dict[str, object]:
-        return self.price_pipeline.diagnostics(self.storage.load_price_observations(5000))
+        observations = self.storage.load_price_observations(5000)
+        diagnostics = self.price_pipeline.diagnostics(observations)
+        diagnostics["candles"] = self.price_candles(observations)
+        return diagnostics
+
+    def price_candles(self, observations: list | None = None) -> list[dict[str, object]]:
+        observations = observations or self.storage.load_price_observations(5000)
+        candles: dict[str, list[float]] = {}
+        for item in observations:
+            if item.accepted and item.price:
+                bucket = item.observed_at.replace(second=0, microsecond=0).isoformat()
+                candles.setdefault(bucket, []).append(item.price)
+        return [
+            {"at": bucket, "open": values[0], "high": max(values), "low": min(values), "close": values[-1], "count": len(values)}
+            for bucket, values in sorted(candles.items())[-240:]
+        ]
 
     def pumpfun_report(self) -> dict[str, object]:
         return self.pumpfun_intelligence.summarize(self.storage.load_all_tokens(5000), self.storage.load_source_events(5000))
@@ -865,6 +943,9 @@ class BotState:
             else:
                 break
         stop_reasons = []
+        replay_confidence = int(self.data_integrity_report().get("replay_confidence", {}).get("score", 0))
+        if self.settings.kill_switch_enabled:
+            stop_reasons.append("manual kill switch enabled")
         if abs(min(0.0, self.stats.total_pnl_sol)) >= self.settings.daily_loss_cap_sol:
             stop_reasons.append("daily loss cap reached")
         if self.open_position_count() >= self.settings.max_open_positions:
@@ -873,6 +954,10 @@ class BotState:
             stop_reasons.append("source health degraded")
         if self.settings.live_trading_enabled:
             stop_reasons.append("live trading request remains blocked by paper boundary")
+        if self.settings.max_consecutive_losses_enabled and consecutive_losses >= self.settings.max_consecutive_losses:
+            stop_reasons.append("consecutive loss halt")
+        if self.settings.halt_on_low_replay_confidence and replay_confidence < self.settings.min_replay_confidence:
+            stop_reasons.append("low replay confidence")
         return {
             "paper_only": True,
             "entries_allowed": not stop_reasons,
@@ -882,6 +967,8 @@ class BotState:
             "daily_loss_cap_sol": self.settings.daily_loss_cap_sol,
             "total_pnl_sol": self.stats.total_pnl_sol,
             "kill_switch_available": True,
+            "kill_switch_enabled": self.settings.kill_switch_enabled,
+            "replay_confidence": replay_confidence,
         }
 
     def operational_monitoring(self) -> dict[str, object]:
@@ -891,9 +978,16 @@ class BotState:
             "backend": {"status": "running", "bot_status": self.status.value, "database_path": str(self.storage.path)},
             "source": source,
             "storage": self.data_summary(),
+            "schema": self.storage.schema_status(),
             "recent_errors": [event.to_dict() for event in events if event.level in {"danger", "error"}][:20],
             "recent_warnings": [event.to_dict() for event in events if event.level == "warning"][:20],
         }
+
+    def source_adapters(self) -> list[dict[str, object]]:
+        return [
+            {"name": "mock", "enabled": True, "status": "available", "capabilities": ["launches", "simulated_prices"], "confidence": 0.7},
+            {"name": "pumpportal", "enabled": True, "status": self.source_status.status if self.source_status.source == "pumpportal" else "available", "capabilities": ["launches", "trades", "raw_events"], "confidence": self.source_health().get("health_score", 0) / 100},
+        ]
 
     def trade_review_detail(self, token_id: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.id == token_id), None)
@@ -1074,6 +1168,12 @@ class BotState:
             return {"trade_sessions": [item.to_dict() for item in self.storage.load_trade_sessions(5000)]}
         if target == "settings_versions":
             return {"settings_versions": [item.to_dict() for item in self.storage.load_settings_versions(5000)]}
+        if target == "experiments":
+            return {"experiments": [item.to_dict() for item in self.storage.load_experiment_runs(5000)]}
+        if target == "trade_labels":
+            return {"trade_labels": [item.to_dict() for item in self.storage.load_trade_labels(5000)]}
+        if target == "strategy_presets":
+            return {"strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)]}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
@@ -1084,6 +1184,9 @@ class BotState:
             "strategy_decisions": [item.to_dict() for item in self.storage.load_strategy_decisions(5000)],
             "trade_sessions": [item.to_dict() for item in self.storage.load_trade_sessions(5000)],
             "settings_versions": [item.to_dict() for item in self.storage.load_settings_versions(5000)],
+            "experiments": [item.to_dict() for item in self.storage.load_experiment_runs(5000)],
+            "trade_labels": [item.to_dict() for item in self.storage.load_trade_labels(5000)],
+            "strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)],
         }
 
     def data_summary(self) -> dict[str, int]:
@@ -1097,6 +1200,9 @@ class BotState:
             "strategy_decisions": self.storage.count_strategy_decisions(),
             "trade_sessions": self.storage.count_trade_sessions(),
             "settings_versions": self.storage.count_settings_versions(),
+            "experiments": self.storage.count_experiment_runs(),
+            "trade_labels": self.storage.count_trade_labels(),
+            "strategy_presets": self.storage.count_strategy_presets(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
@@ -1123,6 +1229,12 @@ class BotState:
         if target in {"settings_versions", "all"}:
             self.storage.clear_settings_versions()
             self.current_settings_version_id = self.ensure_settings_version("reset", [])
+        if target in {"experiments", "all"}:
+            self.storage.clear_experiment_runs()
+        if target in {"trade_labels", "all"}:
+            self.storage.clear_trade_labels()
+        if target in {"strategy_presets", "all"}:
+            self.storage.clear_strategy_presets()
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()

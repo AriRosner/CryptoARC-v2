@@ -103,6 +103,11 @@ class BotSettings:
     stalled_trade_min_move_pct: float = 3.0
     sell_pressure_exit_enabled: bool = False
     sell_pressure_exit_threshold: float = 0.65
+    kill_switch_enabled: bool = False
+    max_consecutive_losses_enabled: bool = False
+    max_consecutive_losses: int = 5
+    halt_on_low_replay_confidence: bool = False
+    min_replay_confidence: int = 50
 
 
 @dataclass(slots=True)
@@ -404,6 +409,53 @@ class SettingsVersion:
     settings: dict[str, Any]
     label: str = ""
     changed_keys: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class ExperimentRun:
+    id: str
+    name: str
+    created_at: datetime
+    settings_version_id: str
+    profile: str
+    replay_source: str
+    result: dict[str, Any]
+    fingerprint: str = ""
+    notes: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class TradeLabel:
+    id: str
+    token_id: str
+    trade_id: str
+    label: str
+    created_at: datetime
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class StrategyPreset:
+    id: str
+    name: str
+    created_at: datetime
+    settings: dict[str, Any]
+    description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

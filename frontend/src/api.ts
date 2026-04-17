@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -164,6 +164,50 @@ export async function fetchOperationalMonitoring(): Promise<OperationalMonitorin
   return request("/api/monitoring/ops");
 }
 
+export async function fetchExperiments(): Promise<ExperimentRun[]> {
+  return request("/api/experiments");
+}
+
+export async function createExperiment(name: string, profile?: string, limit?: number, notes = ""): Promise<ExperimentRun> {
+  return request("/api/experiments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, profile, limit, notes })
+  });
+}
+
+export async function fetchTradeLabels(): Promise<TradeLabel[]> {
+  return request("/api/trade-labels");
+}
+
+export async function labelTrade(tokenId: string, label: string, note = ""): Promise<TradeLabel> {
+  return request(`/api/trade-labels/${encodeURIComponent(tokenId)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ label, note })
+  });
+}
+
+export async function fetchStrategyPresets(): Promise<StrategyPreset[]> {
+  return request("/api/strategy-presets");
+}
+
+export async function saveStrategyPreset(name: string, description = ""): Promise<StrategyPreset> {
+  return request("/api/strategy-presets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description })
+  });
+}
+
+export async function fetchSourceAdapters(): Promise<SourceAdapterStatus[]> {
+  return request("/api/source-adapters");
+}
+
+export async function backupDatabase(): Promise<{ status: string; path: string }> {
+  return request("/api/data/backup", { method: "POST" });
+}
+
 export async function fetchSourceHealth(): Promise<SourceHealth> {
   return request("/api/source-health");
 }
@@ -203,11 +247,11 @@ export async function fetchDataSummary(): Promise<DataSummary> {
   return request("/api/data/summary");
 }
 
-export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all"): Promise<DataSummary> {
+export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all"): Promise<DataSummary> {
   return request(`/api/data/clear/${target}`, { method: "POST" });
 }
 
-export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all"): string {
+export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all"): string {
   return `${API_BASE}/api/export/${target}${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`;
 }
 

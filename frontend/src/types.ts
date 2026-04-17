@@ -27,6 +27,11 @@ export interface BotSettings {
   filter_honeypots: boolean;
   filter_rug_risk: boolean;
   live_trading_enabled: boolean;
+  kill_switch_enabled: boolean;
+  max_consecutive_losses_enabled: boolean;
+  max_consecutive_losses: number;
+  halt_on_low_replay_confidence: boolean;
+  min_replay_confidence: number;
   min_buy_velocity: number;
   max_sell_pressure: number;
   min_metadata_score: number;
@@ -233,6 +238,9 @@ export interface DataSummary {
   strategy_decisions: number;
   trade_sessions: number;
   settings_versions: number;
+  experiments: number;
+  trade_labels: number;
+  strategy_presets: number;
 }
 
 export interface TradeRecord {
@@ -291,6 +299,9 @@ export interface SecurityStatus {
   allowed_origins: string[];
   paper_only_boundary: boolean;
   runtime_password_configurable: boolean;
+  failed_attempts: number;
+  locked: boolean;
+  session_ttl_seconds: number;
 }
 
 export interface PriceObservation {
@@ -447,6 +458,8 @@ export interface SafetyStatus {
   daily_loss_cap_sol: number;
   total_pnl_sol: number;
   kill_switch_available: boolean;
+  kill_switch_enabled: boolean;
+  replay_confidence: number;
 }
 
 export interface OperationalMonitoring {
@@ -472,6 +485,43 @@ export interface TradeReviewDetail {
   observations: PriceObservation[];
   timeline: ReplayTimelineEvent[];
   pnl_breakdown: Record<string, number>;
+}
+
+export interface ExperimentRun {
+  id: string;
+  name: string;
+  created_at: string;
+  settings_version_id: string;
+  profile: string;
+  replay_source: string;
+  result: BacktestV3Result;
+  fingerprint: string;
+  notes: string;
+}
+
+export interface TradeLabel {
+  id: string;
+  token_id: string;
+  trade_id: string;
+  label: string;
+  created_at: string;
+  note: string;
+}
+
+export interface StrategyPreset {
+  id: string;
+  name: string;
+  created_at: string;
+  settings: Record<string, unknown>;
+  description: string;
+}
+
+export interface SourceAdapterStatus {
+  name: string;
+  enabled: boolean;
+  status: string;
+  capabilities: string[];
+  confidence: number;
 }
 
 export interface BotSnapshot {

@@ -4,14 +4,16 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, TokenSignal, TokenStatus, TradeEvent, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 class Storage:
+    SCHEMA_VERSION = 2
+
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -29,6 +31,14 @@ class Storage:
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS settings (
@@ -126,7 +136,38 @@ class Storage:
                 )
                 """
             )
+            for table in ("experiment_runs", "trade_labels", "strategy_presets"):
+                connection.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+                (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+            )
 
+    def schema_status(self) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT version, applied_at FROM schema_migrations ORDER BY version").fetchall()
+        current = max([int(row["version"]) for row in rows], default=0)
+        return {
+            "current_version": current,
+            "expected_version": self.SCHEMA_VERSION,
+            "ok": current >= self.SCHEMA_VERSION,
+            "migrations": [{"version": int(row["version"]), "applied_at": row["applied_at"]} for row in rows],
+        }
+
+    def backup(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {"status": "missing", "path": ""}
+        backup_path = self.path.with_suffix(f".backup-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{self.path.suffix}")
+        backup_path.write_bytes(self.path.read_bytes())
+        return {"status": "created", "path": str(backup_path)}
     def load_settings(self) -> BotSettings:
         with self._connect() as connection:
             row = connection.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
@@ -167,12 +208,56 @@ class Storage:
             row = connection.execute("SELECT COUNT(*) AS count FROM settings_versions").fetchone()
         return int(row["count"] if row else 0)
 
+    def count_experiment_runs(self) -> int:
+        return self._count_table("experiment_runs")
+
+    def count_trade_labels(self) -> int:
+        return self._count_table("trade_labels")
+
+    def count_strategy_presets(self) -> int:
+        return self._count_table("strategy_presets")
+
+    def _count_table(self, table: str) -> int:
+        with self._connect() as connection:
+            row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        return int(row["count"] if row else 0)
+
     def save_settings_version(self, version: SettingsVersion) -> None:
         payload = json.dumps(version.to_dict())
         with self._connect() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO settings_versions (id, payload, created_at) VALUES (?, ?, ?)",
                 (version.id, payload, version.created_at.isoformat()),
+            )
+
+    def load_experiment_runs(self, limit: int = 50) -> list[ExperimentRun]:
+        return [self._experiment_from_payload(payload) for payload in self._load_payloads("experiment_runs", limit)]
+
+    def save_experiment_run(self, run: ExperimentRun) -> None:
+        self._save_payload("experiment_runs", run.id, run.to_dict(), run.created_at)
+
+    def load_trade_labels(self, limit: int = 500) -> list[TradeLabel]:
+        return [self._trade_label_from_payload(payload) for payload in self._load_payloads("trade_labels", limit)]
+
+    def save_trade_label(self, label: TradeLabel) -> None:
+        self._save_payload("trade_labels", label.id, label.to_dict(), label.created_at)
+
+    def load_strategy_presets(self, limit: int = 50) -> list[StrategyPreset]:
+        return [self._strategy_preset_from_payload(payload) for payload in self._load_payloads("strategy_presets", limit)]
+
+    def save_strategy_preset(self, preset: StrategyPreset) -> None:
+        self._save_payload("strategy_presets", preset.id, preset.to_dict(), preset.created_at)
+
+    def _load_payloads(self, table: str, limit: int) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(f"SELECT payload FROM {table} ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def _save_payload(self, table: str, item_id: str, payload: dict[str, Any], created_at: datetime) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                f"INSERT OR REPLACE INTO {table} (id, payload, created_at) VALUES (?, ?, ?)",
+                (item_id, json.dumps(payload), created_at.isoformat()),
             )
 
     def load_tokens(self, limit: int = 80) -> list[TokenSignal]:
@@ -404,6 +489,18 @@ class Storage:
         with self._connect() as connection:
             connection.execute("DELETE FROM settings_versions")
 
+    def clear_experiment_runs(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM experiment_runs")
+
+    def clear_trade_labels(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM trade_labels")
+
+    def clear_strategy_presets(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM strategy_presets")
+
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -439,6 +536,21 @@ class Storage:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         allowed = set(SettingsVersion.__dataclass_fields__.keys())
         return SettingsVersion(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _experiment_from_payload(self, payload: dict[str, Any]) -> ExperimentRun:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        allowed = set(ExperimentRun.__dataclass_fields__.keys())
+        return ExperimentRun(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_label_from_payload(self, payload: dict[str, Any]) -> TradeLabel:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        allowed = set(TradeLabel.__dataclass_fields__.keys())
+        return TradeLabel(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _strategy_preset_from_payload(self, payload: dict[str, Any]) -> StrategyPreset:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        allowed = set(StrategyPreset.__dataclass_fields__.keys())
+        return StrategyPreset(**{key: value for key, value in payload.items() if key in allowed})
 
     def _strategy_decision_from_payload(self, payload: dict[str, Any]) -> StrategyDecisionRecord:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

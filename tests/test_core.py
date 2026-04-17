@@ -2,7 +2,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, PriceObservation, SourceEvent, StrategyDecisionRecord, TokenSignal, TokenStatus, TradeRecord, TradeSession, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
@@ -340,6 +340,19 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("runs", suite)
             self.assertEqual(detail["trade"]["id"], "trd_test")
             self.assertTrue(safety["paper_only"])
+
+    def test_schema_experiments_labels_and_presets_round_trip(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+            now = utc_now()
+            storage.save_experiment_run(ExperimentRun(id="exp_test", name="Experiment", created_at=now, settings_version_id="set_test", profile="balanced", replay_source="backtest_v3", result={"ok": True}, fingerprint="abc"))
+            storage.save_trade_label(TradeLabel(id="lbl_test", token_id="tok_test", trade_id="trd_test", label="good_entry", created_at=now))
+            storage.save_strategy_preset(StrategyPreset(id="strat_test", name="My preset", created_at=now, settings={"score_threshold": 60}))
+
+            self.assertTrue(storage.schema_status()["ok"])
+            self.assertEqual(storage.count_experiment_runs(), 1)
+            self.assertEqual(storage.load_trade_labels()[0].label, "good_entry")
+            self.assertEqual(storage.load_strategy_presets()[0].name, "My preset")
 
 
 if __name__ == "__main__":
