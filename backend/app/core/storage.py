@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionRequest, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 class Storage:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
@@ -147,6 +147,15 @@ class Storage:
                     """
                 )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_execution_requests (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
             )
@@ -217,6 +226,9 @@ class Storage:
     def count_strategy_presets(self) -> int:
         return self._count_table("strategy_presets")
 
+    def count_live_execution_requests(self) -> int:
+        return self._count_table("live_execution_requests")
+
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
@@ -247,6 +259,12 @@ class Storage:
 
     def save_strategy_preset(self, preset: StrategyPreset) -> None:
         self._save_payload("strategy_presets", preset.id, preset.to_dict(), preset.created_at)
+
+    def load_live_execution_requests(self, limit: int = 100) -> list[LiveExecutionRequest]:
+        return [self._live_execution_request_from_payload(payload) for payload in self._load_payloads("live_execution_requests", limit)]
+
+    def save_live_execution_request(self, request: LiveExecutionRequest) -> None:
+        self._save_payload("live_execution_requests", request.id, request.to_dict(), request.created_at)
 
     def _load_payloads(self, table: str, limit: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -501,6 +519,10 @@ class Storage:
         with self._connect() as connection:
             connection.execute("DELETE FROM strategy_presets")
 
+    def clear_live_execution_requests(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM live_execution_requests")
+
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -551,6 +573,12 @@ class Storage:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         allowed = set(StrategyPreset.__dataclass_fields__.keys())
         return StrategyPreset(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _live_execution_request_from_payload(self, payload: dict[str, Any]) -> LiveExecutionRequest:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["reviewed_at"] = datetime.fromisoformat(payload["reviewed_at"]) if payload.get("reviewed_at") else None
+        allowed = set(LiveExecutionRequest.__dataclass_fields__.keys())
+        return LiveExecutionRequest(**{key: value for key, value in payload.items() if key in allowed})
 
     def _strategy_decision_from_payload(self, payload: dict[str, Any]) -> StrategyDecisionRecord:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

@@ -11,6 +11,7 @@ from app.core.models import (
     BotStats,
     BotStatus,
     ExperimentRun,
+    LiveExecutionRequest,
     SettingsVersion,
     SourceStatus,
     SourceEvent,
@@ -32,13 +33,14 @@ from app.core.pumpfun_intelligence import PumpFunIntelligence
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
+from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, normalize_pumpportal_new_token
 from app.core.strategy import DecisionPipeline
 
 
 class BotState:
-    def __init__(self, database_path: str = "data/cryptoarc.db", default_source: str = "mock") -> None:
+    def __init__(self, database_path: str = "data/cryptoarc.db", default_source: str = "mock", default_solana_rpc_url: str = "", default_watch_wallet_address: str = "") -> None:
         self.storage = Storage(database_path)
         self.status = BotStatus.STOPPED
         has_saved_settings = self.storage.has_settings()
@@ -50,6 +52,11 @@ class BotState:
             self.settings.launch_source = default_source
         elif not has_saved_settings and self.settings.launch_source == "mock" and default_source != "mock":
             self.settings.launch_source = default_source
+        if not has_saved_settings:
+            if default_solana_rpc_url:
+                self.settings.solana_rpc_url = default_solana_rpc_url
+            if default_watch_wallet_address:
+                self.settings.watch_wallet_address = default_watch_wallet_address
         self.stats = BotStats()
         self.tokens: deque[TokenSignal] = deque(self.storage.load_tokens(), maxlen=80)
         self.events: deque[TradeEvent] = deque(self.storage.load_events(), maxlen=30)
@@ -65,6 +72,10 @@ class BotState:
         self.simulator = LaunchSimulator()
         self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
         self.current_settings_version_id = self.ensure_settings_version("startup", [])
+        self.last_bot_tick_at: datetime | None = None
+        self.last_ingested_launch_at: datetime | None = None
+        self.last_tick_error: str = ""
+        self.bot_loop_iterations = 0
         self.recalculate_stats()
 
     def start(self) -> BotSnapshot:
@@ -117,6 +128,8 @@ class BotState:
         self.storage.save_event(event)
 
     def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> None:
+        if token:
+            self.last_ingested_launch_at = utc_now()
         event = SourceEvent(
             id=new_id("src"),
             source=source,
@@ -225,6 +238,9 @@ class BotState:
             break
 
     def tick(self) -> BotSnapshot:
+        self.last_bot_tick_at = utc_now()
+        self.last_tick_error = ""
+        self.bot_loop_iterations += 1
         for token in list(self.tokens):
             token.age_seconds = max(0, int((utc_now() - token.detected_at).total_seconds()))
             if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
@@ -954,6 +970,10 @@ class BotState:
             stop_reasons.append("source health degraded")
         if self.settings.live_trading_enabled:
             stop_reasons.append("live trading request remains blocked by paper boundary")
+        if self.settings.manual_live_enabled:
+            stop_reasons.append("manual live execution is audit-only")
+        if self.settings.autonomous_live_enabled:
+            stop_reasons.append("autonomous live mode is not implemented")
         if self.settings.max_consecutive_losses_enabled and consecutive_losses >= self.settings.max_consecutive_losses:
             stop_reasons.append("consecutive loss halt")
         if self.settings.halt_on_low_replay_confidence and replay_confidence < self.settings.min_replay_confidence:
@@ -969,7 +989,106 @@ class BotState:
             "kill_switch_available": True,
             "kill_switch_enabled": self.settings.kill_switch_enabled,
             "replay_confidence": replay_confidence,
+            "manual_live_ready": False,
+            "autonomous_live_ready": False,
+            "live_blockers": [
+                "no signer or transaction executor is present",
+                "paper engine and replay confidence must stay production-stable first",
+                "manual live requests are stored for review only",
+            ],
         }
+
+    def record_bot_loop_error(self, error: Exception) -> None:
+        self.last_tick_error = f"{error.__class__.__name__}: {error}"
+        self.add_event("danger", f"Bot loop recovered after error: {self.last_tick_error}")
+
+    def watchdog_status(self) -> dict[str, object]:
+        now = utc_now()
+        tick_age = int((now - self.last_bot_tick_at).total_seconds()) if self.last_bot_tick_at else None
+        launch_age = int((now - self.last_ingested_launch_at).total_seconds()) if self.last_ingested_launch_at else None
+        source_age = self.source_health().get("last_event_age_seconds")
+        tick_stale = tick_age is None or tick_age > max(10, int(self.settings.source_stale_seconds))
+        source_stale = self.status == BotStatus.RUNNING and source_age is not None and int(source_age) > self.settings.source_stale_seconds
+        launch_stale = self.status == BotStatus.RUNNING and self.settings.detect_new_tokens and launch_age is not None and launch_age > max(120, self.settings.source_stale_seconds * 2)
+        return {
+            "status": "degraded" if tick_stale or source_stale or self.last_tick_error else "ok",
+            "bot_running": self.status == BotStatus.RUNNING,
+            "last_tick_at": self.last_bot_tick_at.isoformat() if self.last_bot_tick_at else None,
+            "tick_age_seconds": tick_age,
+            "last_ingested_launch_at": self.last_ingested_launch_at.isoformat() if self.last_ingested_launch_at else None,
+            "launch_ingestion_age_seconds": launch_age,
+            "source_event_age_seconds": source_age,
+            "tick_stale": tick_stale,
+            "source_stale": source_stale,
+            "launch_stale": launch_stale,
+            "loop_iterations": self.bot_loop_iterations,
+            "last_error": self.last_tick_error,
+            "recommended_action": "recover bot loop or restart service" if tick_stale or self.last_tick_error else "monitor source feed" if source_stale else "none",
+        }
+
+    def recover_bot(self) -> BotSnapshot:
+        self.last_tick_error = ""
+        if self.status != BotStatus.RUNNING:
+            self.status = BotStatus.RUNNING
+            self.add_event("warning", "Watchdog recovery started the paper loop")
+        else:
+            self.add_event("info", "Watchdog recovery cleared transient loop error")
+        self.last_bot_tick_at = utc_now()
+        return self.snapshot()
+
+    def solana_status(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "configured": bool(self.settings.solana_rpc_url),
+            "rpc_url": self.settings.solana_rpc_url,
+            "wallet_configured": bool(self.settings.watch_wallet_address.strip()),
+            "wallet_address": self.settings.watch_wallet_address.strip(),
+            "health": "unknown",
+            "balance_sol": None,
+            "read_only": True,
+            "error": "",
+        }
+        try:
+            client = SolanaReadOnlyClient(self.settings.solana_rpc_url)
+            result["health"] = client.health()
+            if self.settings.watch_wallet_address.strip():
+                result["balance_sol"] = client.balance_sol(self.settings.watch_wallet_address)
+        except Exception as exc:
+            result["error"] = f"{exc.__class__.__name__}: {exc}"
+        return result
+
+    def live_requests(self) -> list[dict[str, object]]:
+        return [request.to_dict() for request in self.storage.load_live_execution_requests(100)]
+
+    def create_manual_live_request(self, action: str, mint: str, amount_sol: float) -> dict[str, object]:
+        amount = max(0.0, float(amount_sol))
+        blockers = []
+        if not self.settings.manual_live_enabled:
+            blockers.append("manual live requests are disabled in settings")
+        if not self.settings.live_trading_enabled:
+            blockers.append("live trading unlock is not requested")
+        if amount > self.settings.manual_live_max_sol:
+            blockers.append(f"amount exceeds manual cap ({self.settings.manual_live_max_sol:.4f} SOL)")
+        if self.settings.require_live_confirmation:
+            blockers.append("manual confirmation would be required before any future signer")
+        blockers.append("no live transaction executor is implemented")
+        request = LiveExecutionRequest(
+            id=new_id("live"),
+            created_at=utc_now(),
+            action=action,
+            mint=mint.strip(),
+            amount_sol=round(amount, 9),
+            status="blocked" if blockers else "review_required",
+            reason="; ".join(blockers) if blockers else "ready for manual review; no transaction sent",
+            payload={
+                "paper_only_boundary": True,
+                "source": "dashboard",
+                "live_trading_requested": self.settings.live_trading_enabled,
+                "manual_live_enabled": self.settings.manual_live_enabled,
+            },
+        )
+        self.storage.save_live_execution_request(request)
+        self.add_event("warning", f"Manual live {action} request stored for {mint[:8] or 'unknown'}: {request.status}")
+        return request.to_dict()
 
     def operational_monitoring(self) -> dict[str, object]:
         events = self.storage.load_all_events(500)
@@ -1174,6 +1293,8 @@ class BotState:
             return {"trade_labels": [item.to_dict() for item in self.storage.load_trade_labels(5000)]}
         if target == "strategy_presets":
             return {"strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)]}
+        if target == "live_execution_requests":
+            return {"live_execution_requests": [item.to_dict() for item in self.storage.load_live_execution_requests(5000)]}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
@@ -1187,6 +1308,7 @@ class BotState:
             "experiments": [item.to_dict() for item in self.storage.load_experiment_runs(5000)],
             "trade_labels": [item.to_dict() for item in self.storage.load_trade_labels(5000)],
             "strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)],
+            "live_execution_requests": [item.to_dict() for item in self.storage.load_live_execution_requests(5000)],
         }
 
     def data_summary(self) -> dict[str, int]:
@@ -1203,6 +1325,7 @@ class BotState:
             "experiments": self.storage.count_experiment_runs(),
             "trade_labels": self.storage.count_trade_labels(),
             "strategy_presets": self.storage.count_strategy_presets(),
+            "live_execution_requests": self.storage.count_live_execution_requests(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
@@ -1235,6 +1358,8 @@ class BotState:
             self.storage.clear_trade_labels()
         if target in {"strategy_presets", "all"}:
             self.storage.clear_strategy_presets()
+        if target in {"live_execution_requests", "all"}:
+            self.storage.clear_live_execution_requests()
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()

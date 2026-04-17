@@ -33,6 +33,7 @@ import {
   fetchBacktests,
   fetchDataSummary,
   fetchExperiments,
+  fetchLiveRequests,
   fetchDataIntegrity,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
@@ -41,6 +42,7 @@ import {
   fetchPumpFunReport,
   fetchReplayTimeline,
   fetchSafetyStatus,
+  fetchSolanaStatus,
   fetchSnapshot,
   fetchSourceEvents,
   fetchSourceHealth,
@@ -54,10 +56,12 @@ import {
   fetchTradeReviewDetail,
   fetchTradeLabels,
   fetchTuningSuggestions,
+  fetchWatchdogStatus,
   login,
   logout,
   openSnapshotSocket,
   patchSettings,
+  recoverWatchdog,
   labelTrade,
   runABStrategyReplay,
   runBacktestV3,
@@ -71,7 +75,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 const fallbackSnapshot: BotSnapshot = {
@@ -153,7 +157,12 @@ const fallbackSnapshot: BotSnapshot = {
     max_consecutive_losses_enabled: false,
     max_consecutive_losses: 5,
     halt_on_low_replay_confidence: false,
-    min_replay_confidence: 50
+    min_replay_confidence: 50,
+    solana_rpc_url: "https://api.mainnet-beta.solana.com",
+    watch_wallet_address: "",
+    manual_live_enabled: false,
+    manual_live_max_sol: 0.05,
+    autonomous_live_enabled: false
   },
   tokens: [],
   events: [],
@@ -385,6 +394,9 @@ function App() {
   const [tradeReviewDetail, setTradeReviewDetail] = React.useState<TradeReviewDetail | null>(null);
   const [sourceHealth, setSourceHealth] = React.useState<SourceHealth | null>(null);
   const [securityStatus, setSecurityStatus] = React.useState<SecurityStatus | null>(null);
+  const [watchdogStatus, setWatchdogStatus] = React.useState<WatchdogStatus | null>(null);
+  const [solanaStatus, setSolanaStatus] = React.useState<SolanaStatus | null>(null);
+  const [liveRequests, setLiveRequests] = React.useState<LiveExecutionRequest[]>([]);
   const [backtestLimit, setBacktestLimit] = React.useState(80);
   const [backtestProfile, setBacktestProfile] = React.useState<BotSettings["strategy_profile"]>("balanced");
   const [backtestDateFrom, setBacktestDateFrom] = React.useState("");
@@ -601,7 +613,7 @@ function App() {
   }
 
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops, experimentRows, labels, presets, adapters] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -622,7 +634,10 @@ function App() {
       fetchExperiments(),
       fetchTradeLabels(),
       fetchStrategyPresets(),
-      fetchSourceAdapters()
+      fetchSourceAdapters(),
+      fetchWatchdogStatus(),
+      fetchSolanaStatus(),
+      fetchLiveRequests()
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -645,6 +660,9 @@ function App() {
     setTradeLabels(labels);
     setStrategyPresetsRemote(presets);
     setSourceAdapters(adapters);
+    setWatchdogStatus(watchdog);
+    setSolanaStatus(solana);
+    setLiveRequests(liveRows);
   }
 
   async function loadReplayTimeline(tokenId: string) {
@@ -658,7 +676,7 @@ function App() {
     }
   }
 
-  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all") {
+  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "all") {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
@@ -955,8 +973,16 @@ function App() {
             safetyStatus={safetyStatus}
             opsMonitoring={opsMonitoring}
             sourceAdapters={sourceAdapters}
+            watchdogStatus={watchdogStatus}
+            solanaStatus={solanaStatus}
+            liveRequests={liveRequests}
             auditEvents={snapshot.events}
             onRefresh={refreshResearchData}
+            onRecover={async () => {
+              const updated = await recoverWatchdog();
+              setSnapshot(updated);
+              await refreshResearchData();
+            }}
             onClear={clearProjectData}
           />
         )}
@@ -1799,8 +1825,12 @@ function DataDashboard({
   safetyStatus,
   opsMonitoring,
   sourceAdapters,
+  watchdogStatus,
+  solanaStatus,
+  liveRequests,
   auditEvents,
   onRefresh,
+  onRecover,
   onClear
 }: {
   summary: DataSummary | null;
@@ -1818,9 +1848,13 @@ function DataDashboard({
   safetyStatus: SafetyStatus | null;
   opsMonitoring: OperationalMonitoring | null;
   sourceAdapters: SourceAdapterStatus[];
+  watchdogStatus: WatchdogStatus | null;
+  solanaStatus: SolanaStatus | null;
+  liveRequests: LiveExecutionRequest[];
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
-  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "all") => Promise<void>;
+  onRecover: () => Promise<void>;
+  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "all") => Promise<void>;
 }) {
   return (
     <section className="dashboard-page">
@@ -1852,16 +1886,19 @@ function DataDashboard({
         <Metric label="Replay confidence" value={`${dataIntegrity?.replay_confidence.score ?? 0}%`} />
         <Metric label="Source health" value={`${sourceHealth?.health_score ?? 0}%`} />
         <Metric label="Safety boundary" value={securityStatus?.paper_only_boundary ? "paper only" : "live enabled"} />
+        <Metric label="Watchdog" value={watchdogStatus?.status ?? "unknown"} />
+        <Metric label="Solana RPC" value={solanaStatus?.health ?? "unknown"} />
+        <Metric label="Live requests" value={(summary?.live_execution_requests ?? liveRequests.length).toString()} />
       </div>
       <div className="maintenance-row">
-        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets"] as const).map((target) => (
+        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests"] as const).map((target) => (
           <button key={target} className="danger outline" onClick={() => onClear(target)}>
             <Trash2 size={14} /> Clear {target.replace("_", " ")}
           </button>
         ))}
       </div>
       <div className="maintenance-row">
-        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"] as const).map((target) => (
+        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"] as const).map((target) => (
           <a key={target} className="export-button" href={exportUrl(target)} target="_blank" rel="noreferrer">
             <Download size={14} /> Export {target.replace("_", " ")}
           </a>
@@ -1902,7 +1939,31 @@ function DataDashboard({
             <BarMetric label="Errors" value={opsMonitoring?.recent_errors.length ?? 0} max={20} />
             <BarMetric label="Open positions" value={safetyStatus?.open_positions ?? 0} max={25} />
           </div>
+          <div className="source-diagnostics">
+            <span>Watchdog: {watchdogStatus?.status ?? "unknown"} / tick age {watchdogStatus?.tick_age_seconds ?? "-"}s</span>
+            <span>Launch age: {watchdogStatus?.launch_ingestion_age_seconds ?? "-"}s / source age {watchdogStatus?.source_event_age_seconds ?? "-"}s</span>
+            <span>{watchdogStatus?.last_error || `Action: ${watchdogStatus?.recommended_action ?? "none"}`}</span>
+          </div>
+          <button className="secondary-action compact-action" onClick={onRecover}>
+            <RotateCcw size={14} /> Recover Bot
+          </button>
           <p className="settings-note">{safetyStatus?.entries_allowed ? "Risk controller allows new paper entries." : `Entries guarded: ${(safetyStatus?.stop_reasons ?? []).join(", ") || "review required"}`}</p>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Solana Read-Only</h3>
+              <p>RPC health and watched wallet balance. No signer is loaded.</p>
+            </div>
+            <Wallet size={18} />
+          </div>
+          <div className="security-list">
+            <span>RPC: <strong>{solanaStatus?.health ?? "unknown"}</strong></span>
+            <span>Wallet: <strong>{solanaStatus?.wallet_configured ? "configured" : "not set"}</strong></span>
+            <span>Balance: <strong>{solanaStatus?.balance_sol === null || solanaStatus?.balance_sol === undefined ? "-" : `${solanaStatus.balance_sol.toFixed(4)} SOL`}</strong></span>
+            <span>Mode: <strong>{solanaStatus?.read_only ? "read only" : "review"}</strong></span>
+          </div>
+          {solanaStatus?.error ? <p className="settings-note">{solanaStatus.error}</p> : null}
         </section>
         <section className="research-card">
           <div className="section-heading">
@@ -1991,7 +2052,29 @@ function DataDashboard({
             <span>2FA: <strong>{securityStatus?.totp_enabled ? "enabled" : "disabled"}</strong></span>
             <span>Live env: <strong>{securityStatus?.live_trading_env_enabled ? "enabled" : "disabled"}</strong></span>
             <span>Paper boundary: <strong>{securityStatus?.paper_only_boundary ? "active" : "inactive"}</strong></span>
+            <span>Manual live: <strong>{safetyStatus?.manual_live_ready ? "ready" : "blocked"}</strong></span>
+            <span>Autonomous live: <strong>{safetyStatus?.autonomous_live_ready ? "ready" : "future"}</strong></span>
             <span>Origins: <strong>{securityStatus?.allowed_origins.join(", ") || "-"}</strong></span>
+          </div>
+          <p className="settings-note">{(safetyStatus?.live_blockers ?? []).join(" / ")}</p>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Manual Live Requests</h3>
+              <p>Audit-only records for future manual execution workflows.</p>
+            </div>
+            <Wallet size={18} />
+          </div>
+          <div className="mini-list">
+            {liveRequests.slice(0, 12).map((request) => (
+              <article key={request.id}>
+                <strong>{request.action} / {request.amount_sol.toFixed(4)} SOL / {request.status}</strong>
+                <span>{new Date(request.created_at).toLocaleString()} / {request.mint}</span>
+                <p>{request.reason}</p>
+              </article>
+            ))}
+            {!liveRequests.length ? <p>No manual live requests have been stored.</p> : null}
           </div>
         </section>
         <section className="research-card">
@@ -2208,8 +2291,8 @@ function SettingsModal({
     strategy: "strategy profile trade size slippage trading speed max open positions entry buy",
     risk: "risk tolerance score creator hold daily loss honeypot rug buy velocity sell pressure metadata token age",
     exits: "exit take profit stop loss max hold time position ticks sell close trailing partial break even stalled sell pressure",
-    simulation: "simulation safety launch interval paper volatility wallet cap live unlock toasts compact table",
-    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata observed subscriptions confidence first move market cap toasts",
+    simulation: "simulation safety launch interval paper volatility wallet cap live unlock toasts compact table solana rpc watch wallet manual live autonomous",
+    advanced: "advanced source stale reconnect backtest replay raw limit health quality export maintenance fees fill delay failed price impact duplicate metadata observed subscriptions confidence first move market cap toasts solana rpc",
     security: "security password 2fa totp authenticator qr code deployment auth"
   };
   const searchQuery = settingsSearch.trim().toLowerCase();
@@ -2473,6 +2556,15 @@ function SettingsModal({
                 <SettingInput label="Launch interval seconds" value={draft.launch_interval_seconds} step="0.5" onChange={(v) => updateNumber("launch_interval_seconds", v)} />
                 <SettingInput label="Paper volatility %" value={draft.paper_price_volatility_pct} onChange={(v) => updateNumber("paper_price_volatility_pct", v)} />
                 <SettingInput label="Future wallet cap SOL" value={draft.wallet_balance_cap_sol} step="0.001" onChange={(v) => updateNumber("wallet_balance_cap_sol", v)} />
+                <label>
+                  Solana RPC URL
+                  <input value={draft.solana_rpc_url} onChange={(event) => updateDraft("solana_rpc_url", event.target.value)} placeholder="https://api.mainnet-beta.solana.com" />
+                </label>
+                <label>
+                  Watched wallet address
+                  <input value={draft.watch_wallet_address} onChange={(event) => updateDraft("watch_wallet_address", event.target.value)} placeholder="Wallet public key for balance checks" />
+                </label>
+                <SettingInput label="Manual live max SOL" value={draft.manual_live_max_sol} step="0.001" onChange={(v) => updateNumber("manual_live_max_sol", v)} />
                 <label className="toggle-line">
                   <input
                     type="checkbox"
@@ -2496,6 +2588,22 @@ function SettingsModal({
                     onChange={(event) => updateDraft("live_trading_enabled", event.target.checked)}
                   />
                   Request live trading unlock
+                </label>
+                <label className="toggle-line">
+                  <input
+                    type="checkbox"
+                    checked={draft.manual_live_enabled}
+                    onChange={(event) => updateDraft("manual_live_enabled", event.target.checked)}
+                  />
+                  Enable manual live request capture
+                </label>
+                <label className="toggle-line">
+                  <input
+                    type="checkbox"
+                    checked={draft.autonomous_live_enabled}
+                    onChange={(event) => updateDraft("autonomous_live_enabled", event.target.checked)}
+                  />
+                  Request autonomous live mode later
                 </label>
                 <p className="settings-note">Live execution remains blocked unless the backend environment explicitly enables it.</p>
               </SettingsSection>

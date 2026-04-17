@@ -79,6 +79,11 @@ export interface BotSettings {
   stalled_trade_min_move_pct: number;
   sell_pressure_exit_enabled: boolean;
   sell_pressure_exit_threshold: number;
+  solana_rpc_url: string;
+  watch_wallet_address: string;
+  manual_live_enabled: boolean;
+  manual_live_max_sol: number;
+  autonomous_live_enabled: boolean;
 }
 
 export interface TokenSignal {
@@ -241,6 +246,7 @@ export interface DataSummary {
   experiments: number;
   trade_labels: number;
   strategy_presets: number;
+  live_execution_requests: number;
 }
 
 export interface TradeRecord {
@@ -460,6 +466,9 @@ export interface SafetyStatus {
   kill_switch_available: boolean;
   kill_switch_enabled: boolean;
   replay_confidence: number;
+  manual_live_ready: boolean;
+  autonomous_live_ready: boolean;
+  live_blockers: string[];
 }
 
 export interface OperationalMonitoring {
@@ -522,6 +531,46 @@ export interface SourceAdapterStatus {
   status: string;
   capabilities: string[];
   confidence: number;
+}
+
+export interface WatchdogStatus {
+  status: string;
+  bot_running: boolean;
+  last_tick_at: string | null;
+  tick_age_seconds: number | null;
+  last_ingested_launch_at: string | null;
+  launch_ingestion_age_seconds: number | null;
+  source_event_age_seconds: number | null;
+  tick_stale: boolean;
+  source_stale: boolean;
+  launch_stale: boolean;
+  loop_iterations: number;
+  last_error: string;
+  recommended_action: string;
+}
+
+export interface SolanaStatus {
+  configured: boolean;
+  rpc_url: string;
+  wallet_configured: boolean;
+  wallet_address: string;
+  health: string;
+  balance_sol: number | null;
+  read_only: boolean;
+  error: string;
+}
+
+export interface LiveExecutionRequest {
+  id: string;
+  created_at: string;
+  action: string;
+  mint: string;
+  amount_sol: number;
+  status: string;
+  reason: string;
+  mode: string;
+  payload: Record<string, unknown>;
+  reviewed_at: string | null;
 }
 
 export interface BotSnapshot {

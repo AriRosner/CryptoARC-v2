@@ -13,6 +13,8 @@ class AppConfig(BaseSettings):
     pumpfun_source: Literal["mock", "pumpportal"] = Field(default="mock", alias="PUMPFUN_SOURCE")
     pumpportal_ws_url: str = Field(default="wss://pumpportal.fun/api/data", alias="PUMPPORTAL_WS_URL")
     solana_wss_endpoint: str = Field(default="", alias="SOLANA_WSS_ENDPOINT")
+    solana_rpc_url: str = Field(default="https://api.mainnet-beta.solana.com", alias="SOLANA_RPC_URL")
+    watch_wallet_address: str = Field(default="", alias="WATCH_WALLET_ADDRESS")
     database_path: str = Field(default="data/cryptoarc.db", alias="DATABASE_PATH")
     live_trading_enabled: bool = Field(default=False, alias="LIVE_TRADING_ENABLED")
     allowed_origins: str = Field(default="http://127.0.0.1:5173,http://localhost:5173", alias="ALLOWED_ORIGINS")

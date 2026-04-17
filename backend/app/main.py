@@ -94,6 +94,11 @@ class SettingsPatch(BaseModel):
     max_consecutive_losses: int | None = Field(default=None, ge=1, le=100)
     halt_on_low_replay_confidence: bool | None = None
     min_replay_confidence: int | None = Field(default=None, ge=0, le=100)
+    solana_rpc_url: str | None = Field(default=None, min_length=8, max_length=300)
+    watch_wallet_address: str | None = Field(default=None, max_length=80)
+    manual_live_enabled: bool | None = None
+    manual_live_max_sol: float | None = Field(default=None, gt=0, le=10)
+    autonomous_live_enabled: bool | None = None
 
 
 class BacktestRequest(BaseModel):
@@ -137,6 +142,12 @@ class StrategyPresetRequest(BaseModel):
     description: str = ""
 
 
+class LiveExecutionPayload(BaseModel):
+    action: Literal["buy", "sell"]
+    mint: str = Field(min_length=1, max_length=100)
+    amount_sol: float = Field(gt=0, le=100)
+
+
 def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
     token = None
     if authorization and authorization.lower().startswith("bearer "):
@@ -149,7 +160,12 @@ def require_auth(authorization: str | None = Header(default=None), token_query: 
 
 config = get_config()
 auth = AuthManager(password=config.dashboard_password, totp_secret=config.dashboard_totp_secret)
-state = BotState(database_path=config.database_path, default_source=config.pumpfun_source)
+state = BotState(
+    database_path=config.database_path,
+    default_source=config.pumpfun_source,
+    default_solana_rpc_url=config.solana_rpc_url,
+    default_watch_wallet_address=config.watch_wallet_address,
+)
 clients: set[WebSocket] = set()
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 source_task: asyncio.Task | None = None
@@ -171,10 +187,13 @@ async def broadcast_snapshot() -> None:
 
 async def bot_loop() -> None:
     while True:
-        await ensure_source_task()
-        await drain_launch_queue()
-        state.tick()
-        await broadcast_snapshot()
+        try:
+            await ensure_source_task()
+            await drain_launch_queue()
+            state.tick()
+            await broadcast_snapshot()
+        except Exception as exc:
+            state.record_bot_loop_error(exc)
         await asyncio.sleep(bot_tick_seconds())
 
 
@@ -284,7 +303,9 @@ async def health_deep() -> dict:
     return {
         "status": "ok",
         "mode": state.settings.mode.value if hasattr(state.settings.mode, "value") else state.settings.mode,
-        "live_trading_enabled": config.live_trading_enabled and state.settings.live_trading_enabled,
+        "live_trading_enabled": False,
+        "live_trading_env_enabled": config.live_trading_enabled,
+        "live_execution_available": False,
         "database": config.database_path,
         "source": state.source_status.to_dict(),
     }
@@ -300,9 +321,10 @@ async def security_status() -> dict:
         "session_ttl_seconds": auth.session_ttl_seconds,
         "live_trading_env_enabled": config.live_trading_enabled,
         "live_trading_requested": state.settings.live_trading_enabled,
-        "effective_live_trading_enabled": config.live_trading_enabled and state.settings.live_trading_enabled,
+        "effective_live_trading_enabled": False,
         "allowed_origins": [origin.strip() for origin in config.allowed_origins.split(",") if origin.strip()],
-        "paper_only_boundary": not (config.live_trading_enabled and state.settings.live_trading_enabled),
+        "paper_only_boundary": True,
+        "live_execution_available": False,
         "runtime_password_configurable": True,
     }
 
@@ -518,6 +540,35 @@ async def safety_status() -> dict:
     return state.safety_status()
 
 
+@app.get("/api/watchdog/status", dependencies=[Depends(require_auth)])
+async def watchdog_status() -> dict:
+    return state.watchdog_status()
+
+
+@app.post("/api/watchdog/recover", dependencies=[Depends(require_auth)])
+async def watchdog_recover() -> dict:
+    result = state.recover_bot().to_dict()
+    await broadcast_snapshot()
+    return result
+
+
+@app.get("/api/solana/status", dependencies=[Depends(require_auth)])
+async def solana_status() -> dict:
+    return state.solana_status()
+
+
+@app.get("/api/live/requests", dependencies=[Depends(require_auth)])
+async def live_requests() -> list[dict]:
+    return state.live_requests()
+
+
+@app.post("/api/live/manual-request", dependencies=[Depends(require_auth)])
+async def manual_live_request(payload: LiveExecutionPayload) -> dict:
+    result = state.create_manual_live_request(payload.action, payload.mint, payload.amount_sol)
+    await broadcast_snapshot()
+    return result
+
+
 @app.get("/api/monitoring/ops", dependencies=[Depends(require_auth)])
 async def operational_monitoring() -> dict:
     return state.operational_monitoring()
@@ -544,14 +595,14 @@ async def data_summary() -> dict:
 
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
-async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"]) -> dict:
+async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"]) -> dict:
     result = state.clear_data(target)
     await broadcast_snapshot()
     return result
 
 
 @app.get("/api/export/{target}", dependencies=[Depends(require_auth)])
-async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "all"]) -> JSONResponse:
+async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"]) -> JSONResponse:
     return JSONResponse(
         content=state.export_data(target),
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-{target}.json"'},

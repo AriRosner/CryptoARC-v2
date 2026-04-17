@@ -15,6 +15,9 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Data Integrity reports for replay confidence, missing records, rejected prices, and malformed source events.
 - Pump.fun intelligence summaries for creator behavior, metadata coverage, bonding curve fields, and launch quality.
 - Operational monitoring for backend state, source health, storage counts, warnings, and safety guard state.
+- Stability watchdog with loop recovery status for production paper deployments.
+- Solana read-only RPC health and watched-wallet balance checks.
+- Manual live execution request ledger for audit-only future-live planning.
 - Dashboard auth with optional authenticator-app 2FA.
 - Docker-ready deployment structure with a paper/live safety boundary.
 
@@ -59,6 +62,8 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - SQLite schema metadata and runtime migration status.
 - Local database backup endpoint.
 - Operational monitoring for backend state, source health, storage counts, warnings, and errors.
+- Watchdog status for stale bot ticks, source events, launch ingestion age, and recover action.
+- Solana read-only status for RPC health and public wallet balance checks.
 - Dashboard password auth, session expiry, login lockout, and optional authenticator-app 2FA.
 - GitHub Actions CI for backend tests and frontend builds.
 
@@ -74,6 +79,8 @@ Default safety assumptions:
 - Dashboard password should be set before any network deployment.
 - Optional TOTP 2FA is available.
 - Paper-only mode remains the default and recommended mode.
+- Manual live requests are audit records only and do not submit transactions.
+- Autonomous live mode remains blocked until a reviewed executor, signer flow, and risk controller exist.
 
 ## Architecture
 
@@ -171,12 +178,14 @@ Start from `.env.example`:
 - `DATABASE_PATH`
 - `PUMPFUN_SOURCE`
 - `PUMPPORTAL_WS_URL`
+- `SOLANA_RPC_URL`
+- `WATCH_WALLET_ADDRESS`
 - `DASHBOARD_PASSWORD`
 - `DASHBOARD_TOTP_SECRET`
 - `ALLOWED_ORIGINS`
 - `LIVE_TRADING_ENABLED`
 
-For any deployment beyond localhost, set a strong dashboard password, restrict CORS origins, use HTTPS, and keep live trading disabled.
+For any deployment beyond localhost, set a strong dashboard password, restrict CORS origins, use HTTPS, and keep live trading disabled. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and [docs/LIVE_TRADING_DESIGN.md](docs/LIVE_TRADING_DESIGN.md).
 
 ## Key API Surfaces
 
@@ -193,6 +202,11 @@ For any deployment beyond localhost, set a strong dashboard password, restrict C
 - `GET /api/price/diagnostics`
 - `GET /api/pumpfun/intelligence`
 - `GET /api/safety/status`
+- `GET /api/watchdog/status`
+- `POST /api/watchdog/recover`
+- `GET /api/solana/status`
+- `GET /api/live/requests`
+- `POST /api/live/manual-request`
 - `GET /api/monitoring/ops`
 - `GET /api/trade-review/{token_id}`
 - `GET /api/replay/timeline/{token_id}`

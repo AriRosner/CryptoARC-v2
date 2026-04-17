@@ -2,7 +2,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionRequest, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
@@ -353,6 +353,40 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(storage.count_experiment_runs(), 1)
             self.assertEqual(storage.load_trade_labels()[0].label, "good_entry")
             self.assertEqual(storage.load_strategy_presets()[0].name, "My preset")
+
+    def test_live_request_storage_and_safety_boundary(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+            request = LiveExecutionRequest(
+                id="live_test",
+                created_at=utc_now(),
+                action="buy",
+                mint="Mint111",
+                amount_sol=0.01,
+                status="blocked",
+                reason="test boundary",
+            )
+
+            storage.save_live_execution_request(request)
+
+            loaded = storage.load_live_execution_requests()[0]
+            self.assertEqual(loaded.id, "live_test")
+            self.assertEqual(storage.count_live_execution_requests(), 1)
+
+    def test_watchdog_and_manual_live_request_are_blocked(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            state.start()
+            state.tick()
+            request = state.create_manual_live_request("buy", "Mint111", 0.01)
+            watchdog = state.watchdog_status()
+            safety = state.safety_status()
+
+            self.assertEqual(watchdog["status"], "ok")
+            self.assertEqual(request["status"], "blocked")
+            self.assertTrue(safety["paper_only"])
+            self.assertFalse(safety["manual_live_ready"])
 
 
 if __name__ == "__main__":

@@ -108,6 +108,11 @@ class BotSettings:
     max_consecutive_losses: int = 5
     halt_on_low_replay_confidence: bool = False
     min_replay_confidence: int = 50
+    solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    watch_wallet_address: str = ""
+    manual_live_enabled: bool = False
+    manual_live_max_sol: float = 0.05
+    autonomous_live_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -208,6 +213,26 @@ class SourceEvent:
         payload = asdict(self)
         payload["received_at"] = self.received_at.isoformat()
         return payload
+
+
+@dataclass(slots=True)
+class LiveExecutionRequest:
+    id: str
+    created_at: datetime
+    action: str
+    mint: str
+    amount_sol: float
+    status: str
+    reason: str
+    mode: str = "manual_review"
+    payload: dict[str, Any] = field(default_factory=dict)
+    reviewed_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["created_at"] = self.created_at.isoformat()
+        data["reviewed_at"] = self.reviewed_at.isoformat() if self.reviewed_at else None
+        return data
 
 
 @dataclass(slots=True)
