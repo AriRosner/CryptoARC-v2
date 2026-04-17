@@ -19,7 +19,7 @@ class StrategyDecision:
 
 
 class DecisionPipeline:
-    ENGINE_VERSION = "strategy-v2"
+    ENGINE_VERSION = "strategy-v3"
 
     def __init__(self, scoring: ScoringEngine | None = None, risk: RiskEngine | None = None) -> None:
         self.scoring = scoring or ScoringEngine()
@@ -56,6 +56,13 @@ class DecisionPipeline:
             "profile": settings.strategy_profile,
             "risk_tolerance": settings.risk_tolerance,
             "effective_threshold": self.risk.effective_score_threshold(settings),
+            "modules": [
+                {"name": "entry_scoring", "enabled": True, "version": "score-v3"},
+                {"name": "risk_guards", "enabled": True, "version": "risk-v3"},
+                {"name": "position_sizing", "enabled": True, "trade_size_sol": settings.trade_size_sol},
+                {"name": "exit_engine", "enabled": True, "version": "exit-v3"},
+                {"name": "source_quality", "enabled": settings.stop_on_source_degraded},
+            ],
             "weights": {
                 "metadata": settings.strategy_weight_metadata,
                 "momentum": settings.strategy_weight_momentum,
@@ -67,6 +74,13 @@ class DecisionPipeline:
                 "stop_loss_pct": settings.stop_loss_pct,
                 "max_hold_time_seconds": settings.max_hold_time_seconds,
                 "max_position_ticks": settings.max_position_ticks,
+                "break_even_stop_enabled": settings.break_even_stop_enabled,
+                "stalled_trade_exit_enabled": settings.stalled_trade_exit_enabled,
+                "sell_pressure_exit_enabled": settings.sell_pressure_exit_enabled,
             },
             "raw": asdict(settings),
         }
+
+    def describe_modules(self, settings: BotSettings) -> list[dict[str, object]]:
+        snapshot = self.strategy_snapshot(settings)
+        return list(snapshot["modules"])

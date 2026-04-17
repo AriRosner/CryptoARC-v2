@@ -1,4 +1,4 @@
-import type { BacktestResult, BotSnapshot, DataSummary, PerformanceAnalytics, PriceObservation, ReplayTimelineEvent, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TradeRecord, TradeSession, TuningSuggestion } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -92,6 +92,14 @@ export async function runABStrategyReplay(options?: BacktestOptions): Promise<Ba
   });
 }
 
+export async function runBacktestV3(options?: BacktestOptions): Promise<BacktestV3Result> {
+  return request("/api/backtest/v3", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(options ?? {})
+  });
+}
+
 export async function fetchBacktests(): Promise<BacktestResult[]> {
   return request("/api/backtests");
 }
@@ -130,6 +138,30 @@ export async function fetchTuningSuggestions(): Promise<TuningSuggestion[]> {
 
 export async function fetchReplayTimeline(tokenId: string): Promise<ReplayTimelineEvent[]> {
   return request(`/api/replay/timeline/${encodeURIComponent(tokenId)}`);
+}
+
+export async function fetchTradeReviewDetail(tokenId: string): Promise<TradeReviewDetail> {
+  return request(`/api/trade-review/${encodeURIComponent(tokenId)}`);
+}
+
+export async function fetchDataIntegrity(): Promise<DataIntegrityReport> {
+  return request("/api/data/integrity");
+}
+
+export async function fetchPriceDiagnostics(): Promise<PriceDiagnostics> {
+  return request("/api/price/diagnostics");
+}
+
+export async function fetchPumpFunReport(): Promise<PumpFunReport> {
+  return request("/api/pumpfun/intelligence");
+}
+
+export async function fetchSafetyStatus(): Promise<SafetyStatus> {
+  return request("/api/safety/status");
+}
+
+export async function fetchOperationalMonitoring(): Promise<OperationalMonitoring> {
+  return request("/api/monitoring/ops");
 }
 
 export async function fetchSourceHealth(): Promise<SourceHealth> {

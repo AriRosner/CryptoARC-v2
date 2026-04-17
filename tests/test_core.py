@@ -2,7 +2,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, PriceObservation, SourceEvent, StrategyDecisionRecord, TokenSignal, TokenStatus, TradeSession, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, PriceObservation, SourceEvent, StrategyDecisionRecord, TokenSignal, TokenStatus, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
@@ -286,6 +286,60 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(run.scratches, 1)
             self.assertEqual(run.losses, 0)
             self.assertEqual(run.win_rate_pct, 0)
+
+    def test_data_integrity_and_price_v3_reports(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.score = 88
+            state.storage.save_token(token)
+            state.storage.save_price_observation(
+                PriceObservation(id="px_test", source="pumpportal", mint=token.mint, observed_at=utc_now(), price=0.00002, price_source="direct", confidence=0.9, accepted=True, token_id=token.id)
+            )
+            state.storage.save_source_event(SourceEvent(id="src_test", source="pumpportal", received_at=utc_now(), raw_payload={"mint": token.mint}, normalized_token_id=token.id, status="normalized"))
+
+            integrity = state.data_integrity_report()
+            price = state.price_diagnostics()
+
+            self.assertIn("determinism_fingerprint", integrity)
+            self.assertGreaterEqual(integrity["replay_confidence"]["score"], 0)
+            self.assertEqual(price["engine_version"], "price-v3")
+            self.assertEqual(price["accepted"], 1)
+
+    def test_backtest_v3_and_trade_review_detail(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.status = TokenStatus.PAPER_SOLD
+            token.score = 92
+            token.pnl_sol = 0.01
+            token.exit_reason = "take profit"
+            state.storage.save_token(token)
+            state.storage.save_trade(
+                TradeRecord(
+                    id="trd_test",
+                    token_id=token.id,
+                    mode="paper",
+                    strategy_profile="balanced",
+                    entry_price=0.00001,
+                    exit_price=0.00002,
+                    amount_sol=0.1,
+                    pnl_sol=0.01,
+                    entry_reason="test",
+                    exit_reason="take profit",
+                    opened_at=utc_now(),
+                    closed_at=utc_now(),
+                )
+            )
+
+            suite = state.backtest_v3(limit=5)
+            detail = state.trade_review_detail(token.id)
+            safety = state.safety_status()
+
+            self.assertEqual(suite["engine_version"], "backtest-v3")
+            self.assertIn("runs", suite)
+            self.assertEqual(detail["trade"]["id"], "trd_test")
+            self.assertTrue(safety["paper_only"])
 
 
 if __name__ == "__main__":

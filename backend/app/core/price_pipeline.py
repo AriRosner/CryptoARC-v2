@@ -21,6 +21,8 @@ class RawPriceCandidate:
 class PricePipeline:
     """Normalizes source price hints before they are allowed to affect paper PnL."""
 
+    ENGINE_VERSION = "price-v3"
+
     @staticmethod
     def from_payload(payload: dict[str, Any], source: str = "pumpportal") -> RawPriceCandidate:
         direct = numeric(payload, "price", "priceSol", "tokenPriceSol")
@@ -91,6 +93,57 @@ class PricePipeline:
             virtual_reserve_price=candidate.virtual_reserve_price,
             selected_price=candidate.price,
         )
+
+    def diagnostics(self, observations: list[PriceObservation]) -> dict[str, Any]:
+        accepted = [item for item in observations if item.accepted]
+        rejected = [item for item in observations if not item.accepted]
+        by_source: dict[str, dict[str, Any]] = {}
+        impossible_jumps = 0
+        previous_by_mint: dict[str, float] = {}
+        for item in sorted(observations, key=lambda observation: observation.observed_at):
+            bucket = by_source.setdefault(item.price_source or "unknown", {"count": 0, "accepted": 0, "confidence_total": 0.0})
+            bucket["count"] += 1
+            bucket["accepted"] += 1 if item.accepted else 0
+            bucket["confidence_total"] += item.confidence or 0.0
+            if item.accepted and item.price and item.mint in previous_by_mint:
+                previous = previous_by_mint[item.mint]
+                if previous > 0 and abs((item.price - previous) / previous) > 10:
+                    impossible_jumps += 1
+            if item.accepted and item.price:
+                previous_by_mint[item.mint] = item.price
+
+        source_rows = []
+        for source, stats in by_source.items():
+            count = max(1, int(stats["count"]))
+            source_rows.append(
+                {
+                    "source": source,
+                    "count": stats["count"],
+                    "accepted": stats["accepted"],
+                    "acceptance_rate": round(stats["accepted"] / count, 3),
+                    "avg_confidence": round(stats["confidence_total"] / count, 3),
+                }
+            )
+
+        return {
+            "engine_version": self.ENGINE_VERSION,
+            "observations": len(observations),
+            "accepted": len(accepted),
+            "rejected": len(rejected),
+            "acceptance_rate": round(len(accepted) / max(1, len(observations)), 3),
+            "impossible_jump_warnings": impossible_jumps,
+            "sources": sorted(source_rows, key=lambda row: row["count"], reverse=True),
+            "recommended_min_confidence": self.recommended_confidence(observations),
+        }
+
+    def recommended_confidence(self, observations: list[PriceObservation]) -> float:
+        if not observations:
+            return 0.45
+        accepted = [item.confidence for item in observations if item.accepted]
+        if not accepted:
+            return 0.55
+        average = sum(accepted) / len(accepted)
+        return round(max(0.45, min(0.85, average - 0.05)), 2)
 
     def validate_first_tick(self, token: TokenSignal, observation: PriceObservation, settings: BotSettings) -> PriceObservation:
         if not observation.accepted or not observation.price or not token.entry_price or token.observed_price_updates > 0:

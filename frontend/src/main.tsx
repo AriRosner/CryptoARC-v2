@@ -30,9 +30,14 @@ import {
   exportUrl,
   fetchBacktests,
   fetchDataSummary,
+  fetchDataIntegrity,
+  fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
+  fetchPriceDiagnostics,
   fetchPriceObservations,
+  fetchPumpFunReport,
   fetchReplayTimeline,
+  fetchSafetyStatus,
   fetchSnapshot,
   fetchSourceEvents,
   fetchSourceHealth,
@@ -41,12 +46,14 @@ import {
   fetchStrategyDecisions,
   fetchTrades,
   fetchTradeSessions,
+  fetchTradeReviewDetail,
   fetchTuningSuggestions,
   login,
   logout,
   openSnapshotSocket,
   patchSettings,
   runABStrategyReplay,
+  runBacktestV3,
   runRawReplayBacktest,
   runReplayBacktest,
   runStrategyComparison,
@@ -56,7 +63,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BotSnapshot, BotSettings, DataSummary, PerformanceAnalytics, PriceObservation, ReplayTimelineEvent, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TokenSignal, TradeEvent, TradeRecord, TradeSession, TuningSuggestion } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SourceEvent, SourceHealth, StrategyDecisionRecord, TokenSignal, TradeEvent, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion } from "./types";
 import "./styles.css";
 
 const fallbackSnapshot: BotSnapshot = {
@@ -350,8 +357,15 @@ function App() {
   const [settingsVersions, setSettingsVersions] = React.useState<SettingsVersion[]>([]);
   const [performanceAnalytics, setPerformanceAnalytics] = React.useState<PerformanceAnalytics | null>(null);
   const [tuningSuggestions, setTuningSuggestions] = React.useState<TuningSuggestion[]>([]);
+  const [dataIntegrity, setDataIntegrity] = React.useState<DataIntegrityReport | null>(null);
+  const [priceDiagnostics, setPriceDiagnostics] = React.useState<PriceDiagnostics | null>(null);
+  const [pumpfunReport, setPumpfunReport] = React.useState<PumpFunReport | null>(null);
+  const [safetyStatus, setSafetyStatus] = React.useState<SafetyStatus | null>(null);
+  const [opsMonitoring, setOpsMonitoring] = React.useState<OperationalMonitoring | null>(null);
+  const [backtestV3Result, setBacktestV3Result] = React.useState<BacktestV3Result | null>(null);
   const [selectedReviewTradeId, setSelectedReviewTradeId] = React.useState<string | null>(null);
   const [replayTimeline, setReplayTimeline] = React.useState<ReplayTimelineEvent[]>([]);
+  const [tradeReviewDetail, setTradeReviewDetail] = React.useState<TradeReviewDetail | null>(null);
   const [sourceHealth, setSourceHealth] = React.useState<SourceHealth | null>(null);
   const [securityStatus, setSecurityStatus] = React.useState<SecurityStatus | null>(null);
   const [backtestLimit, setBacktestLimit] = React.useState(80);
@@ -539,8 +553,19 @@ function App() {
     }
   }
 
+  async function runBacktestSuiteV3() {
+    try {
+      const result = await runBacktestV3({ limit: backtestLimit, profile: backtestProfile, date_from: dateTimeLocalToIso(backtestDateFrom), date_to: dateTimeLocalToIso(backtestDateTo), replay_speed: backtestSpeed });
+      setBacktestV3Result(result);
+      setBacktests(await fetchBacktests());
+      setDataIntegrity(await fetchDataIntegrity());
+    } catch (error) {
+      setApiError(`Backtest v3 failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -552,7 +577,12 @@ function App() {
       fetchTradeSessions(),
       fetchSettingsVersions(),
       fetchPerformanceAnalytics(),
-      fetchTuningSuggestions()
+      fetchTuningSuggestions(),
+      fetchDataIntegrity(),
+      fetchPriceDiagnostics(),
+      fetchPumpFunReport(),
+      fetchSafetyStatus(),
+      fetchOperationalMonitoring()
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -566,12 +596,19 @@ function App() {
     setSettingsVersions(versions);
     setPerformanceAnalytics(analytics);
     setTuningSuggestions(suggestions);
+    setDataIntegrity(integrity);
+    setPriceDiagnostics(price);
+    setPumpfunReport(pumpfun);
+    setSafetyStatus(safety);
+    setOpsMonitoring(ops);
   }
 
   async function loadReplayTimeline(tokenId: string) {
     setSelectedReviewTradeId(tokenId);
     try {
-      setReplayTimeline(await fetchReplayTimeline(tokenId));
+      const [timeline, detail] = await Promise.all([fetchReplayTimeline(tokenId), fetchTradeReviewDetail(tokenId)]);
+      setReplayTimeline(timeline);
+      setTradeReviewDetail(detail);
     } catch (error) {
       setApiError(`Timeline failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -828,11 +865,13 @@ function App() {
             onRawReplay={rawReplayBacktest}
             onCompare={compareStrategies}
             onABReplay={abReplayStrategies}
+            onRunV3={runBacktestSuiteV3}
+            v3Result={backtestV3Result}
           />
         )}
 
         {workspacePage === "analysis" && (
-          <AnalysisDashboard tokens={snapshot.tokens} trades={trades} stats={stats} analytics={performanceAnalytics} suggestions={tuningSuggestions} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
+          <AnalysisDashboard tokens={snapshot.tokens} trades={trades} stats={stats} analytics={performanceAnalytics} suggestions={tuningSuggestions} priceDiagnostics={priceDiagnostics} pumpfunReport={pumpfunReport} safetyStatus={safetyStatus} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
         )}
 
         {workspacePage === "review" && (
@@ -843,6 +882,7 @@ function App() {
             suggestions={tuningSuggestions}
             selectedTradeId={selectedReviewTradeId}
             timeline={replayTimeline}
+            detail={tradeReviewDetail}
             onSelectTrade={loadReplayTimeline}
           />
         )}
@@ -858,6 +898,11 @@ function App() {
             strategyDecisions={strategyDecisions}
             tradeSessions={tradeSessions}
             settingsVersions={settingsVersions}
+            dataIntegrity={dataIntegrity}
+            priceDiagnostics={priceDiagnostics}
+            pumpfunReport={pumpfunReport}
+            safetyStatus={safetyStatus}
+            opsMonitoring={opsMonitoring}
             auditEvents={snapshot.events}
             onRefresh={refreshResearchData}
             onClear={clearProjectData}
@@ -1078,7 +1123,9 @@ function BacktestDashboard({
   onRun,
   onRawReplay,
   onCompare,
-  onABReplay
+  onABReplay,
+  onRunV3,
+  v3Result
 }: {
   runs: BacktestResult[];
   latest: BacktestResult | null;
@@ -1096,6 +1143,8 @@ function BacktestDashboard({
   onRawReplay: () => Promise<void>;
   onCompare: () => Promise<void>;
   onABReplay: () => Promise<void>;
+  onRunV3: () => Promise<void>;
+  v3Result: BacktestV3Result | null;
 }) {
   const active = latest ?? runs[0] ?? null;
   return (
@@ -1144,8 +1193,37 @@ function BacktestDashboard({
           <button className="secondary-action compact-action" onClick={onABReplay}>
             <BarChart3 size={15} /> A/B replay
           </button>
+          <button className="secondary-action compact-action" onClick={onRunV3}>
+            <Shield size={15} /> Suite v3
+          </button>
         </div>
       </div>
+      {v3Result ? (
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Backtesting v3</h3>
+              <p>Deterministic replay, profile comparison, and walk-forward checks.</p>
+            </div>
+            <BarChart3 size={18} />
+          </div>
+          <div className="hero-metrics wide">
+            <Metric label="Engine" value={v3Result.engine_version} />
+            <Metric label="Tokens" value={v3Result.tokens_replayed.toString()} />
+            <Metric label="Best profile" value={v3Result.best_profile || "-"} />
+            <Metric label="Fingerprint" value={v3Result.determinism_fingerprint.slice(0, 10)} />
+          </div>
+          <div className="mini-list">
+            {v3Result.runs.map((run) => (
+              <article key={run.profile}>
+                <strong>{run.profile}</strong>
+                <span>Full {run.full.estimated_pnl_sol.toFixed(4)} SOL / validate {run.validate.win_rate_pct}% win</span>
+                <p>{run.overfit_warning ? "Overfit warning: validation win rate trails training by more than 25 points." : "Walk-forward result is within the current warning band."}</p>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
       {active ? (
         <>
           <div className="hero-metrics wide">
@@ -1239,6 +1317,9 @@ function AnalysisDashboard({
   stats,
   analytics,
   suggestions,
+  priceDiagnostics,
+  pumpfunReport,
+  safetyStatus,
   pnlTimeframe,
   onTimeframeChange
 }: {
@@ -1247,6 +1328,9 @@ function AnalysisDashboard({
   stats: BotSnapshot["stats"];
   analytics: PerformanceAnalytics | null;
   suggestions: TuningSuggestion[];
+  priceDiagnostics: PriceDiagnostics | null;
+  pumpfunReport: PumpFunReport | null;
+  safetyStatus: SafetyStatus | null;
   pnlTimeframe: PnlTimeframe;
   onTimeframeChange: (timeframe: PnlTimeframe) => void;
 }) {
@@ -1298,6 +1382,7 @@ function AnalysisDashboard({
         <Metric label="Avg hold" value={formatDuration(avgHold)} />
         <Metric label="Price confidence" value={`${Math.round(avgConfidence * 100)}%`} />
         <Metric label="All-time P&L" value={`${stats.total_pnl_sol.toFixed(4)} SOL`} />
+        <Metric label="Safety" value={safetyStatus?.entries_allowed ? "entries ok" : "guarded"} />
       </div>
       <div className="analysis-grid">
         {analytics ? (
@@ -1343,6 +1428,38 @@ function AnalysisDashboard({
             <BarChart3 size={18} />
           </div>
           <PnlAreaChart values={history} animationKey={`analysis-${pnlTimeframe}-${history.length}-${history[history.length - 1] ?? 0}`} />
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Price Engine v3</h3>
+              <p>Observed price quality and selected source mix.</p>
+            </div>
+            <Gauge size={18} />
+          </div>
+          <div className="bar-list">
+            <BarMetric label="Acceptance %" value={Math.round((priceDiagnostics?.acceptance_rate ?? 0) * 100)} max={100} />
+            <BarMetric label="Accepted" value={priceDiagnostics?.accepted ?? 0} max={priceDiagnostics?.observations || 1} />
+            <BarMetric label="Rejected" value={priceDiagnostics?.rejected ?? 0} max={priceDiagnostics?.observations || 1} />
+            <BarMetric label="Jump warnings" value={priceDiagnostics?.impossible_jump_warnings ?? 0} max={10} />
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Pump.fun Intelligence</h3>
+              <p>Creator, metadata, and launch-field coverage.</p>
+            </div>
+            <Database size={18} />
+          </div>
+          <div className="mini-list">
+            {(pumpfunReport?.research_notes ?? ["No Pump.fun report loaded yet."]).slice(0, 4).map((note) => (
+              <article key={note}>
+                <strong>{note}</strong>
+                <span>{pumpfunReport ? `${pumpfunReport.tokens_analyzed} tokens / ${pumpfunReport.unique_creators} creators` : "waiting"}</span>
+              </article>
+            ))}
+          </div>
         </section>
         <section className="research-card">
           <div className="section-heading">
@@ -1414,6 +1531,7 @@ function TradeReviewPage({
   suggestions,
   selectedTradeId,
   timeline,
+  detail,
   onSelectTrade
 }: {
   trades: TradeRecord[];
@@ -1422,6 +1540,7 @@ function TradeReviewPage({
   suggestions: TuningSuggestion[];
   selectedTradeId: string | null;
   timeline: ReplayTimelineEvent[];
+  detail: TradeReviewDetail | null;
   onSelectTrade: (tokenId: string) => Promise<void>;
 }) {
   const [filter, setFilter] = React.useState<"all" | "wins" | "losses" | "scratch">("all");
@@ -1497,6 +1616,39 @@ function TradeReviewPage({
           <section className="research-card">
             <div className="section-heading">
               <div>
+                <h3>P&L Breakdown</h3>
+                <p>{detail?.trade?.id || "Select a closed trade."}</p>
+              </div>
+              <Wallet size={18} />
+            </div>
+            <div className="bar-list">
+              <BarMetric label="Final P&L x1000" value={Math.round(Math.abs(detail?.pnl_breakdown.final_pnl_sol ?? 0) * 1000)} max={100} />
+              <BarMetric label="Fees x10000" value={Math.round((detail?.pnl_breakdown.fees_sol ?? 0) * 10000)} max={20} />
+              <BarMetric label="Slippage %" value={Math.round(detail?.pnl_breakdown.slippage_pct ?? 0)} max={20} />
+              <BarMetric label="Impact %" value={Math.round(detail?.pnl_breakdown.price_impact_pct ?? 0)} max={20} />
+            </div>
+          </section>
+          <section className="research-card">
+            <div className="section-heading">
+              <div>
+                <h3>Decision Records</h3>
+                <p>{detail?.decisions.length ?? 0} records for this trade.</p>
+              </div>
+              <Target size={18} />
+            </div>
+            <div className="mini-list">
+              {(detail?.decisions ?? []).slice(0, 3).map((decision) => (
+                <article key={decision.id}>
+                  <strong>{decision.action} / score {decision.score}</strong>
+                  <span>{decision.engine_version} / {decision.profile}</span>
+                  <p>{decision.reason}</p>
+                </article>
+              ))}
+            </div>
+          </section>
+          <section className="research-card">
+            <div className="section-heading">
+              <div>
                 <h3>Replay Timeline</h3>
                 <p>{selectedTradeId ? selectedTradeId : "Select a trade."}</p>
               </div>
@@ -1546,6 +1698,11 @@ function DataDashboard({
   strategyDecisions,
   tradeSessions,
   settingsVersions,
+  dataIntegrity,
+  priceDiagnostics,
+  pumpfunReport,
+  safetyStatus,
+  opsMonitoring,
   auditEvents,
   onRefresh,
   onClear
@@ -1559,6 +1716,11 @@ function DataDashboard({
   strategyDecisions: StrategyDecisionRecord[];
   tradeSessions: TradeSession[];
   settingsVersions: SettingsVersion[];
+  dataIntegrity: DataIntegrityReport | null;
+  priceDiagnostics: PriceDiagnostics | null;
+  pumpfunReport: PumpFunReport | null;
+  safetyStatus: SafetyStatus | null;
+  opsMonitoring: OperationalMonitoring | null;
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
   onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "all") => Promise<void>;
@@ -1584,6 +1746,8 @@ function DataDashboard({
         <Metric label="Prices" value={(summary?.price_observations ?? 0).toString()} />
         <Metric label="Decisions" value={(summary?.strategy_decisions ?? 0).toString()} />
         <Metric label="Settings versions" value={(summary?.settings_versions ?? settingsVersions.length).toString()} />
+        <Metric label="Integrity" value={`${dataIntegrity?.score ?? 0}%`} />
+        <Metric label="Replay confidence" value={`${dataIntegrity?.replay_confidence.score ?? 0}%`} />
         <Metric label="Source health" value={`${sourceHealth?.health_score ?? 0}%`} />
         <Metric label="Safety boundary" value={securityStatus?.paper_only_boundary ? "paper only" : "live enabled"} />
       </div>
@@ -1602,6 +1766,74 @@ function DataDashboard({
         ))}
       </div>
       <div className="research-grid">
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Data Integrity</h3>
+              <p>Replay confidence, determinism, and records that need review.</p>
+            </div>
+            <Shield size={18} />
+          </div>
+          <div className="mini-list">
+            {(dataIntegrity?.issues ?? []).slice(0, 5).map((issue) => (
+              <article key={`${issue.category}-${issue.message}`}>
+                <strong>{issue.severity} / {issue.category}</strong>
+                <span>{issue.count} finding{issue.count === 1 ? "" : "s"}</span>
+                <p>{issue.message}</p>
+              </article>
+            ))}
+            {dataIntegrity && !dataIntegrity.issues.length ? <p>No integrity issues detected.</p> : null}
+            {dataIntegrity ? <p className="settings-note">Fingerprint: {dataIntegrity.determinism_fingerprint.slice(0, 18)}</p> : null}
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Operational Monitoring</h3>
+              <p>Backend, source, storage, warnings, and guard state.</p>
+            </div>
+            <Activity size={18} />
+          </div>
+          <div className="bar-list">
+            <BarMetric label="Source health" value={opsMonitoring?.source.health_score ?? 0} max={100} />
+            <BarMetric label="Warnings" value={opsMonitoring?.recent_warnings.length ?? 0} max={20} />
+            <BarMetric label="Errors" value={opsMonitoring?.recent_errors.length ?? 0} max={20} />
+            <BarMetric label="Open positions" value={safetyStatus?.open_positions ?? 0} max={25} />
+          </div>
+          <p className="settings-note">{safetyStatus?.entries_allowed ? "Risk controller allows new paper entries." : `Entries guarded: ${(safetyStatus?.stop_reasons ?? []).join(", ") || "review required"}`}</p>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Price Diagnostics</h3>
+              <p>{priceDiagnostics?.engine_version ?? "price-v3"} source acceptance.</p>
+            </div>
+            <Gauge size={18} />
+          </div>
+          <div className="mini-list">
+            {(priceDiagnostics?.sources ?? []).slice(0, 4).map((source) => (
+              <article key={source.source}>
+                <strong>{source.source}</strong>
+                <span>{source.accepted}/{source.count} accepted / confidence {Math.round(source.avg_confidence * 100)}%</span>
+              </article>
+            ))}
+            <p className="settings-note">Suggested minimum confidence: {priceDiagnostics?.recommended_min_confidence ?? 0.45}</p>
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Pump.fun Research</h3>
+              <p>Field coverage for token intelligence.</p>
+            </div>
+            <Database size={18} />
+          </div>
+          <div className="bar-list">
+            {Object.entries(pumpfunReport?.field_coverage ?? {}).map(([key, value]) => (
+              <BarMetric key={key} label={key.replace("_", " ")} value={Math.round(value * 100)} max={100} />
+            ))}
+          </div>
+        </section>
         <section className="research-card">
           <div className="section-heading">
             <div>

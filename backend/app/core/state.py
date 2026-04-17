@@ -24,6 +24,8 @@ from app.core.models import (
 )
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
+from app.core.integrity import DataIntegrityAnalyzer
+from app.core.pumpfun_intelligence import PumpFunIntelligence
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
@@ -55,6 +57,8 @@ class BotState:
         self.strategy = DecisionPipeline(self.scoring, self.risk)
         self.paper = PaperTrader()
         self.price_pipeline = PricePipeline()
+        self.integrity = DataIntegrityAnalyzer()
+        self.pumpfun_intelligence = PumpFunIntelligence()
         self.simulator = LaunchSimulator()
         self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
         self.current_settings_version_id = self.ensure_settings_version("startup", [])
@@ -775,6 +779,7 @@ class BotState:
             ),
             "by_price_confidence": self._group_performance(trades, lambda trade: self._confidence_bucket(trade.source_price_confidence)),
             "recent_curve": self._pnl_curve(trades),
+            "strategy_modules": self.strategy.describe_modules(self.settings),
         }
 
     def tuning_suggestions(self) -> list[dict[str, object]]:
@@ -802,6 +807,118 @@ class BotState:
 
     def ab_strategy_replay(self, limit: int = 120) -> BacktestRun:
         return self.compare_strategies(limit=limit)
+
+    def backtest_v3(self, limit: int | None = None) -> dict[str, object]:
+        limit = limit or self.settings.backtest_replay_limit
+        profiles = ["conservative", "balanced", "aggressive", "scalper"]
+        runs = []
+        candidates = [
+            token
+            for token in self.storage.load_all_tokens(limit)
+            if token.status in {TokenStatus.SKIPPED, TokenStatus.PAPER_SOLD, TokenStatus.DETECTED, TokenStatus.ANALYZING}
+        ]
+        midpoint = max(1, len(candidates) // 2)
+        for profile in profiles:
+            settings = self._settings_for_profile(profile)
+            full = self._run_backtest(candidates, replay_source="backtest_v3", settings=settings)
+            train = self._run_backtest(candidates[:midpoint], replay_source="walk_forward_train", settings=settings)
+            validate = self._run_backtest(candidates[midpoint:], replay_source="walk_forward_validate", settings=settings)
+            runs.append(
+                {
+                    "profile": profile,
+                    "full": full.to_dict(),
+                    "train": train.to_dict(),
+                    "validate": validate.to_dict(),
+                    "overfit_warning": train.win_rate_pct - validate.win_rate_pct > 25 and validate.tokens_replayed > 5,
+                }
+            )
+        best = max(runs, key=lambda item: float(item["full"]["estimated_pnl_sol"])) if runs else None
+        return {
+            "engine_version": "backtest-v3",
+            "tokens_replayed": len(candidates),
+            "determinism_fingerprint": self.data_integrity_report()["determinism_fingerprint"],
+            "best_profile": best["profile"] if best else None,
+            "runs": runs,
+        }
+
+    def data_integrity_report(self) -> dict[str, object]:
+        return self.integrity.report(
+            self.storage.load_all_tokens(5000),
+            self.storage.load_trades(5000),
+            self.storage.load_price_observations(5000),
+            self.storage.load_source_events(5000),
+            self.storage.load_strategy_decisions(5000),
+        )
+
+    def price_diagnostics(self) -> dict[str, object]:
+        return self.price_pipeline.diagnostics(self.storage.load_price_observations(5000))
+
+    def pumpfun_report(self) -> dict[str, object]:
+        return self.pumpfun_intelligence.summarize(self.storage.load_all_tokens(5000), self.storage.load_source_events(5000))
+
+    def safety_status(self) -> dict[str, object]:
+        closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        consecutive_losses = 0
+        for trade in closed:
+            if (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001):
+                consecutive_losses += 1
+            else:
+                break
+        stop_reasons = []
+        if abs(min(0.0, self.stats.total_pnl_sol)) >= self.settings.daily_loss_cap_sol:
+            stop_reasons.append("daily loss cap reached")
+        if self.open_position_count() >= self.settings.max_open_positions:
+            stop_reasons.append("max open positions reached")
+        if self.settings.stop_on_source_degraded and self.source_health().get("health_score", 100) < 50:
+            stop_reasons.append("source health degraded")
+        if self.settings.live_trading_enabled:
+            stop_reasons.append("live trading request remains blocked by paper boundary")
+        return {
+            "paper_only": True,
+            "entries_allowed": not stop_reasons,
+            "stop_reasons": stop_reasons,
+            "consecutive_losses": consecutive_losses,
+            "open_positions": self.open_position_count(),
+            "daily_loss_cap_sol": self.settings.daily_loss_cap_sol,
+            "total_pnl_sol": self.stats.total_pnl_sol,
+            "kill_switch_available": True,
+        }
+
+    def operational_monitoring(self) -> dict[str, object]:
+        events = self.storage.load_all_events(500)
+        source = self.source_health()
+        return {
+            "backend": {"status": "running", "bot_status": self.status.value, "database_path": str(self.storage.path)},
+            "source": source,
+            "storage": self.data_summary(),
+            "recent_errors": [event.to_dict() for event in events if event.level in {"danger", "error"}][:20],
+            "recent_warnings": [event.to_dict() for event in events if event.level == "warning"][:20],
+        }
+
+    def trade_review_detail(self, token_id: str) -> dict[str, object]:
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.id == token_id), None)
+        trade = next((item for item in self.storage.load_trades(5000) if item.token_id == token_id), None)
+        decisions = [item.to_dict() for item in self.storage.load_strategy_decisions(1000) if item.token_id == token_id]
+        observations = [item.to_dict() for item in self.storage.load_price_observations(1000, mint=token.mint if token else "")]
+        pnl_breakdown = {}
+        if trade:
+            gross = trade.pnl_sol or 0.0
+            fees = (trade.entry_fee_sol or 0.0) + (trade.exit_fee_sol or 0.0)
+            pnl_breakdown = {
+                "final_pnl_sol": gross,
+                "fees_sol": round(fees, 6),
+                "slippage_pct": trade.slippage_paid_pct,
+                "price_impact_pct": trade.price_impact_pct,
+                "net_before_fees_estimate": round(gross + fees, 6),
+            }
+        return {
+            "token": token.to_dict() if token else None,
+            "trade": trade.to_dict() if trade else None,
+            "decisions": decisions,
+            "observations": observations,
+            "timeline": self.replay_timeline(token_id),
+            "pnl_breakdown": pnl_breakdown,
+        }
 
     def replay_timeline(self, token_id: str) -> list[dict[str, object]]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.id == token_id), None)

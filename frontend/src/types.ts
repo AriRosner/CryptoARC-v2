@@ -397,6 +397,83 @@ export interface ReplayTimelineEvent {
   detail: string;
 }
 
+export interface DataIntegrityReport {
+  score: number;
+  tokens: number;
+  trades: number;
+  source_events: number;
+  price_observations: number;
+  strategy_decisions: number;
+  issues: Array<{ severity: string; category: string; message: string; count: number }>;
+  replay_confidence: {
+    score: number;
+    accepted_price_ratio: number;
+    normalized_event_ratio: number;
+    closed_trade_price_coverage: number;
+    sample_size: Record<string, number>;
+  };
+  determinism_fingerprint: string;
+}
+
+export interface PriceDiagnostics {
+  engine_version: string;
+  observations: number;
+  accepted: number;
+  rejected: number;
+  acceptance_rate: number;
+  impossible_jump_warnings: number;
+  sources: Array<{ source: string; count: number; accepted: number; acceptance_rate: number; avg_confidence: number }>;
+  recommended_min_confidence: number;
+}
+
+export interface PumpFunReport {
+  tokens_analyzed: number;
+  unique_creators: number;
+  repeat_creators: number;
+  high_creator_hold: number;
+  large_initial_buys: number;
+  migration_markers: number;
+  field_coverage: Record<string, number>;
+  top_creators: Array<{ creator: string; launches: number }>;
+  research_notes: string[];
+}
+
+export interface SafetyStatus {
+  paper_only: boolean;
+  entries_allowed: boolean;
+  stop_reasons: string[];
+  consecutive_losses: number;
+  open_positions: number;
+  daily_loss_cap_sol: number;
+  total_pnl_sol: number;
+  kill_switch_available: boolean;
+}
+
+export interface OperationalMonitoring {
+  backend: Record<string, string | number | boolean>;
+  source: SourceHealth;
+  storage: DataSummary;
+  recent_errors: TradeEvent[];
+  recent_warnings: TradeEvent[];
+}
+
+export interface BacktestV3Result {
+  engine_version: string;
+  tokens_replayed: number;
+  determinism_fingerprint: string;
+  best_profile: string | null;
+  runs: Array<{ profile: string; full: BacktestResult; train: BacktestResult; validate: BacktestResult; overfit_warning: boolean }>;
+}
+
+export interface TradeReviewDetail {
+  token: TokenSignal | null;
+  trade: TradeRecord | null;
+  decisions: StrategyDecisionRecord[];
+  observations: PriceObservation[];
+  timeline: ReplayTimelineEvent[];
+  pnl_breakdown: Record<string, number>;
+}
+
 export interface BotSnapshot {
   status: BotStatus;
   settings: BotSettings;

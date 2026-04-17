@@ -372,6 +372,15 @@ async def ab_strategy_replay(payload: BacktestRequest | None = None) -> dict:
     return result.to_dict()
 
 
+@app.post("/api/backtest/v3", dependencies=[Depends(require_auth)])
+async def backtest_v3(payload: BacktestRequest | None = None) -> dict:
+    payload = payload or BacktestRequest()
+    result = state.backtest_v3(limit=payload.limit)
+    state.add_event("info", "Backtest v3 suite finished")
+    await broadcast_snapshot()
+    return result
+
+
 @app.get("/api/backtests", dependencies=[Depends(require_auth)])
 async def backtests() -> list[dict]:
     return state.backtests()
@@ -420,6 +429,36 @@ async def tuning_suggestions() -> list[dict]:
 @app.get("/api/replay/timeline/{token_id}", dependencies=[Depends(require_auth)])
 async def replay_timeline(token_id: str) -> list[dict]:
     return state.replay_timeline(token_id)
+
+
+@app.get("/api/trade-review/{token_id}", dependencies=[Depends(require_auth)])
+async def trade_review_detail(token_id: str) -> dict:
+    return state.trade_review_detail(token_id)
+
+
+@app.get("/api/data/integrity", dependencies=[Depends(require_auth)])
+async def data_integrity() -> dict:
+    return state.data_integrity_report()
+
+
+@app.get("/api/price/diagnostics", dependencies=[Depends(require_auth)])
+async def price_diagnostics() -> dict:
+    return state.price_diagnostics()
+
+
+@app.get("/api/pumpfun/intelligence", dependencies=[Depends(require_auth)])
+async def pumpfun_intelligence() -> dict:
+    return state.pumpfun_report()
+
+
+@app.get("/api/safety/status", dependencies=[Depends(require_auth)])
+async def safety_status() -> dict:
+    return state.safety_status()
+
+
+@app.get("/api/monitoring/ops", dependencies=[Depends(require_auth)])
+async def operational_monitoring() -> dict:
+    return state.operational_monitoring()
 
 
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])
