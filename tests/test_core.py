@@ -80,6 +80,20 @@ class CoreLogicTests(unittest.TestCase):
         self.assertGreater(token.fee_paid_sol, 0)
         self.assertGreater(token.price_impact_pct, 0)
 
+    def test_stats_classify_fee_only_trade_as_scratch(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.status = TokenStatus.PAPER_SOLD
+            token.pnl_sol = -0.0005
+            state.tokens.appendleft(token)
+
+            state.recalculate_stats()
+
+            self.assertEqual(state.stats.scratch_trades, 1)
+            self.assertEqual(state.stats.losing_trades, 0)
+            self.assertEqual(state.stats.win_rate_pct, 0)
+
     def test_storage_round_trip_settings_and_token(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(str(Path(directory) / "test.db"))

@@ -34,6 +34,9 @@ class BotState:
         self.status = BotStatus.STOPPED
         has_saved_settings = self.storage.has_settings()
         self.settings = self.storage.load_settings()
+        if self.settings.max_position_ticks == 12:
+            self.settings.max_position_ticks = 40
+            self.storage.save_settings(self.settings)
         if self.settings.launch_source not in {"mock", "pumpportal"}:
             self.settings.launch_source = default_source
         elif not has_saved_settings and self.settings.launch_source == "mock" and default_source != "mock":
@@ -632,18 +635,27 @@ class BotState:
         skipped = [token for token in self.tokens if token.status == TokenStatus.SKIPPED]
         open_tokens = [token for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}]
         closed = [token for token in self.tokens if token.status == TokenStatus.PAPER_SOLD]
-        wins = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) > 0]
-        losses = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) < 0]
+        scratch_threshold = 0.001
+        wins = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) > scratch_threshold]
+        scratches = [token.pnl_sol or 0.0 for token in closed if abs(token.pnl_sol or 0.0) <= scratch_threshold]
+        losses = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) < -scratch_threshold]
+        gross_wins = [token.pnl_sol or 0.0 for token in closed if (token.pnl_sol or 0.0) > 0]
         gross_win = sum(wins)
         gross_loss = abs(sum(losses))
+        decisive = len(wins) + len(losses)
 
         self.stats = BotStats(
             total_trades=len(closed),
             successful_trades=len(wins),
+            losing_trades=len(losses),
+            scratch_trades=len(scratches),
             skipped_tokens=len(skipped),
             open_positions=len(open_tokens),
             closed_trades=len(closed),
-            win_rate_pct=int((len(wins) / len(closed)) * 100) if closed else 0,
+            win_rate_pct=int((len(wins) / decisive) * 100) if decisive else 0,
+            gross_win_rate_pct=int((len(gross_wins) / len(closed)) * 100) if closed else 0,
+            scratch_rate_pct=int((len(scratches) / len(closed)) * 100) if closed else 0,
+            scratch_threshold_sol=scratch_threshold,
             total_pnl_sol=round(sum(token.pnl_sol or 0.0 for token in closed), 6),
             best_trade_sol=round(max([token.pnl_sol or 0.0 for token in closed], default=0.0), 6),
             worst_trade_sol=round(min([token.pnl_sol or 0.0 for token in closed], default=0.0), 6),

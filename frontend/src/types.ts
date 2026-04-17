@@ -115,10 +115,15 @@ export interface TradeEvent {
 export interface BotStats {
   total_trades: number;
   successful_trades: number;
+  losing_trades: number;
+  scratch_trades: number;
   skipped_tokens: number;
   open_positions: number;
   closed_trades: number;
   win_rate_pct: number;
+  gross_win_rate_pct: number;
+  scratch_rate_pct: number;
+  scratch_threshold_sol: number;
   total_pnl_sol: number;
   best_trade_sol: number;
   worst_trade_sol: number;

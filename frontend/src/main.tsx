@@ -67,7 +67,7 @@ const fallbackSnapshot: BotSnapshot = {
     max_open_positions: 3,
     launch_interval_seconds: 2,
     paper_price_volatility_pct: 18,
-    max_position_ticks: 12,
+    max_position_ticks: 40,
     require_live_confirmation: true,
     detect_new_tokens: true,
     auto_refresh: true,
@@ -102,10 +102,15 @@ const fallbackSnapshot: BotSnapshot = {
   stats: {
     total_trades: 0,
     successful_trades: 0,
+    losing_trades: 0,
+    scratch_trades: 0,
     skipped_tokens: 0,
     open_positions: 0,
     closed_trades: 0,
     win_rate_pct: 0,
+    gross_win_rate_pct: 0,
+    scratch_rate_pct: 0,
+    scratch_threshold_sol: 0.001,
     total_pnl_sol: 0,
     best_trade_sol: 0,
     worst_trade_sol: 0,
@@ -520,8 +525,9 @@ function App() {
         <section className="panel stats-grid">
           <Metric label="Open" value={stats.open_positions.toString()} />
           <Metric label="Closed" value={stats.closed_trades.toString()} />
-          <Metric label="Wins" value={stats.successful_trades.toString()} />
-          <Metric label="Win rate" value={`${stats.win_rate_pct}%`} />
+          <Metric label="W / L / S" value={`${stats.successful_trades} / ${stats.losing_trades} / ${stats.scratch_trades}`} />
+          <Metric label="Net win" value={`${stats.win_rate_pct}%`} />
+          <Metric label="Gross win" value={`${stats.gross_win_rate_pct}%`} />
           <Metric label="P&L" value={`${stats.total_pnl_sol.toFixed(4)} SOL`} />
         </section>
 
@@ -1086,8 +1092,10 @@ function AnalysisDashboard({
   const history = React.useMemo(() => buildPnlHistory(tokens, pnlTimeframe), [tokens, pnlTimeframe]);
   const closed = timeframeClosedTrades(tokens, pnlTimeframe);
   const pnl = closed.reduce((total, token) => total + (token.pnl_sol || 0), 0);
-  const wins = closed.filter((token) => (token.pnl_sol || 0) > 0).length;
-  const losses = closed.filter((token) => (token.pnl_sol || 0) < 0).length;
+  const scratchThreshold = stats.scratch_threshold_sol ?? 0.001;
+  const wins = closed.filter((token) => (token.pnl_sol || 0) > scratchThreshold).length;
+  const losses = closed.filter((token) => (token.pnl_sol || 0) < -scratchThreshold).length;
+  const scratches = closed.filter((token) => Math.abs(token.pnl_sol || 0) <= scratchThreshold).length;
   const detected = tokens.filter((token) => token.status === "detected").length;
   const analyzing = tokens.filter((token) => token.status === "analyzing").length;
   const riskFlags = tokens.filter((token) => token.honeypot_risk || token.rug_risk).length;
@@ -1114,7 +1122,7 @@ function AnalysisDashboard({
       <div className="hero-metrics wide">
         <Metric label="Range P&L" value={`${pnl.toFixed(4)} SOL`} />
         <Metric label="Range trades" value={closed.length.toString()} />
-        <Metric label="Wins / losses" value={`${wins} / ${losses}`} />
+        <Metric label="W / L / S" value={`${wins} / ${losses} / ${scratches}`} />
         <Metric label="All-time P&L" value={`${stats.total_pnl_sol.toFixed(4)} SOL`} />
       </div>
       <div className="analysis-grid">

@@ -48,7 +48,7 @@ class BotSettings:
     max_open_positions: int = 3
     launch_interval_seconds: float = 2.0
     paper_price_volatility_pct: float = 18.0
-    max_position_ticks: int = 12
+    max_position_ticks: int = 40
     require_live_confirmation: bool = True
     detect_new_tokens: bool = True
     auto_refresh: bool = True
@@ -202,10 +202,15 @@ class BacktestRun:
 class BotStats:
     total_trades: int = 0
     successful_trades: int = 0
+    losing_trades: int = 0
+    scratch_trades: int = 0
     skipped_tokens: int = 0
     open_positions: int = 0
     closed_trades: int = 0
     win_rate_pct: int = 0
+    gross_win_rate_pct: int = 0
+    scratch_rate_pct: int = 0
+    scratch_threshold_sol: float = 0.001
     total_pnl_sol: float = 0.0
     best_trade_sol: float = 0.0
     worst_trade_sol: float = 0.0

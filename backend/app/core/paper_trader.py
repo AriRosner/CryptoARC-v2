@@ -114,10 +114,17 @@ class PaperTrader:
         stats.total_trades += 1
         stats.total_pnl_sol = round(stats.total_pnl_sol + pnl, 6)
 
-        if pnl > 0:
+        if pnl > stats.scratch_threshold_sol:
             stats.successful_trades += 1
+        elif pnl < -stats.scratch_threshold_sol:
+            stats.losing_trades += 1
+        else:
+            stats.scratch_trades += 1
 
         stats.best_trade_sol = max(stats.best_trade_sol, pnl)
         stats.worst_trade_sol = min(stats.worst_trade_sol, pnl)
-        stats.win_rate_pct = int((stats.successful_trades / stats.total_trades) * 100)
+        decisive = stats.successful_trades + stats.losing_trades
+        stats.win_rate_pct = int((stats.successful_trades / decisive) * 100) if decisive else 0
+        stats.gross_win_rate_pct = int((stats.successful_trades / stats.total_trades) * 100) if stats.total_trades else 0
+        stats.scratch_rate_pct = int((stats.scratch_trades / stats.total_trades) * 100) if stats.total_trades else 0
         return stats
