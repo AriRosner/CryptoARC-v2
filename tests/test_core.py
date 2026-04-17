@@ -8,6 +8,7 @@ from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
 from app.core.sources import normalize_pumpportal_new_token, normalize_pumpportal_trade
 from app.core.storage import Storage
+from app.core.state import BotState
 
 
 class CoreLogicTests(unittest.TestCase):
@@ -154,6 +155,24 @@ class CoreLogicTests(unittest.TestCase):
         self.assertGreater(token.buy_velocity, 0.0)
         self.assertEqual(token.creator_hold_pct, 7.5)
 
+    def test_pumpportal_new_token_prefers_market_cap_price_over_virtual_ratio(self) -> None:
+        token = normalize_pumpportal_new_token(
+            {
+                "txType": "create",
+                "mint": "Mint111",
+                "symbol": "ARC",
+                "name": "Arc Token",
+                "marketCapSol": 30,
+                "vSolInBondingCurve": 30,
+                "vTokensInBondingCurve": 1_000_000_000,
+            },
+            utc_now(),
+        )
+
+        self.assertIsNotNone(token)
+        assert token is not None
+        self.assertAlmostEqual(token.current_price or 0, 0.00003)
+
     def test_pumpportal_normalization_rejects_missing_mint(self) -> None:
         token = normalize_pumpportal_new_token({"txType": "create", "symbol": "ARC"}, utc_now())
         self.assertIsNone(token)
@@ -169,6 +188,25 @@ class CoreLogicTests(unittest.TestCase):
         self.assertEqual(event.kind, "trade")
         self.assertEqual(event.mint, "Mint111")
         self.assertGreater(event.observed_price or 0, 0)
+
+    def test_observed_trade_rebases_bad_entry_price_instead_of_fantasy_pnl(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.mint = "Mint111"
+            token.entry_price = 0.000001
+            token.current_price = 0.000001
+            token.amount_sol = 0.1
+            token.fee_paid_sol = 0.00025
+            state.tokens.appendleft(token)
+            event = normalize_pumpportal_trade({"txType": "buy", "mint": "Mint111", "marketCapSol": 30}, utc_now())
+            assert event is not None
+
+            state.apply_observed_trade(event)
+
+            self.assertEqual(token.price_source, "observed_rebased")
+            self.assertLess(abs(token.pnl_sol or 0), 0.001)
+            self.assertAlmostEqual(token.entry_price or 0, event.observed_price or 0)
 
 
 if __name__ == "__main__":

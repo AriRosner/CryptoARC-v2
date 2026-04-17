@@ -110,6 +110,27 @@ class BotState:
             if token.mint != event.mint:
                 continue
             old_price = token.current_price or event.observed_price
+            if token.entry_price and token.observed_price_updates == 0:
+                ratio = event.observed_price / max(token.entry_price, 0.000000001)
+                if ratio > 5 and token.entry_price <= 0.0000011:
+                    token.entry_price = event.observed_price
+                    token.current_price = event.observed_price
+                    token.exit_price = event.observed_price if token.exit_price else None
+                    token.peak_price = event.observed_price
+                    token.trough_price = event.observed_price
+                    token.price_source = "observed_rebased"
+                    token.observed_price_updates += 1
+                    token.last_observed_trade_at = event.received_at
+                    fee_drag = token.fee_paid_sol + ((token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000))
+                    token.pnl_sol = round(-fee_drag, 6)
+                    token.unrealized_pct = 0.0
+                    token.highest_unrealized_pct = max(token.highest_unrealized_pct, 0.0)
+                    token.lowest_unrealized_pct = min(token.lowest_unrealized_pct, 0.0)
+                    token.decision_log.append(
+                        f"Observed {event.trade_side} trade rebased entry to {event.observed_price:.8f}; ignored mismatched {ratio:.1f}x first tick"
+                    )
+                    self.storage.save_token(token)
+                    break
             token.current_price = event.observed_price
             token.price_source = "observed"
             token.observed_price_updates += 1
@@ -121,7 +142,9 @@ class BotState:
             if token.entry_price:
                 move_pct = ((token.current_price - token.entry_price) / token.entry_price) * 100
                 token.unrealized_pct = round(move_pct, 2)
-                token.pnl_sol = round((token.amount_sol or self.settings.trade_size_sol) * (move_pct / 100), 6)
+                gross_pnl = (token.amount_sol or self.settings.trade_size_sol) * (move_pct / 100)
+                exit_fee = (token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000)
+                token.pnl_sol = round(gross_pnl - token.fee_paid_sol - exit_fee, 6)
             token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {event.observed_price:.8f}")
             self.storage.save_token(token)
             break

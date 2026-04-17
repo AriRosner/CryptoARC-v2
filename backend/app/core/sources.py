@@ -181,8 +181,6 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
     buy_velocity = min(1.0, max(0.05, initial_buy / 5 if initial_buy else 0.25))
     sell_pressure = 0.08
     current_price = observed_price_from_payload(payload) or max(0.000001, (market_cap or 30.0) / 1_000_000)
-    if virtual_sol and virtual_tokens:
-        current_price = max(0.000000001, virtual_sol / virtual_tokens)
 
     token = TokenSignal(
         id=new_id("tok"),
@@ -196,7 +194,7 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
         buy_velocity=round(buy_velocity, 2),
         sell_pressure=sell_pressure,
         metadata_score=round(min(metadata_score, 1.0), 2),
-        current_price=round(current_price, 8),
+        current_price=round(current_price, 10),
         creator_hold_pct=round(max(0.0, min(100.0, creator_hold if creator_hold is not None else 0.0)), 2),
         honeypot_risk=honeypot_risk,
         rug_risk=rug_risk,
