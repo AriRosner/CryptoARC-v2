@@ -194,6 +194,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             token = self.make_token()
             token.mint = "Mint111"
+            token.status = TokenStatus.PAPER_BOUGHT
             token.entry_price = 0.000001
             token.current_price = 0.000001
             token.amount_sol = 0.1
@@ -207,6 +208,27 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(token.price_source, "observed_rebased")
             self.assertLess(abs(token.pnl_sol or 0), 0.001)
             self.assertAlmostEqual(token.entry_price or 0, event.observed_price or 0)
+
+    def test_observed_trade_does_not_mutate_sold_position_pnl(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.mint = "Mint111"
+            token.status = TokenStatus.PAPER_SOLD
+            token.entry_price = 0.00003
+            token.current_price = 0.00004
+            token.exit_price = 0.00004
+            token.amount_sol = 0.1
+            token.pnl_sol = 0.033
+            state.tokens.appendleft(token)
+            event = normalize_pumpportal_trade({"txType": "sell", "mint": "Mint111", "marketCapSol": 10}, utc_now())
+            assert event is not None
+
+            state.apply_observed_trade(event)
+
+            self.assertEqual(token.pnl_sol, 0.033)
+            self.assertEqual(token.current_price, 0.00004)
+            self.assertEqual(token.observed_price_updates, 0)
 
 
 if __name__ == "__main__":

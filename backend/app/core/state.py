@@ -109,6 +109,8 @@ class BotState:
         for token in self.tokens:
             if token.mint != event.mint:
                 continue
+            if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
+                continue
             old_price = token.current_price or event.observed_price
             if token.entry_price and token.observed_price_updates == 0:
                 ratio = event.observed_price / max(token.entry_price, 0.000000001)
