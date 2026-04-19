@@ -32,6 +32,8 @@ export interface BotSettings {
   max_consecutive_losses: number;
   halt_on_low_replay_confidence: boolean;
   min_replay_confidence: number;
+  halt_on_low_readiness: boolean;
+  min_readiness_score: number;
   min_buy_velocity: number;
   max_sell_pressure: number;
   min_metadata_score: number;
@@ -469,6 +471,34 @@ export interface SafetyStatus {
   manual_live_ready: boolean;
   autonomous_live_ready: boolean;
   live_blockers: string[];
+}
+
+export interface ReadinessGate {
+  id: string;
+  label: string;
+  status: "pass" | "warn" | "fail";
+  value: string | number | boolean;
+  target: string | number | boolean;
+  weight: number;
+  reason: string;
+}
+
+export interface ReadinessStatus {
+  engine_version: "readiness-v1";
+  score: number;
+  status: "not_enough_data" | "blocked" | "warning" | "ready";
+  entries_allowed: boolean;
+  gates: ReadinessGate[];
+  recommended_actions: string[];
+  sample_size: {
+    closed_trades: number;
+    source_events: number;
+    price_observations: number;
+    strategy_decisions: number;
+  };
+  paper_only: boolean;
+  halt_on_low_readiness: boolean;
+  min_readiness_score: number;
 }
 
 export interface OperationalMonitoring {

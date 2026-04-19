@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -160,6 +160,10 @@ export async function fetchSafetyStatus(): Promise<SafetyStatus> {
   return request("/api/safety/status");
 }
 
+export async function fetchReadinessStatus(): Promise<ReadinessStatus> {
+  return request("/api/readiness/status");
+}
+
 export async function fetchWatchdogStatus(): Promise<WatchdogStatus> {
   return request("/api/watchdog/status");
 }
@@ -181,6 +185,14 @@ export async function createManualLiveRequest(action: "buy" | "sell", mint: stri
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action, mint, amount_sol })
+  });
+}
+
+export async function reviewLiveRequest(requestId: string, status: "reviewed" | "rejected", note = ""): Promise<LiveExecutionRequest> {
+  return request(`/api/live/requests/${encodeURIComponent(requestId)}/review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status, note })
   });
 }
 

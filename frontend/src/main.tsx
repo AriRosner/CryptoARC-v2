@@ -40,6 +40,7 @@ import {
   fetchPriceDiagnostics,
   fetchPriceObservations,
   fetchPumpFunReport,
+  fetchReadinessStatus,
   fetchReplayTimeline,
   fetchSafetyStatus,
   fetchSolanaStatus,
@@ -62,6 +63,7 @@ import {
   openSnapshotSocket,
   patchSettings,
   recoverWatchdog,
+  reviewLiveRequest,
   labelTrade,
   runABStrategyReplay,
   runBacktestV3,
@@ -75,7 +77,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 const fallbackSnapshot: BotSnapshot = {
@@ -158,6 +160,8 @@ const fallbackSnapshot: BotSnapshot = {
     max_consecutive_losses: 5,
     halt_on_low_replay_confidence: false,
     min_replay_confidence: 50,
+    halt_on_low_readiness: false,
+    min_readiness_score: 70,
     solana_rpc_url: "https://api.mainnet-beta.solana.com",
     watch_wallet_address: "",
     manual_live_enabled: false,
@@ -383,6 +387,7 @@ function App() {
   const [priceDiagnostics, setPriceDiagnostics] = React.useState<PriceDiagnostics | null>(null);
   const [pumpfunReport, setPumpfunReport] = React.useState<PumpFunReport | null>(null);
   const [safetyStatus, setSafetyStatus] = React.useState<SafetyStatus | null>(null);
+  const [readinessStatus, setReadinessStatus] = React.useState<ReadinessStatus | null>(null);
   const [opsMonitoring, setOpsMonitoring] = React.useState<OperationalMonitoring | null>(null);
   const [backtestV3Result, setBacktestV3Result] = React.useState<BacktestV3Result | null>(null);
   const [experiments, setExperiments] = React.useState<ExperimentRun[]>([]);
@@ -613,7 +618,7 @@ function App() {
   }
 
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -630,6 +635,7 @@ function App() {
       fetchPriceDiagnostics(),
       fetchPumpFunReport(),
       fetchSafetyStatus(),
+      fetchReadinessStatus(),
       fetchOperationalMonitoring(),
       fetchExperiments(),
       fetchTradeLabels(),
@@ -655,6 +661,7 @@ function App() {
     setPriceDiagnostics(price);
     setPumpfunReport(pumpfun);
     setSafetyStatus(safety);
+    setReadinessStatus(readiness);
     setOpsMonitoring(ops);
     setExperiments(experimentRows);
     setTradeLabels(labels);
@@ -684,6 +691,16 @@ function App() {
       setSnapshot(await fetchSnapshot());
     } catch (error) {
       setApiError(`Clear failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function reviewManualLiveRequest(requestId: string, status: "reviewed" | "rejected") {
+    try {
+      const updated = await reviewLiveRequest(requestId, status, "Dashboard audit review");
+      setLiveRequests((current) => current.map((request) => request.id === requestId ? updated : request));
+      await refreshResearchData();
+    } catch (error) {
+      setApiError(`Live request review failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
   }
 
@@ -935,7 +952,7 @@ function App() {
         )}
 
         {workspacePage === "analysis" && (
-          <AnalysisDashboard tokens={snapshot.tokens} trades={trades} stats={stats} analytics={performanceAnalytics} suggestions={tuningSuggestions} priceDiagnostics={priceDiagnostics} pumpfunReport={pumpfunReport} safetyStatus={safetyStatus} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
+          <AnalysisDashboard tokens={snapshot.tokens} trades={trades} stats={stats} analytics={performanceAnalytics} suggestions={tuningSuggestions} priceDiagnostics={priceDiagnostics} pumpfunReport={pumpfunReport} safetyStatus={safetyStatus} readinessStatus={readinessStatus} pnlTimeframe={pnlTimeframe} onTimeframeChange={setPnlTimeframe} />
         )}
 
         {workspacePage === "review" && (
@@ -971,6 +988,7 @@ function App() {
             priceDiagnostics={priceDiagnostics}
             pumpfunReport={pumpfunReport}
             safetyStatus={safetyStatus}
+            readinessStatus={readinessStatus}
             opsMonitoring={opsMonitoring}
             sourceAdapters={sourceAdapters}
             watchdogStatus={watchdogStatus}
@@ -983,6 +1001,7 @@ function App() {
               setSnapshot(updated);
               await refreshResearchData();
             }}
+            onReviewLiveRequest={reviewManualLiveRequest}
             onClear={clearProjectData}
           />
         )}
@@ -1424,6 +1443,7 @@ function AnalysisDashboard({
   priceDiagnostics,
   pumpfunReport,
   safetyStatus,
+  readinessStatus,
   pnlTimeframe,
   onTimeframeChange
 }: {
@@ -1435,6 +1455,7 @@ function AnalysisDashboard({
   priceDiagnostics: PriceDiagnostics | null;
   pumpfunReport: PumpFunReport | null;
   safetyStatus: SafetyStatus | null;
+  readinessStatus: ReadinessStatus | null;
   pnlTimeframe: PnlTimeframe;
   onTimeframeChange: (timeframe: PnlTimeframe) => void;
 }) {
@@ -1487,8 +1508,24 @@ function AnalysisDashboard({
         <Metric label="Price confidence" value={`${Math.round(avgConfidence * 100)}%`} />
         <Metric label="All-time P&L" value={`${stats.total_pnl_sol.toFixed(4)} SOL`} />
         <Metric label="Safety" value={safetyStatus?.entries_allowed ? "entries ok" : "guarded"} />
+        <Metric label="Readiness" value={readinessStatus ? `${readinessStatus.score}% ${readinessStatus.status.replace(/_/g, " ")}` : "loading"} />
       </div>
       <div className="analysis-grid">
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Readiness Scorecard</h3>
+              <p>Paper edge validation across data, source, price, replay, and performance.</p>
+            </div>
+            <Shield size={18} />
+          </div>
+          <div className="bar-list">
+            <BarMetric label="Score" value={readinessStatus?.score ?? 0} max={100} />
+            <BarMetric label="Closed trades" value={readinessStatus?.sample_size.closed_trades ?? 0} max={30} />
+            <BarMetric label="Source events" value={readinessStatus?.sample_size.source_events ?? 0} max={100} />
+          </div>
+          <p className="settings-note">Status: <strong>{readinessStatus?.status.replace(/_/g, " ") ?? "loading"}</strong> / Halt: <strong>{readinessStatus?.halt_on_low_readiness ? "enabled" : "off"}</strong></p>
+        </section>
         {analytics ? (
           <section className="research-card">
             <div className="section-heading">
@@ -1823,6 +1860,7 @@ function DataDashboard({
   priceDiagnostics,
   pumpfunReport,
   safetyStatus,
+  readinessStatus,
   opsMonitoring,
   sourceAdapters,
   watchdogStatus,
@@ -1831,6 +1869,7 @@ function DataDashboard({
   auditEvents,
   onRefresh,
   onRecover,
+  onReviewLiveRequest,
   onClear
 }: {
   summary: DataSummary | null;
@@ -1846,6 +1885,7 @@ function DataDashboard({
   priceDiagnostics: PriceDiagnostics | null;
   pumpfunReport: PumpFunReport | null;
   safetyStatus: SafetyStatus | null;
+  readinessStatus: ReadinessStatus | null;
   opsMonitoring: OperationalMonitoring | null;
   sourceAdapters: SourceAdapterStatus[];
   watchdogStatus: WatchdogStatus | null;
@@ -1854,6 +1894,7 @@ function DataDashboard({
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
   onRecover: () => Promise<void>;
+  onReviewLiveRequest: (requestId: string, status: "reviewed" | "rejected") => Promise<void>;
   onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "all") => Promise<void>;
 }) {
   return (
@@ -1886,6 +1927,7 @@ function DataDashboard({
         <Metric label="Replay confidence" value={`${dataIntegrity?.replay_confidence.score ?? 0}%`} />
         <Metric label="Source health" value={`${sourceHealth?.health_score ?? 0}%`} />
         <Metric label="Safety boundary" value={securityStatus?.paper_only_boundary ? "paper only" : "live enabled"} />
+        <Metric label="Readiness" value={readinessStatus ? `${readinessStatus.score}%` : "loading"} />
         <Metric label="Watchdog" value={watchdogStatus?.status ?? "unknown"} />
         <Metric label="Solana RPC" value={solanaStatus?.health ?? "unknown"} />
         <Metric label="Live requests" value={(summary?.live_execution_requests ?? liveRequests.length).toString()} />
@@ -1905,6 +1947,38 @@ function DataDashboard({
         ))}
       </div>
       <div className="research-grid">
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Readiness Scorecard</h3>
+              <p>Paper edge validation before raising risk.</p>
+            </div>
+            <Shield size={18} />
+          </div>
+          <div className="readiness-summary">
+            <span className={`readiness-pill ${readinessStatus?.status ?? "loading"}`}>{readinessStatus?.status.replace(/_/g, " ") ?? "loading"}</span>
+            <strong>{readinessStatus?.score ?? 0}%</strong>
+            <span>Optional halt: {readinessStatus?.halt_on_low_readiness ? `on at ${readinessStatus.min_readiness_score}%` : "off"}</span>
+            <span>Entries: {readinessStatus?.entries_allowed ? "allowed" : "halted"}</span>
+          </div>
+          <div className="mini-list">
+            {(readinessStatus?.gates ?? []).filter((gate) => gate.status !== "pass").slice(0, 6).map((gate) => (
+              <article key={gate.id}>
+                <strong>{gate.label} / {gate.status}</strong>
+                <span>{String(gate.value)} target {String(gate.target)} / weight {gate.weight}</span>
+                <p>{gate.reason}</p>
+              </article>
+            ))}
+            {readinessStatus && readinessStatus.gates.every((gate) => gate.status === "pass") ? <p>All readiness gates are passing.</p> : null}
+          </div>
+          <div className="mini-list compact-list">
+            {(readinessStatus?.recommended_actions ?? ["Collect more paper data to build a readiness score."]).slice(0, 4).map((action) => (
+              <article key={action}>
+                <strong>{action}</strong>
+              </article>
+            ))}
+          </div>
+        </section>
         <section className="research-card">
           <div className="section-heading">
             <div>
@@ -2071,7 +2145,14 @@ function DataDashboard({
               <article key={request.id}>
                 <strong>{request.action} / {request.amount_sol.toFixed(4)} SOL / {request.status}</strong>
                 <span>{new Date(request.created_at).toLocaleString()} / {request.mint}</span>
+                {request.reviewed_at ? <span>Reviewed: {new Date(request.reviewed_at).toLocaleString()}</span> : null}
                 <p>{request.reason}</p>
+                {!["reviewed", "rejected"].includes(request.status) ? (
+                  <div className="inline-actions">
+                    <button className="secondary-action mini-action" onClick={() => onReviewLiveRequest(request.id, "reviewed")}>Mark reviewed</button>
+                    <button className="secondary-action mini-action" onClick={() => onReviewLiveRequest(request.id, "rejected")}>Reject</button>
+                  </div>
+                ) : null}
               </article>
             ))}
             {!liveRequests.length ? <p>No manual live requests have been stored.</p> : null}
@@ -2565,6 +2646,15 @@ function SettingsModal({
                   <input value={draft.watch_wallet_address} onChange={(event) => updateDraft("watch_wallet_address", event.target.value)} placeholder="Wallet public key for balance checks" />
                 </label>
                 <SettingInput label="Manual live max SOL" value={draft.manual_live_max_sol} step="0.001" onChange={(v) => updateNumber("manual_live_max_sol", v)} />
+                <label className="toggle-line">
+                  <input
+                    type="checkbox"
+                    checked={draft.halt_on_low_readiness}
+                    onChange={(event) => updateDraft("halt_on_low_readiness", event.target.checked)}
+                  />
+                  Halt paper entries on low readiness
+                </label>
+                <SettingInput label="Min readiness score" value={draft.min_readiness_score} onChange={(v) => updateNumber("min_readiness_score", v)} />
                 <label className="toggle-line">
                   <input
                     type="checkbox"

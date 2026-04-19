@@ -28,6 +28,79 @@ class CoreLogicTests(unittest.TestCase):
             current_price=0.00001,
         )
 
+    def seed_readiness_dataset(self, state: BotState, pnl_sol: float = 0.01, source_connected: bool = True) -> None:
+        now = utc_now()
+        state.source_status.status = "connected" if source_connected else "offline"
+        state.source_status.last_event_at = now
+        state.source_status.raw_events_seen = 100
+        state.source_status.normalized_events = 100 if source_connected else 10
+        for index in range(30):
+            token = self.make_token()
+            token.id = f"tok_ready_{index}"
+            token.mint = f"MintReady{index}"
+            token.symbol = f"ARC{index}"
+            token.score = 88
+            token.status = TokenStatus.PAPER_SOLD
+            token.pnl_sol = pnl_sol
+            token.exit_reason = "take profit" if pnl_sol >= 0 else "stop loss"
+            state.storage.save_token(token)
+            state.storage.save_trade(
+                TradeRecord(
+                    id=f"trd_ready_{index}",
+                    token_id=token.id,
+                    mode="paper",
+                    strategy_profile="balanced",
+                    entry_price=0.00001,
+                    exit_price=0.00002,
+                    amount_sol=0.1,
+                    pnl_sol=pnl_sol,
+                    entry_reason="test",
+                    exit_reason=token.exit_reason,
+                    opened_at=now,
+                    closed_at=now,
+                    source_price_confidence=0.9,
+                )
+            )
+            state.storage.save_strategy_decision(
+                StrategyDecisionRecord(
+                    id=f"dec_ready_{index}",
+                    token_id=token.id,
+                    mint=token.mint,
+                    created_at=now,
+                    engine_version="strategy-v3",
+                    profile="balanced",
+                    score=88,
+                    allowed=True,
+                    action="paper_buy",
+                    reason="test",
+                    risk_reason="passed",
+                )
+            )
+            state.storage.save_price_observation(
+                PriceObservation(
+                    id=f"px_ready_{index}",
+                    source="pumpportal",
+                    mint=token.mint,
+                    observed_at=now,
+                    price=0.00002,
+                    price_source="direct",
+                    confidence=0.9,
+                    accepted=True,
+                    token_id=token.id,
+                )
+            )
+        for index in range(100):
+            state.storage.save_source_event(
+                SourceEvent(
+                    id=f"src_ready_{index}",
+                    source="pumpportal",
+                    received_at=now,
+                    raw_payload={"mint": f"MintReady{index % 30}"},
+                    normalized_token_id=f"tok_ready_{index % 30}",
+                    status="normalized",
+                )
+            )
+
     def test_scoring_rewards_good_launch_profile(self) -> None:
         token = self.make_token()
         result = ScoringEngine().score(token)
@@ -341,6 +414,56 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(detail["trade"]["id"], "trd_test")
             self.assertTrue(safety["paper_only"])
 
+    def test_readiness_empty_state_needs_data(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            readiness = state.readiness_status()
+
+            self.assertEqual(readiness["engine_version"], "readiness-v1")
+            self.assertEqual(readiness["status"], "not_enough_data")
+            self.assertTrue(readiness["paper_only"])
+            self.assertTrue(readiness["entries_allowed"])
+
+    def test_readiness_strong_dataset_is_ready(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.seed_readiness_dataset(state)
+
+            readiness = state.readiness_status()
+
+            self.assertEqual(readiness["status"], "ready")
+            self.assertGreaterEqual(readiness["score"], 75)
+            self.assertTrue(all(gate["status"] != "fail" for gate in readiness["gates"]))
+
+    def test_readiness_source_failure_blocks_after_enough_data(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.seed_readiness_dataset(state, source_connected=False)
+
+            readiness = state.readiness_status()
+            source_gate = next(gate for gate in readiness["gates"] if gate["id"] == "source_health")
+
+            self.assertEqual(readiness["status"], "blocked")
+            self.assertEqual(source_gate["status"], "fail")
+
+    def test_readiness_halt_waits_for_evidence_then_blocks_entries(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.settings.halt_on_low_readiness = True
+            state.settings.min_readiness_score = 70
+            state.settings.max_trades_per_hour_enabled = False
+
+            self.assertIsNone(state.evaluate_session_guards(self.make_token()))
+
+            self.seed_readiness_dataset(state, source_connected=False)
+            guard = state.evaluate_session_guards(self.make_token())
+            safety = state.safety_status()
+
+            self.assertIsNotNone(guard)
+            self.assertIn("readiness halt active", guard or "")
+            self.assertIn("readiness halt active", ", ".join(safety["stop_reasons"]))
+
     def test_schema_experiments_labels_and_presets_round_trip(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(str(Path(directory) / "test.db"))
@@ -371,6 +494,7 @@ class CoreLogicTests(unittest.TestCase):
 
             loaded = storage.load_live_execution_requests()[0]
             self.assertEqual(loaded.id, "live_test")
+            self.assertEqual(storage.load_live_execution_request("live_test").mint, "Mint111")
             self.assertEqual(storage.count_live_execution_requests(), 1)
 
     def test_watchdog_and_manual_live_request_are_blocked(self) -> None:
@@ -387,6 +511,21 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(request["status"], "blocked")
             self.assertTrue(safety["paper_only"])
             self.assertFalse(safety["manual_live_ready"])
+
+    def test_manual_live_request_review_remains_audit_only(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            request = state.create_manual_live_request("sell", "Mint222", 0.02)
+            reviewed = state.review_live_request(str(request["id"]), "rejected", "bad setup")
+            loaded = state.storage.load_live_execution_request(str(request["id"]))
+
+            self.assertEqual(reviewed["status"], "rejected")
+            self.assertIsNotNone(reviewed["reviewed_at"])
+            self.assertIn("without execution", reviewed["reason"])
+            self.assertTrue(reviewed["payload"]["reviewed_without_execution"])
+            self.assertTrue(reviewed["payload"]["paper_only_boundary"])
+            self.assertEqual(loaded.status, "rejected")
 
 
 if __name__ == "__main__":

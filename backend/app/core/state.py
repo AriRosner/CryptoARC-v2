@@ -452,6 +452,9 @@ class BotState:
             return f"same creator buy cap reached ({self.settings.max_same_creator_buys})"
         if self.settings.stop_on_source_degraded and self.source_health().get("health_score", 100) < 50:
             return "source health degraded"
+        readiness_halt = self.readiness_halt_reason()
+        if readiness_halt:
+            return readiness_halt
         return None
 
     def replay_backtest(
@@ -950,6 +953,200 @@ class BotState:
     def pumpfun_report(self) -> dict[str, object]:
         return self.pumpfun_intelligence.summarize(self.storage.load_all_tokens(5000), self.storage.load_source_events(5000))
 
+    def readiness_status(self) -> dict[str, object]:
+        closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        integrity = self.data_integrity_report()
+        source = self.source_health()
+        price = self.price_diagnostics()
+        performance = self._performance_group("all trades", closed)
+        closed_count = len(closed)
+        source_events = int(integrity.get("source_events", 0))
+        gross_win = sum((trade.pnl_sol or 0.0) for trade in closed if (trade.pnl_sol or 0.0) > (self.stats.scratch_threshold_sol or 0.001))
+        gross_loss = abs(sum((trade.pnl_sol or 0.0) for trade in closed if (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001)))
+        effective_profit_factor = 99.0 if gross_win > 0 and gross_loss == 0 else float(performance.get("profit_factor", 0.0))
+
+        gates = [
+            self._readiness_gate(
+                "closed_trades",
+                "Closed paper trades",
+                closed_count,
+                ">= 30",
+                10,
+                "pass" if closed_count >= 30 else "warn" if closed_count >= 10 else "fail",
+                "Closed paper trades provide the minimum performance sample.",
+            ),
+            self._readiness_gate(
+                "source_events",
+                "Source events",
+                source_events,
+                ">= 100",
+                5,
+                "pass" if source_events >= 100 else "warn" if source_events >= 25 else "fail",
+                "Captured source events make replay and source-quality checks meaningful.",
+            ),
+            self._readiness_gate(
+                "data_integrity",
+                "Data integrity",
+                int(integrity.get("score", 0)),
+                ">= 80",
+                15,
+                self._threshold_status(float(integrity.get("score", 0)), 80, 65),
+                "Integrity score combines missing records, malformed source events, and replay trust.",
+            ),
+            self._readiness_gate(
+                "replay_confidence",
+                "Replay confidence",
+                int(integrity.get("replay_confidence", {}).get("score", 0)) if isinstance(integrity.get("replay_confidence"), dict) else 0,
+                ">= 70",
+                15,
+                self._threshold_status(float(integrity.get("replay_confidence", {}).get("score", 0)) if isinstance(integrity.get("replay_confidence"), dict) else 0.0, 70, 50),
+                "Replay confidence requires accepted prices, normalized source events, and closed-trade coverage.",
+            ),
+            self._readiness_gate(
+                "source_health",
+                "Source health",
+                int(source.get("health_score", 0)),
+                ">= 70",
+                15,
+                self._threshold_status(float(source.get("health_score", 0)), 70, 50),
+                "Source health tracks connection status, staleness, normalization ratio, and reconnect pressure.",
+            ),
+            self._readiness_gate(
+                "price_acceptance",
+                "Price acceptance",
+                round(float(price.get("acceptance_rate", 0.0)), 3),
+                ">= 0.70",
+                10,
+                self._threshold_status(float(price.get("acceptance_rate", 0.0)), 0.70, 0.50),
+                "Accepted observed prices should dominate rejected or low-confidence marks.",
+            ),
+            self._readiness_gate(
+                "price_jumps",
+                "Impossible price jumps",
+                int(price.get("impossible_jump_warnings", 0)),
+                "0",
+                5,
+                "pass" if int(price.get("impossible_jump_warnings", 0)) == 0 else "warn" if int(price.get("impossible_jump_warnings", 0)) <= 2 else "fail",
+                "Large accepted jumps indicate price normalization needs review.",
+            ),
+            self._readiness_gate(
+                "paper_performance",
+                "Paper performance",
+                f"{performance.get('pnl_sol', 0)} SOL / PF {round(effective_profit_factor, 2)}",
+                "PnL > 0 and PF > 1.1",
+                20,
+                self._paper_performance_status(closed_count, float(performance.get("pnl_sol", 0.0)), effective_profit_factor),
+                "Paper performance should be positive after the sample is large enough.",
+            ),
+            self._readiness_gate(
+                "safety_boundary",
+                "Paper safety boundary",
+                "paper-only",
+                "paper-only",
+                5,
+                "pass",
+                "No signer, wallet connection, transaction builder, or live executor is available.",
+            ),
+        ]
+        score = int(round(sum(int(gate["weight"]) if gate["status"] == "pass" else int(gate["weight"]) * 0.5 if gate["status"] == "warn" else 0 for gate in gates)))
+        enough_data = closed_count >= 10 and source_events >= 25
+        critical_ids = {"data_integrity", "replay_confidence", "source_health", "price_acceptance", "price_jumps", "safety_boundary"}
+        critical_failed = any(gate["id"] in critical_ids and gate["status"] == "fail" for gate in gates)
+        any_failed = any(gate["status"] == "fail" for gate in gates)
+        if not enough_data:
+            status = "not_enough_data"
+        elif critical_failed or score < 50:
+            status = "blocked"
+        elif score >= 75 and not any_failed and closed_count >= 30:
+            status = "ready"
+        else:
+            status = "warning"
+
+        result = {
+            "engine_version": "readiness-v1",
+            "score": max(0, min(100, score)),
+            "status": status,
+            "entries_allowed": True,
+            "gates": gates,
+            "recommended_actions": self._readiness_actions(gates, status),
+            "sample_size": {
+                "closed_trades": closed_count,
+                "source_events": source_events,
+                "price_observations": int(integrity.get("price_observations", 0)),
+                "strategy_decisions": int(integrity.get("strategy_decisions", 0)),
+            },
+            "paper_only": True,
+            "halt_on_low_readiness": self.settings.halt_on_low_readiness,
+            "min_readiness_score": self.settings.min_readiness_score,
+        }
+        result["entries_allowed"] = self.readiness_halt_reason(result) is None
+        return result
+
+    def readiness_halt_reason(self, readiness: dict[str, object] | None = None) -> str | None:
+        if not self.settings.halt_on_low_readiness:
+            return None
+        readiness = readiness or self.readiness_status()
+        sample = readiness.get("sample_size", {})
+        closed_count = int(sample.get("closed_trades", 0)) if isinstance(sample, dict) else 0
+        source_events = int(sample.get("source_events", 0)) if isinstance(sample, dict) else 0
+        if closed_count < 30 and source_events < 100:
+            return None
+        score = int(readiness.get("score", 0))
+        if readiness.get("status") == "blocked" or score < self.settings.min_readiness_score:
+            return f"readiness halt active ({score} below {self.settings.min_readiness_score})"
+        return None
+
+    def _readiness_gate(self, gate_id: str, label: str, value: object, target: object, weight: int, status: str, reason: str) -> dict[str, object]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "status": status,
+            "value": value,
+            "target": target,
+            "weight": weight,
+            "reason": reason,
+        }
+
+    def _threshold_status(self, value: float, pass_at: float, warn_at: float) -> str:
+        if value >= pass_at:
+            return "pass"
+        if value >= warn_at:
+            return "warn"
+        return "fail"
+
+    def _paper_performance_status(self, closed_count: int, pnl_sol: float, profit_factor: float) -> str:
+        if closed_count < 30:
+            return "warn"
+        if pnl_sol > 0 and profit_factor > 1.1:
+            return "pass"
+        return "fail"
+
+    def _readiness_actions(self, gates: list[dict[str, object]], status: str) -> list[str]:
+        if status == "ready":
+            return ["Keep collecting paper samples and compare promoted presets before changing risk settings."]
+        actions: list[str] = []
+        for gate in gates:
+            if gate["status"] == "pass":
+                continue
+            gate_id = gate["id"]
+            if gate_id == "closed_trades":
+                actions.append("Run more paper sessions until at least 30 closed trades are available.")
+            elif gate_id == "source_events":
+                actions.append("Collect more PumpPortal or mock source events before trusting replay results.")
+            elif gate_id == "data_integrity":
+                actions.append("Review Data Integrity issues for missing records or malformed source events.")
+            elif gate_id == "replay_confidence":
+                actions.append("Improve accepted price and normalized event coverage before promoting settings.")
+            elif gate_id == "source_health":
+                actions.append("Stabilize the source feed or reconnect behavior before trusting live paper runs.")
+            elif gate_id in {"price_acceptance", "price_jumps"}:
+                actions.append("Review price diagnostics and confidence thresholds for rejected or jumpy observations.")
+            elif gate_id == "paper_performance":
+                actions.append("Use Strategy Builder and labels to tune weak paper performance before raising risk.")
+            elif gate_id == "safety_boundary":
+                actions.append("Keep the paper-only boundary active; do not add execution while readiness is unresolved.")
+        return list(dict.fromkeys(actions))[:6]
+
     def safety_status(self) -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
         consecutive_losses = 0
@@ -978,6 +1175,9 @@ class BotState:
             stop_reasons.append("consecutive loss halt")
         if self.settings.halt_on_low_replay_confidence and replay_confidence < self.settings.min_replay_confidence:
             stop_reasons.append("low replay confidence")
+        readiness_halt = self.readiness_halt_reason()
+        if readiness_halt:
+            stop_reasons.append(readiness_halt)
         return {
             "paper_only": True,
             "entries_allowed": not stop_reasons,
@@ -1088,6 +1288,33 @@ class BotState:
         )
         self.storage.save_live_execution_request(request)
         self.add_event("warning", f"Manual live {action} request stored for {mint[:8] or 'unknown'}: {request.status}")
+        return request.to_dict()
+
+    def review_live_request(self, request_id: str, status: str, note: str = "") -> dict[str, object]:
+        request = self.storage.load_live_execution_request(request_id)
+        if request is None:
+            raise ValueError(f"Live request not found: {request_id}")
+        if status not in {"reviewed", "rejected"}:
+            raise ValueError("Live request review status must be reviewed or rejected")
+        if request.status in {"reviewed", "rejected"}:
+            return request.to_dict()
+
+        request.status = status
+        request.reviewed_at = utc_now()
+        review_note = note.strip()
+        review_reason = "reviewed without execution" if status == "reviewed" else "rejected without execution"
+        if review_note:
+            review_reason = f"{review_reason}: {review_note}"
+        request.reason = f"{request.reason}; {review_reason}" if request.reason else review_reason
+        request.payload = {
+            **request.payload,
+            "review_status": status,
+            "review_note": review_note,
+            "reviewed_without_execution": True,
+            "paper_only_boundary": True,
+        }
+        self.storage.save_live_execution_request(request)
+        self.add_event("warning", f"Manual live {request.action} request {status} without execution for {request.mint[:8] or 'unknown'}")
         return request.to_dict()
 
     def operational_monitoring(self) -> dict[str, object]:

@@ -263,6 +263,13 @@ class Storage:
     def load_live_execution_requests(self, limit: int = 100) -> list[LiveExecutionRequest]:
         return [self._live_execution_request_from_payload(payload) for payload in self._load_payloads("live_execution_requests", limit)]
 
+    def load_live_execution_request(self, request_id: str) -> LiveExecutionRequest | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM live_execution_requests WHERE id = ?", (request_id,)).fetchone()
+        if not row:
+            return None
+        return self._live_execution_request_from_payload(json.loads(row["payload"]))
+
     def save_live_execution_request(self, request: LiveExecutionRequest) -> None:
         self._save_payload("live_execution_requests", request.id, request.to_dict(), request.created_at)
 

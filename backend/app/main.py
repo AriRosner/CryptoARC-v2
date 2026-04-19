@@ -94,6 +94,8 @@ class SettingsPatch(BaseModel):
     max_consecutive_losses: int | None = Field(default=None, ge=1, le=100)
     halt_on_low_replay_confidence: bool | None = None
     min_replay_confidence: int | None = Field(default=None, ge=0, le=100)
+    halt_on_low_readiness: bool | None = None
+    min_readiness_score: int | None = Field(default=None, ge=0, le=100)
     solana_rpc_url: str | None = Field(default=None, min_length=8, max_length=300)
     watch_wallet_address: str | None = Field(default=None, max_length=80)
     manual_live_enabled: bool | None = None
@@ -146,6 +148,11 @@ class LiveExecutionPayload(BaseModel):
     action: Literal["buy", "sell"]
     mint: str = Field(min_length=1, max_length=100)
     amount_sol: float = Field(gt=0, le=100)
+
+
+class LiveExecutionReviewPayload(BaseModel):
+    status: Literal["reviewed", "rejected"]
+    note: str = Field(default="", max_length=500)
 
 
 def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
@@ -540,6 +547,11 @@ async def safety_status() -> dict:
     return state.safety_status()
 
 
+@app.get("/api/readiness/status", dependencies=[Depends(require_auth)])
+async def readiness_status() -> dict:
+    return state.readiness_status()
+
+
 @app.get("/api/watchdog/status", dependencies=[Depends(require_auth)])
 async def watchdog_status() -> dict:
     return state.watchdog_status()
@@ -565,6 +577,17 @@ async def live_requests() -> list[dict]:
 @app.post("/api/live/manual-request", dependencies=[Depends(require_auth)])
 async def manual_live_request(payload: LiveExecutionPayload) -> dict:
     result = state.create_manual_live_request(payload.action, payload.mint, payload.amount_sol)
+    await broadcast_snapshot()
+    return result
+
+
+@app.post("/api/live/requests/{request_id}/review", dependencies=[Depends(require_auth)])
+async def review_live_request(request_id: str, payload: LiveExecutionReviewPayload) -> dict:
+    try:
+        result = state.review_live_request(request_id, payload.status, payload.note)
+    except ValueError as exc:
+        message = str(exc)
+        raise HTTPException(status_code=404 if "not found" in message.lower() else 400, detail=message) from exc
     await broadcast_snapshot()
     return result
 

@@ -108,6 +108,8 @@ class BotSettings:
     max_consecutive_losses: int = 5
     halt_on_low_replay_confidence: bool = False
     min_replay_confidence: int = 50
+    halt_on_low_readiness: bool = False
+    min_readiness_score: int = 70
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     watch_wallet_address: str = ""
     manual_live_enabled: bool = False
