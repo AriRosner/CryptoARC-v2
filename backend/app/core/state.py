@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import base64
+import json
+import urllib.error
+import urllib.request
 from collections import Counter, deque
 from dataclasses import asdict
 from datetime import datetime, timedelta
+from typing import Any
 
 from app.core.models import (
     BacktestRun,
@@ -11,8 +16,15 @@ from app.core.models import (
     BotStats,
     BotStatus,
     ExperimentRun,
+    LiveExecutionAudit,
+    LiveExecutionIntent,
+    LivePosition,
+    LiveQuote,
     LiveExecutionRequest,
+    LiveSession,
+    LiveSimulation,
     SettingsVersion,
+    SignerStatus,
     SourceStatus,
     SourceEvent,
     StrategyDecisionRecord,
@@ -48,6 +60,8 @@ class BotState:
         if self.settings.max_position_ticks == 12:
             self.settings.max_position_ticks = 40
             self.storage.save_settings(self.settings)
+        if self.settings.live_signer_mode not in {"browser_wallet", "local_signer_daemon"}:
+            self.settings.live_signer_mode = "browser_wallet"
         if self.settings.launch_source not in {"mock", "pumpportal"}:
             self.settings.launch_source = default_source
         elif not has_saved_settings and self.settings.launch_source == "mock" and default_source != "mock":
@@ -1256,6 +1270,324 @@ class BotState:
             result["error"] = f"{exc.__class__.__name__}: {exc}"
         return result
 
+    def signer_status(self, mode: str = "browser_wallet", wallet_public_key: str = "") -> dict[str, object]:
+        if mode == "browser_wallet":
+            connected = bool(wallet_public_key.strip())
+            return SignerStatus(
+                mode="browser_wallet",
+                connected=connected,
+                wallet_public_key=wallet_public_key.strip(),
+                can_sign=connected,
+                can_unattended_sign=False,
+                message="Browser wallet requires manual approval for each transaction" if connected else "Browser wallet is not connected",
+            ).to_dict()
+        return SignerStatus(
+            mode="local_signer_daemon",
+            connected=False,
+            wallet_public_key="",
+            can_sign=False,
+            can_unattended_sign=False,
+            message="Local signer daemon is designed for a later phase and disabled in v1",
+        ).to_dict()
+
+    def live_caps_snapshot(self) -> dict[str, object]:
+        return {
+            "max_trade_sol": self.settings.live_max_trade_sol,
+            "daily_loss_cap_sol": self.settings.live_daily_loss_cap_sol,
+            "wallet_exposure_cap_sol": self.settings.live_wallet_exposure_cap_sol,
+            "max_open_positions": self.settings.live_max_open_positions,
+            "max_slippage_pct": self.settings.live_max_slippage_pct,
+            "priority_fee_cap_sol": self.settings.live_priority_fee_cap_sol,
+        }
+
+    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None) -> dict[str, object]:
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        signer = self.signer_status(signer_mode, wallet_public_key)
+        caps = self.live_caps_snapshot()
+        blockers: list[str] = []
+        if not env_live_enabled:
+            blockers.append("LIVE_TRADING_ENABLED is false")
+        if self.settings.kill_switch_enabled:
+            blockers.append("manual kill switch enabled")
+        if signer_mode == "local_signer_daemon":
+            blockers.append("local signer daemon is disabled in v1")
+        if not signer.get("connected"):
+            blockers.append("no connected signer")
+        if not self.settings.live_session_acknowledged:
+            blockers.append("live session acknowledgement is required")
+        for key, value in caps.items():
+            if float(value or 0) <= 0:
+                blockers.append(f"{key} must be set")
+        if not self.settings.solana_rpc_url:
+            blockers.append("Solana RPC URL is not configured")
+        readiness = self.readiness_status()
+        return {
+            "mode": "manual_browser_wallet_v1",
+            "paper_default": True,
+            "live_execution_available": not blockers,
+            "env_live_enabled": env_live_enabled,
+            "effective_live_enabled": not blockers,
+            "blockers": blockers,
+            "signer": signer,
+            "caps": caps,
+            "session_acknowledged": self.settings.live_session_acknowledged,
+            "readiness": readiness,
+            "local_desktop_only": True,
+            "autonomous_live_available": False,
+            "auto_sell_available": signer_mode != "browser_wallet" and bool(signer.get("can_unattended_sign")),
+            "autonomy_blockers": ["browser wallets cannot unattended-sign", "local signer daemon is disabled in v1"],
+        }
+
+    def start_live_session(self, env_live_enabled: bool, wallet_public_key: str, signer_mode: str = "browser_wallet") -> dict[str, object]:
+        status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
+        session = LiveSession(
+            id=new_id("liveses"),
+            created_at=utc_now(),
+            status="blocked" if status["blockers"] else "active",
+            signer_mode=signer_mode,
+            wallet_public_key=wallet_public_key.strip(),
+            caps_snapshot=self.live_caps_snapshot(),
+            acknowledged_at=utc_now() if self.settings.live_session_acknowledged else None,
+        )
+        self.storage.save_live_session(session)
+        self.add_event("warning", f"Live session {session.status}: {', '.join(status['blockers']) or 'manual browser-wallet mode'}")
+        return {**session.to_dict(), "live_status": status}
+
+    def acknowledge_live_session(self) -> dict[str, object]:
+        self.settings.live_session_acknowledged = True
+        self.storage.save_settings(self.settings)
+        self.add_event("warning", "Live session acknowledgement recorded")
+        return {"acknowledged": True, "acknowledged_at": utc_now().isoformat()}
+
+    def live_positions(self, wallet_public_key: str = "") -> list[dict[str, object]]:
+        if not wallet_public_key.strip():
+            return []
+        mints = {audit.mint for audit in self.storage.load_live_execution_audits(500) if audit.mint}
+        positions: list[dict[str, object]] = []
+        for mint in sorted(mints):
+            token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
+            warning = ""
+            balance = 0.0
+            try:
+                balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet_public_key, mint) or 0.0
+            except Exception as exc:
+                warning = f"{exc.__class__.__name__}: {exc}"
+            positions.append(
+                LivePosition(
+                    mint=mint,
+                    symbol=token.symbol if token else "",
+                    token_balance=balance,
+                    estimated_value_sol=0.0,
+                    source="wallet_rpc",
+                    warning=warning,
+                ).to_dict()
+            )
+        return positions
+
+    def live_audit(self) -> list[dict[str, object]]:
+        return [audit.to_dict() for audit in self.storage.load_live_execution_audits(100)]
+
+    def live_quote(
+        self,
+        env_live_enabled: bool,
+        action: str,
+        mint: str,
+        amount: str,
+        denominated_in_sol: bool,
+        slippage_pct: float,
+        priority_fee_sol: float,
+        pool: str,
+        wallet_public_key: str,
+        signer_mode: str = "browser_wallet",
+    ) -> dict[str, object]:
+        status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
+        blockers = list(status["blockers"])
+        validation_error = self._validate_live_order(action, amount, denominated_in_sol, slippage_pct, priority_fee_sol, wallet_public_key, signer_mode)
+        if validation_error:
+            blockers.append(validation_error)
+        if action == "sell":
+            balance = self._wallet_token_balance(wallet_public_key, mint)
+            if balance["error"]:
+                blockers.append(f"wallet token balance check failed: {balance['error']}")
+        else:
+            balance = {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": ""}
+
+        intent = LiveExecutionIntent(
+            id=new_id("intent"),
+            created_at=utc_now(),
+            action=action,
+            mint=mint.strip(),
+            amount=str(amount).strip(),
+            denominated_in_sol=denominated_in_sol,
+            signer_mode=signer_mode,
+            wallet_public_key=wallet_public_key.strip(),
+            status="blocked" if blockers else "quote_requested",
+            reason="; ".join(blockers),
+        )
+        quote_payload: dict[str, object] = {}
+        quote_error = ""
+        unsigned_tx = ""
+        if not blockers:
+            quote_payload, unsigned_tx, quote_error = self._pumpportal_local_transaction(
+                action=action,
+                mint=mint,
+                amount=amount,
+                denominated_in_sol=denominated_in_sol,
+                slippage_pct=slippage_pct,
+                priority_fee_sol=priority_fee_sol,
+                pool=pool,
+                wallet_public_key=wallet_public_key,
+            )
+            if quote_error:
+                blockers.append(quote_error)
+        quote = LiveQuote(
+            id=new_id("quote"),
+            created_at=utc_now(),
+            intent_id=intent.id,
+            provider="pumpportal_local",
+            action=action,
+            mint=mint.strip(),
+            amount=str(amount).strip(),
+            denominated_in_sol=denominated_in_sol,
+            slippage_pct=round(float(slippage_pct), 4),
+            priority_fee_sol=round(float(priority_fee_sol), 9),
+            pool=pool,
+            status="blocked" if blockers else "ready",
+            unsigned_transaction_base64=unsigned_tx,
+            error="; ".join(blockers),
+        )
+        audit = LiveExecutionAudit(
+            id=new_id("liveaudit"),
+            created_at=utc_now(),
+            updated_at=utc_now(),
+            action=action,
+            mint=mint.strip(),
+            amount=str(amount).strip(),
+            status=quote.status,
+            signer_mode=signer_mode,
+            wallet_public_key=wallet_public_key.strip(),
+            request=intent.to_dict(),
+            quote={**quote.to_dict(), "provider_request": quote_payload},
+            caps_snapshot=self.live_caps_snapshot(),
+            balance_snapshot=balance,
+            errors=blockers,
+            warnings=["Simulation warnings do not absolutely block manual signing"] if not blockers else [],
+            final_status=quote.status,
+        )
+        self.storage.save_live_execution_audit(audit)
+        self.add_event("warning", f"Live {action} quote {quote.status} for {mint[:8] or 'unknown'}")
+        return audit.to_dict()
+
+    def live_simulate(self, audit_id: str, ok: bool, warning: str = "", error: str = "", result: dict[str, Any] | None = None) -> dict[str, object]:
+        audit = self._require_live_audit(audit_id)
+        simulation = LiveSimulation(
+            id=new_id("sim"),
+            created_at=utc_now(),
+            quote_id=str(audit.quote.get("id", "")),
+            status="ok" if ok else "warning",
+            ok=ok,
+            warning=warning.strip(),
+            error=error.strip(),
+            result=result or {},
+        )
+        audit.simulation = simulation.to_dict()
+        audit.status = "simulated" if ok else "simulation_warning"
+        audit.final_status = audit.status
+        audit.updated_at = utc_now()
+        if warning:
+            audit.warnings.append(warning)
+        if error:
+            audit.errors.append(error)
+        self.storage.save_live_execution_audit(audit)
+        return audit.to_dict()
+
+    def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
+        audit = self._require_live_audit(audit_id)
+        if audit.signer_mode == "browser_wallet" and not signature.strip():
+            raise ValueError("browser wallet submit requires a transaction signature")
+        audit.transaction_signature = signature.strip()
+        audit.status = "submitted"
+        audit.final_status = "submitted"
+        audit.updated_at = utc_now()
+        self.storage.save_live_execution_audit(audit)
+        self.add_event("warning", f"Live {audit.action} submitted: {signature[:10]}")
+        return audit.to_dict()
+
+    def live_confirm(self, audit_id: str, confirmation_status: str, error: str = "") -> dict[str, object]:
+        audit = self._require_live_audit(audit_id)
+        audit.confirmation_status = confirmation_status.strip()
+        audit.status = "confirmed" if confirmation_status in {"confirmed", "finalized"} and not error else "failed"
+        audit.final_status = audit.status
+        audit.updated_at = utc_now()
+        if error:
+            audit.errors.append(error)
+        self.storage.save_live_execution_audit(audit)
+        return audit.to_dict()
+
+    def _validate_live_order(self, action: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, wallet_public_key: str, signer_mode: str) -> str:
+        if action not in {"buy", "sell"}:
+            return "action must be buy or sell"
+        if signer_mode == "browser_wallet" and not wallet_public_key.strip():
+            return "browser wallet is not connected"
+        if signer_mode == "local_signer_daemon":
+            return "local signer daemon is disabled in v1"
+        try:
+            numeric_amount = float(str(amount).replace("%", ""))
+        except ValueError:
+            return "amount must be numeric or a sell percentage"
+        if numeric_amount <= 0:
+            return "amount must be positive"
+        if action == "buy":
+            if not denominated_in_sol:
+                return "buy amount must be denominated in SOL"
+            if numeric_amount > self.settings.live_max_trade_sol:
+                return f"amount exceeds live max trade cap ({self.settings.live_max_trade_sol:.4f} SOL)"
+        if action == "sell" and str(amount).endswith("%") and numeric_amount > 100:
+            return "sell percentage cannot exceed 100%"
+        if slippage_pct > self.settings.live_max_slippage_pct:
+            return f"slippage exceeds live cap ({self.settings.live_max_slippage_pct:.2f}%)"
+        if priority_fee_sol > self.settings.live_priority_fee_cap_sol:
+            return f"priority fee exceeds live cap ({self.settings.live_priority_fee_cap_sol:.9f} SOL)"
+        return ""
+
+    def _wallet_token_balance(self, wallet_public_key: str, mint: str) -> dict[str, object]:
+        try:
+            balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet_public_key, mint)
+            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": ""}
+        except Exception as exc:
+            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    def _pumpportal_local_transaction(self, action: str, mint: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, pool: str, wallet_public_key: str) -> tuple[dict[str, object], str, str]:
+        payload = {
+            "publicKey": wallet_public_key.strip(),
+            "action": action,
+            "mint": mint.strip(),
+            "amount": amount,
+            "denominatedInSol": "true" if denominated_in_sol else "false",
+            "slippage": float(slippage_pct),
+            "priorityFee": float(priority_fee_sol),
+            "pool": pool,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            "https://pumpportal.fun/api/trade-local",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read()
+        except urllib.error.URLError as exc:
+            return payload, "", f"PumpPortal quote failed: {exc}"
+        return payload, base64.b64encode(body).decode("ascii"), ""
+
+    def _require_live_audit(self, audit_id: str) -> LiveExecutionAudit:
+        audit = self.storage.load_live_execution_audit(audit_id)
+        if audit is None:
+            raise ValueError(f"Live audit not found: {audit_id}")
+        return audit
+
     def live_requests(self) -> list[dict[str, object]]:
         return [request.to_dict() for request in self.storage.load_live_execution_requests(100)]
 
@@ -1522,6 +1854,10 @@ class BotState:
             return {"strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)]}
         if target == "live_execution_requests":
             return {"live_execution_requests": [item.to_dict() for item in self.storage.load_live_execution_requests(5000)]}
+        if target == "live_sessions":
+            return {"live_sessions": [item.to_dict() for item in self.storage.load_live_sessions(5000)]}
+        if target == "live_execution_audits":
+            return {"live_execution_audits": [item.to_dict() for item in self.storage.load_live_execution_audits(5000)]}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
@@ -1536,6 +1872,8 @@ class BotState:
             "trade_labels": [item.to_dict() for item in self.storage.load_trade_labels(5000)],
             "strategy_presets": [item.to_dict() for item in self.storage.load_strategy_presets(5000)],
             "live_execution_requests": [item.to_dict() for item in self.storage.load_live_execution_requests(5000)],
+            "live_sessions": [item.to_dict() for item in self.storage.load_live_sessions(5000)],
+            "live_execution_audits": [item.to_dict() for item in self.storage.load_live_execution_audits(5000)],
         }
 
     def data_summary(self) -> dict[str, int]:
@@ -1553,6 +1891,8 @@ class BotState:
             "trade_labels": self.storage.count_trade_labels(),
             "strategy_presets": self.storage.count_strategy_presets(),
             "live_execution_requests": self.storage.count_live_execution_requests(),
+            "live_sessions": self.storage.count_live_sessions(),
+            "live_execution_audits": self.storage.count_live_execution_audits(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
@@ -1587,6 +1927,10 @@ class BotState:
             self.storage.clear_strategy_presets()
         if target in {"live_execution_requests", "all"}:
             self.storage.clear_live_execution_requests()
+        if target in {"live_sessions", "all"}:
+            self.storage.clear_live_sessions()
+        if target in {"live_execution_audits", "all"}:
+            self.storage.clear_live_execution_audits()
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()

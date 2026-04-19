@@ -527,6 +527,80 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(reviewed["payload"]["paper_only_boundary"])
             self.assertEqual(loaded.status, "rejected")
 
+    def configure_live_caps(self, state: BotState) -> None:
+        state.settings.live_max_trade_sol = 0.01
+        state.settings.live_daily_loss_cap_sol = 0.05
+        state.settings.live_wallet_exposure_cap_sol = 0.1
+        state.settings.live_max_open_positions = 1
+        state.settings.live_max_slippage_pct = 5
+        state.settings.live_priority_fee_cap_sol = 0.0001
+        state.settings.live_session_acknowledged = True
+
+    def test_live_status_blocks_without_env_caps_or_wallet(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            status = state.live_status(env_live_enabled=False)
+
+            self.assertFalse(status["live_execution_available"])
+            self.assertIn("LIVE_TRADING_ENABLED is false", status["blockers"])
+            self.assertIn("no connected signer", status["blockers"])
+            self.assertTrue(any("max_trade_sol" in blocker for blocker in status["blockers"]))
+
+    def test_browser_wallet_live_quote_creates_blocked_audit_when_env_disabled(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+
+            audit = state.live_quote(False, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
+
+            self.assertEqual(audit["status"], "blocked")
+            self.assertIn("LIVE_TRADING_ENABLED is false", audit["errors"])
+            self.assertEqual(state.storage.count_live_execution_audits(), 1)
+
+    def test_live_quote_validates_caps_and_disabled_signer(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+
+            too_large = state.live_quote(True, "buy", "Mint111", "0.02", True, 1, 0.00001, "pump", "Wallet111")
+            daemon = state.live_quote(True, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111", signer_mode="local_signer_daemon")
+
+            self.assertTrue(any("amount exceeds live max trade cap" in error for error in too_large["errors"]))
+            self.assertIn("local signer daemon is disabled in v1", daemon["errors"])
+            self.assertFalse(state.signer_status("browser_wallet", "Wallet111")["can_unattended_sign"])
+
+    def test_live_simulation_submit_and_confirm_update_audit(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            audit = LiveExecutionRequest(
+                id="legacy",
+                created_at=utc_now(),
+                action="buy",
+                mint="Mint111",
+                amount_sol=0.01,
+                status="blocked",
+                reason="legacy",
+            )
+            state.storage.save_live_execution_request(audit)
+            live_audit = state.live_quote(False, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
+
+            simulated = state.live_simulate(live_audit["id"], False, "simulation warning")
+            submitted = state.live_submit(live_audit["id"], "sig111")
+            confirmed = state.live_confirm(live_audit["id"], "confirmed")
+
+            self.assertEqual(simulated["status"], "simulation_warning")
+            self.assertEqual(submitted["transaction_signature"], "sig111")
+            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(confirmed["confirmation_status"], "confirmed")
+
+    def test_no_private_key_fields_are_added_to_settings_or_live_audit(self) -> None:
+        settings_keys = set(BotSettings.__dataclass_fields__.keys())
+        audit_keys = {"request", "quote", "simulation", "wallet_public_key", "transaction_signature"}
+
+        self.assertFalse(any("private" in key.lower() or "seed" in key.lower() for key in settings_keys))
+        self.assertFalse(any("private" in key.lower() or "seed" in key.lower() for key in audit_keys))
+
 
 if __name__ == "__main__":
     unittest.main()

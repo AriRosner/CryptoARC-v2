@@ -46,3 +46,24 @@ class SolanaReadOnlyClient:
         if lamports is None:
             return None
         return round(float(lamports) / 1_000_000_000, 9)
+
+    def token_balance(self, wallet_address: str, mint: str) -> float | None:
+        wallet_address = wallet_address.strip()
+        mint = mint.strip()
+        if not wallet_address or not mint:
+            return None
+        result = self.rpc(
+            "getTokenAccountsByOwner",
+            [
+                wallet_address,
+                {"mint": mint},
+                {"encoding": "jsonParsed"},
+            ],
+        ).get("result") or {}
+        total = 0.0
+        for account in result.get("value", []):
+            info = account.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            amount = info.get("tokenAmount", {}).get("uiAmount")
+            if amount is not None:
+                total += float(amount)
+        return round(total, 9)

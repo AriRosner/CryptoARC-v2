@@ -1,5 +1,6 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
+import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import {
   Activity,
   BarChart3,
@@ -25,7 +26,10 @@ import {
 } from "lucide-react";
 import {
   backupDatabase,
+  acknowledgeLiveSession,
   clearData,
+  confirmLiveAudit,
+  createLiveQuote,
   createExperiment,
   disableTotp,
   authStatus,
@@ -34,6 +38,9 @@ import {
   fetchDataSummary,
   fetchExperiments,
   fetchLiveRequests,
+  fetchLiveAudit,
+  fetchLivePositions,
+  fetchLiveStatus,
   fetchDataIntegrity,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
@@ -63,7 +70,9 @@ import {
   openSnapshotSocket,
   patchSettings,
   recoverWatchdog,
+  recordLiveSimulation,
   reviewLiveRequest,
+  submitLiveAudit,
   labelTrade,
   runABStrategyReplay,
   runBacktestV3,
@@ -77,8 +86,23 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionRequest, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
+
+type BrowserSolanaProvider = {
+  isPhantom?: boolean;
+  publicKey?: { toString(): string };
+  connect: () => Promise<{ publicKey: { toString(): string } }>;
+  disconnect?: () => Promise<void>;
+  signAndSendTransaction?: (transaction: VersionedTransaction) => Promise<{ signature: string }>;
+  signTransaction?: (transaction: VersionedTransaction) => Promise<VersionedTransaction>;
+};
+
+declare global {
+  interface Window {
+    solana?: BrowserSolanaProvider;
+  }
+}
 
 const fallbackSnapshot: BotSnapshot = {
   status: "stopped",
@@ -166,7 +190,15 @@ const fallbackSnapshot: BotSnapshot = {
     watch_wallet_address: "",
     manual_live_enabled: false,
     manual_live_max_sol: 0.05,
-    autonomous_live_enabled: false
+    autonomous_live_enabled: false,
+    live_max_trade_sol: 0,
+    live_daily_loss_cap_sol: 0,
+    live_wallet_exposure_cap_sol: 0,
+    live_max_open_positions: 0,
+    live_max_slippage_pct: 0,
+    live_priority_fee_cap_sol: 0,
+    live_session_acknowledged: false,
+    live_signer_mode: "browser_wallet"
   },
   tokens: [],
   events: [],
@@ -227,6 +259,10 @@ function formatDuration(totalSeconds: number): string {
   return `${days}d ${hours % 24}h`;
 }
 
+function shortAddress(value: string): string {
+  return value ? `${value.slice(0, 6)}...${value.slice(-4)}` : "not connected";
+}
+
 function dateTimeLocalToIso(value: string): string | undefined {
   if (!value) return undefined;
   const date = new Date(value);
@@ -245,6 +281,7 @@ type QueueFilter = "all" | "open" | "profitable" | "losses";
 type QueueSort = "newest" | "score" | "pnl" | "creator";
 type WorkspacePage = "monitor" | "analysis" | "backtests" | "review" | "data";
 type SettingsPage = "source" | "strategy" | "risk" | "exits" | "simulation" | "advanced" | "security";
+type LiveWalletMethod = "browser_wallet" | "local_signer_daemon";
 
 const pnlTimeframes: Array<{ label: string; value: PnlTimeframe; millis: number | null }> = [
   { label: "5m", value: "5m", millis: 5 * 60 * 1000 },
@@ -402,6 +439,20 @@ function App() {
   const [watchdogStatus, setWatchdogStatus] = React.useState<WatchdogStatus | null>(null);
   const [solanaStatus, setSolanaStatus] = React.useState<SolanaStatus | null>(null);
   const [liveRequests, setLiveRequests] = React.useState<LiveExecutionRequest[]>([]);
+  const [liveStatus, setLiveStatus] = React.useState<LiveStatus | null>(null);
+  const [liveAudit, setLiveAudit] = React.useState<LiveExecutionAudit[]>([]);
+  const [livePositions, setLivePositions] = React.useState<LivePosition[]>([]);
+  const [walletPublicKey, setWalletPublicKey] = React.useState(() => window.localStorage.getItem("cryptoarc_wallet_public_key") || "");
+  const [walletBalanceSol, setWalletBalanceSol] = React.useState<number | null>(null);
+  const [liveWalletOpen, setLiveWalletOpen] = React.useState(false);
+  const [liveWalletMethod, setLiveWalletMethod] = React.useState<LiveWalletMethod>("browser_wallet");
+  const [liveAction, setLiveAction] = React.useState<"buy" | "sell">("buy");
+  const [liveMint, setLiveMint] = React.useState("");
+  const [liveAmount, setLiveAmount] = React.useState("0.001");
+  const [liveSlippage, setLiveSlippage] = React.useState(5);
+  const [livePriorityFee, setLivePriorityFee] = React.useState(0.00001);
+  const [livePool, setLivePool] = React.useState("pump");
+  const [activeLiveAudit, setActiveLiveAudit] = React.useState<LiveExecutionAudit | null>(null);
   const [backtestLimit, setBacktestLimit] = React.useState(80);
   const [backtestProfile, setBacktestProfile] = React.useState<BotSettings["strategy_profile"]>("balanced");
   const [backtestDateFrom, setBacktestDateFrom] = React.useState("");
@@ -491,6 +542,8 @@ function App() {
   const settings = snapshot.settings;
   const stats = snapshot.stats;
   const running = snapshot.status === "running";
+  const liveCapsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
+  const latestLiveAudit = liveAudit[0] ?? null;
   const selectedToken = snapshot.tokens.find((token) => token.id === selectedTokenId) ?? null;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
@@ -617,8 +670,22 @@ function App() {
     }
   }
 
+  async function refreshConnectedWalletBalance(publicKey = walletPublicKey) {
+    if (!publicKey) {
+      setWalletBalanceSol(null);
+      return;
+    }
+    try {
+      const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
+      const lamports = await connection.getBalance(new PublicKey(publicKey));
+      setWalletBalanceSol(lamports / 1_000_000_000);
+    } catch {
+      setWalletBalanceSol(null);
+    }
+  }
+
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -643,7 +710,10 @@ function App() {
       fetchSourceAdapters(),
       fetchWatchdogStatus(),
       fetchSolanaStatus(),
-      fetchLiveRequests()
+      fetchLiveRequests(),
+      fetchLiveStatus(walletPublicKey),
+      fetchLiveAudit(),
+      fetchLivePositions(walletPublicKey)
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -670,6 +740,10 @@ function App() {
     setWatchdogStatus(watchdog);
     setSolanaStatus(solana);
     setLiveRequests(liveRows);
+    setLiveStatus(liveState);
+    setLiveAudit(auditRows);
+    setLivePositions(livePositionRows);
+    refreshConnectedWalletBalance().catch(() => undefined);
   }
 
   async function loadReplayTimeline(tokenId: string) {
@@ -683,7 +757,7 @@ function App() {
     }
   }
 
-  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "all") {
+  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all") {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
@@ -704,9 +778,103 @@ function App() {
     }
   }
 
+  async function connectBrowserWallet() {
+    try {
+      if (!window.solana) {
+        setApiError("Browser wallet not found. Install or unlock Phantom/Solflare and refresh.");
+        return;
+      }
+      const result = await window.solana.connect();
+      const publicKey = result.publicKey.toString();
+      setWalletPublicKey(publicKey);
+      window.localStorage.setItem("cryptoarc_wallet_public_key", publicKey);
+      setLiveStatus(await fetchLiveStatus(publicKey));
+      setLivePositions(await fetchLivePositions(publicKey));
+      await refreshConnectedWalletBalance(publicKey);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Wallet connect failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function acknowledgeLiveRisk() {
+    try {
+      await acknowledgeLiveSession();
+      const updated = await fetchSnapshot();
+      setSnapshot(updated);
+      setLiveStatus(await fetchLiveStatus(walletPublicKey));
+    } catch (error) {
+      setApiError(`Live acknowledgement failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function createLivePreview() {
+    try {
+      const audit = await createLiveQuote({
+        action: liveAction,
+        mint: liveMint,
+        amount: liveAmount,
+        denominated_in_sol: liveAction === "buy",
+        slippage_pct: liveSlippage,
+        priority_fee_sol: livePriorityFee,
+        pool: livePool,
+        wallet_public_key: walletPublicKey,
+        signer_mode: "browser_wallet"
+      });
+      const simulated = await recordLiveSimulation(audit.id, false, "Browser wallet simulation must be reviewed before signing.");
+      setActiveLiveAudit(simulated);
+      setLiveAudit((current) => [simulated, ...current.filter((item) => item.id !== simulated.id)]);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Live quote failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function signAndSendLiveAudit() {
+    if (!activeLiveAudit) return;
+    try {
+      if (!window.solana) throw new Error("Browser wallet not connected");
+      const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
+      if (!encoded) throw new Error("No unsigned transaction is available");
+      const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+      const transaction = VersionedTransaction.deserialize(bytes);
+      let signature = "";
+      if (window.solana.signAndSendTransaction) {
+        signature = (await window.solana.signAndSendTransaction(transaction)).signature;
+      } else if (window.solana.signTransaction) {
+        const signed = await window.solana.signTransaction(transaction);
+        const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
+        signature = await connection.sendTransaction(signed);
+      } else {
+        throw new Error("Wallet does not support transaction signing");
+      }
+      const submitted = await submitLiveAudit(activeLiveAudit.id, signature);
+      const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
+      const confirmation = await connection.confirmTransaction(signature, "confirmed");
+      const confirmed = await confirmLiveAudit(submitted.id, confirmation.value.err ? "failed" : "confirmed", confirmation.value.err ? JSON.stringify(confirmation.value.err) : "");
+      setActiveLiveAudit(confirmed);
+      setLiveAudit((current) => [confirmed, ...current.filter((item) => item.id !== confirmed.id)]);
+      setLivePositions(await fetchLivePositions(walletPublicKey));
+    } catch (error) {
+      setApiError(`Wallet submit failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   React.useEffect(() => {
     refreshResearchData().catch(() => undefined);
   }, []);
+
+  React.useEffect(() => {
+    if (!walletPublicKey) {
+      setWalletBalanceSol(null);
+      return;
+    }
+    Promise.all([
+      fetchLiveStatus(walletPublicKey).then(setLiveStatus),
+      fetchLivePositions(walletPublicKey).then(setLivePositions),
+      refreshConnectedWalletBalance(walletPublicKey)
+    ]).catch(() => undefined);
+  }, [walletPublicKey, snapshot.settings.solana_rpc_url]);
 
   return (
     <main className="app-shell">
@@ -723,12 +891,21 @@ function App() {
         <section className="panel">
           <div className="panel-title">
             <Wallet size={15} />
-            Wallet Safety
+            Live Wallet
           </div>
-          <button className="wallet-button" disabled>
-            Live wallet locked
+          <button className="wallet-button" onClick={() => setLiveWalletOpen(true)}>
+            {walletPublicKey ? "Manage live wallet" : "Connect wallet"}
           </button>
-          <p className="muted">Paper trading only. No keys, no signatures, no live transactions.</p>
+          <div className="wallet-summary">
+            <span>Wallet <strong>{shortAddress(walletPublicKey)}</strong></span>
+            <span>Balance <strong>{walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`}</strong></span>
+            <span>Live env <strong>{liveStatus?.env_live_enabled ? "enabled" : "disabled"}</strong></span>
+            <span>Caps <strong>{liveCapsSet ? "set" : "required"}</strong></span>
+            <span>Ack <strong>{settings.live_session_acknowledged ? "done" : "needed"}</strong></span>
+            <span>Gates <strong>{liveStatus?.live_execution_available ? "open" : "blocked"}</strong></span>
+            <span>Latest <strong>{latestLiveAudit?.status ?? "none"}</strong></span>
+          </div>
+          <p className="muted">Connect and review wallet state anytime. Quotes and signing stay blocked until live mode is enabled.</p>
         </section>
 
         <section className="panel control-panel">
@@ -994,6 +1171,7 @@ function App() {
             watchdogStatus={watchdogStatus}
             solanaStatus={solanaStatus}
             liveRequests={liveRequests}
+            liveAudit={liveAudit}
             auditEvents={snapshot.events}
             onRefresh={refreshResearchData}
             onRecover={async () => {
@@ -1007,6 +1185,36 @@ function App() {
         )}
       </section>
       {apiError && <button className="api-error" onClick={() => setApiError("")}>{apiError}</button>}
+      {liveWalletOpen && (
+        <LiveWalletModal
+          method={liveWalletMethod}
+          onMethodChange={setLiveWalletMethod}
+          walletPublicKey={walletPublicKey}
+          walletBalanceSol={walletBalanceSol}
+          settings={settings}
+          liveStatus={liveStatus}
+          liveAudit={liveAudit}
+          livePositions={livePositions}
+          liveAction={liveAction}
+          liveMint={liveMint}
+          liveAmount={liveAmount}
+          liveSlippage={liveSlippage}
+          livePriorityFee={livePriorityFee}
+          livePool={livePool}
+          activeLiveAudit={activeLiveAudit}
+          onClose={() => setLiveWalletOpen(false)}
+          onConnectWallet={connectBrowserWallet}
+          onAcknowledgeLive={acknowledgeLiveRisk}
+          onLiveActionChange={setLiveAction}
+          onLiveMintChange={setLiveMint}
+          onLiveAmountChange={setLiveAmount}
+          onLiveSlippageChange={setLiveSlippage}
+          onLivePriorityFeeChange={setLivePriorityFee}
+          onLivePoolChange={setLivePool}
+          onCreateLivePreview={createLivePreview}
+          onSignAndSendLive={signAndSendLiveAudit}
+        />
+      )}
       {settingsOpen && (
         <SettingsModal
           settings={settings}
@@ -1020,6 +1228,220 @@ function App() {
       {selectedToken && <TokenDetail token={selectedToken} onClose={() => setSelectedTokenId(null)} />}
       <ToastStack toasts={toasts} onDismiss={(id) => setToasts((current) => current.filter((toast) => toast.id !== id))} />
     </main>
+  );
+}
+
+function LiveWalletModal({
+  method,
+  onMethodChange,
+  walletPublicKey,
+  walletBalanceSol,
+  settings,
+  liveStatus,
+  liveAudit,
+  livePositions,
+  liveAction,
+  liveMint,
+  liveAmount,
+  liveSlippage,
+  livePriorityFee,
+  livePool,
+  activeLiveAudit,
+  onClose,
+  onConnectWallet,
+  onAcknowledgeLive,
+  onLiveActionChange,
+  onLiveMintChange,
+  onLiveAmountChange,
+  onLiveSlippageChange,
+  onLivePriorityFeeChange,
+  onLivePoolChange,
+  onCreateLivePreview,
+  onSignAndSendLive
+}: {
+  method: LiveWalletMethod;
+  onMethodChange: (method: LiveWalletMethod) => void;
+  walletPublicKey: string;
+  walletBalanceSol: number | null;
+  settings: BotSettings;
+  liveStatus: LiveStatus | null;
+  liveAudit: LiveExecutionAudit[];
+  livePositions: LivePosition[];
+  liveAction: "buy" | "sell";
+  liveMint: string;
+  liveAmount: string;
+  liveSlippage: number;
+  livePriorityFee: number;
+  livePool: string;
+  activeLiveAudit: LiveExecutionAudit | null;
+  onClose: () => void;
+  onConnectWallet: () => Promise<void>;
+  onAcknowledgeLive: () => Promise<void>;
+  onLiveActionChange: (action: "buy" | "sell") => void;
+  onLiveMintChange: (mint: string) => void;
+  onLiveAmountChange: (amount: string) => void;
+  onLiveSlippageChange: (slippage: number) => void;
+  onLivePriorityFeeChange: (fee: number) => void;
+  onLivePoolChange: (pool: string) => void;
+  onCreateLivePreview: () => Promise<void>;
+  onSignAndSendLive: () => Promise<void>;
+}) {
+  const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
+  const latestAudit = liveAudit[0] ?? null;
+  const envEnabled = Boolean(liveStatus?.env_live_enabled);
+  const quoteBlocked = !envEnabled || method !== "browser_wallet";
+  const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
+
+  return (
+    <div className="overlay">
+      <section className="modal live-wallet-modal">
+        <div className="modal-heading">
+          <div>
+            <p className="eyebrow">Local live execution</p>
+            <h3>Live Wallet</h3>
+            <p>Manual browser-wallet buy and sell flow with quote previews, wallet approval, and audit records.</p>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="Close live wallet">
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="wallet-method-grid">
+          <button className={method === "browser_wallet" ? "wallet-method active" : "wallet-method"} onClick={() => onMethodChange("browser_wallet")}>
+            <strong>Browser wallet</strong>
+            <span>Manual approval through Phantom, Solflare, or a compatible Solana wallet.</span>
+          </button>
+          <button className="wallet-method disabled" disabled onClick={() => onMethodChange("local_signer_daemon")}>
+            <strong>Local signer daemon</strong>
+            <span>Coming later. Required for any future unattended signing capability.</span>
+          </button>
+        </div>
+
+        <section className="live-wallet-step">
+          <div className="section-heading">
+            <div>
+              <h3>Connect Wallet</h3>
+              <p>CryptoARC stores the public key for status checks only. Reconnect and signing still require wallet approval.</p>
+            </div>
+            <Wallet size={18} />
+          </div>
+          <div className="button-row fit-row">
+            <button className="secondary-action compact-action" onClick={onConnectWallet} disabled={method !== "browser_wallet"}>
+              {walletPublicKey ? "Reconnect Browser Wallet" : "Connect Browser Wallet"}
+            </button>
+          </div>
+          <div className="security-list wallet-info-grid">
+            <span>Wallet: <strong>{shortAddress(walletPublicKey)}</strong></span>
+            <span>SOL balance: <strong>{walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`}</strong></span>
+            <span>Live env: <strong>{envEnabled ? "enabled" : "disabled"}</strong></span>
+            <span>Caps: <strong>{capsSet ? "set" : "required"}</strong></span>
+            <span>Acknowledgement: <strong>{settings.live_session_acknowledged ? "done" : "needed"}</strong></span>
+            <span>Live gates: <strong>{liveStatus?.live_execution_available ? "open" : "blocked"}</strong></span>
+            <span>Auto-sell: <strong>{liveStatus?.auto_sell_available ? "available" : "not for browser wallet"}</strong></span>
+            <span>Latest audit: <strong>{latestAudit?.status ?? "none"}</strong></span>
+          </div>
+        </section>
+
+        <section className="live-wallet-step">
+          <div className="section-heading">
+            <div>
+              <h3>Blockers & Caps</h3>
+              <p>Review the current gate state before creating a quote preview.</p>
+            </div>
+            <Shield size={18} />
+          </div>
+          <div className="mini-list compact-list">
+            {blockers.length ? blockers.map((blocker) => (
+              <article key={blocker}>
+                <strong>{blocker}</strong>
+              </article>
+            )) : (
+              <article>
+                <strong>Manual live prerequisites are passing.</strong>
+              </article>
+            )}
+          </div>
+          <div className="button-row fit-row">
+            <button className="secondary-action compact-action" onClick={onAcknowledgeLive}>
+              Acknowledge Risk
+            </button>
+          </div>
+        </section>
+
+        <section className="live-wallet-step">
+          <div className="section-heading">
+            <div>
+              <h3>Quote Preview</h3>
+              <p>Quotes use PumpPortal local transactions and stay manual. Simulation warnings are recorded for review.</p>
+            </div>
+            <Target size={18} />
+          </div>
+          <div className="live-form">
+            <label>
+              Action
+              <select value={liveAction} onChange={(event) => onLiveActionChange(event.target.value as "buy" | "sell")}>
+                <option value="buy">buy</option>
+                <option value="sell">sell</option>
+              </select>
+            </label>
+            <label>
+              Mint
+              <input value={liveMint} onChange={(event) => onLiveMintChange(event.target.value)} placeholder="Pump.fun mint address" />
+            </label>
+            <label>
+              Amount
+              <input value={liveAmount} onChange={(event) => onLiveAmountChange(event.target.value)} placeholder={liveAction === "sell" ? "100%" : "0.001"} />
+            </label>
+            <SettingInput label="Slippage %" value={liveSlippage} step="0.1" onChange={(value) => onLiveSlippageChange(Number(value))} />
+            <SettingInput label="Priority fee SOL" value={livePriorityFee} step="0.00001" onChange={(value) => onLivePriorityFeeChange(Number(value))} />
+            <label>
+              Pool
+              <select value={livePool} onChange={(event) => onLivePoolChange(event.target.value)}>
+                {["pump", "auto", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk"].map((pool) => <option key={pool} value={pool}>{pool}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="button-row fit-row">
+            <button className="secondary-action compact-action" onClick={onCreateLivePreview} disabled={quoteBlocked}>
+              Create Preview
+            </button>
+            <button className="danger compact-action" onClick={onSignAndSendLive} disabled={quoteBlocked || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>
+              Sign & Send
+            </button>
+          </div>
+          {!envEnabled ? <p className="settings-note">Live env is disabled, so quotes and signing are blocked. Wallet connection and status checks still work.</p> : null}
+          {activeLiveAudit ? (
+            <div className="mini-list compact-list">
+              <article>
+                <strong>{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
+                <span>{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
+                <p>{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || "Preview ready for wallet review."}</p>
+              </article>
+            </div>
+          ) : null}
+        </section>
+
+        <section className="live-wallet-step">
+          <div className="section-heading">
+            <div>
+              <h3>Wallet Positions</h3>
+              <p>RPC token balances for mints touched by live audit records.</p>
+            </div>
+            <Database size={18} />
+          </div>
+          <div className="mini-list compact-list">
+            {livePositions.slice(0, 6).map((position) => (
+              <article key={position.mint}>
+                <strong>{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
+                <span>{position.mint}</span>
+                {position.warning ? <p>{position.warning}</p> : null}
+              </article>
+            ))}
+            {!livePositions.length ? <p>No live wallet positions loaded.</p> : null}
+          </div>
+        </section>
+      </section>
+    </div>
   );
 }
 
@@ -1866,6 +2288,7 @@ function DataDashboard({
   watchdogStatus,
   solanaStatus,
   liveRequests,
+  liveAudit,
   auditEvents,
   onRefresh,
   onRecover,
@@ -1891,11 +2314,12 @@ function DataDashboard({
   watchdogStatus: WatchdogStatus | null;
   solanaStatus: SolanaStatus | null;
   liveRequests: LiveExecutionRequest[];
+  liveAudit: LiveExecutionAudit[];
   auditEvents: TradeEvent[];
   onRefresh: () => Promise<void>;
   onRecover: () => Promise<void>;
   onReviewLiveRequest: (requestId: string, status: "reviewed" | "rejected") => Promise<void>;
-  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "all") => Promise<void>;
+  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all") => Promise<void>;
 }) {
   return (
     <section className="dashboard-page">
@@ -1933,14 +2357,14 @@ function DataDashboard({
         <Metric label="Live requests" value={(summary?.live_execution_requests ?? liveRequests.length).toString()} />
       </div>
       <div className="maintenance-row">
-        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests"] as const).map((target) => (
+        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits"] as const).map((target) => (
           <button key={target} className="danger outline" onClick={() => onClear(target)}>
             <Trash2 size={14} /> Clear {target.replace("_", " ")}
           </button>
         ))}
       </div>
       <div className="maintenance-row">
-        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"] as const).map((target) => (
+        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "all"] as const).map((target) => (
           <a key={target} className="export-button" href={exportUrl(target)} target="_blank" rel="noreferrer">
             <Download size={14} /> Export {target.replace("_", " ")}
           </a>
@@ -1977,6 +2401,26 @@ function DataDashboard({
                 <strong>{action}</strong>
               </article>
             ))}
+          </div>
+        </section>
+        <section className="research-card">
+          <div className="section-heading">
+            <div>
+              <h3>Live Execution Audit</h3>
+              <p>Quotes, simulations, signatures, confirmations, and warnings.</p>
+            </div>
+            <Database size={18} />
+          </div>
+          <div className="mini-list">
+            {liveAudit.slice(0, 12).map((audit) => (
+              <article key={audit.id}>
+                <strong>{audit.action} / {audit.amount} / {audit.status}</strong>
+                <span>{new Date(audit.created_at).toLocaleString()} / {audit.mint}</span>
+                {audit.transaction_signature ? <a href={`https://solscan.io/tx/${audit.transaction_signature}`} target="_blank" rel="noreferrer">Solscan</a> : null}
+                <p>{[...audit.warnings, ...audit.errors].join(" / ") || audit.final_status}</p>
+              </article>
+            ))}
+            {!liveAudit.length ? <p>No live execution audit records yet.</p> : null}
           </div>
         </section>
         <section className="research-card">
@@ -2646,6 +3090,19 @@ function SettingsModal({
                   <input value={draft.watch_wallet_address} onChange={(event) => updateDraft("watch_wallet_address", event.target.value)} placeholder="Wallet public key for balance checks" />
                 </label>
                 <SettingInput label="Manual live max SOL" value={draft.manual_live_max_sol} step="0.001" onChange={(v) => updateNumber("manual_live_max_sol", v)} />
+                <SettingInput label="Live max trade SOL" value={draft.live_max_trade_sol} step="0.001" onChange={(v) => updateNumber("live_max_trade_sol", v)} />
+                <SettingInput label="Live daily loss cap SOL" value={draft.live_daily_loss_cap_sol} step="0.001" onChange={(v) => updateNumber("live_daily_loss_cap_sol", v)} />
+                <SettingInput label="Live wallet exposure cap SOL" value={draft.live_wallet_exposure_cap_sol} step="0.001" onChange={(v) => updateNumber("live_wallet_exposure_cap_sol", v)} />
+                <SettingInput label="Live max open positions" value={draft.live_max_open_positions} onChange={(v) => updateNumber("live_max_open_positions", v)} />
+                <SettingInput label="Live max slippage %" value={draft.live_max_slippage_pct} step="0.1" onChange={(v) => updateNumber("live_max_slippage_pct", v)} />
+                <SettingInput label="Live priority fee cap SOL" value={draft.live_priority_fee_cap_sol} step="0.00001" onChange={(v) => updateNumber("live_priority_fee_cap_sol", v)} />
+                <label>
+                  Live signer mode
+                  <select value={draft.live_signer_mode} onChange={(event) => updateDraft("live_signer_mode", event.target.value as BotSettings["live_signer_mode"])}>
+                    <option value="browser_wallet">browser wallet</option>
+                    <option value="local_signer_daemon">local signer daemon later</option>
+                  </select>
+                </label>
                 <label className="toggle-line">
                   <input
                     type="checkbox"

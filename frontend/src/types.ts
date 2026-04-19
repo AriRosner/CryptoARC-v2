@@ -86,6 +86,14 @@ export interface BotSettings {
   manual_live_enabled: boolean;
   manual_live_max_sol: number;
   autonomous_live_enabled: boolean;
+  live_max_trade_sol: number;
+  live_daily_loss_cap_sol: number;
+  live_wallet_exposure_cap_sol: number;
+  live_max_open_positions: number;
+  live_max_slippage_pct: number;
+  live_priority_fee_cap_sol: number;
+  live_session_acknowledged: boolean;
+  live_signer_mode: "browser_wallet" | "local_signer_daemon";
 }
 
 export interface TokenSignal {
@@ -249,6 +257,8 @@ export interface DataSummary {
   trade_labels: number;
   strategy_presets: number;
   live_execution_requests: number;
+  live_sessions: number;
+  live_execution_audits: number;
 }
 
 export interface TradeRecord {
@@ -601,6 +611,63 @@ export interface LiveExecutionRequest {
   mode: string;
   payload: Record<string, unknown>;
   reviewed_at: string | null;
+}
+
+export interface SignerStatus {
+  mode: "browser_wallet" | "local_signer_daemon";
+  connected: boolean;
+  wallet_public_key: string;
+  can_sign: boolean;
+  can_unattended_sign: boolean;
+  message: string;
+}
+
+export interface LiveStatus {
+  mode: string;
+  paper_default: boolean;
+  live_execution_available: boolean;
+  env_live_enabled: boolean;
+  effective_live_enabled: boolean;
+  blockers: string[];
+  signer: SignerStatus;
+  caps: Record<string, number>;
+  session_acknowledged: boolean;
+  readiness: ReadinessStatus;
+  local_desktop_only: boolean;
+  autonomous_live_available: boolean;
+  auto_sell_available: boolean;
+  autonomy_blockers: string[];
+}
+
+export interface LiveExecutionAudit {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  action: "buy" | "sell";
+  mint: string;
+  amount: string;
+  status: string;
+  signer_mode: string;
+  wallet_public_key: string;
+  quote: Record<string, unknown>;
+  simulation: Record<string, unknown>;
+  request: Record<string, unknown>;
+  caps_snapshot: Record<string, unknown>;
+  balance_snapshot: Record<string, unknown>;
+  transaction_signature: string;
+  confirmation_status: string;
+  errors: string[];
+  warnings: string[];
+  final_status: string;
+}
+
+export interface LivePosition {
+  mint: string;
+  symbol: string;
+  token_balance: number;
+  estimated_value_sol: number;
+  source: string;
+  warning: string;
 }
 
 export interface BotSnapshot {

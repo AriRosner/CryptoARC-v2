@@ -115,6 +115,14 @@ class BotSettings:
     manual_live_enabled: bool = False
     manual_live_max_sol: float = 0.05
     autonomous_live_enabled: bool = False
+    live_max_trade_sol: float = 0.0
+    live_daily_loss_cap_sol: float = 0.0
+    live_wallet_exposure_cap_sol: float = 0.0
+    live_max_open_positions: int = 0
+    live_max_slippage_pct: float = 0.0
+    live_priority_fee_cap_sol: float = 0.0
+    live_session_acknowledged: bool = False
+    live_signer_mode: str = "browser_wallet"
 
 
 @dataclass(slots=True)
@@ -235,6 +243,140 @@ class LiveExecutionRequest:
         data["created_at"] = self.created_at.isoformat()
         data["reviewed_at"] = self.reviewed_at.isoformat() if self.reviewed_at else None
         return data
+
+
+@dataclass(slots=True)
+class LiveSession:
+    id: str
+    created_at: datetime
+    status: str
+    signer_mode: str
+    wallet_public_key: str
+    caps_snapshot: dict[str, Any] = field(default_factory=dict)
+    acknowledged_at: datetime | None = None
+    closed_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["acknowledged_at"] = self.acknowledged_at.isoformat() if self.acknowledged_at else None
+        payload["closed_at"] = self.closed_at.isoformat() if self.closed_at else None
+        return payload
+
+
+@dataclass(slots=True)
+class SignerStatus:
+    mode: str
+    connected: bool
+    wallet_public_key: str = ""
+    can_sign: bool = False
+    can_unattended_sign: bool = False
+    message: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class LivePosition:
+    mint: str
+    symbol: str = ""
+    token_balance: float = 0.0
+    estimated_value_sol: float = 0.0
+    source: str = "wallet_rpc"
+    warning: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class LiveExecutionIntent:
+    id: str
+    created_at: datetime
+    action: str
+    mint: str
+    amount: str
+    denominated_in_sol: bool
+    signer_mode: str
+    wallet_public_key: str
+    status: str = "created"
+    reason: str = ""
+    source: str = "dashboard"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class LiveQuote:
+    id: str
+    created_at: datetime
+    intent_id: str
+    provider: str
+    action: str
+    mint: str
+    amount: str
+    denominated_in_sol: bool
+    slippage_pct: float
+    priority_fee_sol: float
+    pool: str
+    status: str
+    unsigned_transaction_base64: str = ""
+    error: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class LiveSimulation:
+    id: str
+    created_at: datetime
+    quote_id: str
+    status: str
+    ok: bool
+    warning: str = ""
+    error: str = ""
+    result: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class LiveExecutionAudit:
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    action: str
+    mint: str
+    amount: str
+    status: str
+    signer_mode: str
+    wallet_public_key: str
+    quote: dict[str, Any] = field(default_factory=dict)
+    simulation: dict[str, Any] = field(default_factory=dict)
+    request: dict[str, Any] = field(default_factory=dict)
+    caps_snapshot: dict[str, Any] = field(default_factory=dict)
+    balance_snapshot: dict[str, Any] = field(default_factory=dict)
+    transaction_signature: str = ""
+    confirmation_status: str = ""
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    final_status: str = "pending"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        return payload
 
 
 @dataclass(slots=True)

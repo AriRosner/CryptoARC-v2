@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionRequest, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 class Storage:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
@@ -156,6 +156,24 @@ class Storage:
                 """
             )
             connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_sessions (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_execution_audits (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
             )
@@ -229,6 +247,12 @@ class Storage:
     def count_live_execution_requests(self) -> int:
         return self._count_table("live_execution_requests")
 
+    def count_live_sessions(self) -> int:
+        return self._count_table("live_sessions")
+
+    def count_live_execution_audits(self) -> int:
+        return self._count_table("live_execution_audits")
+
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
@@ -272,6 +296,25 @@ class Storage:
 
     def save_live_execution_request(self, request: LiveExecutionRequest) -> None:
         self._save_payload("live_execution_requests", request.id, request.to_dict(), request.created_at)
+
+    def load_live_sessions(self, limit: int = 50) -> list[LiveSession]:
+        return [self._live_session_from_payload(payload) for payload in self._load_payloads("live_sessions", limit)]
+
+    def save_live_session(self, session: LiveSession) -> None:
+        self._save_payload("live_sessions", session.id, session.to_dict(), session.created_at)
+
+    def load_live_execution_audits(self, limit: int = 100) -> list[LiveExecutionAudit]:
+        return [self._live_execution_audit_from_payload(payload) for payload in self._load_payloads("live_execution_audits", limit)]
+
+    def load_live_execution_audit(self, audit_id: str) -> LiveExecutionAudit | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM live_execution_audits WHERE id = ?", (audit_id,)).fetchone()
+        if not row:
+            return None
+        return self._live_execution_audit_from_payload(json.loads(row["payload"]))
+
+    def save_live_execution_audit(self, audit: LiveExecutionAudit) -> None:
+        self._save_payload("live_execution_audits", audit.id, audit.to_dict(), audit.created_at)
 
     def _load_payloads(self, table: str, limit: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -530,6 +573,14 @@ class Storage:
         with self._connect() as connection:
             connection.execute("DELETE FROM live_execution_requests")
 
+    def clear_live_sessions(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM live_sessions")
+
+    def clear_live_execution_audits(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM live_execution_audits")
+
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -586,6 +637,19 @@ class Storage:
         payload["reviewed_at"] = datetime.fromisoformat(payload["reviewed_at"]) if payload.get("reviewed_at") else None
         allowed = set(LiveExecutionRequest.__dataclass_fields__.keys())
         return LiveExecutionRequest(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _live_session_from_payload(self, payload: dict[str, Any]) -> LiveSession:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["acknowledged_at"] = datetime.fromisoformat(payload["acknowledged_at"]) if payload.get("acknowledged_at") else None
+        payload["closed_at"] = datetime.fromisoformat(payload["closed_at"]) if payload.get("closed_at") else None
+        allowed = set(LiveSession.__dataclass_fields__.keys())
+        return LiveSession(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _live_execution_audit_from_payload(self, payload: dict[str, Any]) -> LiveExecutionAudit:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["updated_at"] = datetime.fromisoformat(payload["updated_at"])
+        allowed = set(LiveExecutionAudit.__dataclass_fields__.keys())
+        return LiveExecutionAudit(**{key: value for key, value in payload.items() if key in allowed})
 
     def _strategy_decision_from_payload(self, payload: dict[str, Any]) -> StrategyDecisionRecord:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

@@ -101,6 +101,14 @@ class SettingsPatch(BaseModel):
     manual_live_enabled: bool | None = None
     manual_live_max_sol: float | None = Field(default=None, gt=0, le=10)
     autonomous_live_enabled: bool | None = None
+    live_max_trade_sol: float | None = Field(default=None, ge=0, le=100)
+    live_daily_loss_cap_sol: float | None = Field(default=None, ge=0, le=100)
+    live_wallet_exposure_cap_sol: float | None = Field(default=None, ge=0, le=1000)
+    live_max_open_positions: int | None = Field(default=None, ge=0, le=100)
+    live_max_slippage_pct: float | None = Field(default=None, ge=0, le=100)
+    live_priority_fee_cap_sol: float | None = Field(default=None, ge=0, le=1)
+    live_session_acknowledged: bool | None = None
+    live_signer_mode: Literal["browser_wallet", "local_signer_daemon"] | None = None
 
 
 class BacktestRequest(BaseModel):
@@ -153,6 +161,42 @@ class LiveExecutionPayload(BaseModel):
 class LiveExecutionReviewPayload(BaseModel):
     status: Literal["reviewed", "rejected"]
     note: str = Field(default="", max_length=500)
+
+
+class LiveSessionStartPayload(BaseModel):
+    wallet_public_key: str = Field(default="", max_length=100)
+    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+
+
+class LiveQuotePayload(BaseModel):
+    action: Literal["buy", "sell"]
+    mint: str = Field(min_length=1, max_length=100)
+    amount: str = Field(min_length=1, max_length=40)
+    denominated_in_sol: bool = True
+    slippage_pct: float = Field(ge=0, le=100)
+    priority_fee_sol: float = Field(ge=0, le=1)
+    pool: Literal["pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto"] = "pump"
+    wallet_public_key: str = Field(default="", max_length=100)
+    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+
+
+class LiveSimulationPayload(BaseModel):
+    audit_id: str
+    ok: bool = False
+    warning: str = Field(default="", max_length=500)
+    error: str = Field(default="", max_length=500)
+    result: dict = Field(default_factory=dict)
+
+
+class LiveSubmitPayload(BaseModel):
+    audit_id: str
+    signature: str = Field(min_length=1, max_length=200)
+
+
+class LiveConfirmPayload(BaseModel):
+    audit_id: str
+    confirmation_status: str = Field(default="confirmed", max_length=50)
+    error: str = Field(default="", max_length=500)
 
 
 def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
@@ -574,6 +618,79 @@ async def live_requests() -> list[dict]:
     return state.live_requests()
 
 
+@app.get("/api/live/status", dependencies=[Depends(require_auth)])
+async def live_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
+    return state.live_status(config.live_trading_enabled, wallet_public_key, signer_mode)
+
+
+@app.get("/api/live/wallet/status", dependencies=[Depends(require_auth)])
+async def live_wallet_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
+    return state.signer_status(signer_mode, wallet_public_key)
+
+
+@app.post("/api/live/session/start", dependencies=[Depends(require_auth)])
+async def live_session_start(payload: LiveSessionStartPayload) -> dict:
+    return state.start_live_session(config.live_trading_enabled, payload.wallet_public_key, payload.signer_mode)
+
+
+@app.post("/api/live/session/acknowledge", dependencies=[Depends(require_auth)])
+async def live_session_acknowledge() -> dict:
+    return state.acknowledge_live_session()
+
+
+@app.post("/api/live/quote", dependencies=[Depends(require_auth)])
+async def live_quote(payload: LiveQuotePayload) -> dict:
+    try:
+        return state.live_quote(
+            config.live_trading_enabled,
+            payload.action,
+            payload.mint,
+            payload.amount,
+            payload.denominated_in_sol,
+            payload.slippage_pct,
+            payload.priority_fee_sol,
+            payload.pool,
+            payload.wallet_public_key,
+            payload.signer_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/simulate", dependencies=[Depends(require_auth)])
+async def live_simulate(payload: LiveSimulationPayload) -> dict:
+    try:
+        return state.live_simulate(payload.audit_id, payload.ok, payload.warning, payload.error, payload.result)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/submit", dependencies=[Depends(require_auth)])
+async def live_submit(payload: LiveSubmitPayload) -> dict:
+    try:
+        return state.live_submit(payload.audit_id, payload.signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/confirm", dependencies=[Depends(require_auth)])
+async def live_confirm(payload: LiveConfirmPayload) -> dict:
+    try:
+        return state.live_confirm(payload.audit_id, payload.confirmation_status, payload.error)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
+@app.get("/api/live/positions", dependencies=[Depends(require_auth)])
+async def live_positions(wallet_public_key: str = "") -> list[dict]:
+    return state.live_positions(wallet_public_key)
+
+
+@app.get("/api/live/audit", dependencies=[Depends(require_auth)])
+async def live_audit() -> list[dict]:
+    return state.live_audit()
+
+
 @app.post("/api/live/manual-request", dependencies=[Depends(require_auth)])
 async def manual_live_request(payload: LiveExecutionPayload) -> dict:
     result = state.create_manual_live_request(payload.action, payload.mint, payload.amount_sol)
@@ -618,14 +735,14 @@ async def data_summary() -> dict:
 
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
-async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"]) -> dict:
+async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "all"]) -> dict:
     result = state.clear_data(target)
     await broadcast_snapshot()
     return result
 
 
 @app.get("/api/export/{target}", dependencies=[Depends(require_auth)])
-async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "all"]) -> JSONResponse:
+async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "all"]) -> JSONResponse:
     return JSONResponse(
         content=state.export_data(target),
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-{target}.json"'},
