@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -782,6 +783,30 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(len(ledger["positions"]), 1)
             self.assertGreater(ledger["summary"]["unrealized_pnl_sol"], 0)
             self.assertEqual(other_wallet["positions"], [])
+
+    def test_snapshot_keeps_all_non_skipped_tokens_for_monitor_filters(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            for index in range(90):
+                token = self.make_token()
+                token.id = f"skip_{index}"
+                token.mint = f"SkipMint{index}"
+                token.detected_at = utc_now()
+                token.status = TokenStatus.SKIPPED
+                state.storage.save_token(token)
+            for index in range(14):
+                token = self.make_token()
+                token.id = f"sold_{index}"
+                token.mint = f"SoldMint{index}"
+                token.status = TokenStatus.PAPER_SOLD
+                token.pnl_sol = 0.001
+                state.storage.save_token(token)
+            state.tokens = deque(state.storage.load_tokens(), maxlen=80)
+
+            snapshot = state.snapshot()
+            non_skipped = [token for token in snapshot.tokens if token.status != TokenStatus.SKIPPED]
+
+            self.assertEqual(len(non_skipped), 14)
 
     def test_no_private_key_fields_are_added_to_settings_or_live_audit(self) -> None:
         settings_keys = set(BotSettings.__dataclass_fields__.keys())

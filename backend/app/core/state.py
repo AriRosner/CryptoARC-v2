@@ -746,6 +746,9 @@ class BotState:
     def trades(self, limit: int = 300) -> list[dict[str, object]]:
         return [trade.to_dict() for trade in self.storage.load_trades(limit)]
 
+    def monitor_tokens(self) -> list[dict[str, object]]:
+        return [token.to_dict() for token in self._snapshot_tokens()]
+
     def market_sol_usd(self) -> dict[str, object]:
         now = utc_now()
         if self.sol_usd_price > 0 and self.sol_usd_price_updated_at and (now - self.sol_usd_price_updated_at).total_seconds() < 60:
@@ -2710,8 +2713,16 @@ class BotState:
         return BotSnapshot(
             status=self.status,
             settings=self.settings,
-            tokens=list(self.tokens),
+            tokens=self._snapshot_tokens(),
             events=list(self.events),
             stats=self.stats,
             source_status=self.source_status,
         )
+
+    def _snapshot_tokens(self) -> list[TokenSignal]:
+        current = list(self.tokens)
+        by_id = {token.id: token for token in current}
+        for token in self.storage.load_all_tokens(5000):
+            if token.status != TokenStatus.SKIPPED:
+                by_id[token.id] = token
+        return sorted(by_id.values(), key=lambda token: token.detected_at, reverse=True)

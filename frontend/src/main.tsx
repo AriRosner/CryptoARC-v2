@@ -46,6 +46,7 @@ import {
   fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
+  fetchMonitorTokens,
   fetchDataIntegrity,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
@@ -332,6 +333,15 @@ function buildLivePnlHistory(ledger: LiveLedger | null, timeframe: PnlTimeframe)
   return [0, current];
 }
 
+function mergeMonitorTokens(current: TokenSignal[], incoming: TokenSignal[]): TokenSignal[] {
+  const byId = new Map<string, TokenSignal>();
+  for (const token of incoming) byId.set(token.id, token);
+  for (const token of current) {
+    if (token.status !== "skipped" && !byId.has(token.id)) byId.set(token.id, token);
+  }
+  return [...byId.values()].sort((left, right) => new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime());
+}
+
 function App() {
   const [snapshot, setSnapshot] = React.useState<BotSnapshot>(fallbackSnapshot);
   const [apiState, setApiState] = React.useState("connecting");
@@ -350,6 +360,7 @@ function App() {
   const [backtestResult, setBacktestResult] = React.useState<BacktestResult | null>(null);
   const [backtests, setBacktests] = React.useState<BacktestResult[]>([]);
   const [sourceEvents, setSourceEvents] = React.useState<SourceEvent[]>([]);
+  const [monitorTokens, setMonitorTokens] = React.useState<TokenSignal[]>([]);
   const [dataSummary, setDataSummary] = React.useState<DataSummary | null>(null);
   const [trades, setTrades] = React.useState<TradeRecord[]>([]);
   const [priceObservations, setPriceObservations] = React.useState<PriceObservation[]>([]);
@@ -440,6 +451,7 @@ function App() {
       .then((data) => {
         data.events.forEach((event) => seenToastIds.current.add(event.id));
         setSnapshot(data);
+        setMonitorTokens((current) => mergeMonitorTokens(current, data.tokens));
         setApiState("connected");
       })
       .catch((error) => {
@@ -450,6 +462,7 @@ function App() {
     function connect() {
       socket = openSnapshotSocket((data) => {
         setSnapshot(data);
+        setMonitorTokens((current) => mergeMonitorTokens(current, data.tokens));
         retryDelay = 1000;
         if (!readyForToasts.current) {
           data.events.forEach((event) => seenToastIds.current.add(event.id));
@@ -494,8 +507,9 @@ function App() {
 
   const settings = snapshot.settings;
   const stats = snapshot.stats;
+  const tokenSource = monitorTokens.length ? monitorTokens : snapshot.tokens;
   const selectedLivePnlWallet = pnlWalletScope === "paper" ? "" : pnlWalletScope;
-  const selectedToken = snapshot.tokens.find((token) => token.id === selectedTokenId) ?? null;
+  const selectedToken = tokenSource.find((token) => token.id === selectedTokenId) ?? null;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
   const paperTimeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
@@ -528,7 +542,7 @@ function App() {
         : "USD price loading"
     : "SOL display";
   const filteredTokens = React.useMemo(() => {
-    let tokens = snapshot.tokens;
+    let tokens = tokenSource;
     const query = tokenSearch.trim().toLowerCase();
     if (query) {
       tokens = tokens.filter((token) =>
@@ -560,7 +574,7 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, snapshot.tokens, tokenSearch, showWatchlistOnly, hideSkippedTokens, watchSet]);
+  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, tokenSource, tokenSearch, showWatchlistOnly, hideSkippedTokens, watchSet]);
 
   React.useEffect(() => {
     if (pnlWalletScope !== "live") return;
@@ -733,10 +747,11 @@ function App() {
   }
 
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows, intentRows, ledgerState] = await Promise.all([
+    const [runs, events, summary, monitorRows, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows, intentRows, ledgerState] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
+      fetchMonitorTokens(),
       fetchTrades(),
       fetchSourceHealth(),
       fetchSecurityStatus(),
@@ -768,6 +783,7 @@ function App() {
     setBacktests(runs);
     setSourceEvents(events);
     setDataSummary(summary);
+    setMonitorTokens(monitorRows);
     setTrades(tradeRows);
     setSourceHealth(health);
     setSecurityStatus(security);
@@ -1148,7 +1164,7 @@ function App() {
 
       {workspacePage === "analysis" && (
         <AnalysisPage
-          tokens={snapshot.tokens}
+          tokens={tokenSource}
           trades={trades}
           stats={stats}
           analytics={performanceAnalytics}

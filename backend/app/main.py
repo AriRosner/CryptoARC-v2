@@ -535,6 +535,11 @@ async def trades() -> list[dict]:
     return state.trades()
 
 
+@app.get("/api/tokens", dependencies=[Depends(require_auth)])
+async def monitor_tokens() -> list[dict]:
+    return state.monitor_tokens()
+
+
 @app.get("/api/market/sol-usd", dependencies=[Depends(require_auth)])
 async def market_sol_usd() -> dict:
     return state.market_sol_usd()
