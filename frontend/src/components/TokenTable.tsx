@@ -19,6 +19,8 @@ interface TokenTableProps {
   setFilter: (f: any) => void;
   sort: string;
   setSort: (s: any) => void;
+  hideSkipped: boolean;
+  setHideSkipped: (value: boolean) => void;
 }
 
 const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "warning" | "info" | "neutral" => {
@@ -147,13 +149,15 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   filter,
   setFilter,
   sort,
-  setSort
+  setSort,
+  hideSkipped,
+  setHideSkipped
 }) => {
   const visibleRows = React.useMemo(() => tokens, [tokens]);
 
   return (
     <Card className="flex h-[clamp(520px,calc(100vh-270px),760px)] min-h-[520px] flex-col" hover={false}>
-      <div className="grid min-h-12 grid-cols-[max-content_minmax(220px,1fr)_9rem_9.5rem] items-center gap-2 border-b border-white/5 px-3 py-2">
+      <div className="grid min-h-12 grid-cols-[max-content_minmax(200px,1fr)_8.5rem_9rem_8rem] items-center gap-2 border-b border-white/5 px-3 py-2">
         <h3 className="flex shrink-0 items-center gap-2 text-xs font-black uppercase tracking-[0.2em] text-white">
           <Activity size={14} className="text-amber-400" />
           Token Monitor
@@ -193,6 +197,19 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
           <option value="score">Highest Score</option>
           <option value="pnl">Highest P&L</option>
         </select>
+
+        <label
+          style={{ display: "flex", margin: 0, gap: "0.5rem" }}
+          className="m-0 h-9 cursor-pointer items-center justify-center gap-2 rounded-lg border border-white/10 bg-black/40 px-2.5 text-[10px] font-black uppercase tracking-widest text-zinc-400 transition hover:border-amber-500/30 hover:text-white"
+        >
+          <input
+            type="checkbox"
+            checked={hideSkipped}
+            onChange={(event) => setHideSkipped(event.target.checked)}
+            className="h-4 w-4"
+          />
+          <span className="whitespace-nowrap leading-none">Hide Skips</span>
+        </label>
       </div>
 
       <div className="crypto-scrollbar flex-1 overflow-auto">

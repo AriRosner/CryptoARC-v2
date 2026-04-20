@@ -341,6 +341,7 @@ function App() {
   const [pnlCurrency, setPnlCurrency] = React.useState<PnlCurrency>(() => (window.localStorage.getItem("cryptoarc_pnl_currency") === "USD" ? "USD" : "SOL"));
   const [solUsdPrice, setSolUsdPrice] = React.useState(0);
   const [solUsdStale, setSolUsdStale] = React.useState(false);
+  const [solUsdError, setSolUsdError] = React.useState("");
   const [botActionStatus, setBotActionStatus] = React.useState<BotActionStatus>("");
   const [queueFilter, setQueueFilter] = React.useState<QueueFilter>("all");
   const [queueSort, setQueueSort] = React.useState<QueueSort>("newest");
@@ -402,6 +403,7 @@ function App() {
   const [backtestSpeed, setBacktestSpeed] = React.useState(50);
   const [tokenSearch, setTokenSearch] = React.useState("");
   const [showWatchlistOnly, setShowWatchlistOnly] = React.useState(false);
+  const [hideSkippedTokens, setHideSkippedTokens] = React.useState(() => window.localStorage.getItem("cryptoarc_hide_skipped_tokens") === "true");
   const [watchlist, setWatchlist] = React.useState<string[]>(() => JSON.parse(window.localStorage.getItem("cryptoarc_watchlist") || "[]"));
   const [apiError, setApiError] = React.useState("");
   const [authRequired, setAuthRequired] = React.useState(false);
@@ -521,7 +523,9 @@ function App() {
   const pnlCurrencyLabel = pnlCurrency === "USD"
     ? solUsdPrice > 0
       ? `USD via SOL ${solUsdStale ? "stale" : "live"} price: $${solUsdPrice.toFixed(2)}`
-      : "USD price loading"
+      : solUsdError
+        ? "USD quote retrying; showing SOL"
+        : "USD price loading"
     : "SOL display";
   const filteredTokens = React.useMemo(() => {
     let tokens = snapshot.tokens;
@@ -536,6 +540,9 @@ function App() {
     }
     if (showWatchlistOnly) {
       tokens = tokens.filter((token) => watchSet.has(token.mint));
+    }
+    if (hideSkippedTokens) {
+      tokens = tokens.filter((token) => token.status !== "skipped");
     }
     if (queueFilter === "open") {
       tokens = tokens.filter((token) => ["buying", "paper_bought", "monitoring"].includes(token.status));
@@ -553,7 +560,7 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, snapshot.tokens, tokenSearch, showWatchlistOnly, watchSet]);
+  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, snapshot.tokens, tokenSearch, showWatchlistOnly, hideSkippedTokens, watchSet]);
 
   React.useEffect(() => {
     if (pnlWalletScope !== "live") return;
@@ -573,6 +580,11 @@ function App() {
     window.localStorage.setItem("cryptoarc_pnl_wallet_scope", scope);
   }
 
+  function updateHideSkippedTokens(value: boolean) {
+    setHideSkippedTokens(value);
+    window.localStorage.setItem("cryptoarc_hide_skipped_tokens", String(value));
+  }
+
   function togglePnlCurrency() {
     setPnlCurrency((current) => {
       const next = current === "SOL" ? "USD" : "SOL";
@@ -585,9 +597,17 @@ function App() {
   }
 
   async function refreshSolUsdPrice() {
-    const quote = await fetchSolUsdPrice();
-    setSolUsdPrice(Number(quote.price || 0));
-    setSolUsdStale(Boolean(quote.stale));
+    try {
+      const quote = await fetchSolUsdPrice();
+      setSolUsdPrice(Number(quote.price || 0));
+      setSolUsdStale(Boolean(quote.stale));
+      setSolUsdError(quote.error || "");
+      if (!quote.error && Number(quote.price || 0) > 0) {
+        setApiError((current) => current.startsWith("SOL/USD quote") ? "" : current);
+      }
+    } catch (error) {
+      setSolUsdError(error instanceof Error ? error.message : "unknown error");
+    }
   }
 
   async function handleStartBot() {
@@ -1055,9 +1075,9 @@ function App() {
   React.useEffect(() => {
     const interval = window.setInterval(() => {
       refreshSolUsdPrice().catch(() => undefined);
-    }, 60000);
+    }, solUsdPrice > 0 ? 60000 : 10000);
     return () => window.clearInterval(interval);
-  }, []);
+  }, [solUsdPrice]);
 
   React.useEffect(() => {
     if (!walletPublicKey) {
@@ -1120,6 +1140,8 @@ function App() {
           setFilter={setQueueFilter}
           sort={queueSort}
           setSort={setQueueSort}
+          hideSkipped={hideSkippedTokens}
+          setHideSkipped={updateHideSkippedTokens}
           apiState={apiState}
         />
       )}

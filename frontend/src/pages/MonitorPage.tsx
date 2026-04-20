@@ -34,6 +34,8 @@ interface MonitorPageProps {
   setFilter: (f: any) => void;
   sort: string;
   setSort: (s: any) => void;
+  hideSkipped: boolean;
+  setHideSkipped: (value: boolean) => void;
   apiState: string;
 }
 
@@ -63,6 +65,8 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
   setFilter,
   sort,
   setSort,
+  hideSkipped,
+  setHideSkipped,
   apiState
 }) => {
   return (
@@ -105,6 +109,8 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
             setFilter={setFilter}
             sort={sort}
             setSort={setSort}
+            hideSkipped={hideSkipped}
+            setHideSkipped={setHideSkipped}
           />
         </div>
 

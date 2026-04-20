@@ -758,37 +758,54 @@ class BotState:
                 "stale": False,
                 "error": "",
             }
-        try:
-            request = urllib.request.Request(
+        sources = [
+            (
+                "coingecko",
                 "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
-                headers={"Accept": "application/json", "User-Agent": "CryptoARC-v2"},
-            )
-            with urllib.request.urlopen(request, timeout=4) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            price = float((body.get("solana") or {}).get("usd") or 0.0)
-            if price <= 0:
-                raise RuntimeError("SOL/USD price unavailable")
-            self.sol_usd_price = price
-            self.sol_usd_price_updated_at = now
-            return {
-                "symbol": "SOL",
-                "currency": "USD",
-                "price": round(price, 4),
-                "updated_at": now.isoformat(),
-                "source": "coingecko",
-                "stale": False,
-                "error": "",
-            }
-        except Exception as exc:
-            return {
-                "symbol": "SOL",
-                "currency": "USD",
-                "price": round(self.sol_usd_price, 4),
-                "updated_at": self.sol_usd_price_updated_at.isoformat() if self.sol_usd_price_updated_at else None,
-                "source": "coingecko",
-                "stale": True,
-                "error": f"{exc.__class__.__name__}: {exc}",
-            }
+                lambda body: float((body.get("solana") or {}).get("usd") or 0.0),
+            ),
+            (
+                "coinbase",
+                "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+                lambda body: float((body.get("data") or {}).get("amount") or 0.0),
+            ),
+            (
+                "binance",
+                "https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT",
+                lambda body: float(body.get("price") or 0.0),
+            ),
+        ]
+        errors: list[str] = []
+        for source, url, parser in sources:
+            try:
+                request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "CryptoARC-v2"})
+                with urllib.request.urlopen(request, timeout=4) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                price = parser(body)
+                if price <= 0:
+                    raise RuntimeError("SOL/USD price unavailable")
+                self.sol_usd_price = price
+                self.sol_usd_price_updated_at = now
+                return {
+                    "symbol": "SOL",
+                    "currency": "USD",
+                    "price": round(price, 4),
+                    "updated_at": now.isoformat(),
+                    "source": source,
+                    "stale": False,
+                    "error": "",
+                }
+            except Exception as exc:
+                errors.append(f"{source}: {exc.__class__.__name__}: {exc}")
+        return {
+            "symbol": "SOL",
+            "currency": "USD",
+            "price": round(self.sol_usd_price, 4),
+            "updated_at": self.sol_usd_price_updated_at.isoformat() if self.sol_usd_price_updated_at else None,
+            "source": "cache" if self.sol_usd_price > 0 else "unavailable",
+            "stale": True,
+            "error": "; ".join(errors),
+        }
 
     def price_observations(self, limit: int = 300) -> list[dict[str, object]]:
         return [observation.to_dict() for observation in self.storage.load_price_observations(limit)]
