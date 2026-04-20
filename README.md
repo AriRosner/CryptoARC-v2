@@ -17,7 +17,7 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Operational monitoring for backend state, source health, storage counts, warnings, and safety guard state.
 - Stability watchdog with loop recovery status for production paper deployments.
 - Solana read-only RPC health and watched-wallet balance checks.
-- Manual live execution request ledger for audit-only future-live planning.
+- Manual browser-wallet live intent workbench with caps, quote previews, simulation warnings, audit records, confirmation recovery, and reconciliation.
 - Dashboard auth with optional authenticator-app 2FA.
 - Docker-ready deployment structure with a paper/live safety boundary.
 
@@ -69,17 +69,17 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 
 ## Safety Boundary
 
-CryptoARC v2 does not execute live trades. The backend exposes a paper-only safety boundary and refuses live execution unless a future executor is explicitly added and enabled through environment-level controls.
+CryptoARC v2 is paper-first. Live-money support is limited to a local manual browser-wallet flow that requires explicit environment enablement, user-set caps, and wallet approval for every transaction. The backend does not store signer material and does not autonomously sign, send, or resubmit transactions.
 
 Default safety assumptions:
 
 - No private-key storage.
-- No automatic wallet signing.
+- No automatic wallet signing or unattended live execution.
 - `LIVE_TRADING_ENABLED=false` in normal use.
 - Dashboard password should be set before any network deployment.
 - Optional TOTP 2FA is available.
 - Paper-only mode remains the default and recommended mode.
-- Manual live requests are audit records only and do not submit transactions.
+- Browser-wallet live actions are manual and audited; legacy manual live requests remain audit records only.
 - Autonomous live mode remains blocked until a reviewed executor, signer flow, and risk controller exist.
 
 ## Architecture
@@ -205,6 +205,18 @@ For any deployment beyond localhost, set a strong dashboard password, restrict C
 - `GET /api/watchdog/status`
 - `POST /api/watchdog/recover`
 - `GET /api/solana/status`
+- `GET /api/live/status`
+- `GET /api/live/intents`
+- `POST /api/live/intents`
+- `POST /api/live/intents/{id}/quote`
+- `POST /api/live/intents/{id}/submit`
+- `POST /api/live/intents/{id}/confirm`
+- `POST /api/live/intents/{id}/reconcile`
+- `GET /api/live/ledger`
+- `GET /api/live/positions`
+- `GET /api/live/audit`
+- `POST /api/live/audit/recover-unresolved`
+- `POST /api/live/audit/{id}/recover`
 - `GET /api/live/requests`
 - `POST /api/live/manual-request`
 - `GET /api/monitoring/ops`
@@ -230,6 +242,10 @@ Near-term priorities:
 - Add richer replay filters and saved experiment runs.
 - Add strategy-builder UX for cloning and comparing custom rule sets.
 - Keep live execution out of scope until the paper engine, replay data, auth, and audit systems are mature.
+
+## AI Handoff
+
+If another AI agent takes over this repo, start with [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). It summarizes the architecture, current safety boundary, verification commands, and the rules for preserving the paper-first/manual-only live trading model.
 
 ## Disclaimer
 

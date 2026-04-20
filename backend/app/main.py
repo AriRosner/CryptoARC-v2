@@ -273,6 +273,15 @@ async def bot_loop() -> None:
         await asyncio.sleep(bot_tick_seconds())
 
 
+async def live_audit_poll_loop() -> None:
+    while True:
+        try:
+            state.poll_live_audits(config.live_trading_enabled)
+        except Exception as exc:
+            state.add_event("warning", f"Live audit poller warning: {exc.__class__.__name__}: {exc}")
+        await asyncio.sleep(15)
+
+
 def bot_tick_seconds() -> float:
     return {
         "slow": 4.0,
@@ -333,14 +342,20 @@ async def drain_launch_queue() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(bot_loop())
+    live_poll_task = asyncio.create_task(live_audit_poll_loop())
     try:
         yield
     finally:
         if source_task:
             source_task.cancel()
         task.cancel()
+        live_poll_task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await live_poll_task
         except asyncio.CancelledError:
             pass
 
@@ -796,6 +811,19 @@ async def live_positions(wallet_public_key: str = "") -> list[dict]:
 @app.get("/api/live/audit", dependencies=[Depends(require_auth)])
 async def live_audit() -> list[dict]:
     return state.live_audit()
+
+
+@app.post("/api/live/audit/recover-unresolved", dependencies=[Depends(require_auth)])
+async def live_audit_recover_unresolved() -> dict:
+    return state.recover_unresolved_live_audits()
+
+
+@app.post("/api/live/audit/{audit_id}/recover", dependencies=[Depends(require_auth)])
+async def live_audit_recover(audit_id: str) -> dict:
+    try:
+        return state.recover_live_audit(audit_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
 
 
 @app.post("/api/live/manual-request", dependencies=[Depends(require_auth)])

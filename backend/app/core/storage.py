@@ -698,6 +698,7 @@ class Storage:
     def _live_execution_audit_from_payload(self, payload: dict[str, Any]) -> LiveExecutionAudit:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["updated_at"] = datetime.fromisoformat(payload["updated_at"])
+        payload["confirmation_checked_at"] = datetime.fromisoformat(payload["confirmation_checked_at"]) if payload.get("confirmation_checked_at") else None
         allowed = set(LiveExecutionAudit.__dataclass_fields__.keys())
         return LiveExecutionAudit(**{key: value for key, value in payload.items() if key in allowed})
 

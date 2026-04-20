@@ -641,6 +641,17 @@ export interface LiveStatus {
   autonomy_blockers: string[];
   active_intent_count: number;
   stale_quote_count: number;
+  unresolved_audit_count: number;
+  recoverable_audit_count: number;
+  last_live_poll_at: string | null;
+  poller_status: string;
+  recovery_summary: {
+    checked: number;
+    updated: number;
+    skipped: boolean;
+    reason?: string;
+    errors?: string[];
+  };
   latest_reconciliation_status: string;
   wallet_adapter: WalletAdapterStatus;
   live_pnl: {
@@ -737,6 +748,11 @@ export interface LiveExecutionAudit {
   intent_id: string;
   reconciliation_status: LiveReconciliationStatus;
   reconciliation: Record<string, unknown>;
+  confirmation: Record<string, unknown>;
+  confirmation_checked_at: string | null;
+  recovery_attempts: number;
+  last_recovery_error: string;
+  recommended_action: string;
 }
 
 export type LiveReconciliationStatus = "pending" | "matched" | "needs_review" | string;

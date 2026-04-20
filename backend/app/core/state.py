@@ -92,6 +92,8 @@ class BotState:
         self.last_ingested_launch_at: datetime | None = None
         self.last_tick_error: str = ""
         self.bot_loop_iterations = 0
+        self.live_last_poll_at: datetime | None = None
+        self.live_last_poll_summary: dict[str, object] = {"checked": 0, "updated": 0, "skipped": True, "reason": "not run"}
         self.recalculate_stats()
 
     def start(self) -> BotSnapshot:
@@ -1325,6 +1327,9 @@ class BotState:
         readiness = self.readiness_status()
         intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
         ledger = self._live_ledger_positions(wallet_public_key)
+        audit_rows = self._normalize_live_audits(self.storage.load_live_execution_audits(200))
+        unresolved = [audit for audit in audit_rows if self._is_unresolved_live_audit(audit)]
+        recoverable = [audit for audit in unresolved if audit.transaction_signature]
         stale_quotes = sum(1 for intent in intents if intent.stale and intent.quote_id)
         latest_reconciliation = next((position.reconciliation_status for position in ledger), "pending")
         live_pnl = {
@@ -1350,6 +1355,11 @@ class BotState:
             "autonomy_blockers": ["browser wallets cannot unattended-sign", "local signer daemon is disabled in v1"],
             "active_intent_count": len([intent for intent in intents if intent.status not in {"cancelled", "executed", "expired"}]),
             "stale_quote_count": stale_quotes,
+            "unresolved_audit_count": len(unresolved),
+            "recoverable_audit_count": len(recoverable),
+            "last_live_poll_at": self.live_last_poll_at.isoformat() if self.live_last_poll_at else None,
+            "poller_status": "enabled" if env_live_enabled else "disabled",
+            "recovery_summary": self.live_last_poll_summary,
             "latest_reconciliation_status": latest_reconciliation,
             "wallet_adapter": {
                 "mode": signer_mode,
@@ -1408,7 +1418,37 @@ class BotState:
         return positions
 
     def live_audit(self) -> list[dict[str, object]]:
-        return [audit.to_dict() for audit in self.storage.load_live_execution_audits(100)]
+        return [audit.to_dict() for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(100))]
+
+    def _normalize_live_audits(self, audits: list[LiveExecutionAudit]) -> list[LiveExecutionAudit]:
+        now = utc_now()
+        for audit in audits:
+            expires_at = audit.quote.get("expires_at") if isinstance(audit.quote, dict) else None
+            if expires_at and audit.status in {"ready", "simulated", "simulation_warning"} and not audit.transaction_signature:
+                try:
+                    if datetime.fromisoformat(str(expires_at)) < now:
+                        audit.status = "stale"
+                        audit.final_status = "stale"
+                        audit.recommended_action = "Regenerate the quote before signing."
+                        audit.updated_at = now
+                        if isinstance(audit.quote, dict):
+                            audit.quote["stale"] = True
+                        self.storage.save_live_execution_audit(audit)
+                except ValueError:
+                    audit.status = "needs_review"
+                    audit.final_status = "needs_review"
+                    audit.last_recovery_error = "Quote expiry timestamp is invalid"
+                    audit.recommended_action = "Review the audit record and regenerate the quote."
+                    audit.updated_at = now
+                    self.storage.save_live_execution_audit(audit)
+        return audits
+
+    def _is_unresolved_live_audit(self, audit: LiveExecutionAudit) -> bool:
+        if audit.status in {"submitted", "needs_review", "failed", "stale"}:
+            return True
+        if audit.transaction_signature and audit.status not in {"reconciled"} and audit.reconciliation_status != "matched":
+            return True
+        return False
 
     def live_intents(self) -> list[dict[str, object]]:
         intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
@@ -1749,11 +1789,13 @@ class BotState:
     def live_confirm(self, audit_id: str, confirmation_status: str, error: str = "") -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
         audit.confirmation_status = confirmation_status.strip()
+        audit.confirmation = {"source": "frontend", "confirmation_status": audit.confirmation_status, "error": error.strip()}
+        audit.confirmation_checked_at = utc_now()
         audit.status = "confirmed" if confirmation_status in {"confirmed", "finalized"} and not error else "failed"
         audit.final_status = audit.status
         audit.updated_at = utc_now()
         if error:
-            audit.errors.append(error)
+            self._append_unique(audit.errors, error)
         self.storage.save_live_execution_audit(audit)
         if audit.intent_id:
             intent = self.storage.load_live_intent(audit.intent_id)
@@ -1762,7 +1804,158 @@ class BotState:
                 intent.updated_at = utc_now()
                 self.storage.save_live_intent(intent)
         if audit.status == "confirmed":
-            self._record_live_fill(audit)
+            position = self._record_live_fill(audit)
+            if audit.reconciliation_status == "matched":
+                audit.status = "reconciled"
+                audit.final_status = "reconciled"
+                audit.recommended_action = "No action needed."
+            elif position is not None:
+                audit.status = "needs_review"
+                audit.final_status = "needs_review"
+                audit.recommended_action = "Review wallet/RPC balance reconciliation."
+            audit.updated_at = utc_now()
+            self.storage.save_live_execution_audit(audit)
+        return audit.to_dict()
+
+    def recover_unresolved_live_audits(self, limit: int = 25) -> dict[str, object]:
+        audits = [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500)) if self._is_unresolved_live_audit(audit)]
+        checked = 0
+        updated = 0
+        errors: list[str] = []
+        recovered: list[dict[str, object]] = []
+        for audit in audits[: max(1, int(limit or 25))]:
+            try:
+                before = (audit.status, audit.reconciliation_status, audit.recovery_attempts)
+                result = self.recover_live_audit(audit.id)
+                checked += 1
+                after = (str(result.get("status", "")), str(result.get("reconciliation_status", "")), int(result.get("recovery_attempts", 0)))
+                if after != before:
+                    updated += 1
+                recovered.append(result)
+            except Exception as exc:
+                checked += 1
+                errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
+        summary = {"checked": checked, "updated": updated, "errors": errors, "skipped": checked == 0, "reason": "no unresolved audits" if checked == 0 else ""}
+        self.live_last_poll_at = utc_now()
+        self.live_last_poll_summary = summary
+        return {"summary": summary, "audits": recovered}
+
+    def poll_live_audits(self, env_live_enabled: bool, limit: int = 25) -> dict[str, object]:
+        if not env_live_enabled:
+            summary = {"checked": 0, "updated": 0, "errors": [], "skipped": True, "reason": "LIVE_TRADING_ENABLED is false"}
+            self.live_last_poll_at = utc_now()
+            self.live_last_poll_summary = summary
+            return summary
+        unresolved = [
+            audit
+            for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+            if audit.transaction_signature and audit.status in {"submitted", "needs_review", "failed"}
+        ]
+        if not unresolved:
+            summary = {"checked": 0, "updated": 0, "errors": [], "skipped": True, "reason": "no unresolved submitted audits"}
+            self.live_last_poll_at = utc_now()
+            self.live_last_poll_summary = summary
+            return summary
+        checked = 0
+        updated = 0
+        errors: list[str] = []
+        for audit in unresolved[: max(1, int(limit or 25))]:
+            try:
+                before = (audit.status, audit.reconciliation_status, audit.recovery_attempts)
+                result = self.recover_live_audit(audit.id)
+                checked += 1
+                after = (str(result.get("status", "")), str(result.get("reconciliation_status", "")), int(result.get("recovery_attempts", 0)))
+                if after != before:
+                    updated += 1
+            except Exception as exc:
+                checked += 1
+                errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
+        summary = {"checked": checked, "updated": updated, "errors": errors, "skipped": checked == 0, "reason": ""}
+        self.live_last_poll_at = utc_now()
+        self.live_last_poll_summary = summary
+        return summary
+
+    def recover_live_audit(self, audit_id: str) -> dict[str, object]:
+        audit = self._require_live_audit(audit_id)
+        audit.recovery_attempts += 1
+        audit.confirmation_checked_at = utc_now()
+        audit.updated_at = utc_now()
+        if not audit.transaction_signature:
+            if audit.status in {"ready", "simulated", "simulation_warning", "stale"}:
+                audit.status = "stale"
+                audit.final_status = "stale"
+                audit.recommended_action = "Regenerate the quote before signing."
+            else:
+                audit.status = "needs_review"
+                audit.final_status = "needs_review"
+                audit.recommended_action = "No transaction signature is recorded. Review the wallet and audit trail."
+            audit.last_recovery_error = "missing transaction signature"
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+
+        status = self._signature_status(audit.transaction_signature)
+        audit.confirmation = status
+        audit.confirmation_status = str(status.get("confirmation_status") or status.get("status") or "")
+        if not status.get("ok", False):
+            error = str(status.get("error") or "RPC status check failed")
+            audit.status = "needs_review"
+            audit.final_status = "needs_review"
+            audit.last_recovery_error = error
+            audit.recommended_action = "Retry confirmation later and inspect the signature in Solscan."
+            self._append_unique(audit.warnings, error)
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+
+        if not status.get("found", False):
+            audit.status = "submitted"
+            audit.final_status = "submitted"
+            audit.last_recovery_error = ""
+            audit.recommended_action = "Signature is not visible to RPC yet. Wait, then retry confirmation."
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+
+        if status.get("err"):
+            error = f"Transaction error: {status.get('err')}"
+            audit.status = "failed"
+            audit.final_status = "failed"
+            audit.last_recovery_error = error
+            audit.recommended_action = "Review the wallet transaction details. Do not resubmit automatically."
+            self._append_unique(audit.errors, error)
+            self._mark_live_intent_review(audit)
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+
+        if audit.confirmation_status in {"confirmed", "finalized"}:
+            audit.status = "confirmed"
+            audit.final_status = "confirmed"
+            audit.last_recovery_error = ""
+            audit.recommended_action = "Confirmed by RPC. Reconciliation is running."
+            self.storage.save_live_execution_audit(audit)
+            position = self._record_live_fill(audit)
+            if audit.reconciliation_status == "matched":
+                audit.status = "reconciled"
+                audit.final_status = "reconciled"
+                audit.recommended_action = "No action needed."
+                if audit.intent_id:
+                    intent = self.storage.load_live_intent(audit.intent_id)
+                    if intent:
+                        intent.status = "executed"
+                        intent.updated_at = utc_now()
+                        self.storage.save_live_intent(intent)
+            elif position is not None:
+                audit.status = "needs_review"
+                audit.final_status = "needs_review"
+                audit.recommended_action = "Review wallet/RPC balance reconciliation."
+                self._mark_live_intent_review(audit)
+            audit.updated_at = utc_now()
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+
+        audit.status = "submitted"
+        audit.final_status = "submitted"
+        audit.last_recovery_error = ""
+        audit.recommended_action = "RPC has not confirmed the transaction yet. Retry confirmation later."
+        self.storage.save_live_execution_audit(audit)
         return audit.to_dict()
 
     def reconcile_live_intent(self, intent_id: str) -> dict[str, object]:
@@ -1809,6 +2002,47 @@ class BotState:
             return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": ""}
         except Exception as exc:
             return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    def _signature_status(self, signature: str) -> dict[str, object]:
+        signature = signature.strip()
+        if not signature:
+            return {"ok": False, "found": False, "confirmation_status": "", "error": "missing transaction signature"}
+        try:
+            response = SolanaReadOnlyClient(self.settings.solana_rpc_url).rpc(
+                "getSignatureStatuses",
+                [[signature], {"searchTransactionHistory": True}],
+            )
+            values = (response.get("result") or {}).get("value") or []
+            status = values[0] if values else None
+            if not status:
+                return {"ok": True, "found": False, "confirmation_status": "not_found", "signature": signature}
+            confirmation_status = str(status.get("confirmationStatus") or ("finalized" if status.get("confirmations") is None else "processed"))
+            return {
+                "ok": True,
+                "found": True,
+                "signature": signature,
+                "confirmation_status": confirmation_status,
+                "slot": status.get("slot"),
+                "confirmations": status.get("confirmations"),
+                "err": status.get("err"),
+            }
+        except Exception as exc:
+            return {"ok": False, "found": False, "confirmation_status": "", "signature": signature, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    def _append_unique(self, values: list[str], value: str) -> None:
+        clean = str(value or "").strip()
+        if clean and clean not in values:
+            values.append(clean)
+
+    def _mark_live_intent_review(self, audit: LiveExecutionAudit) -> None:
+        if not audit.intent_id:
+            return
+        intent = self.storage.load_live_intent(audit.intent_id)
+        if not intent:
+            return
+        intent.status = "needs_review"
+        intent.updated_at = utc_now()
+        self.storage.save_live_intent(intent)
 
     def _pumpportal_local_transaction(self, action: str, mint: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, pool: str, wallet_public_key: str) -> tuple[dict[str, object], str, str]:
         payload = {
@@ -1885,6 +2119,8 @@ class BotState:
             wallet_public_key=wallet,
             symbol=token.symbol if token else "",
         )
+        if any(fill.get("audit_id") == audit.id for fill in position.fills):
+            return self._reconcile_live_audit(audit)
         amount_sol = 0.0
         try:
             if audit.action == "buy" and not str(audit.amount).endswith("%"):
@@ -1941,7 +2177,10 @@ class BotState:
         if balance.get("error"):
             position.reconciliation_status = "needs_review"
             audit.reconciliation_status = "needs_review"
-            audit.warnings.append(f"Reconciliation needs review: {balance['error']}")
+            audit.status = "needs_review"
+            audit.final_status = "needs_review"
+            audit.recommended_action = "Review wallet/RPC balance reconciliation."
+            self._append_unique(audit.warnings, f"Reconciliation needs review: {balance['error']}")
         else:
             position.token_balance = float(balance.get("token_balance") or 0.0)
             position.reconciliation_status = "matched"

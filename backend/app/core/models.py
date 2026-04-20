@@ -388,11 +388,17 @@ class LiveExecutionAudit:
     intent_id: str = ""
     reconciliation_status: str = "pending"
     reconciliation: dict[str, Any] = field(default_factory=dict)
+    confirmation: dict[str, Any] = field(default_factory=dict)
+    confirmation_checked_at: datetime | None = None
+    recovery_attempts: int = 0
+    last_recovery_error: str = ""
+    recommended_action: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
         payload["updated_at"] = self.updated_at.isoformat()
+        payload["confirmation_checked_at"] = self.confirmation_checked_at.isoformat() if self.confirmation_checked_at else None
         return payload
 
 

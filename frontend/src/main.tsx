@@ -75,6 +75,8 @@ import {
   openSnapshotSocket,
   patchSettings,
   quoteLiveIntent,
+  recoverLiveAudit,
+  recoverUnresolvedLiveAudit,
   recoverWatchdog,
   reconcileLiveIntent,
   recordLiveSimulation,
@@ -909,6 +911,44 @@ function App() {
     }
   }
 
+  async function refreshLiveExecutionSurfaces() {
+    const [status, audits, positions, intents, ledger] = await Promise.all([
+      fetchLiveStatus(walletPublicKey),
+      fetchLiveAudit(),
+      fetchLivePositions(walletPublicKey),
+      fetchLiveIntents(),
+      fetchLiveLedger(selectedLivePnlWallet)
+    ]);
+    setLiveStatus(status);
+    setLiveAudit(audits);
+    setLivePositions(positions);
+    setLiveIntents(intents);
+    setLiveLedger(ledger);
+  }
+
+  async function recoverAllLiveAudits() {
+    try {
+      const result = await recoverUnresolvedLiveAudit();
+      const firstAudit = result.audits?.[0];
+      if (firstAudit) setActiveLiveAudit(firstAudit);
+      await refreshLiveExecutionSurfaces();
+      setApiError("");
+    } catch (error) {
+      setApiError(`Live audit recovery failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function recoverSingleLiveAudit(auditId: string) {
+    try {
+      const audit = await recoverLiveAudit(auditId);
+      setActiveLiveAudit(audit);
+      await refreshLiveExecutionSurfaces();
+      setApiError("");
+    } catch (error) {
+      setApiError(`Live audit recovery failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   React.useEffect(() => {
     refreshResearchData().catch(() => undefined);
   }, []);
@@ -1123,6 +1163,8 @@ function App() {
           onCancelIntent={cancelWorkbenchIntent}
           onSimulateActiveAudit={simulateActiveLiveAudit}
           onSignAndSendLive={signAndSendLiveAudit}
+          onRecoverAllLiveAudits={recoverAllLiveAudits}
+          onRecoverLiveAudit={recoverSingleLiveAudit}
         />
       )}
     </AppLayout>
@@ -1163,7 +1205,9 @@ function LiveWalletModal({
   onQuoteIntent,
   onCancelIntent,
   onSimulateActiveAudit,
-  onSignAndSendLive
+  onSignAndSendLive,
+  onRecoverAllLiveAudits,
+  onRecoverLiveAudit
 }: {
   method: LiveWalletMethod;
   onMethodChange: (method: LiveWalletMethod) => void;
@@ -1199,11 +1243,17 @@ function LiveWalletModal({
   onCancelIntent: (intentId: string) => Promise<void>;
   onSimulateActiveAudit: () => Promise<void>;
   onSignAndSendLive: () => Promise<void>;
+  onRecoverAllLiveAudits: () => Promise<void>;
+  onRecoverLiveAudit: (auditId: string) => Promise<void>;
 }) {
   const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
   const quoteBlocked = !envEnabled || method !== "browser_wallet";
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
+  const activeQuoteStale = activeLiveAudit?.status === "stale" || Boolean(activeLiveAudit?.quote?.stale);
+  const recoverableAuditStatuses = new Set(["submitted", "failed", "needs_review", "stale"]);
+  const reviewAudits = liveAudit.filter((audit) => recoverableAuditStatuses.has(audit.status) || audit.reconciliation_status === "needs_review");
+  const recoverySummary = liveStatus?.recovery_summary;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
@@ -1402,7 +1452,7 @@ function LiveWalletModal({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
                   <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                  <button className="h-9 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                  <button className="h-9 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
                 {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and status checks still work.</p> : null}
                 {activeLiveAudit ? (
@@ -1416,6 +1466,53 @@ function LiveWalletModal({
               </section>
             </div>
           </div>
+
+          <section className="mt-4 rounded-xl border border-amber-400/20 bg-amber-500/[0.045] p-4">
+            <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-black uppercase tracking-widest text-white">Recovery & Review</h3>
+                <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
+              </div>
+              <button
+                className="h-9 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={onRecoverAllLiveAudits}
+                disabled={!reviewAudits.length}
+              >
+                Recover unresolved
+              </button>
+            </div>
+            <div className="mb-3 grid gap-2 sm:grid-cols-4">
+              <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Unresolved <strong className="block pt-1 text-xs text-white">{liveStatus?.unresolved_audit_count ?? reviewAudits.length}</strong></span>
+              <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Recoverable <strong className="block pt-1 text-xs text-white">{liveStatus?.recoverable_audit_count ?? reviewAudits.filter((audit) => audit.transaction_signature).length}</strong></span>
+              <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Poller <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.poller_status ?? "unknown"}</strong></span>
+              <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Last check <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.last_live_poll_at ? new Date(liveStatus.last_live_poll_at).toLocaleTimeString() : "not run"}</strong></span>
+            </div>
+            <p className="mb-3 rounded-lg border border-white/5 bg-black/20 p-3 text-xs text-zinc-400">
+              Recovery summary: checked {Number(recoverySummary?.checked ?? 0)}, updated {Number(recoverySummary?.updated ?? 0)}
+              {recoverySummary?.reason ? ` / ${recoverySummary.reason}` : ""}
+            </p>
+            <div className="grid max-h-72 gap-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent lg:grid-cols-2">
+              {reviewAudits.slice(0, 8).map((audit) => (
+                <article key={audit.id} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <strong className="block truncate text-xs font-black uppercase tracking-widest text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
+                      <span className="mt-1 block truncate text-[10px] font-bold uppercase tracking-widest text-zinc-500">{audit.transaction_signature || "missing signature"}</span>
+                    </div>
+                    <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
+                  </div>
+                  <div className="mt-2 grid gap-2 text-[11px] text-zinc-400 sm:grid-cols-3">
+                    <span>RPC: {audit.confirmation_status || String(audit.confirmation?.confirmation_status ?? "unknown")}</span>
+                    <span>Attempts: {audit.recovery_attempts ?? 0}</span>
+                    <span>Checked: {audit.confirmation_checked_at ? new Date(audit.confirmation_checked_at).toLocaleTimeString() : "not run"}</span>
+                  </div>
+                  {audit.last_recovery_error ? <p className="mt-2 text-xs text-amber-200">{audit.last_recovery_error}</p> : null}
+                  <p className="mt-2 text-xs text-zinc-500">{audit.recommended_action || "Review the audit row before taking any wallet action."}</p>
+                </article>
+              ))}
+              {!reviewAudits.length ? <p className="rounded-lg border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No unresolved live audits need recovery.</p> : null}
+            </div>
+          </section>
 
           <div className="mt-4 grid gap-4 lg:grid-cols-2">
             <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">

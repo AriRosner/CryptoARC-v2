@@ -252,6 +252,14 @@ export async function fetchLiveAudit(): Promise<LiveExecutionAudit[]> {
   return request("/api/live/audit");
 }
 
+export async function recoverUnresolvedLiveAudit(): Promise<{ summary: Record<string, unknown>; audits: LiveExecutionAudit[] }> {
+  return request("/api/live/audit/recover-unresolved", { method: "POST" });
+}
+
+export async function recoverLiveAudit(auditId: string): Promise<LiveExecutionAudit> {
+  return request(`/api/live/audit/${encodeURIComponent(auditId)}/recover`, { method: "POST" });
+}
+
 export async function fetchLiveIntents(): Promise<LiveIntent[]> {
   return request("/api/live/intents");
 }

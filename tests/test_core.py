@@ -2,7 +2,7 @@ import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionRequest, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
@@ -582,6 +582,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.configure_live_caps(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 10.0, "error": ""}
             audit = LiveExecutionRequest(
                 id="legacy",
                 created_at=utc_now(),
@@ -600,7 +601,7 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(simulated["status"], "simulation_warning")
             self.assertEqual(submitted["transaction_signature"], "sig111")
-            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(confirmed["status"], "reconciled")
             self.assertEqual(confirmed["confirmation_status"], "confirmed")
 
     def test_live_submit_rejects_blocked_or_stale_quotes(self) -> None:
@@ -674,9 +675,91 @@ class CoreLogicTests(unittest.TestCase):
             confirmed = state.live_confirm(quote["id"], "confirmed")
             ledger = state.live_ledger()
 
-            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(confirmed["status"], "needs_review")
             self.assertEqual(ledger["positions"][0]["reconciliation_status"], "needs_review")
             self.assertGreaterEqual(ledger["positions"][0]["cost_basis_sol"], 0.001)
+
+    def test_live_recovery_confirms_and_reconciles_submitted_audit(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 100.0, "error": ""}
+            state._signature_status = lambda signature: {
+                "ok": True,
+                "found": True,
+                "signature": signature,
+                "confirmation_status": "confirmed",
+                "err": None,
+                "slot": 123,
+            }
+
+            quote = state.live_quote(True, "buy", "MintRecover", "0.001", True, 1, 0.00001, "pump", "WalletRecover")
+            submitted = state.live_submit(quote["id"], "sigrecover")
+            recovered = state.recover_live_audit(submitted["id"])
+            status = state.live_status(True, "WalletRecover")
+
+            self.assertEqual(recovered["status"], "reconciled")
+            self.assertEqual(recovered["confirmation_status"], "confirmed")
+            self.assertEqual(recovered["reconciliation_status"], "matched")
+            self.assertEqual(status["unresolved_audit_count"], 0)
+
+    def test_live_recovery_keeps_unknown_signature_unresolved(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._signature_status = lambda signature: {"ok": True, "found": False, "confirmation_status": "not_found", "signature": signature}
+
+            quote = state.live_quote(True, "buy", "MintUnknown", "0.001", True, 1, 0.00001, "pump", "WalletUnknown")
+            submitted = state.live_submit(quote["id"], "sigunknown")
+            recovered = state.recover_live_audit(submitted["id"])
+
+            self.assertEqual(recovered["status"], "submitted")
+            self.assertEqual(recovered["recovery_attempts"], 1)
+            self.assertIn("not visible", recovered["recommended_action"])
+
+    def test_live_recovery_rpc_failure_records_review_warning(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._signature_status = lambda signature: {"ok": False, "found": False, "confirmation_status": "", "signature": signature, "error": "RPC down"}
+
+            quote = state.live_quote(True, "buy", "MintRpcDown", "0.001", True, 1, 0.00001, "pump", "WalletRpc")
+            submitted = state.live_submit(quote["id"], "sigrpc")
+            recovered = state.recover_live_audit(submitted["id"])
+
+            self.assertEqual(recovered["status"], "needs_review")
+            self.assertEqual(recovered["last_recovery_error"], "RPC down")
+            self.assertIn("RPC down", recovered["warnings"])
+
+    def test_live_poller_skips_without_env_or_audits(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            disabled = state.poll_live_audits(False)
+            enabled_empty = state.poll_live_audits(True)
+
+            self.assertTrue(disabled["skipped"])
+            self.assertIn("LIVE_TRADING_ENABLED", disabled["reason"])
+            self.assertTrue(enabled_empty["skipped"])
+            self.assertEqual(enabled_empty["reason"], "no unresolved submitted audits")
+
+    def test_live_recovery_endpoint_path_never_submits_transactions(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 1.0, "error": ""}
+            state._signature_status = lambda signature: {"ok": True, "found": True, "confirmation_status": "finalized", "signature": signature, "err": None}
+
+            quote = state.live_quote(True, "buy", "MintNoSubmit", "0.001", True, 1, 0.00001, "pump", "WalletNoSubmit")
+            state.live_submit(quote["id"], "signosubmit")
+            summary = state.recover_unresolved_live_audits()
+
+            self.assertEqual(summary["summary"]["checked"], 1)
+            self.assertEqual(state.storage.count_live_execution_audits(), 1)
 
     def test_live_ledger_pnl_uses_wallet_balance_and_latest_price(self) -> None:
         with TemporaryDirectory() as directory:
@@ -702,7 +785,7 @@ class CoreLogicTests(unittest.TestCase):
 
     def test_no_private_key_fields_are_added_to_settings_or_live_audit(self) -> None:
         settings_keys = set(BotSettings.__dataclass_fields__.keys())
-        audit_keys = {"request", "quote", "simulation", "wallet_public_key", "transaction_signature"}
+        audit_keys = set(LiveExecutionAudit.__dataclass_fields__.keys())
 
         self.assertFalse(any("private" in key.lower() or "seed" in key.lower() for key in settings_keys))
         self.assertFalse(any("private" in key.lower() or "seed" in key.lower() for key in audit_keys))
