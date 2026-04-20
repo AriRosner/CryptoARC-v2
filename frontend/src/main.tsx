@@ -115,7 +115,7 @@ const fallbackSnapshot: BotSnapshot = {
   status: "stopped",
   settings: {
     mode: "paper",
-    launch_source: "mock",
+    launch_source: "pumpportal",
     strategy_profile: "balanced",
     trade_size_sol: 0.1,
     slippage_tolerance_pct: 1,
@@ -231,7 +231,7 @@ const fallbackSnapshot: BotSnapshot = {
     avg_hold_seconds: 0
   },
   source_status: {
-    source: "mock",
+    source: "pumpportal",
     status: "offline",
     message: "Source is idle",
     events_received: 0,
@@ -410,17 +410,18 @@ function timeframeClosedTrades(trades: TradeRecord[], timeframe: PnlTimeframe): 
 function buildLivePnlHistory(ledger: LiveLedger | null, timeframe: PnlTimeframe): number[] {
   const summary = ledger?.summary;
   const current = Number(((summary?.realized_pnl_sol ?? 0) + (summary?.unrealized_pnl_sol ?? 0)).toFixed(6));
+  if (!ledger?.positions.length) return [0];
+
   const selectedFrame = pnlTimeframes.find((item) => item.value === timeframe) ?? pnlTimeframes[pnlTimeframes.length - 1];
-  const cutoff = selectedFrame.millis === null ? null : Date.now() - selectedFrame.millis;
-  const fills = (ledger?.positions ?? [])
-    .flatMap((position) => position.fills ?? [])
-    .filter((fill) => cutoff === null || new Date(fill.created_at).getTime() >= cutoff)
-    .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
-  if (!fills.length) return [0, current];
-  const values = [0];
-  fills.forEach(() => values.push(values[values.length - 1]));
-  if (values[values.length - 1] !== current) values.push(current);
-  return values.slice(-40);
+  if (selectedFrame.millis !== null) {
+    const cutoff = Date.now() - selectedFrame.millis;
+    const hasRecentFill = ledger.positions.some((position) =>
+      (position.fills ?? []).some((fill) => new Date(fill.created_at).getTime() >= cutoff)
+    );
+    if (!hasRecentFill) return [0];
+  }
+
+  return [0, current];
 }
 
 function App() {
@@ -496,6 +497,15 @@ function App() {
   const [totpRequired, setTotpRequired] = React.useState(false);
   const seenToastIds = React.useRef<Set<string>>(new Set());
   const readyForToasts = React.useRef(false);
+  const researchRefreshTimer = React.useRef<number | null>(null);
+
+  function scheduleResearchRefresh() {
+    if (researchRefreshTimer.current !== null) return;
+    researchRefreshTimer.current = window.setTimeout(() => {
+      researchRefreshTimer.current = null;
+      refreshResearchData().catch(() => undefined);
+    }, 750);
+  }
 
   React.useEffect(() => {
     let closed = false;
@@ -538,7 +548,7 @@ function App() {
           .slice(0, 3);
         if (tradeEvents.length) {
           tradeEvents.forEach((event) => seenToastIds.current.add(event.id));
-          refreshResearchData().catch(() => undefined);
+          scheduleResearchRefresh();
           if (data.settings.enable_trade_toasts) {
             setToasts((current) => [...tradeEvents, ...current].slice(0, 4));
           }
@@ -560,13 +570,12 @@ function App() {
     return () => {
       closed = true;
       window.clearTimeout(retryTimer);
+      if (researchRefreshTimer.current !== null) {
+        window.clearTimeout(researchRefreshTimer.current);
+      }
       socket?.close();
     };
   }, []);
-
-  if (authRequired && !authed) {
-    return <AuthGate totpRequired={totpRequired} onAuthed={() => setAuthed(true)} onError={setApiError} error={apiError} />;
-  }
 
   const settings = snapshot.settings;
   const stats = snapshot.stats;
@@ -1006,6 +1015,10 @@ function App() {
     ]).catch(() => undefined);
   }, [walletPublicKey, selectedLivePnlWallet, snapshot.settings.solana_rpc_url]);
 
+  if (authRequired && !authed) {
+    return <AuthGate totpRequired={totpRequired} onAuthed={() => setAuthed(true)} onError={setApiError} error={apiError} />;
+  }
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -1109,7 +1122,7 @@ function App() {
               {walletPublicKey && !liveWallets.includes(walletPublicKey) ? <option value={walletPublicKey}>Live {shortAddress(walletPublicKey)}</option> : null}
             </select>
           </label>
-          <PnlAreaChart values={pnlHistory} animationKey={`${pnlHistory.length}-${pnlHistory[pnlHistory.length - 1] ?? 0}`} />
+          <PnlAreaChart values={pnlHistory} />
           <div className="pnl-range">
             <span>Low {Math.min(...pnlHistory).toFixed(4)}</span>
             <span>High {Math.max(...pnlHistory).toFixed(4)}</span>
@@ -1182,7 +1195,7 @@ function App() {
         {workspacePage === "monitor" && <section className="hero-strip">
           <div>
             <h2>Live Launch Monitor</h2>
-            <p>Mock Pump.fun launch stream for strategy, risk, and dashboard testing.</p>
+            <p>{snapshot.source_status.source === "mock" ? "Mock launch stream for strategy, risk, and dashboard testing." : "PumpPortal launch stream for paper research and live readiness."}</p>
             <p>{snapshot.source_status.message}</p>
           </div>
           <div className="hero-metrics">
@@ -1668,10 +1681,11 @@ function LiveWalletModal({
   );
 }
 
-function PnlAreaChart({ values, animationKey }: { values: number[]; animationKey: string }) {
+const PnlAreaChart = React.memo(function PnlAreaChart({ values }: { values: number[] }) {
   const width = 260;
   const height = 92;
-  const padded = values.length > 1 ? values : [0, values[0] ?? 0];
+  const finiteValues = values.filter((value) => Number.isFinite(value));
+  const padded = finiteValues.length > 1 ? finiteValues : [0, finiteValues[0] ?? 0];
   const min = Math.min(...padded);
   const max = Math.max(...padded);
   const span = max - min || 1;
@@ -1689,11 +1703,11 @@ function PnlAreaChart({ values, animationKey }: { values: number[]; animationKey
   return (
     <svg className="pnl-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Live paper P&L chart">
       <line x1="0" y1={zeroY} x2={width} y2={zeroY} className="pnl-zero" />
-      <polygon key={`${animationKey}-area`} points={areaPoints} className={positive ? "pnl-area positive-area" : "pnl-area negative-area"} />
-      <polyline key={animationKey} points={linePoints} className={positive ? "pnl-line positive-line" : "pnl-line negative-line"} />
+      <polygon points={areaPoints} className={positive ? "pnl-area positive-area" : "pnl-area negative-area"} />
+      <polyline points={linePoints} className={positive ? "pnl-line positive-line" : "pnl-line negative-line"} />
     </svg>
   );
-}
+});
 
 function AuthGate({
   totpRequired,
@@ -2016,7 +2030,7 @@ function BacktestDashboard({
                 </div>
                 <BarChart3 size={18} />
               </div>
-              <PnlAreaChart values={active.pnl_curve.length ? active.pnl_curve : [0]} animationKey={active.id} />
+              <PnlAreaChart values={active.pnl_curve.length ? active.pnl_curve : [0]} />
             </section>
             <section className="research-card">
               <div className="section-heading">
@@ -2213,7 +2227,7 @@ function AnalysisDashboard({
             </div>
             <BarChart3 size={18} />
           </div>
-          <PnlAreaChart values={history} animationKey={`analysis-${pnlTimeframe}-${history.length}-${history[history.length - 1] ?? 0}`} />
+          <PnlAreaChart values={history} />
         </section>
         <section className="research-card">
           <div className="section-heading">

@@ -184,6 +184,13 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(loaded.id, token.id)
             self.assertEqual(loaded.score_breakdown, ["clean metadata"])
 
+    def test_fresh_state_defaults_to_pumpportal_source(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            self.assertEqual(state.settings.launch_source, "pumpportal")
+            self.assertEqual(state.source_status.source, "pumpportal")
+
     def test_storage_round_trip_source_event_and_backtest(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(str(Path(directory) / "test.db"))

@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class AppConfig(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    pumpfun_source: Literal["mock", "pumpportal"] = Field(default="mock", alias="PUMPFUN_SOURCE")
+    pumpfun_source: Literal["mock", "pumpportal"] = Field(default="pumpportal", alias="PUMPFUN_SOURCE")
     pumpportal_ws_url: str = Field(default="wss://pumpportal.fun/api/data", alias="PUMPPORTAL_WS_URL")
     solana_wss_endpoint: str = Field(default="", alias="SOLANA_WSS_ENDPOINT")
     solana_rpc_url: str = Field(default="https://api.mainnet-beta.solana.com", alias="SOLANA_RPC_URL")

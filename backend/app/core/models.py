@@ -32,7 +32,7 @@ class TokenStatus(str, Enum):
 @dataclass(slots=True)
 class BotSettings:
     mode: BotMode = BotMode.PAPER
-    launch_source: str = "mock"
+    launch_source: str = "pumpportal"
     strategy_profile: str = "balanced"
     trade_size_sol: float = 0.1
     slippage_tolerance_pct: float = 1.0
@@ -583,7 +583,7 @@ class BotStats:
 
 @dataclass(slots=True)
 class SourceStatus:
-    source: str = "mock"
+    source: str = "pumpportal"
     status: str = "offline"
     message: str = "Source is idle"
     events_received: int = 0

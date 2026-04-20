@@ -54,7 +54,7 @@ from app.core.strategy import DecisionPipeline
 
 
 class BotState:
-    def __init__(self, database_path: str = "data/cryptoarc.db", default_source: str = "mock", default_solana_rpc_url: str = "", default_watch_wallet_address: str = "") -> None:
+    def __init__(self, database_path: str = "data/cryptoarc.db", default_source: str = "pumpportal", default_solana_rpc_url: str = "", default_watch_wallet_address: str = "") -> None:
         self.storage = Storage(database_path)
         self.status = BotStatus.STOPPED
         has_saved_settings = self.storage.has_settings()

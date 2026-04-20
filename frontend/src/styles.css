@@ -44,7 +44,7 @@ body::before {
   z-index: -1;
   background: linear-gradient(110deg, transparent 0%, rgba(255, 255, 255, 0.035) 46%, transparent 58%);
   transform: translateX(-70%);
-  animation: ambient-sweep 11s var(--ease-fluid) infinite;
+  animation: ambient-sweep 18s var(--ease-fluid) infinite;
 }
 
 ::selection {
@@ -681,17 +681,12 @@ select:focus {
   stroke-linejoin: round;
   stroke-linecap: round;
   vector-effect: non-scaling-stroke;
-  stroke-dasharray: 700;
-  stroke-dashoffset: 700;
-  filter: drop-shadow(0 0 7px rgba(121, 224, 166, 0.22));
-  animation:
-    draw-line 1100ms ease forwards,
-    line-breathe 2.8s ease-in-out infinite;
+  transition: points 260ms var(--ease-fluid), stroke 220ms var(--ease-fluid);
 }
 
 .pnl-area {
-  opacity: 0;
-  animation: area-rise 700ms ease forwards;
+  opacity: 0.82;
+  transition: points 260ms var(--ease-fluid), fill 220ms var(--ease-fluid), opacity 220ms var(--ease-fluid);
 }
 
 .positive-area {
@@ -708,7 +703,6 @@ select:focus {
 
 .negative-line {
   stroke: #ff7d86;
-  filter: drop-shadow(0 0 7px rgba(255, 125, 134, 0.22));
 }
 
 .pnl-range {
