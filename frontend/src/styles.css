@@ -613,6 +613,10 @@ select:focus {
   margin-bottom: 10px;
 }
 
+.pnl-wallet-select {
+  margin: 0 0 10px;
+}
+
 .timeframe {
   min-height: 28px;
   border: 1px solid #242632;

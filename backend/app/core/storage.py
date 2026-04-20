@@ -8,11 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 class Storage:
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
@@ -173,6 +173,16 @@ class Storage:
                 )
                 """
             )
+            for table in ("live_intents", "live_ledger_positions"):
+                connection.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        id TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
                 (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
@@ -253,6 +263,12 @@ class Storage:
     def count_live_execution_audits(self) -> int:
         return self._count_table("live_execution_audits")
 
+    def count_live_intents(self) -> int:
+        return self._count_table("live_intents")
+
+    def count_live_ledger_positions(self) -> int:
+        return self._count_table("live_ledger_positions")
+
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
@@ -315,6 +331,32 @@ class Storage:
 
     def save_live_execution_audit(self, audit: LiveExecutionAudit) -> None:
         self._save_payload("live_execution_audits", audit.id, audit.to_dict(), audit.created_at)
+
+    def load_live_intents(self, limit: int = 100) -> list[LiveExecutionIntent]:
+        return [self._live_intent_from_payload(payload) for payload in self._load_payloads("live_intents", limit)]
+
+    def load_live_intent(self, intent_id: str) -> LiveExecutionIntent | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM live_intents WHERE id = ?", (intent_id,)).fetchone()
+        if not row:
+            return None
+        return self._live_intent_from_payload(json.loads(row["payload"]))
+
+    def save_live_intent(self, intent: LiveExecutionIntent) -> None:
+        self._save_payload("live_intents", intent.id, intent.to_dict(), intent.created_at)
+
+    def load_live_ledger_positions(self, limit: int = 100) -> list[LiveLedgerPosition]:
+        return [self._live_ledger_position_from_payload(payload) for payload in self._load_payloads("live_ledger_positions", limit)]
+
+    def load_live_ledger_position(self, position_id: str) -> LiveLedgerPosition | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM live_ledger_positions WHERE id = ?", (position_id,)).fetchone()
+        if not row:
+            return None
+        return self._live_ledger_position_from_payload(json.loads(row["payload"]))
+
+    def save_live_ledger_position(self, position: LiveLedgerPosition) -> None:
+        self._save_payload("live_ledger_positions", position.id, position.to_dict(), position.created_at)
 
     def _load_payloads(self, table: str, limit: int) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -581,6 +623,14 @@ class Storage:
         with self._connect() as connection:
             connection.execute("DELETE FROM live_execution_audits")
 
+    def clear_live_intents(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM live_intents")
+
+    def clear_live_ledger_positions(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM live_ledger_positions")
+
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -650,6 +700,19 @@ class Storage:
         payload["updated_at"] = datetime.fromisoformat(payload["updated_at"])
         allowed = set(LiveExecutionAudit.__dataclass_fields__.keys())
         return LiveExecutionAudit(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _live_intent_from_payload(self, payload: dict[str, Any]) -> LiveExecutionIntent:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["updated_at"] = datetime.fromisoformat(payload.get("updated_at") or payload["created_at"])
+        payload["expires_at"] = datetime.fromisoformat(payload["expires_at"]) if payload.get("expires_at") else None
+        allowed = set(LiveExecutionIntent.__dataclass_fields__.keys())
+        return LiveExecutionIntent(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _live_ledger_position_from_payload(self, payload: dict[str, Any]) -> LiveLedgerPosition:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["updated_at"] = datetime.fromisoformat(payload.get("updated_at") or payload["created_at"])
+        allowed = set(LiveLedgerPosition.__dataclass_fields__.keys())
+        return LiveLedgerPosition(**{key: value for key, value in payload.items() if key in allowed})
 
     def _strategy_decision_from_payload(self, payload: dict[str, Any]) -> StrategyDecisionRecord:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

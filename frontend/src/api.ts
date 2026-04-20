@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -252,6 +252,57 @@ export async function fetchLiveAudit(): Promise<LiveExecutionAudit[]> {
   return request("/api/live/audit");
 }
 
+export async function fetchLiveIntents(): Promise<LiveIntent[]> {
+  return request("/api/live/intents");
+}
+
+export async function fetchLiveLedger(walletPublicKey = ""): Promise<LiveLedger> {
+  return request(`/api/live/ledger?wallet_public_key=${encodeURIComponent(walletPublicKey)}`);
+}
+
+export async function createLiveIntent(payload: {
+  action: "buy" | "sell";
+  mint: string;
+  amount: string;
+  denominated_in_sol: boolean;
+  wallet_public_key: string;
+  signer_mode: string;
+  source?: string;
+  reason?: string;
+  symbol?: string;
+  score?: number;
+}): Promise<LiveIntent> {
+  return request("/api/live/intents", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+}
+
+export async function generateLiveIntents(wallet_public_key: string, signer_mode = "browser_wallet", watchlist: string[] = []): Promise<LiveIntent[]> {
+  return request("/api/live/intents/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ wallet_public_key, signer_mode, watchlist })
+  });
+}
+
+export async function cancelLiveIntent(intentId: string): Promise<LiveIntent> {
+  return request(`/api/live/intents/${encodeURIComponent(intentId)}/cancel`, { method: "POST" });
+}
+
+export async function quoteLiveIntent(intentId: string, slippage_pct: number, priority_fee_sol: number, pool: string): Promise<LiveExecutionAudit> {
+  return request(`/api/live/intents/${encodeURIComponent(intentId)}/quote`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ slippage_pct, priority_fee_sol, pool })
+  });
+}
+
+export async function reconcileLiveIntent(intentId: string): Promise<Record<string, unknown>> {
+  return request(`/api/live/intents/${encodeURIComponent(intentId)}/reconcile`, { method: "POST" });
+}
+
 export async function createManualLiveRequest(action: "buy" | "sell", mint: string, amount_sol: number): Promise<LiveExecutionRequest> {
   return request("/api/live/manual-request", {
     method: "POST",
@@ -355,11 +406,11 @@ export async function fetchDataSummary(): Promise<DataSummary> {
   return request("/api/data/summary");
 }
 
-export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all"): Promise<DataSummary> {
+export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all"): Promise<DataSummary> {
   return request(`/api/data/clear/${target}`, { method: "POST" });
 }
 
-export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all"): string {
+export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all"): string {
   return `${API_BASE}/api/export/${target}${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`;
 }
 

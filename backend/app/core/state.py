@@ -18,6 +18,8 @@ from app.core.models import (
     ExperimentRun,
     LiveExecutionAudit,
     LiveExecutionIntent,
+    LiveFill,
+    LiveLedgerPosition,
     LivePosition,
     LiveQuote,
     LiveExecutionRequest,
@@ -1321,6 +1323,16 @@ class BotState:
         if not self.settings.solana_rpc_url:
             blockers.append("Solana RPC URL is not configured")
         readiness = self.readiness_status()
+        intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
+        ledger = self._live_ledger_positions(wallet_public_key)
+        stale_quotes = sum(1 for intent in intents if intent.stale and intent.quote_id)
+        latest_reconciliation = next((position.reconciliation_status for position in ledger), "pending")
+        live_pnl = {
+            "realized_pnl_sol": round(sum(position.realized_pnl_sol for position in ledger), 6),
+            "unrealized_pnl_sol": round(sum(position.unrealized_pnl_sol for position in ledger), 6),
+            "cost_basis_sol": round(sum(position.cost_basis_sol for position in ledger), 6),
+            "approximate": True,
+        }
         return {
             "mode": "manual_browser_wallet_v1",
             "paper_default": True,
@@ -1336,6 +1348,17 @@ class BotState:
             "autonomous_live_available": False,
             "auto_sell_available": signer_mode != "browser_wallet" and bool(signer.get("can_unattended_sign")),
             "autonomy_blockers": ["browser wallets cannot unattended-sign", "local signer daemon is disabled in v1"],
+            "active_intent_count": len([intent for intent in intents if intent.status not in {"cancelled", "executed", "expired"}]),
+            "stale_quote_count": stale_quotes,
+            "latest_reconciliation_status": latest_reconciliation,
+            "wallet_adapter": {
+                "mode": signer_mode,
+                "manual_approval_required": True,
+                "can_sign": bool(signer.get("can_sign")),
+                "can_unattended_sign": False,
+            },
+            "live_pnl": live_pnl,
+            "readiness_warnings": readiness.get("recommended_actions", []) if readiness.get("status") != "ready" else [],
         }
 
     def start_live_session(self, env_live_enabled: bool, wallet_public_key: str, signer_mode: str = "browser_wallet") -> dict[str, object]:
@@ -1387,6 +1410,148 @@ class BotState:
     def live_audit(self) -> list[dict[str, object]]:
         return [audit.to_dict() for audit in self.storage.load_live_execution_audits(100)]
 
+    def live_intents(self) -> list[dict[str, object]]:
+        intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
+        return [intent.to_dict() for intent in self._rank_live_intents(intents)[:100]]
+
+    def live_ledger(self, wallet_public_key: str = "") -> dict[str, object]:
+        positions = self._live_ledger_positions(wallet_public_key)
+        return {
+            "positions": [position.to_dict() for position in positions],
+            "summary": {
+                "realized_pnl_sol": round(sum(position.realized_pnl_sol for position in positions), 6),
+                "unrealized_pnl_sol": round(sum(position.unrealized_pnl_sol for position in positions), 6),
+                "cost_basis_sol": round(sum(position.cost_basis_sol for position in positions), 6),
+                "open_positions": len([position for position in positions if position.status == "open"]),
+                "approximate": True,
+                "wallet_public_key": wallet_public_key,
+            },
+        }
+
+    def create_live_intent(
+        self,
+        action: str,
+        mint: str,
+        amount: str,
+        denominated_in_sol: bool,
+        wallet_public_key: str,
+        signer_mode: str = "browser_wallet",
+        source: str = "manual",
+        reason: str = "",
+        symbol: str = "",
+        score: int = 0,
+    ) -> dict[str, object]:
+        if action not in {"buy", "sell"}:
+            raise ValueError("action must be buy or sell")
+        now = utc_now()
+        intent = LiveExecutionIntent(
+            id=new_id("intent"),
+            created_at=now,
+            updated_at=now,
+            action=action,
+            mint=mint.strip(),
+            amount=str(amount).strip(),
+            denominated_in_sol=denominated_in_sol,
+            signer_mode=signer_mode,
+            wallet_public_key=wallet_public_key.strip(),
+            status="open",
+            reason=reason.strip() or f"{source} live intent",
+            source=source,
+            symbol=symbol,
+            score=int(score or 0),
+            priority=float(score or 0),
+            expires_at=now + timedelta(seconds=30),
+        )
+        self.storage.save_live_intent(intent)
+        return intent.to_dict()
+
+    def generate_live_intents(self, wallet_public_key: str, signer_mode: str = "browser_wallet", include_watchlist: list[str] | None = None) -> list[dict[str, object]]:
+        existing = [intent for intent in self.storage.load_live_intents(200) if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
+        existing_keys = {(intent.action, intent.mint) for intent in existing}
+        candidates: list[LiveExecutionIntent] = []
+        now = utc_now()
+        for token in self.tokens:
+            if len(existing) + len(candidates) >= 10:
+                break
+            if token.mint and token.score >= self.settings.score_threshold and ("buy", token.mint) not in existing_keys:
+                candidates.append(
+                    LiveExecutionIntent(
+                        id=new_id("intent"),
+                        created_at=now,
+                        updated_at=now,
+                        action="buy",
+                        mint=token.mint,
+                        amount=str(min(max(self.settings.live_max_trade_sol or self.settings.trade_size_sol, 0.0), self.settings.trade_size_sol)),
+                        denominated_in_sol=True,
+                        signer_mode=signer_mode,
+                        wallet_public_key=wallet_public_key.strip(),
+                        status="open",
+                        reason=f"Promoted paper decision: score {token.score}",
+                        source="paper_promoted",
+                        symbol=token.symbol,
+                        score=token.score,
+                        priority=float(token.score) + float(token.price_confidence or 0) * 10,
+                        expires_at=now + timedelta(seconds=30),
+                    )
+                )
+        for mint in include_watchlist or []:
+            if len(existing) + len(candidates) >= 10:
+                break
+            if mint and ("buy", mint) not in existing_keys:
+                candidates.append(
+                    LiveExecutionIntent(
+                        id=new_id("intent"),
+                        created_at=now,
+                        updated_at=now,
+                        action="buy",
+                        mint=mint.strip(),
+                        amount=str(self.settings.live_max_trade_sol or self.settings.trade_size_sol),
+                        denominated_in_sol=True,
+                        signer_mode=signer_mode,
+                        wallet_public_key=wallet_public_key.strip(),
+                        status="open",
+                        reason="Watchlist/manual mint candidate",
+                        source="watchlist",
+                        score=0,
+                        priority=0,
+                        expires_at=now + timedelta(seconds=30),
+                    )
+                )
+        for position in self.storage.load_live_ledger_positions(200):
+            if len(existing) + len(candidates) >= 10:
+                break
+            if position.status == "open" and position.token_balance > 0 and ("sell", position.mint) not in existing_keys:
+                candidates.append(
+                    LiveExecutionIntent(
+                        id=new_id("intent"),
+                        created_at=now,
+                        updated_at=now,
+                        action="sell",
+                        mint=position.mint,
+                        amount="100%",
+                        denominated_in_sol=False,
+                        signer_mode=signer_mode,
+                        wallet_public_key=wallet_public_key.strip(),
+                        status="open",
+                        reason="Risk-first live position exit intent",
+                        source="live_position_rules",
+                        symbol=position.symbol,
+                        score=100,
+                        priority=1000,
+                        expires_at=now + timedelta(seconds=30),
+                    )
+                )
+        for intent in candidates:
+            self.storage.save_live_intent(intent)
+        return [intent.to_dict() for intent in self._rank_live_intents(existing + candidates)[:10]]
+
+    def cancel_live_intent(self, intent_id: str) -> dict[str, object]:
+        intent = self._require_live_intent(intent_id)
+        intent.status = "cancelled"
+        intent.updated_at = utc_now()
+        self.storage.save_live_intent(intent)
+        return intent.to_dict()
+
     def live_quote(
         self,
         env_live_enabled: bool,
@@ -1415,6 +1580,7 @@ class BotState:
         intent = LiveExecutionIntent(
             id=new_id("intent"),
             created_at=utc_now(),
+            updated_at=utc_now(),
             action=action,
             mint=mint.strip(),
             amount=str(amount).strip(),
@@ -1423,6 +1589,7 @@ class BotState:
             wallet_public_key=wallet_public_key.strip(),
             status="blocked" if blockers else "quote_requested",
             reason="; ".join(blockers),
+            expires_at=utc_now() + timedelta(seconds=30),
         )
         quote_payload: dict[str, object] = {}
         quote_error = ""
@@ -1455,6 +1622,7 @@ class BotState:
             status="blocked" if blockers else "ready",
             unsigned_transaction_base64=unsigned_tx,
             error="; ".join(blockers),
+            expires_at=utc_now() + timedelta(seconds=30),
         )
         audit = LiveExecutionAudit(
             id=new_id("liveaudit"),
@@ -1473,10 +1641,58 @@ class BotState:
             errors=blockers,
             warnings=["Simulation warnings do not absolutely block manual signing"] if not blockers else [],
             final_status=quote.status,
+            intent_id=intent.id,
         )
+        intent.quote_id = quote.id
+        intent.audit_id = audit.id
+        intent.status = "blocked" if blockers else "quoted"
+        intent.reason = "; ".join(blockers) if blockers else "Quote preview ready"
+        self.storage.save_live_intent(intent)
         self.storage.save_live_execution_audit(audit)
         self.add_event("warning", f"Live {action} quote {quote.status} for {mint[:8] or 'unknown'}")
         return audit.to_dict()
+
+    def quote_live_intent(self, env_live_enabled: bool, intent_id: str, slippage_pct: float, priority_fee_sol: float, pool: str) -> dict[str, object]:
+        intent = self._require_live_intent(intent_id)
+        if intent.status == "cancelled":
+            raise ValueError("cannot quote a cancelled intent")
+        audit = self.live_quote(
+            env_live_enabled=env_live_enabled,
+            action=intent.action,
+            mint=intent.mint,
+            amount=intent.amount,
+            denominated_in_sol=intent.denominated_in_sol,
+            slippage_pct=slippage_pct,
+            priority_fee_sol=priority_fee_sol,
+            pool=pool,
+            wallet_public_key=intent.wallet_public_key,
+            signer_mode=intent.signer_mode,
+        )
+        stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
+        if stored_audit:
+            generated_intent_id = str(stored_audit.request.get("id", "")) if isinstance(stored_audit.request, dict) else ""
+            if generated_intent_id and generated_intent_id != intent.id:
+                generated = self.storage.load_live_intent(generated_intent_id)
+                if generated:
+                    generated.status = "cancelled"
+                    generated.reason = "Superseded by quoted workbench intent"
+                    generated.updated_at = utc_now()
+                    self.storage.save_live_intent(generated)
+            stored_audit.intent_id = intent.id
+            stored_audit.request = intent.to_dict()
+            stored_audit.quote = {**stored_audit.quote, "intent_id": intent.id}
+            self.storage.save_live_execution_audit(stored_audit)
+            audit = stored_audit.to_dict()
+        intent.quote_id = str(audit.get("quote", {}).get("id", ""))
+        intent.audit_id = str(audit.get("id", ""))
+        intent.status = "quoted" if audit.get("status") == "ready" else "blocked"
+        intent.reason = str(audit.get("final_status", ""))
+        intent.updated_at = utc_now()
+        intent.expires_at = utc_now() + timedelta(seconds=30)
+        intent.stale = False
+        self.storage.save_live_intent(intent)
+        audit["intent"] = intent.to_dict()
+        return audit
 
     def live_simulate(self, audit_id: str, ok: bool, warning: str = "", error: str = "", result: dict[str, Any] | None = None) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
@@ -1499,17 +1715,34 @@ class BotState:
         if error:
             audit.errors.append(error)
         self.storage.save_live_execution_audit(audit)
+        if audit.intent_id:
+            intent = self.storage.load_live_intent(audit.intent_id)
+            if intent:
+                intent.status = audit.status
+                intent.updated_at = utc_now()
+                self.storage.save_live_intent(intent)
         return audit.to_dict()
 
     def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
         if audit.signer_mode == "browser_wallet" and not signature.strip():
             raise ValueError("browser wallet submit requires a transaction signature")
+        if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
+            raise ValueError("cannot submit a live audit without a ready unsigned transaction")
+        expires_at = audit.quote.get("expires_at")
+        if expires_at and datetime.fromisoformat(str(expires_at)) < utc_now():
+            raise ValueError("cannot submit a stale live quote")
         audit.transaction_signature = signature.strip()
         audit.status = "submitted"
         audit.final_status = "submitted"
         audit.updated_at = utc_now()
         self.storage.save_live_execution_audit(audit)
+        if audit.intent_id:
+            intent = self.storage.load_live_intent(audit.intent_id)
+            if intent:
+                intent.status = "submitted"
+                intent.updated_at = utc_now()
+                self.storage.save_live_intent(intent)
         self.add_event("warning", f"Live {audit.action} submitted: {signature[:10]}")
         return audit.to_dict()
 
@@ -1522,7 +1755,27 @@ class BotState:
         if error:
             audit.errors.append(error)
         self.storage.save_live_execution_audit(audit)
+        if audit.intent_id:
+            intent = self.storage.load_live_intent(audit.intent_id)
+            if intent:
+                intent.status = "executed" if audit.status == "confirmed" else "needs_review"
+                intent.updated_at = utc_now()
+                self.storage.save_live_intent(intent)
+        if audit.status == "confirmed":
+            self._record_live_fill(audit)
         return audit.to_dict()
+
+    def reconcile_live_intent(self, intent_id: str) -> dict[str, object]:
+        intent = self._require_live_intent(intent_id)
+        audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
+        if audit is None:
+            intent.status = "needs_review"
+            intent.warnings.append("No execution audit exists for reconciliation")
+            intent.updated_at = utc_now()
+            self.storage.save_live_intent(intent)
+            return intent.to_dict()
+        position = self._reconcile_live_audit(audit)
+        return {"intent": intent.to_dict(), "audit": audit.to_dict(), "position": position.to_dict() if position else None}
 
     def _validate_live_order(self, action: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, wallet_public_key: str, signer_mode: str) -> str:
         if action not in {"buy", "sell"}:
@@ -1587,6 +1840,156 @@ class BotState:
         if audit is None:
             raise ValueError(f"Live audit not found: {audit_id}")
         return audit
+
+    def _require_live_intent(self, intent_id: str) -> LiveExecutionIntent:
+        intent = self.storage.load_live_intent(intent_id)
+        if intent is None:
+            raise ValueError(f"Live intent not found: {intent_id}")
+        return intent
+
+    def _mark_stale_live_intents(self, intents: list[LiveExecutionIntent]) -> list[LiveExecutionIntent]:
+        now = utc_now()
+        for intent in intents:
+            if intent.expires_at and intent.expires_at < now and intent.status in {"open", "quoted", "simulated", "simulation_warning"}:
+                intent.stale = True
+                if intent.quote_id:
+                    intent.status = "expired"
+                intent.updated_at = now
+                self.storage.save_live_intent(intent)
+        return intents
+
+    def _rank_live_intents(self, intents: list[LiveExecutionIntent]) -> list[LiveExecutionIntent]:
+        return sorted(
+            intents,
+            key=lambda intent: (
+                1 if intent.status in {"open", "quoted", "simulated", "simulation_warning"} else 0,
+                float(intent.priority or 0),
+                int(intent.score or 0),
+                intent.created_at.timestamp(),
+            ),
+            reverse=True,
+        )
+
+    def _record_live_fill(self, audit: LiveExecutionAudit) -> LiveLedgerPosition | None:
+        wallet = audit.wallet_public_key
+        if not wallet:
+            return None
+        existing = next((position for position in self.storage.load_live_ledger_positions(500) if position.mint == audit.mint and position.wallet_public_key == wallet), None)
+        now = utc_now()
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == audit.mint), None)
+        position = existing or LiveLedgerPosition(
+            id=new_id("livepos"),
+            created_at=now,
+            updated_at=now,
+            mint=audit.mint,
+            wallet_public_key=wallet,
+            symbol=token.symbol if token else "",
+        )
+        amount_sol = 0.0
+        try:
+            if audit.action == "buy" and not str(audit.amount).endswith("%"):
+                amount_sol = float(audit.amount)
+        except ValueError:
+            amount_sol = 0.0
+        priority_fee = float(audit.quote.get("priority_fee_sol", 0.0) or 0.0) if isinstance(audit.quote, dict) else 0.0
+        fill = LiveFill(
+            id=new_id("fill"),
+            created_at=now,
+            audit_id=audit.id,
+            intent_id=audit.intent_id,
+            action=audit.action,
+            mint=audit.mint,
+            amount=audit.amount,
+            amount_sol=amount_sol,
+            token_amount=0.0,
+            fee_sol=0.0,
+            priority_fee_sol=priority_fee,
+            signature=audit.transaction_signature,
+        ).to_dict()
+        position.fills.append(fill)
+        position.total_priority_fees_sol = round(position.total_priority_fees_sol + priority_fee, 9)
+        mark_price = self._latest_live_mark_price(audit.mint)
+        if audit.action == "buy":
+            position.cost_basis_sol = round(position.cost_basis_sol + amount_sol + priority_fee, 9)
+            position.status = "open"
+        else:
+            sale_fraction = 1.0 if str(audit.amount).endswith("%") else 0.0
+            try:
+                if str(audit.amount).endswith("%"):
+                    sale_fraction = min(1.0, max(0.0, float(str(audit.amount).replace("%", "")) / 100))
+            except ValueError:
+                sale_fraction = 1.0
+            realized_basis = position.cost_basis_sol * sale_fraction
+            estimated_proceeds = (position.token_balance * mark_price * sale_fraction) if mark_price > 0 and position.token_balance > 0 else 0.0
+            position.realized_pnl_sol = round(position.realized_pnl_sol + estimated_proceeds - realized_basis - priority_fee, 9)
+            position.cost_basis_sol = round(max(0.0, position.cost_basis_sol - realized_basis), 9)
+            if sale_fraction >= 0.999:
+                position.status = "closed"
+        position.updated_at = now
+        position.reconciliation_status = "pending"
+        self.storage.save_live_ledger_position(position)
+        return self._reconcile_live_audit(audit)
+
+    def _reconcile_live_audit(self, audit: LiveExecutionAudit) -> LiveLedgerPosition | None:
+        wallet = audit.wallet_public_key
+        position = next((item for item in self.storage.load_live_ledger_positions(500) if item.mint == audit.mint and item.wallet_public_key == wallet), None)
+        if position is None:
+            return None
+        balance = self._wallet_token_balance(wallet, audit.mint)
+        position.reconciliation = balance
+        audit.reconciliation = balance
+        if balance.get("error"):
+            position.reconciliation_status = "needs_review"
+            audit.reconciliation_status = "needs_review"
+            audit.warnings.append(f"Reconciliation needs review: {balance['error']}")
+        else:
+            position.token_balance = float(balance.get("token_balance") or 0.0)
+            position.reconciliation_status = "matched"
+            audit.reconciliation_status = "matched"
+        self._refresh_live_position_estimate(position)
+        position.updated_at = utc_now()
+        audit.updated_at = utc_now()
+        self.storage.save_live_ledger_position(position)
+        self.storage.save_live_execution_audit(audit)
+        return position
+
+    def _live_ledger_positions(self, wallet_public_key: str = "") -> list[LiveLedgerPosition]:
+        positions = self.storage.load_live_ledger_positions(500)
+        if wallet_public_key.strip():
+            positions = [position for position in positions if position.wallet_public_key == wallet_public_key.strip()]
+        refreshed: list[LiveLedgerPosition] = []
+        for position in positions:
+            self._refresh_live_position_estimate(position)
+            self.storage.save_live_ledger_position(position)
+            refreshed.append(position)
+        return refreshed
+
+    def _refresh_live_position_estimate(self, position: LiveLedgerPosition) -> None:
+        price = self._latest_live_mark_price(position.mint)
+        if price > 0 and position.token_balance > 0:
+            estimated_value = position.token_balance * price
+            position.unrealized_pnl_sol = round(estimated_value - position.cost_basis_sol, 9)
+            position.average_entry_price_sol = round(position.cost_basis_sol / position.token_balance, 12) if position.token_balance else 0.0
+        elif position.status == "closed" or position.token_balance <= 0:
+            position.unrealized_pnl_sol = 0.0
+
+    def _latest_live_mark_price(self, mint: str) -> float:
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
+        candidates: list[float] = []
+        if token:
+            candidates.extend([float(value or 0.0) for value in (token.current_price, token.exit_price, token.entry_price)])
+        for observation in self.storage.load_price_observations(100, mint=mint):
+            if observation.accepted:
+                candidates.extend(
+                    [
+                        float(observation.selected_price or 0.0),
+                        float(observation.price or 0.0),
+                        float(observation.direct_price or 0.0),
+                        float(observation.market_cap_price or 0.0),
+                    ]
+                )
+                break
+        return next((value for value in candidates if value > 0), 0.0)
 
     def live_requests(self) -> list[dict[str, object]]:
         return [request.to_dict() for request in self.storage.load_live_execution_requests(100)]
@@ -1858,6 +2261,10 @@ class BotState:
             return {"live_sessions": [item.to_dict() for item in self.storage.load_live_sessions(5000)]}
         if target == "live_execution_audits":
             return {"live_execution_audits": [item.to_dict() for item in self.storage.load_live_execution_audits(5000)]}
+        if target == "live_intents":
+            return {"live_intents": [item.to_dict() for item in self.storage.load_live_intents(5000)]}
+        if target == "live_ledger_positions":
+            return {"live_ledger_positions": [item.to_dict() for item in self.storage.load_live_ledger_positions(5000)]}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
@@ -1874,6 +2281,8 @@ class BotState:
             "live_execution_requests": [item.to_dict() for item in self.storage.load_live_execution_requests(5000)],
             "live_sessions": [item.to_dict() for item in self.storage.load_live_sessions(5000)],
             "live_execution_audits": [item.to_dict() for item in self.storage.load_live_execution_audits(5000)],
+            "live_intents": [item.to_dict() for item in self.storage.load_live_intents(5000)],
+            "live_ledger_positions": [item.to_dict() for item in self.storage.load_live_ledger_positions(5000)],
         }
 
     def data_summary(self) -> dict[str, int]:
@@ -1893,6 +2302,8 @@ class BotState:
             "live_execution_requests": self.storage.count_live_execution_requests(),
             "live_sessions": self.storage.count_live_sessions(),
             "live_execution_audits": self.storage.count_live_execution_audits(),
+            "live_intents": self.storage.count_live_intents(),
+            "live_ledger_positions": self.storage.count_live_ledger_positions(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
@@ -1931,6 +2342,10 @@ class BotState:
             self.storage.clear_live_sessions()
         if target in {"live_execution_audits", "all"}:
             self.storage.clear_live_execution_audits()
+        if target in {"live_intents", "all"}:
+            self.storage.clear_live_intents()
+        if target in {"live_ledger_positions", "all"}:
+            self.storage.clear_live_ledger_positions()
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()

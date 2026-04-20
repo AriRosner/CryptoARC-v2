@@ -573,6 +573,8 @@ class CoreLogicTests(unittest.TestCase):
     def test_live_simulation_submit_and_confirm_update_audit(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             audit = LiveExecutionRequest(
                 id="legacy",
                 created_at=utc_now(),
@@ -583,7 +585,7 @@ class CoreLogicTests(unittest.TestCase):
                 reason="legacy",
             )
             state.storage.save_live_execution_request(audit)
-            live_audit = state.live_quote(False, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
+            live_audit = state.live_quote(True, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
 
             simulated = state.live_simulate(live_audit["id"], False, "simulation warning")
             submitted = state.live_submit(live_audit["id"], "sig111")
@@ -593,6 +595,103 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(submitted["transaction_signature"], "sig111")
             self.assertEqual(confirmed["status"], "confirmed")
             self.assertEqual(confirmed["confirmation_status"], "confirmed")
+
+    def test_live_submit_rejects_blocked_or_stale_quotes(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            blocked = state.live_quote(False, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
+
+            with self.assertRaises(ValueError):
+                state.live_submit(blocked["id"], "sig111")
+
+    def test_live_intent_generation_cap_and_quote_expiry(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            for index in range(12):
+                token = self.make_token()
+                token.id = f"tok_live_{index}"
+                token.mint = f"MintLive{index}"
+                token.score = 90 - index
+                state.tokens.append(token)
+
+            intents = state.generate_live_intents("Wallet111")
+            first = intents[0]
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            quoted = state.quote_live_intent(True, first["id"], 1, 0.00001, "pump")
+
+            self.assertLessEqual(len(intents), 10)
+            self.assertGreaterEqual(intents[0]["score"], intents[-1]["score"])
+            self.assertEqual(quoted["status"], "ready")
+            loaded = state.storage.load_live_intent(first["id"])
+            loaded.expires_at = utc_now().replace(year=2000)
+            state.storage.save_live_intent(loaded)
+            stale = next(item for item in state.live_intents() if item["id"] == first["id"])
+            self.assertTrue(stale["stale"])
+
+    def test_live_intent_readiness_warning_does_not_block_quote(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            intent = state.create_live_intent("buy", "Mint111", "0.001", True, "Wallet111")
+            quote = state.quote_live_intent(True, intent["id"], 1, 0.00001, "pump")
+
+            self.assertEqual(state.readiness_status()["status"], "not_enough_data")
+            self.assertEqual(quote["status"], "ready")
+
+    def test_live_kill_switch_blocks_new_intent_quotes(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.kill_switch_enabled = True
+            intent = state.create_live_intent("buy", "Mint111", "0.001", True, "Wallet111")
+
+            quote = state.quote_live_intent(True, intent["id"], 1, 0.00001, "pump")
+
+            self.assertEqual(quote["status"], "blocked")
+            self.assertIn("manual kill switch enabled", quote["errors"])
+
+    def test_live_ledger_reconciliation_needs_review_on_balance_error(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": None, "error": "rpc down"}
+
+            intent = state.create_live_intent("buy", "Mint111", "0.001", True, "Wallet111")
+            quote = state.quote_live_intent(True, intent["id"], 1, 0.00001, "pump")
+            state.live_submit(quote["id"], "sig111")
+            confirmed = state.live_confirm(quote["id"], "confirmed")
+            ledger = state.live_ledger()
+
+            self.assertEqual(confirmed["status"], "confirmed")
+            self.assertEqual(ledger["positions"][0]["reconciliation_status"], "needs_review")
+            self.assertGreaterEqual(ledger["positions"][0]["cost_basis_sol"], 0.001)
+
+    def test_live_ledger_pnl_uses_wallet_balance_and_latest_price(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            token = self.make_token()
+            token.mint = "MintPnl"
+            token.current_price = 0.00002
+            state.storage.save_token(token)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 100.0, "error": ""}
+
+            intent = state.create_live_intent("buy", "MintPnl", "0.001", True, "WalletPnl")
+            quote = state.quote_live_intent(True, intent["id"], 1, 0.00001, "pump")
+            state.live_submit(quote["id"], "sigpnl")
+            state.live_confirm(quote["id"], "confirmed")
+            ledger = state.live_ledger("WalletPnl")
+            other_wallet = state.live_ledger("OtherWallet")
+
+            self.assertEqual(len(ledger["positions"]), 1)
+            self.assertGreater(ledger["summary"]["unrealized_pnl_sol"], 0)
+            self.assertEqual(other_wallet["positions"], [])
 
     def test_no_private_key_fields_are_added_to_settings_or_live_audit(self) -> None:
         settings_keys = set(BotSettings.__dataclass_fields__.keys())

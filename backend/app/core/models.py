@@ -294,6 +294,7 @@ class LivePosition:
 class LiveExecutionIntent:
     id: str
     created_at: datetime
+    updated_at: datetime
     action: str
     mint: str
     amount: str
@@ -303,10 +304,20 @@ class LiveExecutionIntent:
     status: str = "created"
     reason: str = ""
     source: str = "dashboard"
+    symbol: str = ""
+    score: int = 0
+    priority: float = 0.0
+    quote_id: str = ""
+    audit_id: str = ""
+    expires_at: datetime | None = None
+    stale: bool = False
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
         return payload
 
 
@@ -326,10 +337,13 @@ class LiveQuote:
     status: str
     unsigned_transaction_base64: str = ""
     error: str = ""
+    expires_at: datetime | None = None
+    stale: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
         return payload
 
 
@@ -371,6 +385,59 @@ class LiveExecutionAudit:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     final_status: str = "pending"
+    intent_id: str = ""
+    reconciliation_status: str = "pending"
+    reconciliation: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class LiveFill:
+    id: str
+    created_at: datetime
+    audit_id: str
+    intent_id: str
+    action: str
+    mint: str
+    amount: str
+    amount_sol: float = 0.0
+    token_amount: float = 0.0
+    price_sol: float = 0.0
+    fee_sol: float = 0.0
+    priority_fee_sol: float = 0.0
+    signature: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class LiveLedgerPosition:
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    mint: str
+    wallet_public_key: str
+    symbol: str = ""
+    status: str = "open"
+    token_balance: float = 0.0
+    cost_basis_sol: float = 0.0
+    realized_pnl_sol: float = 0.0
+    unrealized_pnl_sol: float = 0.0
+    average_entry_price_sol: float = 0.0
+    total_fees_sol: float = 0.0
+    total_priority_fees_sol: float = 0.0
+    fills: list[dict[str, Any]] = field(default_factory=list)
+    reconciliation_status: str = "pending"
+    reconciliation: dict[str, Any] = field(default_factory=dict)
+    review_notes: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

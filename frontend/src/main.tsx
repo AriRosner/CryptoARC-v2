@@ -29,6 +29,8 @@ import {
   acknowledgeLiveSession,
   clearData,
   confirmLiveAudit,
+  cancelLiveIntent,
+  createLiveIntent,
   createLiveQuote,
   createExperiment,
   disableTotp,
@@ -39,6 +41,8 @@ import {
   fetchExperiments,
   fetchLiveRequests,
   fetchLiveAudit,
+  fetchLiveIntents,
+  fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
   fetchDataIntegrity,
@@ -69,9 +73,12 @@ import {
   logout,
   openSnapshotSocket,
   patchSettings,
+  quoteLiveIntent,
   recoverWatchdog,
+  reconcileLiveIntent,
   recordLiveSimulation,
   reviewLiveRequest,
+  generateLiveIntents,
   submitLiveAudit,
   labelTrade,
   runABStrategyReplay,
@@ -86,7 +93,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 type BrowserSolanaProvider = {
@@ -282,6 +289,7 @@ type QueueSort = "newest" | "score" | "pnl" | "creator";
 type WorkspacePage = "monitor" | "analysis" | "backtests" | "review" | "data";
 type SettingsPage = "source" | "strategy" | "risk" | "exits" | "simulation" | "advanced" | "security";
 type LiveWalletMethod = "browser_wallet" | "local_signer_daemon";
+type PnlWalletScope = "paper" | string;
 
 const pnlTimeframes: Array<{ label: string; value: PnlTimeframe; millis: number | null }> = [
   { label: "5m", value: "5m", millis: 5 * 60 * 1000 },
@@ -399,6 +407,22 @@ function timeframeClosedTrades(trades: TradeRecord[], timeframe: PnlTimeframe): 
   });
 }
 
+function buildLivePnlHistory(ledger: LiveLedger | null, timeframe: PnlTimeframe): number[] {
+  const summary = ledger?.summary;
+  const current = Number(((summary?.realized_pnl_sol ?? 0) + (summary?.unrealized_pnl_sol ?? 0)).toFixed(6));
+  const selectedFrame = pnlTimeframes.find((item) => item.value === timeframe) ?? pnlTimeframes[pnlTimeframes.length - 1];
+  const cutoff = selectedFrame.millis === null ? null : Date.now() - selectedFrame.millis;
+  const fills = (ledger?.positions ?? [])
+    .flatMap((position) => position.fills ?? [])
+    .filter((fill) => cutoff === null || new Date(fill.created_at).getTime() >= cutoff)
+    .sort((left, right) => new Date(left.created_at).getTime() - new Date(right.created_at).getTime());
+  if (!fills.length) return [0, current];
+  const values = [0];
+  fills.forEach(() => values.push(values[values.length - 1]));
+  if (values[values.length - 1] !== current) values.push(current);
+  return values.slice(-40);
+}
+
 function App() {
   const [snapshot, setSnapshot] = React.useState<BotSnapshot>(fallbackSnapshot);
   const [apiState, setApiState] = React.useState("connecting");
@@ -442,7 +466,11 @@ function App() {
   const [liveStatus, setLiveStatus] = React.useState<LiveStatus | null>(null);
   const [liveAudit, setLiveAudit] = React.useState<LiveExecutionAudit[]>([]);
   const [livePositions, setLivePositions] = React.useState<LivePosition[]>([]);
+  const [liveIntents, setLiveIntents] = React.useState<LiveIntent[]>([]);
+  const [liveLedger, setLiveLedger] = React.useState<LiveLedger | null>(null);
   const [walletPublicKey, setWalletPublicKey] = React.useState(() => window.localStorage.getItem("cryptoarc_wallet_public_key") || "");
+  const [liveWallets, setLiveWallets] = React.useState<string[]>(() => JSON.parse(window.localStorage.getItem("cryptoarc_live_wallets") || "[]"));
+  const [pnlWalletScope, setPnlWalletScope] = React.useState<PnlWalletScope>(() => window.localStorage.getItem("cryptoarc_pnl_wallet_scope") || "paper");
   const [walletBalanceSol, setWalletBalanceSol] = React.useState<number | null>(null);
   const [liveWalletOpen, setLiveWalletOpen] = React.useState(false);
   const [liveWalletMethod, setLiveWalletMethod] = React.useState<LiveWalletMethod>("browser_wallet");
@@ -453,6 +481,7 @@ function App() {
   const [livePriorityFee, setLivePriorityFee] = React.useState(0.00001);
   const [livePool, setLivePool] = React.useState("pump");
   const [activeLiveAudit, setActiveLiveAudit] = React.useState<LiveExecutionAudit | null>(null);
+  const [activeLiveIntentId, setActiveLiveIntentId] = React.useState("");
   const [backtestLimit, setBacktestLimit] = React.useState(80);
   const [backtestProfile, setBacktestProfile] = React.useState<BotSettings["strategy_profile"]>("balanced");
   const [backtestDateFrom, setBacktestDateFrom] = React.useState("");
@@ -544,11 +573,16 @@ function App() {
   const running = snapshot.status === "running";
   const liveCapsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
   const latestLiveAudit = liveAudit[0] ?? null;
+  const selectedLivePnlWallet = pnlWalletScope === "paper" ? "" : pnlWalletScope;
   const selectedToken = snapshot.tokens.find((token) => token.id === selectedTokenId) ?? null;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
-  const timeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
-  const pnlHistory = React.useMemo(() => buildPnlHistory(trades, pnlTimeframe), [trades, pnlTimeframe]);
+  const paperTimeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
+  const liveTimeframePnl = Number(((liveLedger?.summary.realized_pnl_sol ?? 0) + (liveLedger?.summary.unrealized_pnl_sol ?? 0)).toFixed(6));
+  const timeframePnl = pnlWalletScope === "paper" ? paperTimeframePnl : liveTimeframePnl;
+  const paperPnlHistory = React.useMemo(() => buildPnlHistory(trades, pnlTimeframe), [trades, pnlTimeframe]);
+  const livePnlHistory = React.useMemo(() => buildLivePnlHistory(liveLedger, pnlTimeframe), [liveLedger, pnlTimeframe]);
+  const pnlHistory = pnlWalletScope === "paper" ? paperPnlHistory : livePnlHistory;
   const filteredTokens = React.useMemo(() => {
     let tokens = snapshot.tokens;
     const query = tokenSearch.trim().toLowerCase();
@@ -685,7 +719,7 @@ function App() {
   }
 
   async function refreshResearchData() {
-    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows] = await Promise.all([
+    const [runs, events, summary, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows, intentRows, ledgerState] = await Promise.all([
       fetchBacktests(),
       fetchSourceEvents(),
       fetchDataSummary(),
@@ -713,7 +747,9 @@ function App() {
       fetchLiveRequests(),
       fetchLiveStatus(walletPublicKey),
       fetchLiveAudit(),
-      fetchLivePositions(walletPublicKey)
+      fetchLivePositions(walletPublicKey),
+      fetchLiveIntents(),
+      fetchLiveLedger(selectedLivePnlWallet)
     ]);
     setBacktests(runs);
     setSourceEvents(events);
@@ -743,6 +779,8 @@ function App() {
     setLiveStatus(liveState);
     setLiveAudit(auditRows);
     setLivePositions(livePositionRows);
+    setLiveIntents(intentRows);
+    setLiveLedger(ledgerState);
     refreshConnectedWalletBalance().catch(() => undefined);
   }
 
@@ -757,7 +795,7 @@ function App() {
     }
   }
 
-  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all") {
+  async function clearProjectData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all") {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
@@ -788,6 +826,9 @@ function App() {
       const publicKey = result.publicKey.toString();
       setWalletPublicKey(publicKey);
       window.localStorage.setItem("cryptoarc_wallet_public_key", publicKey);
+      const nextWallets = [publicKey, ...liveWallets.filter((wallet) => wallet !== publicKey)].slice(0, 8);
+      setLiveWallets(nextWallets);
+      window.localStorage.setItem("cryptoarc_live_wallets", JSON.stringify(nextWallets));
       setLiveStatus(await fetchLiveStatus(publicKey));
       setLivePositions(await fetchLivePositions(publicKey));
       await refreshConnectedWalletBalance(publicKey);
@@ -830,6 +871,87 @@ function App() {
     }
   }
 
+  async function createManualIntent() {
+    try {
+      const intent = await createLiveIntent({
+        action: liveAction,
+        mint: liveMint,
+        amount: liveAmount,
+        denominated_in_sol: liveAction === "buy",
+        wallet_public_key: walletPublicKey,
+        signer_mode: "browser_wallet",
+        source: "manual",
+        reason: "Manual Live Wallet workbench intent"
+      });
+      setLiveIntents((current) => [intent, ...current.filter((item) => item.id !== intent.id)]);
+      setActiveLiveIntentId(intent.id);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Live intent failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function generateWorkbenchIntents() {
+    try {
+      const intents = await generateLiveIntents(walletPublicKey, "browser_wallet", watchlist);
+      setLiveIntents(intents);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Intent generation failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function quoteWorkbenchIntent(intentId: string) {
+    try {
+      const audit = await quoteLiveIntent(intentId, liveSlippage, livePriorityFee, livePool);
+      setActiveLiveAudit(audit);
+      setActiveLiveIntentId(intentId);
+      setLiveAudit((current) => [audit, ...current.filter((item) => item.id !== audit.id)]);
+      setLiveIntents(await fetchLiveIntents());
+      setApiError("");
+    } catch (error) {
+      setApiError(`Intent quote failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function cancelWorkbenchIntent(intentId: string) {
+    try {
+      const intent = await cancelLiveIntent(intentId);
+      setLiveIntents((current) => current.map((item) => item.id === intent.id ? intent : item));
+      if (activeLiveIntentId === intentId) setActiveLiveIntentId("");
+    } catch (error) {
+      setApiError(`Cancel intent failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function simulateActiveLiveAudit() {
+    if (!activeLiveAudit) return;
+    try {
+      const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
+      if (!encoded) throw new Error("No unsigned transaction is available");
+      const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
+      const transaction = VersionedTransaction.deserialize(bytes);
+      const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
+      const simulation = await connection.simulateTransaction(transaction);
+      const ok = !simulation.value.err;
+      const warning = ok ? "" : `RPC simulation warning: ${JSON.stringify(simulation.value.err)}`;
+      const result = {
+        err: simulation.value.err,
+        logs: simulation.value.logs || [],
+        unitsConsumed: simulation.value.unitsConsumed || 0
+      };
+      const updated = await recordLiveSimulation(activeLiveAudit.id, ok, warning, "", result);
+      setActiveLiveAudit(updated);
+      setLiveAudit((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
+      setLiveIntents(await fetchLiveIntents());
+      setApiError("");
+    } catch (error) {
+      const updated = await recordLiveSimulation(activeLiveAudit.id, false, "RPC simulation could not complete; manual signing remains available.", error instanceof Error ? error.message : "unknown error", {});
+      setActiveLiveAudit(updated);
+      setLiveAudit((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
+    }
+  }
+
   async function signAndSendLiveAudit() {
     if (!activeLiveAudit) return;
     try {
@@ -855,6 +977,12 @@ function App() {
       setActiveLiveAudit(confirmed);
       setLiveAudit((current) => [confirmed, ...current.filter((item) => item.id !== confirmed.id)]);
       setLivePositions(await fetchLivePositions(walletPublicKey));
+      setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
+      setLiveIntents(await fetchLiveIntents());
+      if (activeLiveIntentId) {
+        await reconcileLiveIntent(activeLiveIntentId).catch(() => undefined);
+        setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
+      }
     } catch (error) {
       setApiError(`Wallet submit failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -872,9 +1000,11 @@ function App() {
     Promise.all([
       fetchLiveStatus(walletPublicKey).then(setLiveStatus),
       fetchLivePositions(walletPublicKey).then(setLivePositions),
+      fetchLiveIntents().then(setLiveIntents),
+      fetchLiveLedger(selectedLivePnlWallet).then(setLiveLedger),
       refreshConnectedWalletBalance(walletPublicKey)
     ]).catch(() => undefined);
-  }, [walletPublicKey, snapshot.settings.solana_rpc_url]);
+  }, [walletPublicKey, selectedLivePnlWallet, snapshot.settings.solana_rpc_url]);
 
   return (
     <main className="app-shell">
@@ -963,12 +1093,32 @@ function App() {
               </button>
             ))}
           </div>
+          <label className="pnl-wallet-select">
+            Wallet scope
+            <select
+              value={pnlWalletScope}
+              onChange={(event) => {
+                setPnlWalletScope(event.target.value);
+                window.localStorage.setItem("cryptoarc_pnl_wallet_scope", event.target.value);
+              }}
+            >
+              <option value="paper">Paper wallet</option>
+              {liveWallets.map((wallet) => (
+                <option key={wallet} value={wallet}>Live {shortAddress(wallet)}</option>
+              ))}
+              {walletPublicKey && !liveWallets.includes(walletPublicKey) ? <option value={walletPublicKey}>Live {shortAddress(walletPublicKey)}</option> : null}
+            </select>
+          </label>
           <PnlAreaChart values={pnlHistory} animationKey={`${pnlHistory.length}-${pnlHistory[pnlHistory.length - 1] ?? 0}`} />
           <div className="pnl-range">
             <span>Low {Math.min(...pnlHistory).toFixed(4)}</span>
             <span>High {Math.max(...pnlHistory).toFixed(4)}</span>
           </div>
-          <p className="pnl-caption">{timeframeTrades.length} closed trades in selected range</p>
+          <p className="pnl-caption">
+            {pnlWalletScope === "paper"
+              ? `${timeframeTrades.length} closed paper trades in selected range`
+              : `${liveLedger?.summary.open_positions ?? 0} live positions / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"} P&L`}
+          </p>
         </section>
 
         <section className="panel replay-panel">
@@ -1195,6 +1345,8 @@ function App() {
           liveStatus={liveStatus}
           liveAudit={liveAudit}
           livePositions={livePositions}
+          liveIntents={liveIntents}
+          liveLedger={liveLedger}
           liveAction={liveAction}
           liveMint={liveMint}
           liveAmount={liveAmount}
@@ -1202,6 +1354,7 @@ function App() {
           livePriorityFee={livePriorityFee}
           livePool={livePool}
           activeLiveAudit={activeLiveAudit}
+          activeLiveIntentId={activeLiveIntentId}
           onClose={() => setLiveWalletOpen(false)}
           onConnectWallet={connectBrowserWallet}
           onAcknowledgeLive={acknowledgeLiveRisk}
@@ -1212,6 +1365,11 @@ function App() {
           onLivePriorityFeeChange={setLivePriorityFee}
           onLivePoolChange={setLivePool}
           onCreateLivePreview={createLivePreview}
+          onCreateManualIntent={createManualIntent}
+          onGenerateIntents={generateWorkbenchIntents}
+          onQuoteIntent={quoteWorkbenchIntent}
+          onCancelIntent={cancelWorkbenchIntent}
+          onSimulateActiveAudit={simulateActiveLiveAudit}
           onSignAndSendLive={signAndSendLiveAudit}
         />
       )}
@@ -1240,6 +1398,8 @@ function LiveWalletModal({
   liveStatus,
   liveAudit,
   livePositions,
+  liveIntents,
+  liveLedger,
   liveAction,
   liveMint,
   liveAmount,
@@ -1247,6 +1407,7 @@ function LiveWalletModal({
   livePriorityFee,
   livePool,
   activeLiveAudit,
+  activeLiveIntentId,
   onClose,
   onConnectWallet,
   onAcknowledgeLive,
@@ -1257,6 +1418,11 @@ function LiveWalletModal({
   onLivePriorityFeeChange,
   onLivePoolChange,
   onCreateLivePreview,
+  onCreateManualIntent,
+  onGenerateIntents,
+  onQuoteIntent,
+  onCancelIntent,
+  onSimulateActiveAudit,
   onSignAndSendLive
 }: {
   method: LiveWalletMethod;
@@ -1267,6 +1433,8 @@ function LiveWalletModal({
   liveStatus: LiveStatus | null;
   liveAudit: LiveExecutionAudit[];
   livePositions: LivePosition[];
+  liveIntents: LiveIntent[];
+  liveLedger: LiveLedger | null;
   liveAction: "buy" | "sell";
   liveMint: string;
   liveAmount: string;
@@ -1274,6 +1442,7 @@ function LiveWalletModal({
   livePriorityFee: number;
   livePool: string;
   activeLiveAudit: LiveExecutionAudit | null;
+  activeLiveIntentId: string;
   onClose: () => void;
   onConnectWallet: () => Promise<void>;
   onAcknowledgeLive: () => Promise<void>;
@@ -1284,6 +1453,11 @@ function LiveWalletModal({
   onLivePriorityFeeChange: (fee: number) => void;
   onLivePoolChange: (pool: string) => void;
   onCreateLivePreview: () => Promise<void>;
+  onCreateManualIntent: () => Promise<void>;
+  onGenerateIntents: () => Promise<void>;
+  onQuoteIntent: (intentId: string) => Promise<void>;
+  onCancelIntent: (intentId: string) => Promise<void>;
+  onSimulateActiveAudit: () => Promise<void>;
   onSignAndSendLive: () => Promise<void>;
 }) {
   const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
@@ -1371,6 +1545,44 @@ function LiveWalletModal({
         <section className="live-wallet-step">
           <div className="section-heading">
             <div>
+              <h3>Intent Queue</h3>
+              <p>Paper-promoted, watchlist, manual, and live-position intents. Quotes expire after 30 seconds.</p>
+            </div>
+            <Sparkles size={18} />
+          </div>
+          <div className="button-row fit-row">
+            <button className="secondary-action compact-action" onClick={onGenerateIntents}>Generate Intents</button>
+            <button className="secondary-action compact-action" onClick={onCreateManualIntent}>Add Manual Intent</button>
+          </div>
+          <div className="readiness-summary">
+            <span>Active: {liveStatus?.active_intent_count ?? liveIntents.length}</span>
+            <span>Stale quotes: {liveStatus?.stale_quote_count ?? 0}</span>
+            <span>Reconciliation: {liveStatus?.latest_reconciliation_status ?? "pending"}</span>
+            <span>Realized PnL: {(liveLedger?.summary.realized_pnl_sol ?? liveStatus?.live_pnl?.realized_pnl_sol ?? 0).toFixed(6)} SOL</span>
+          </div>
+          <div className="mini-list compact-list">
+            {liveIntents.slice(0, 10).map((intent) => (
+              <article key={intent.id} className={activeLiveIntentId === intent.id ? "selected-row" : ""}>
+                <strong>{intent.action} / {intent.symbol || intent.mint.slice(0, 8)} / {intent.status}</strong>
+                <span>{intent.source} / score {intent.score} / expires {intent.expires_at ? new Date(intent.expires_at).toLocaleTimeString() : "-"}</span>
+                <p>{intent.reason || "Live intent candidate"}</p>
+                <div className="inline-actions">
+                  <button className="secondary-action mini-action" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>
+                    Quote
+                  </button>
+                  <button className="secondary-action mini-action" onClick={() => onCancelIntent(intent.id)}>
+                    Cancel
+                  </button>
+                </div>
+              </article>
+            ))}
+            {!liveIntents.length ? <p>No active live intents yet.</p> : null}
+          </div>
+        </section>
+
+        <section className="live-wallet-step">
+          <div className="section-heading">
+            <div>
               <h3>Quote Preview</h3>
               <p>Quotes use PumpPortal local transactions and stay manual. Simulation warnings are recorded for review.</p>
             </div>
@@ -1405,6 +1617,9 @@ function LiveWalletModal({
             <button className="secondary-action compact-action" onClick={onCreateLivePreview} disabled={quoteBlocked}>
               Create Preview
             </button>
+            <button className="secondary-action compact-action" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>
+              Simulate
+            </button>
             <button className="danger compact-action" onClick={onSignAndSendLive} disabled={quoteBlocked || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>
               Sign & Send
             </button>
@@ -1415,6 +1630,7 @@ function LiveWalletModal({
               <article>
                 <strong>{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
                 <span>{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
+                <span>Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
                 <p>{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || "Preview ready for wallet review."}</p>
               </article>
             </div>
@@ -1430,6 +1646,13 @@ function LiveWalletModal({
             <Database size={18} />
           </div>
           <div className="mini-list compact-list">
+            {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
+              <article key={position.id}>
+                <strong>{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
+                <span>Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
+                <p>{position.mint}</p>
+              </article>
+            ))}
             {livePositions.slice(0, 6).map((position) => (
               <article key={position.mint}>
                 <strong>{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
@@ -1437,7 +1660,7 @@ function LiveWalletModal({
                 {position.warning ? <p>{position.warning}</p> : null}
               </article>
             ))}
-            {!livePositions.length ? <p>No live wallet positions loaded.</p> : null}
+            {!livePositions.length && !(liveLedger?.positions.length) ? <p>No live wallet positions loaded.</p> : null}
           </div>
         </section>
       </section>
@@ -2319,7 +2542,7 @@ function DataDashboard({
   onRefresh: () => Promise<void>;
   onRecover: () => Promise<void>;
   onReviewLiveRequest: (requestId: string, status: "reviewed" | "rejected") => Promise<void>;
-  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "all") => Promise<void>;
+  onClear: (target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all") => Promise<void>;
 }) {
   return (
     <section className="dashboard-page">
@@ -2357,14 +2580,14 @@ function DataDashboard({
         <Metric label="Live requests" value={(summary?.live_execution_requests ?? liveRequests.length).toString()} />
       </div>
       <div className="maintenance-row">
-        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits"] as const).map((target) => (
+        {(["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions"] as const).map((target) => (
           <button key={target} className="danger outline" onClick={() => onClear(target)}>
             <Trash2 size={14} /> Clear {target.replace("_", " ")}
           </button>
         ))}
       </div>
       <div className="maintenance-row">
-        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "all"] as const).map((target) => (
+        {(["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "all"] as const).map((target) => (
           <a key={target} className="export-button" href={exportUrl(target)} target="_blank" rel="noreferrer">
             <Download size={14} /> Export {target.replace("_", " ")}
           </a>

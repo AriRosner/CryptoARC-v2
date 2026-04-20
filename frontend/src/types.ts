@@ -258,6 +258,8 @@ export interface DataSummary {
   strategy_presets: number;
   live_execution_requests: number;
   live_sessions: number;
+  live_intents: number;
+  live_ledger_positions: number;
   live_execution_audits: number;
 }
 
@@ -637,6 +639,79 @@ export interface LiveStatus {
   autonomous_live_available: boolean;
   auto_sell_available: boolean;
   autonomy_blockers: string[];
+  active_intent_count: number;
+  stale_quote_count: number;
+  latest_reconciliation_status: string;
+  wallet_adapter: WalletAdapterStatus;
+  live_pnl: {
+    realized_pnl_sol: number;
+    unrealized_pnl_sol: number;
+    cost_basis_sol: number;
+    approximate: boolean;
+  };
+  readiness_warnings: string[];
+}
+
+export type LiveIntentSource = "manual" | "watchlist" | "paper_promoted" | "live_position_rules" | string;
+
+export interface WalletAdapterStatus {
+  mode: string;
+  manual_approval_required: boolean;
+  can_sign: boolean;
+  can_unattended_sign: boolean;
+}
+
+export interface LiveQuotePreview {
+  id: string;
+  created_at: string;
+  intent_id: string;
+  provider: string;
+  action: "buy" | "sell";
+  mint: string;
+  amount: string;
+  denominated_in_sol: boolean;
+  slippage_pct: number;
+  priority_fee_sol: number;
+  pool: string;
+  status: string;
+  unsigned_transaction_base64: string;
+  error: string;
+  expires_at: string | null;
+  stale: boolean;
+}
+
+export interface LiveSimulationResult {
+  id: string;
+  created_at: string;
+  quote_id: string;
+  status: string;
+  ok: boolean;
+  warning: string;
+  error: string;
+  result: Record<string, unknown>;
+}
+
+export interface LiveIntent {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  action: "buy" | "sell";
+  mint: string;
+  amount: string;
+  denominated_in_sol: boolean;
+  signer_mode: string;
+  wallet_public_key: string;
+  status: string;
+  reason: string;
+  source: LiveIntentSource;
+  symbol: string;
+  score: number;
+  priority: number;
+  quote_id: string;
+  audit_id: string;
+  expires_at: string | null;
+  stale: boolean;
+  warnings: string[];
 }
 
 export interface LiveExecutionAudit {
@@ -659,6 +734,62 @@ export interface LiveExecutionAudit {
   errors: string[];
   warnings: string[];
   final_status: string;
+  intent_id: string;
+  reconciliation_status: LiveReconciliationStatus;
+  reconciliation: Record<string, unknown>;
+}
+
+export type LiveReconciliationStatus = "pending" | "matched" | "needs_review" | string;
+
+export interface LiveFill {
+  id: string;
+  created_at: string;
+  audit_id: string;
+  intent_id: string;
+  action: "buy" | "sell";
+  mint: string;
+  amount: string;
+  amount_sol: number;
+  token_amount: number;
+  price_sol: number;
+  fee_sol: number;
+  priority_fee_sol: number;
+  signature: string;
+}
+
+export interface LiveCostBasis {
+  cost_basis_sol: number;
+  realized_pnl_sol: number;
+  unrealized_pnl_sol: number;
+  average_entry_price_sol: number;
+}
+
+export interface LiveLedgerPosition extends LiveCostBasis {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  mint: string;
+  wallet_public_key: string;
+  symbol: string;
+  status: string;
+  token_balance: number;
+  total_fees_sol: number;
+  total_priority_fees_sol: number;
+  fills: LiveFill[];
+  reconciliation_status: LiveReconciliationStatus;
+  reconciliation: Record<string, unknown>;
+  review_notes: string;
+}
+
+export interface LiveLedger {
+  positions: LiveLedgerPosition[];
+  summary: {
+    realized_pnl_sol: number;
+    unrealized_pnl_sol: number;
+    cost_basis_sol: number;
+    open_positions: number;
+    approximate: boolean;
+  };
 }
 
 export interface LivePosition {
