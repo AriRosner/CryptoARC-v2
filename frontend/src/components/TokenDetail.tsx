@@ -186,7 +186,7 @@ export const TokenDetail: React.FC<TokenDetailProps> = ({ token, isOpen, onClose
           </div>
         </section>
 
-        <div className="grid grid-cols-2 gap-4 pt-4">
+        <div className="sticky bottom-[-1.5rem] z-20 -mx-6 -mb-6 grid grid-cols-2 gap-4 border-t border-white/10 bg-[#10121c]/95 p-4 backdrop-blur-xl">
           <Button 
             variant="secondary" 
             className="w-full"

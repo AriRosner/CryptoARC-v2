@@ -36,9 +36,9 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
     <div className="flex min-h-screen bg-[#08090f] text-zinc-100 selection:bg-amber-500/30 selection:text-white">
       {/* Dynamic Background */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden">
-        <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-amber-500/5 blur-[120px] rounded-full" />
-        <div className="absolute bottom-[10%] right-[10%] w-[30%] h-[30%] bg-emerald-500/5 blur-[120px] rounded-full" />
-        <div className="absolute inset-0 bg-[url('https://grainy-gradients.vercel.app/noise.svg')] opacity-20 mix-blend-overlay" />
+        <div className="absolute top-[-8%] left-[-8%] h-[34%] w-[34%] rounded-full bg-amber-500/5 blur-[80px]" />
+        <div className="absolute bottom-[8%] right-[8%] h-[28%] w-[28%] rounded-full bg-emerald-500/5 blur-[80px]" />
+        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:40px_40px] opacity-35" />
       </div>
 
       <Sidebar

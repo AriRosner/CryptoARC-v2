@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+import { motion } from "framer-motion";
 import {
   Activity,
   BarChart3,
@@ -1205,202 +1206,267 @@ function LiveWalletModal({
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
 
   return (
-    <div className="overlay">
-      <section className="modal live-wallet-modal">
-        <div className="modal-heading">
-          <div>
-            <p className="eyebrow">Local live execution</p>
-            <h3>Live Wallet</h3>
-            <p>Manual browser-wallet buy and sell flow with quote previews, wallet approval, and audit records.</p>
-          </div>
-          <button className="icon-button" onClick={onClose} aria-label="Close live wallet">
-            <X size={18} />
-          </button>
-        </div>
-
-        <div className="wallet-method-grid">
-          <button className={method === "browser_wallet" ? "wallet-method active" : "wallet-method"} onClick={() => onMethodChange("browser_wallet")}>
-            <strong>Browser wallet</strong>
-            <span>Manual approval through Phantom, Solflare, or a compatible Solana wallet.</span>
-          </button>
-          <button className="wallet-method disabled" disabled onClick={() => onMethodChange("local_signer_daemon")}>
-            <strong>Local signer daemon</strong>
-            <span>Coming later. Required for any future unattended signing capability.</span>
-          </button>
-        </div>
-
-        <section className="live-wallet-step">
-          <div className="section-heading">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
+      <motion.section
+        initial={{ opacity: 0, scale: 0.97, y: 18 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.97, y: 18 }}
+        transition={{ type: "spring", stiffness: 360, damping: 32 }}
+        className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-white/10 bg-[#0a0c13]/95 shadow-2xl shadow-black/70"
+      >
+        <div className="sticky top-0 z-10 border-b border-white/10 bg-[#0d0f18]/95 px-5 py-4 backdrop-blur-xl">
+          <div className="flex items-start justify-between gap-4">
             <div>
-              <h3>Connect Wallet</h3>
-              <p>CryptoARC stores the public key for status checks only. Reconnect and signing still require wallet approval.</p>
+              <p className="text-[10px] font-black uppercase tracking-[0.28em] text-amber-400">Local live execution</p>
+              <h3 className="mt-1 text-2xl font-black tracking-tight text-white">Live Wallet</h3>
+              <p className="mt-1 max-w-3xl text-xs font-medium text-zinc-400">
+                Manual browser-wallet buy and sell flow with quote previews, wallet approval, and audit records.
+              </p>
             </div>
-            <Wallet size={18} />
-          </div>
-          <div className="button-row fit-row">
-            <button className="secondary-action compact-action" onClick={onConnectWallet} disabled={method !== "browser_wallet"}>
-              {walletPublicKey ? "Reconnect Browser Wallet" : "Connect Browser Wallet"}
+            <button
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-400 transition hover:border-amber-500/40 hover:text-white"
+              onClick={onClose}
+              aria-label="Close live wallet"
+            >
+              <X size={18} />
             </button>
           </div>
-          <div className="security-list wallet-info-grid">
-            <span>Wallet: <strong>{shortAddress(walletPublicKey)}</strong></span>
-            <span>SOL balance: <strong>{walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`}</strong></span>
-            <span>Live env: <strong>{envEnabled ? "enabled" : "disabled"}</strong></span>
-            <span>Caps: <strong>{capsSet ? "set" : "required"}</strong></span>
-            <span>Acknowledgement: <strong>{settings.live_session_acknowledged ? "done" : "needed"}</strong></span>
-            <span>Live gates: <strong>{liveStatus?.live_execution_available ? "open" : "blocked"}</strong></span>
-            <span>Auto-sell: <strong>{liveStatus?.auto_sell_available ? "available" : "not for browser wallet"}</strong></span>
-          </div>
-        </section>
+        </div>
 
-        <section className="live-wallet-step">
-          <div className="section-heading">
-            <div>
-              <h3>Blockers & Caps</h3>
-              <p>Review the current gate state before creating a quote preview.</p>
-            </div>
-            <Shield size={18} />
-          </div>
-          <div className="mini-list compact-list">
-            {blockers.length ? blockers.map((blocker) => (
-              <article key={blocker}>
-                <strong>{blocker}</strong>
-              </article>
-            )) : (
-              <article>
-                <strong>Manual live prerequisites are passing.</strong>
-              </article>
-            )}
-          </div>
-          <div className="button-row fit-row">
-            <button className="secondary-action compact-action" onClick={onAcknowledgeLive}>
-              Acknowledge Risk
+        <div className="overflow-y-auto p-5 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+          <div className="grid gap-4 lg:grid-cols-2">
+            <button
+              className={`rounded-xl border p-4 text-left transition ${
+                method === "browser_wallet"
+                  ? "border-emerald-400/50 bg-emerald-500/10 shadow-lg shadow-emerald-500/10"
+                  : "border-white/10 bg-white/[0.03] hover:border-white/20"
+              }`}
+              onClick={() => onMethodChange("browser_wallet")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <strong className="text-sm font-black uppercase tracking-widest text-white">Browser wallet</strong>
+                <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-emerald-300">Active</span>
+              </div>
+              <span className="mt-2 block text-xs leading-5 text-zinc-400">Manual approval through Phantom, Solflare, or a compatible Solana wallet.</span>
+            </button>
+            <button
+              className="cursor-not-allowed rounded-xl border border-white/10 bg-white/[0.02] p-4 text-left opacity-60"
+              disabled
+              onClick={() => onMethodChange("local_signer_daemon")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <strong className="text-sm font-black uppercase tracking-widest text-white">Local signer daemon</strong>
+                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-zinc-400">Coming later</span>
+              </div>
+              <span className="mt-2 block text-xs leading-5 text-zinc-500">Required for any future unattended signing capability.</span>
             </button>
           </div>
-        </section>
 
-        <section className="live-wallet-step">
-          <div className="section-heading">
-            <div>
-              <h3>Intent Queue</h3>
-              <p>Paper-promoted, watchlist, manual, and live-position intents. Quotes expire after 30 seconds.</p>
-            </div>
-            <Sparkles size={18} />
-          </div>
-          <div className="button-row fit-row">
-            <button className="secondary-action compact-action" onClick={onGenerateIntents}>Generate Intents</button>
-            <button className="secondary-action compact-action" onClick={onCreateManualIntent}>Add Manual Intent</button>
-          </div>
-          <div className="readiness-summary">
-            <span>Active: {liveStatus?.active_intent_count ?? liveIntents.length}</span>
-            <span>Stale quotes: {liveStatus?.stale_quote_count ?? 0}</span>
-            <span>Reconciliation: {liveStatus?.latest_reconciliation_status ?? "pending"}</span>
-            <span>Realized PnL: {(liveLedger?.summary.realized_pnl_sol ?? liveStatus?.live_pnl?.realized_pnl_sol ?? 0).toFixed(6)} SOL</span>
-          </div>
-          <div className="mini-list compact-list">
-            {liveIntents.slice(0, 10).map((intent) => (
-              <article key={intent.id} className={activeLiveIntentId === intent.id ? "selected-row" : ""}>
-                <strong>{intent.action} / {intent.symbol || intent.mint.slice(0, 8)} / {intent.status}</strong>
-                <span>{intent.source} / score {intent.score} / expires {intent.expires_at ? new Date(intent.expires_at).toLocaleTimeString() : "-"}</span>
-                <p>{intent.reason || "Live intent candidate"}</p>
-                <div className="inline-actions">
-                  <button className="secondary-action mini-action" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>
-                    Quote
-                  </button>
-                  <button className="secondary-action mini-action" onClick={() => onCancelIntent(intent.id)}>
-                    Cancel
-                  </button>
+          <div className="mt-4 grid gap-4 xl:grid-cols-[0.85fr_1.15fr]">
+            <div className="space-y-4">
+              <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+                <div className="mb-4 flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Connect Wallet</h3>
+                    <p className="mt-1 text-xs text-zinc-400">CryptoARC stores the public key for status checks only. Reconnect and signing still require wallet approval.</p>
+                  </div>
+                  <Wallet size={18} className="text-amber-400" />
                 </div>
-              </article>
-            ))}
-            {!liveIntents.length ? <p>No active live intents yet.</p> : null}
-          </div>
-        </section>
+                <button
+                  className="mb-4 h-10 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 text-xs font-black uppercase tracking-widest text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={onConnectWallet}
+                  disabled={method !== "browser_wallet"}
+                >
+                  {walletPublicKey ? "Reconnect Browser Wallet" : "Connect Browser Wallet"}
+                </button>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {[
+                    ["Wallet", shortAddress(walletPublicKey)],
+                    ["SOL balance", walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`],
+                    ["Live env", envEnabled ? "enabled" : "disabled"],
+                    ["Caps", capsSet ? "set" : "required"],
+                    ["Acknowledgement", settings.live_session_acknowledged ? "done" : "needed"],
+                    ["Live gates", liveStatus?.live_execution_available ? "open" : "blocked"],
+                    ["Auto-sell", liveStatus?.auto_sell_available ? "available" : "not for browser wallet"]
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
+                      <p className="mt-1 truncate text-xs font-bold text-white">{value}</p>
+                    </div>
+                  ))}
+                </div>
+              </section>
 
-        <section className="live-wallet-step">
-          <div className="section-heading">
-            <div>
-              <h3>Quote Preview</h3>
-              <p>Quotes use PumpPortal local transactions and stay manual. Simulation warnings are recorded for review.</p>
+              <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+                <div className="mb-4 flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Blockers & Caps</h3>
+                    <p className="mt-1 text-xs text-zinc-400">Review the current gate state before creating a quote preview.</p>
+                  </div>
+                  <Shield size={18} className="text-amber-400" />
+                </div>
+                <div className="space-y-2">
+                  {blockers.length ? blockers.map((blocker) => (
+                    <article key={blocker} className="rounded-lg border border-rose-500/20 bg-rose-500/10 p-3 text-xs font-bold text-rose-200">
+                      {blocker}
+                    </article>
+                  )) : (
+                    <article className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-200">
+                      Manual live prerequisites are passing.
+                    </article>
+                  )}
+                </div>
+                <button
+                  className="mt-4 h-10 rounded-lg border border-white/10 bg-white/5 px-4 text-xs font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
+                  onClick={onAcknowledgeLive}
+                >
+                  Acknowledge Risk
+                </button>
+              </section>
             </div>
-            <Target size={18} />
-          </div>
-          <div className="live-form">
-            <label>
-              Action
-              <select value={liveAction} onChange={(event) => onLiveActionChange(event.target.value as "buy" | "sell")}>
-                <option value="buy">buy</option>
-                <option value="sell">sell</option>
-              </select>
-            </label>
-            <label>
-              Mint
-              <input value={liveMint} onChange={(event) => onLiveMintChange(event.target.value)} placeholder="Pump.fun mint address" />
-            </label>
-            <label>
-              Amount
-              <input value={liveAmount} onChange={(event) => onLiveAmountChange(event.target.value)} placeholder={liveAction === "sell" ? "100%" : "0.001"} />
-            </label>
-            <SettingInput label="Slippage %" value={liveSlippage} step="0.1" onChange={(value) => onLiveSlippageChange(Number(value))} />
-            <SettingInput label="Priority fee SOL" value={livePriorityFee} step="0.00001" onChange={(value) => onLivePriorityFeeChange(Number(value))} />
-            <label>
-              Pool
-              <select value={livePool} onChange={(event) => onLivePoolChange(event.target.value)}>
-                {["pump", "auto", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk"].map((pool) => <option key={pool} value={pool}>{pool}</option>)}
-              </select>
-            </label>
-          </div>
-          <div className="button-row fit-row">
-            <button className="secondary-action compact-action" onClick={onCreateLivePreview} disabled={quoteBlocked}>
-              Create Preview
-            </button>
-            <button className="secondary-action compact-action" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>
-              Simulate
-            </button>
-            <button className="danger compact-action" onClick={onSignAndSendLive} disabled={quoteBlocked || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>
-              Sign & Send
-            </button>
-          </div>
-          {!envEnabled ? <p className="settings-note">Live env is disabled, so quotes and signing are blocked. Wallet connection and status checks still work.</p> : null}
-          {activeLiveAudit ? (
-            <div className="mini-list compact-list">
-              <article>
-                <strong>{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
-                <span>{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
-                <span>Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
-                <p>{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
-              </article>
-            </div>
-          ) : null}
-        </section>
 
-        <section className="live-wallet-step">
-          <div className="section-heading">
-            <div>
-              <h3>Wallet Positions</h3>
-              <p>RPC token balances for mints touched by live audit records.</p>
+            <div className="space-y-4">
+              <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+                <div className="mb-4 flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Intent Queue</h3>
+                    <p className="mt-1 text-xs text-zinc-400">Paper-promoted, watchlist, manual, and live-position intents. Quotes expire after 30 seconds.</p>
+                  </div>
+                  <Sparkles size={18} className="text-amber-400" />
+                </div>
+                <div className="mb-3 flex flex-wrap gap-2">
+                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
+                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Add Manual Intent</button>
+                </div>
+                <div className="mb-3 grid gap-2 sm:grid-cols-4">
+                  <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Active <strong className="block pt-1 text-xs text-white">{liveStatus?.active_intent_count ?? liveIntents.length}</strong></span>
+                  <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Stale <strong className="block pt-1 text-xs text-white">{liveStatus?.stale_quote_count ?? 0}</strong></span>
+                  <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Recon <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.latest_reconciliation_status ?? "pending"}</strong></span>
+                  <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Realized <strong className="block pt-1 text-xs text-white">{(liveLedger?.summary.realized_pnl_sol ?? liveStatus?.live_pnl?.realized_pnl_sol ?? 0).toFixed(6)} SOL</strong></span>
+                </div>
+                <div className="max-h-72 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                  {liveIntents.slice(0, 10).map((intent) => (
+                    <article key={intent.id} className={`rounded-lg border p-3 ${activeLiveIntentId === intent.id ? "border-amber-500/40 bg-amber-500/10" : "border-white/5 bg-black/25"}`}>
+                      <strong className="block text-xs font-black uppercase tracking-widest text-white">{intent.action} / {intent.symbol || intent.mint.slice(0, 8)} / {intent.status}</strong>
+                      <span className="mt-1 block text-[10px] font-bold uppercase tracking-widest text-zinc-500">{intent.source} / score {intent.score} / expires {intent.expires_at ? new Date(intent.expires_at).toLocaleTimeString() : "-"}</span>
+                      <p className="mt-2 text-xs text-zinc-400">{intent.reason || "Live intent candidate"}</p>
+                      <div className="mt-3 flex gap-2">
+                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
+                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
+                      </div>
+                    </article>
+                  ))}
+                  {!liveIntents.length ? <p className="rounded-lg border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No active live intents yet.</p> : null}
+                </div>
+              </section>
+
+              <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+                <div className="mb-4 flex items-start justify-between gap-3">
+                  <div>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Quote Preview</h3>
+                    <p className="mt-1 text-xs text-zinc-400">Quotes use PumpPortal local transactions and stay manual. Simulation warnings are recorded for review.</p>
+                  </div>
+                  <Target size={18} className="text-amber-400" />
+                </div>
+                <div className="grid gap-3 md:grid-cols-3">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Action
+                    <select className="dashboard-select mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" value={liveAction} onChange={(event) => onLiveActionChange(event.target.value as "buy" | "sell")}>
+                      <option value="buy">buy</option>
+                      <option value="sell">sell</option>
+                    </select>
+                  </label>
+                  <label className="md:col-span-2 text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Mint
+                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white placeholder-zinc-600" value={liveMint} onChange={(event) => onLiveMintChange(event.target.value)} placeholder="Pump.fun mint address" />
+                  </label>
+                  <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Amount
+                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white placeholder-zinc-600" value={liveAmount} onChange={(event) => onLiveAmountChange(event.target.value)} placeholder={liveAction === "sell" ? "100%" : "0.001"} />
+                  </label>
+                  <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Slippage %
+                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" type="number" min="0.001" step="0.1" value={liveSlippage} onChange={(event) => onLiveSlippageChange(Number(event.target.value))} />
+                  </label>
+                  <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Priority fee SOL
+                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" type="number" min="0.001" step="0.00001" value={livePriorityFee} onChange={(event) => onLivePriorityFeeChange(Number(event.target.value))} />
+                  </label>
+                  <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
+                    Pool
+                    <select className="dashboard-select mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" value={livePool} onChange={(event) => onLivePoolChange(event.target.value)}>
+                      {["pump", "auto", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk"].map((pool) => <option key={pool} value={pool}>{pool}</option>)}
+                    </select>
+                  </label>
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
+                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
+                  <button className="h-9 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                </div>
+                {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and status checks still work.</p> : null}
+                {activeLiveAudit ? (
+                  <article className="mt-3 rounded-lg border border-white/5 bg-black/25 p-3">
+                    <strong className="block text-xs font-black uppercase tracking-widest text-white">{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
+                    <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
+                    <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
+                    <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                  </article>
+                ) : null}
+              </section>
             </div>
-            <Database size={18} />
           </div>
-          <div className="mini-list compact-list">
-            {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
-              <article key={position.id}>
-                <strong>{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
-                <span>Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
-                <p>{position.mint}</p>
-              </article>
-            ))}
-            {livePositions.slice(0, 6).map((position) => (
-              <article key={position.mint}>
-                <strong>{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
-                <span>{position.mint}</span>
-                {position.warning ? <p>{position.warning}</p> : null}
-              </article>
-            ))}
-            {!livePositions.length && !(liveLedger?.positions.length) ? <p>No live wallet positions loaded.</p> : null}
+
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-widest text-white">Wallet Positions</h3>
+                  <p className="mt-1 text-xs text-zinc-400">RPC token balances for mints touched by live audit records.</p>
+                </div>
+                <Database size={18} className="text-amber-400" />
+              </div>
+              <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
+                  <article key={position.id} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                    <strong className="block text-xs font-black uppercase tracking-widest text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
+                    <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
+                    <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
+                  </article>
+                ))}
+                {livePositions.slice(0, 6).map((position) => (
+                  <article key={position.mint} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                    <strong className="block text-xs font-black uppercase tracking-widest text-white">{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
+                    <span className="mt-1 block truncate text-xs text-zinc-500">{position.mint}</span>
+                    {position.warning ? <p className="mt-2 text-xs text-amber-200">{position.warning}</p> : null}
+                  </article>
+                ))}
+                {!livePositions.length && !(liveLedger?.positions.length) ? <p className="rounded-lg border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No live wallet positions loaded.</p> : null}
+              </div>
+            </section>
+
+            <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <h3 className="text-sm font-black uppercase tracking-widest text-white">Latest Audit</h3>
+                  <p className="mt-1 text-xs text-zinc-400">Recent quote, simulation, submission, and reconciliation records.</p>
+                </div>
+                <Activity size={18} className="text-amber-400" />
+              </div>
+              <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                {liveAudit.slice(0, 6).map((audit) => (
+                  <article key={audit.id} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                    <strong className="block text-xs font-black uppercase tracking-widest text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
+                    <span className="mt-1 block truncate text-xs text-zinc-400">{audit.transaction_signature ? `Signature ${audit.transaction_signature}` : audit.wallet_public_key || "No wallet recorded"}</span>
+                    <p className="mt-2 text-xs text-zinc-500">{[...audit.warnings, ...audit.errors].join(" / ") || audit.final_status}</p>
+                  </article>
+                ))}
+                {!liveAudit.length ? <p className="rounded-lg border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No live audit records yet.</p> : null}
+              </div>
+            </section>
           </div>
-        </section>
-      </section>
+        </div>
+      </motion.section>
     </div>
   );
 }
@@ -1454,25 +1520,6 @@ function AuthGate({
         {error ? <p className="auth-error">{error}</p> : null}
       </form>
     </main>
-  );
-}
-
-function SettingInput({
-  label,
-  value,
-  step = "1",
-  onChange
-}: {
-  label: string;
-  value: number;
-  step?: string;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <label>
-      {label}
-      <input type="number" min="0.001" step={step} value={value} onChange={(event) => onChange(event.target.value)} />
-    </label>
   );
 }
 

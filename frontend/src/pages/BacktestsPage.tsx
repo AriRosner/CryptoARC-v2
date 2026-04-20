@@ -83,14 +83,17 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
         {/* Controls Column */}
         <div className="space-y-6 lg:col-span-1">
           <Card className="p-6" hover={false}>
-            <h3 className="mb-6 text-sm font-black uppercase tracking-widest text-zinc-500">Configuration</h3>
+            <h3 className="mb-6 flex items-center gap-2 text-sm font-black uppercase tracking-widest text-zinc-500">
+              <Target size={16} className="text-amber-400" />
+              Configuration
+            </h3>
             <div className="space-y-4">
               <label className="flex flex-col gap-1.5">
                 <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-tight">Strategy Profile</span>
                 <select 
                   value={profile} 
                   onChange={(e) => onProfileChange(e.target.value)}
-                  className="rounded-lg border border-white/10 bg-black px-3 py-2 text-xs text-white"
+                  className="dashboard-select rounded-lg border border-white/10 bg-black px-3 py-2 text-xs text-white"
                 >
                   <option value="conservative">Conservative</option>
                   <option value="balanced">Balanced</option>
@@ -135,7 +138,7 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
                 <select 
                   value={speed} 
                   onChange={(e) => onSpeedChange(e.target.value)}
-                  className="rounded-lg border border-white/10 bg-black px-3 py-2 text-xs text-white"
+                  className="dashboard-select rounded-lg border border-white/10 bg-black px-3 py-2 text-xs text-white"
                 >
                   <option value="instant">Instant</option>
                   <option value="fast">Fast (10x)</option>
@@ -157,7 +160,10 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
             <Card className="p-6 border-amber-500/20 bg-amber-500/[0.02]" hover={false}>
               <div className="mb-6 flex items-center justify-between">
                 <div>
-                  <h3 className="text-sm font-black uppercase tracking-widest text-amber-500">Latest Run Results</h3>
+                  <h3 className="flex items-center gap-2 text-sm font-black uppercase tracking-widest text-amber-500">
+                    <TrendingUp size={16} />
+                    Latest Run Results
+                  </h3>
                   <p className="text-[10px] text-zinc-500 mt-1">Profile: {latest.profile} • {new Date().toLocaleTimeString()}</p>
                 </div>
                 <Button variant="primary" size="sm" onClick={onSaveExperiment}>Save Experiment</Button>
@@ -187,7 +193,10 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
 
           <Card className="flex flex-col h-[400px]" hover={false}>
              <div className="border-b border-white/5 p-4 flex items-center justify-between">
-              <h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">History</h3>
+              <h3 className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-zinc-500">
+                <History size={14} className="text-amber-400" />
+                History
+              </h3>
               <Badge variant="info">{runs.length} Runs</Badge>
             </div>
             <div className="flex-1 overflow-auto scrollbar-thin scrollbar-thumb-white/10">

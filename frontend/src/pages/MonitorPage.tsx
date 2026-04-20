@@ -1,6 +1,6 @@
 import React from "react";
 import { motion } from "framer-motion";
-import { LayoutDashboard, TrendingUp } from "lucide-react";
+import { Activity, LayoutDashboard, TrendingUp } from "lucide-react";
 import { PageHeader } from "../components/PageHeader";
 import { StatsGrid } from "../components/StatsGrid";
 import { Card } from "../components/Card";
@@ -127,7 +127,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
                 <select
                   value={pnlWallet}
                   onChange={(event) => setPnlWallet(event.target.value)}
-                  className="min-w-44 rounded-lg border border-white/10 bg-black/50 px-2 py-1 text-xs font-bold normal-case tracking-normal text-white"
+                  className="dashboard-select min-w-44 rounded-lg border border-white/10 bg-black/50 px-2 py-1 text-xs font-bold normal-case tracking-normal text-white"
                 >
                   <option value="paper">Paper wallet</option>
                   {liveWallets.map((wallet) => (
@@ -143,7 +143,10 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
           </Card>
 
           <Card className="p-6" hover={false}>
-            <h4 className="mb-4 text-sm font-black uppercase tracking-widest text-zinc-500">Market Signal</h4>
+            <h4 className="mb-4 flex items-center gap-2 text-sm font-black uppercase tracking-widest text-zinc-500">
+              <Activity size={16} className="text-amber-400" />
+              Market Signal
+            </h4>
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-zinc-400">Network Readiness</span>

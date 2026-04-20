@@ -1,6 +1,6 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Search, Filter, Eye, Pin } from "lucide-react";
+import { Activity, Search, Filter, Eye, Pin } from "lucide-react";
 import { Card } from "./Card";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
@@ -29,7 +29,114 @@ const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "w
   return "neutral";
 };
 
-export const TokenTable: React.FC<TokenTableProps> = ({
+const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 132px 118px 76px";
+
+interface TokenRowProps {
+  token: TokenSignal;
+  selected: boolean;
+  watched: boolean;
+  onSelectToken: (id: string) => void;
+  onToggleWatch: (token: TokenSignal) => void;
+}
+
+const TokenRow = React.memo(function TokenRow({
+  token,
+  selected,
+  watched,
+  onSelectToken,
+  onToggleWatch
+}: TokenRowProps) {
+  const pnl = token.pnl_sol || 0;
+
+  return (
+    <motion.div
+      key={token.id}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -4 }}
+      transition={{ duration: 0.16 }}
+      onClick={() => onSelectToken(token.id)}
+      style={{ gridTemplateColumns: tokenGridColumns }}
+      className={cn(
+        "group grid min-h-[62px] cursor-pointer items-center border-b border-white/5 transition-colors hover:bg-white/[0.03]",
+        selected && "bg-amber-500/[0.06] hover:bg-amber-500/[0.09]"
+      )}
+    >
+      <div className="min-w-0 px-4 py-2.5">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-zinc-800 to-zinc-950 font-black text-amber-400 shadow-inner">
+            {token.symbol.slice(0, 1)}
+          </div>
+          <div className="min-w-0">
+            <div className="truncate font-bold text-white transition-colors group-hover:text-amber-400">{token.symbol}</div>
+            <div className="truncate text-[10px] font-medium text-zinc-500">{token.name}</div>
+          </div>
+        </div>
+      </div>
+      <div className="px-3 py-2.5">
+        <Button
+          variant={watched ? "outline" : "ghost"}
+          size="sm"
+          className={cn(
+            "h-7 w-[76px] gap-1 px-2 text-[10px]",
+            watched && "border-amber-500/40 bg-amber-500/10 text-amber-400"
+          )}
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggleWatch(token);
+          }}
+        >
+          <Pin size={12} />
+          {watched ? "Pinned" : "Pin"}
+        </Button>
+      </div>
+      <div className="px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <div className="h-1.5 w-14 overflow-hidden rounded-full bg-white/5">
+            <div
+              style={{ width: `${Math.max(0, Math.min(100, token.score))}%` }}
+              className={cn(
+                "h-full rounded-full transition-[width] duration-300",
+                token.score > 70 ? "bg-emerald-500" : token.score > 40 ? "bg-amber-500" : "bg-rose-500"
+              )}
+            />
+          </div>
+          <span className="w-7 text-xs font-bold text-zinc-300">{token.score}</span>
+        </div>
+      </div>
+      <div className="px-3 py-2.5">
+        <Badge variant={statusVariant(token.status)}>
+          {token.status.replace("_", " ")}
+        </Badge>
+      </div>
+      <div className="px-3 py-2.5">
+        <span className={cn(
+          "whitespace-nowrap text-xs font-black tracking-tight",
+          pnl > 0 ? "text-emerald-500" : pnl < 0 ? "text-rose-500" : "text-zinc-500"
+        )}>
+          {pnl ? `${pnl > 0 ? "+" : ""}${pnl.toFixed(4)}` : "0.0000"}
+        </span>
+      </div>
+      <div className="px-4 py-2.5 text-right">
+        <Button variant="ghost" size="icon" className="h-8 w-8 opacity-70 transition-opacity group-hover:opacity-100">
+          <Eye size={14} />
+        </Button>
+      </div>
+    </motion.div>
+  );
+}, (prev, next) => (
+  prev.selected === next.selected &&
+  prev.watched === next.watched &&
+  prev.token.id === next.token.id &&
+  prev.token.mint === next.token.mint &&
+  prev.token.symbol === next.token.symbol &&
+  prev.token.name === next.token.name &&
+  prev.token.score === next.token.score &&
+  prev.token.status === next.token.status &&
+  prev.token.pnl_sol === next.token.pnl_sol
+));
+
+export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   tokens,
   onSelectToken,
   selectedTokenId,
@@ -42,143 +149,80 @@ export const TokenTable: React.FC<TokenTableProps> = ({
   sort,
   setSort
 }) => {
-  return (
-    <Card className="flex h-full flex-col" hover={false}>
-      <div className="border-b border-white/5 p-4 lg:flex lg:items-center lg:justify-between lg:gap-4">
-        <h3 className="text-lg font-bold text-white mb-4 lg:mb-0 flex items-center gap-2">
-          Token Monitor
-          <Badge variant="info" className="ml-2">{tokens.length}</Badge>
-        </h3>
-        
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative flex-1 min-w-[200px]">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
-            <input
-              type="text"
-              placeholder="Search tokens..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="h-10 w-full rounded-xl border border-white/10 bg-black/40 pl-10 pr-4 text-sm text-white placeholder-zinc-500 transition-all focus:border-amber-500/50 focus:outline-none focus:ring-4 focus:ring-amber-500/10"
-            />
-          </div>
-          
-          <select
-            value={filter}
-            onChange={(e) => setFilter(e.target.value as any)}
-            className="h-10 rounded-xl border border-white/10 bg-black/40 px-3 text-sm text-white focus:outline-none focus:ring-4 focus:ring-amber-500/10"
-          >
-            <option value="all">All Status</option>
-            <option value="open">Open Positions</option>
-            <option value="profitable">Profitable</option>
-            <option value="losses">Losses</option>
-          </select>
+  const visibleRows = React.useMemo(() => tokens, [tokens]);
 
-          <select
-            value={sort}
-            onChange={(e) => setSort(e.target.value as any)}
-            className="h-10 rounded-xl border border-white/10 bg-black/40 px-3 text-sm text-white focus:outline-none focus:ring-4 focus:ring-amber-500/10"
-          >
-            <option value="newest">Newest First</option>
-            <option value="score">Highest Score</option>
-            <option value="pnl">Highest P&L</option>
-          </select>
+  return (
+    <Card className="flex h-[clamp(520px,calc(100vh-270px),760px)] min-h-[520px] flex-col" hover={false}>
+      <div className="grid min-h-12 grid-cols-[max-content_minmax(220px,1fr)_9rem_9.5rem] items-center gap-2 border-b border-white/5 px-3 py-2">
+        <h3 className="flex shrink-0 items-center gap-2 text-xs font-black uppercase tracking-[0.2em] text-white">
+          <Activity size={14} className="text-amber-400" />
+          Token Monitor
+          <Badge variant="info">{tokens.length}</Badge>
+        </h3>
+
+        <div className="relative min-w-0">
+          <Search className="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+          <input
+            type="text"
+            placeholder="Search tokens..."
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="dashboard-search-input h-9 w-full rounded-lg border border-white/10 bg-black/40 pr-3 text-xs font-semibold text-white placeholder-zinc-600 transition-all focus:border-amber-500/50 focus:outline-none focus:ring-4 focus:ring-amber-500/10"
+          />
         </div>
+          
+        <select
+          aria-label="Filter token status"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value as any)}
+          className="dashboard-select h-9 w-full rounded-lg border border-white/10 bg-black/40 pl-2.5 text-xs font-bold text-white focus:outline-none focus:ring-4 focus:ring-amber-500/10"
+        >
+          <option value="all">All Status</option>
+          <option value="open">Open Positions</option>
+          <option value="profitable">Profitable</option>
+          <option value="losses">Losses</option>
+        </select>
+
+        <select
+          aria-label="Sort token monitor"
+          value={sort}
+          onChange={(e) => setSort(e.target.value as any)}
+          className="dashboard-select h-9 w-full rounded-lg border border-white/10 bg-black/40 pl-2.5 text-xs font-bold text-white focus:outline-none focus:ring-4 focus:ring-amber-500/10"
+        >
+          <option value="newest">Newest First</option>
+          <option value="score">Highest Score</option>
+          <option value="pnl">Highest P&L</option>
+        </select>
       </div>
 
-      <div className="flex-1 overflow-auto scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-        <table className="w-full border-collapse text-left">
-          <thead className="sticky top-0 z-10 bg-[#10121c] after:absolute after:bottom-0 after:left-0 after:h-px after:w-full after:bg-white/5">
-            <tr>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500">Token / Symbol</th>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500">Watch</th>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500">Score</th>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500">Status</th>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500">P&L (SOL)</th>
-              <th className="px-6 py-4 text-[10px] font-black uppercase tracking-widest text-zinc-500 text-right">Action</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-white/5">
-            <AnimatePresence mode="popLayout">
-              {tokens.map((token, index) => (
-                <motion.tr
+      <div className="crypto-scrollbar flex-1 overflow-auto">
+        <div className="min-w-[780px]">
+          <div
+            style={{ gridTemplateColumns: tokenGridColumns }}
+            className="sticky top-0 z-20 grid h-9 items-center border-b border-white/5 bg-[#10121c]/95 text-[10px] font-black uppercase tracking-widest text-zinc-500 backdrop-blur-md"
+          >
+            <div className="px-4">Token / Symbol</div>
+            <div className="px-3">Watch</div>
+            <div className="px-3">Score</div>
+            <div className="px-3">Status</div>
+            <div className="px-3">P&L (SOL)</div>
+            <div className="px-4 text-right">Action</div>
+          </div>
+          <div>
+            <AnimatePresence initial={false}>
+              {visibleRows.map((token) => (
+                <TokenRow
                   key={token.id}
-                  layout
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.95 }}
-                  transition={{ duration: 0.2, delay: Math.min(index * 0.05, 0.5) }}
-                  onClick={() => onSelectToken(token.id)}
-                  className={cn(
-                    "group cursor-pointer transition-colors hover:bg-white/[0.02]",
-                    selectedTokenId === token.id && "bg-amber-500/[0.05] hover:bg-amber-500/[0.08]"
-                  )}
-                >
-                  <td className="px-6 py-4">
-                    <div className="flex items-center gap-3">
-                      <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-zinc-800 to-zinc-900 font-black text-amber-500 shadow-inner">
-                        {token.symbol.slice(0, 1)}
-                      </div>
-                      <div>
-                        <div className="font-bold text-white group-hover:text-amber-500 transition-colors">{token.symbol}</div>
-                        <div className="text-[10px] font-medium text-zinc-500">{token.name}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">
-                    <Button
-                      variant={watchlist.has(token.mint) ? "outline" : "ghost"}
-                      size="sm"
-                      className={cn(
-                        "h-8 gap-1 text-[10px]",
-                        watchlist.has(token.mint) && "border-amber-500/40 bg-amber-500/10 text-amber-500"
-                      )}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onToggleWatch(token);
-                      }}
-                    >
-                      <Pin size={12} />
-                      {watchlist.has(token.mint) ? "Pinned" : "Pin"}
-                    </Button>
-                  </td>
-                  <td className="px-6 py-4">
-                    <div className="flex items-center gap-2">
-                      <div className="h-1.5 w-12 rounded-full bg-white/5 overflow-hidden">
-                        <motion.div
-                          initial={{ width: 0 }}
-                          animate={{ width: `${token.score}%` }}
-                          className={cn(
-                            "h-full rounded-full",
-                            token.score > 70 ? "bg-emerald-500" : token.score > 40 ? "bg-amber-500" : "bg-rose-500"
-                          )}
-                        />
-                      </div>
-                      <span className="text-xs font-bold text-zinc-300">{token.score}</span>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">
-                    <Badge variant={statusVariant(token.status)}>
-                      {token.status.replace("_", " ")}
-                    </Badge>
-                  </td>
-                  <td className="px-6 py-4">
-                    <span className={cn(
-                      "text-xs font-black tracking-tight",
-                      (token.pnl_sol || 0) > 0 ? "text-emerald-500" : (token.pnl_sol || 0) < 0 ? "text-rose-500" : "text-zinc-500"
-                    )}>
-                      {token.pnl_sol ? (token.pnl_sol > 0 ? "+" : "") + token.pnl_sol.toFixed(4) : "0.0000"}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 text-right">
-                    <Button variant="ghost" size="icon" className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <Eye size={14} />
-                    </Button>
-                  </td>
-                </motion.tr>
+                  token={token}
+                  selected={selectedTokenId === token.id}
+                  watched={watchlist.has(token.mint)}
+                  onSelectToken={onSelectToken}
+                  onToggleWatch={onToggleWatch}
+                />
               ))}
             </AnimatePresence>
-          </tbody>
-        </table>
+          </div>
+        </div>
         
         {tokens.length === 0 && (
           <div className="flex h-64 flex-col items-center justify-center text-center">
@@ -192,4 +236,6 @@ export const TokenTable: React.FC<TokenTableProps> = ({
       </div>
     </Card>
   );
-};
+});
+
+TokenTable.displayName = "TokenTable";

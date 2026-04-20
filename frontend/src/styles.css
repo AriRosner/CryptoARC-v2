@@ -54,6 +54,39 @@ body::before {
   color: #fff8ec;
 }
 
+* {
+  scrollbar-color: rgba(232, 154, 74, 0.38) rgba(8, 9, 15, 0.72);
+  scrollbar-width: thin;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent),
+    rgba(8, 9, 15, 0.82);
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(8, 9, 15, 0.92);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(232, 154, 74, 0.78), rgba(121, 224, 166, 0.46));
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background:
+    linear-gradient(180deg, rgba(232, 154, 74, 0.95), rgba(121, 224, 166, 0.64));
+}
+
+.crypto-scrollbar {
+  scrollbar-color: rgba(232, 154, 74, 0.52) rgba(8, 9, 15, 0.78);
+  scrollbar-width: thin;
+}
+
 .auth-screen {
   display: grid;
   place-items: center;
@@ -88,6 +121,44 @@ button,
 input,
 select {
   font: inherit;
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  color-scheme: dark;
+  min-height: 2.25rem;
+  line-height: 1.25rem;
+  padding-top: 0;
+  padding-right: 2rem;
+  padding-bottom: 0;
+}
+
+select option {
+  background: #10121c;
+  color: #f6f2ea;
+}
+
+select option:checked {
+  background: #2a2419;
+  color: #f8c47c;
+}
+
+select option:hover,
+select option:focus {
+  background: #2a2419;
+  color: #fff8ec;
+}
+
+.dashboard-select {
+  background-color: rgba(0, 0, 0, 0.42) !important;
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23e89a4a' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+  background-position: 0 0, right 0.65rem center !important;
+  background-repeat: repeat, no-repeat !important;
+  background-size: auto, 0.875rem 0.875rem !important;
+  padding-right: 2rem;
 }
 
 button {
@@ -2399,6 +2470,16 @@ td span {
   50% {
     stroke-width: 5;
   }
+}
+
+.dashboard-search-input {
+  padding-left: 2.75rem;
+}
+
+.dashboard-select {
+  padding-top: 0;
+  padding-right: 2rem;
+  padding-bottom: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {

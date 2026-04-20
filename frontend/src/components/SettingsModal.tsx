@@ -10,7 +10,13 @@ import {
   Save,
   Lock,
   Smartphone,
-  AlertTriangle
+  AlertTriangle,
+  Radio,
+  Brain,
+  Sparkles,
+  TimerReset,
+  Cpu,
+  KeyRound
 } from "lucide-react";
 import { Modal } from "./Modal";
 import { Button } from "./Button";
@@ -215,6 +221,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       tab.keywords.toLowerCase().includes(query)
     );
   }, [searchQuery]);
+  const navScrollable = filteredTabs.length > 8;
 
   const activeTabExists = filteredTabs.some(t => t.id === activeTab);
   React.useEffect(() => {
@@ -234,16 +241,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       <div className="flex h-[600px] gap-6">
         <div className="flex w-52 flex-col space-y-1 border-r border-white/5 pr-4">
           <div className="relative mb-4">
-            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+            <Search className="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
             <input
               type="text"
               placeholder="Search..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="h-9 w-full rounded-lg border border-white/10 bg-black/40 pl-8 pr-3 text-xs text-white focus:border-amber-500/50 focus:outline-none"
+              className="dashboard-search-input h-9 w-full rounded-lg border border-white/10 bg-black/40 pr-3 text-xs text-white focus:border-amber-500/50 focus:outline-none"
             />
           </div>
-          <div className="flex-1 space-y-1 overflow-y-auto scrollbar-none">
+          <div className={cn("space-y-1", navScrollable ? "max-h-72 overflow-y-auto pr-1 crypto-scrollbar" : "overflow-visible")}>
             {filteredTabs.map((tab) => (
               <NavItem
                 key={tab.id}
@@ -284,13 +291,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "source" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Launch Configuration</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Radio size={13} />
+                  Launch Configuration
+                </h4>
                 <div className="grid gap-3">
                   <SettingRow label="Launch Source" description="Choose where new token launches come from.">
                     <select
                       value={draft.launch_source}
                       onChange={(e) => updateDraft("launch_source", e.target.value as BotSettings["launch_source"])}
-                      className="rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
+                      className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
                     >
                       <option value="mock">Mock stream</option>
                       <option value="pumpportal">PumpPortal Real-time</option>
@@ -308,7 +318,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
                 <section className="rounded-2xl border border-amber-500/20 bg-amber-500/[0.03] p-5">
                   <div className="flex items-center justify-between mb-4">
-                    <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500">Source Health</h4>
+                    <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500">
+                      <Database size={13} />
+                      Source Health
+                    </h4>
                     <Badge variant={sourceStatus.status === "connected" ? "success" : "danger"}>
                       {sourceStatus.status}
                     </Badge>
@@ -335,13 +348,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "strategy" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Strategy Profiles</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Brain size={13} />
+                  Strategy Profiles
+                </h4>
                 <div className="grid gap-3">
                   <SettingRow label="Active Profile" description="Start from a preset, then customize weights.">
                     <select
                       value={draft.strategy_profile}
                       onChange={(e) => applyProfile(e.target.value as BotSettings["strategy_profile"])}
-                      className="rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
+                      className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
                     >
                       <option value="conservative">Conservative</option>
                       <option value="balanced">Balanced</option>
@@ -360,7 +376,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <NumberInput field="max_open_positions" />
                   </SettingRow>
                   <SettingRow label="Trading Speed" description="Controls paper execution cadence and strategy aggression.">
-                    <select value={draft.trading_speed} onChange={(e) => updateDraft("trading_speed", e.target.value as BotSettings["trading_speed"])} className="rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">
+                    <select value={draft.trading_speed} onChange={(e) => updateDraft("trading_speed", e.target.value as BotSettings["trading_speed"])} className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">
                       <option value="slow">slow</option>
                       <option value="normal">normal</option>
                       <option value="fast">fast</option>
@@ -372,7 +388,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </SettingRow>
                 </div>
 
-                <h4 className="mt-4 text-[10px] font-black uppercase tracking-widest text-amber-500/80">Scoring Intelligence</h4>
+                <h4 className="mt-4 flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Sparkles size={13} />
+                  Scoring Intelligence
+                </h4>
                 <div className="grid grid-cols-2 gap-3">
                   {["metadata", "momentum", "pressure", "creator"].map((weight) => (
                     <div key={weight} className="rounded-xl border border-white/5 bg-white/[0.01] p-3">
@@ -400,13 +419,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "risk" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Risk Filters</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Shield size={13} />
+                  Risk Filters
+                </h4>
                 <div className="grid gap-3">
                    <SettingRow label="Risk Tolerance" description="Overall aggressiveness of entry signals.">
                     <select
                       value={draft.risk_tolerance}
                       onChange={(e) => updateDraft("risk_tolerance", e.target.value as BotSettings["risk_tolerance"])}
-                      className="rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
+                      className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
                     >
                       <option value="low">Low</option>
                       <option value="medium">Medium</option>
@@ -476,7 +498,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "exits" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Profit & Loss Controls</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <TimerReset size={13} />
+                  Profit & Loss Controls
+                </h4>
                 <div className="grid gap-3">
                   <SettingRow label="Take Profit (%)" description="Exit position when target profit is reached.">
                     <input
@@ -535,7 +560,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "simulation" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Environment Tuning</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Gauge size={13} />
+                  Environment Tuning
+                </h4>
                 <div className="grid gap-3">
                   <SettingRow label="RPC URL" description="Custom Solana RPC endpoint for balance and price data.">
                     <input
@@ -576,7 +604,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </div>
                   </SettingRow>
                   <SettingRow label="Live Signer Mode" description="Browser wallet works now; local signer remains future-gated.">
-                    <select value={draft.live_signer_mode} onChange={(e) => updateDraft("live_signer_mode", e.target.value as BotSettings["live_signer_mode"])} className="rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">
+                    <select value={draft.live_signer_mode} onChange={(e) => updateDraft("live_signer_mode", e.target.value as BotSettings["live_signer_mode"])} className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">
                       <option value="browser_wallet">browser wallet</option>
                       <option value="local_signer_daemon">local signer daemon later</option>
                     </select>
@@ -605,7 +633,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "advanced" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Engine Optimization</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <Cpu size={13} />
+                  Engine Optimization
+                </h4>
                 <div className="grid gap-3">
                   <SettingRow label="Source Stale (s)" description="Time before source data is considered disconnected.">
                     <NumberInput field="source_stale_seconds" />
@@ -661,7 +692,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === "security" && (
               <>
-                <h4 className="text-[10px] font-black uppercase tracking-widest text-amber-500/80">Access Control</h4>
+                <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                  <KeyRound size={13} />
+                  Access Control
+                </h4>
                 <div className="grid gap-3">
                   <section className="rounded-2xl border border-white/5 bg-white/[0.01] p-5">
                     <h5 className="mb-3 text-xs font-bold text-white flex items-center gap-2">
