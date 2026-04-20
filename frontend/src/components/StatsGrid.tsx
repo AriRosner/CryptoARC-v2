@@ -1,5 +1,5 @@
 import React from "react";
-import { TrendingUp, TrendingDown, Target, Zap } from "lucide-react";
+import { Activity, RefreshCw, TrendingUp, TrendingDown, Target, Zap } from "lucide-react";
 import { Card } from "./Card";
 import { AnimatedNumber } from "./AnimatedNumber";
 import { cn } from "./utils";
@@ -11,43 +11,57 @@ interface StatsGridProps {
     total_pnl_sol: number;
     open_positions: number;
   };
+  pnlCurrency?: "SOL" | "USD";
+  solUsdPrice?: number;
+  onTogglePnlCurrency?: () => void;
 }
 
-export const StatsGrid: React.FC<StatsGridProps> = ({ stats }) => {
+export const StatsGrid: React.FC<StatsGridProps> = ({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency }) => {
+  const showUsd = pnlCurrency === "USD" && solUsdPrice > 0;
   const items = [
     {
       label: "Total P&L",
-      value: stats.total_pnl_sol,
-      precision: 4,
-      suffix: " SOL",
+      value: showUsd ? stats.total_pnl_sol * solUsdPrice : stats.total_pnl_sol,
+      precision: showUsd ? 2 : 4,
+      prefix: showUsd ? "$" : "",
+      suffix: showUsd ? "" : " SOL",
       icon: stats.total_pnl_sol >= 0 ? TrendingUp : TrendingDown,
       color: stats.total_pnl_sol >= 0 ? "text-emerald-500" : "text-rose-500",
-      bg: stats.total_pnl_sol >= 0 ? "bg-emerald-500/10" : "bg-rose-500/10"
+      bg: stats.total_pnl_sol >= 0 ? "bg-emerald-500/10" : "bg-rose-500/10",
+      canToggle: true
     },
     {
       label: "Win Rate",
       value: stats.win_rate_pct,
       precision: 1,
+      prefix: "",
       suffix: "%",
       icon: Target,
       color: "text-amber-500",
-      bg: "bg-amber-500/10"
+      bg: "bg-amber-500/10",
+      canToggle: false
     },
     {
       label: "Total Trades",
       value: stats.total_trades,
       precision: 0,
+      prefix: "",
+      suffix: "",
       icon: Activity,
       color: "text-blue-500",
-      bg: "bg-blue-500/10"
+      bg: "bg-blue-500/10",
+      canToggle: false
     },
     {
       label: "Open Positions",
       value: stats.open_positions,
       precision: 0,
+      prefix: "",
+      suffix: "",
       icon: Zap,
       color: "text-purple-500",
-      bg: "bg-purple-500/10"
+      bg: "bg-purple-500/10",
+      canToggle: false
     }
   ];
 
@@ -62,19 +76,30 @@ export const StatsGrid: React.FC<StatsGridProps> = ({ stats }) => {
                 <AnimatedNumber
                   value={item.value}
                   precision={item.precision}
+                  prefix={item.prefix}
                   suffix={item.suffix}
                   className={cn("text-2xl font-black tracking-tight", item.color)}
                 />
               </div>
+              {item.canToggle ? <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-600">{showUsd ? "USD display" : "SOL display"}</p> : null}
             </div>
-            <div className={cn("flex h-12 w-12 items-center justify-center rounded-2xl", item.bg)}>
-              <item.icon size={24} className={item.color} />
-            </div>
+            {item.canToggle && onTogglePnlCurrency ? (
+              <button
+                className={cn("flex h-12 w-12 items-center justify-center rounded-2xl transition hover:scale-105", item.bg)}
+                onClick={onTogglePnlCurrency}
+                title="Switch P&L currency"
+                aria-label="Switch P&L currency"
+              >
+                <RefreshCw size={22} className={item.color} />
+              </button>
+            ) : (
+              <div className={cn("flex h-12 w-12 items-center justify-center rounded-2xl", item.bg)}>
+                <item.icon size={24} className={item.color} />
+              </div>
+            )}
           </div>
         </Card>
       ))}
     </div>
   );
 };
-
-import { Activity } from "lucide-react";

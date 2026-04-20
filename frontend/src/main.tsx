@@ -61,6 +61,7 @@ import {
   fetchSourceHealth,
   fetchSecurityStatus,
   fetchSettingsVersions,
+  fetchSolUsdPrice,
   fetchSourceAdapters,
   fetchStrategyDecisions,
   fetchStrategyPresets,
@@ -275,6 +276,8 @@ type QueueSort = "newest" | "score" | "pnl" | "creator";
 type WorkspacePage = "monitor" | "analysis" | "backtests" | "review" | "data";
 type LiveWalletMethod = "browser_wallet" | "local_signer_daemon";
 type PnlWalletScope = "paper" | string;
+type PnlCurrency = "SOL" | "USD";
+type BotActionStatus = "starting" | "stopping" | "";
 
 const pnlTimeframes: Array<{ label: string; value: PnlTimeframe; millis: number | null }> = [
   { label: "5m", value: "5m", millis: 5 * 60 * 1000 },
@@ -335,6 +338,10 @@ function App() {
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [selectedTokenId, setSelectedTokenId] = React.useState<string | null>(null);
   const [pnlTimeframe, setPnlTimeframe] = React.useState<PnlTimeframe>("all");
+  const [pnlCurrency, setPnlCurrency] = React.useState<PnlCurrency>(() => (window.localStorage.getItem("cryptoarc_pnl_currency") === "USD" ? "USD" : "SOL"));
+  const [solUsdPrice, setSolUsdPrice] = React.useState(0);
+  const [solUsdStale, setSolUsdStale] = React.useState(false);
+  const [botActionStatus, setBotActionStatus] = React.useState<BotActionStatus>("");
   const [queueFilter, setQueueFilter] = React.useState<QueueFilter>("all");
   const [queueSort, setQueueSort] = React.useState<QueueSort>("newest");
   const [workspacePage, setWorkspacePage] = React.useState<WorkspacePage>("monitor");
@@ -403,6 +410,7 @@ function App() {
   const seenToastIds = React.useRef<Set<string>>(new Set());
   const readyForToasts = React.useRef(false);
   const researchRefreshTimer = React.useRef<number | null>(null);
+  const pnlRefreshInFlight = React.useRef(false);
 
   function scheduleResearchRefresh() {
     if (researchRefreshTimer.current !== null) return;
@@ -490,10 +498,31 @@ function App() {
   const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
   const paperTimeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
   const liveTimeframePnl = Number(((liveLedger?.summary.realized_pnl_sol ?? 0) + (liveLedger?.summary.unrealized_pnl_sol ?? 0)).toFixed(6));
-  const timeframePnl = pnlWalletScope === "paper" ? paperTimeframePnl : liveTimeframePnl;
-  const paperPnlHistory = React.useMemo(() => buildPnlHistory(trades, pnlTimeframe), [trades, pnlTimeframe]);
-  const livePnlHistory = React.useMemo(() => buildLivePnlHistory(liveLedger, pnlTimeframe), [liveLedger, pnlTimeframe]);
-  const pnlHistory = pnlWalletScope === "paper" ? paperPnlHistory : livePnlHistory;
+  const timeframePnlSol = pnlWalletScope === "paper" ? paperTimeframePnl : liveTimeframePnl;
+  const effectivePnlCurrency: PnlCurrency = pnlCurrency === "USD" && solUsdPrice > 0 ? "USD" : "SOL";
+  const pnlDisplayMultiplier = effectivePnlCurrency === "USD" ? solUsdPrice : 1;
+  const displayPnlValue = Number((timeframePnlSol * pnlDisplayMultiplier).toFixed(effectivePnlCurrency === "USD" ? 2 : 6));
+  const paperPnlHistory = React.useMemo(() => {
+    const history = buildPnlHistory(trades, pnlTimeframe);
+    if (history.length) return history;
+    if (stats.closed_trades > 0 || stats.total_pnl_sol !== 0) {
+      return [0, Number(stats.total_pnl_sol.toFixed(6))];
+    }
+    return [0, 0];
+  }, [trades, pnlTimeframe, stats.closed_trades, stats.total_pnl_sol]);
+  const livePnlHistory = React.useMemo(() => {
+    const history = buildLivePnlHistory(liveLedger, pnlTimeframe);
+    if (history.length) return history;
+    const current = Number(((liveStatus?.live_pnl?.realized_pnl_sol ?? 0) + (liveStatus?.live_pnl?.unrealized_pnl_sol ?? 0)).toFixed(6));
+    return [0, current];
+  }, [liveLedger, liveStatus?.live_pnl?.realized_pnl_sol, liveStatus?.live_pnl?.unrealized_pnl_sol, pnlTimeframe]);
+  const pnlHistorySol = pnlWalletScope === "paper" ? paperPnlHistory : livePnlHistory;
+  const pnlHistory = React.useMemo(() => pnlHistorySol.map((value) => Number((value * pnlDisplayMultiplier).toFixed(effectivePnlCurrency === "USD" ? 2 : 6))), [pnlHistorySol, pnlDisplayMultiplier, effectivePnlCurrency]);
+  const pnlCurrencyLabel = pnlCurrency === "USD"
+    ? solUsdPrice > 0
+      ? `USD via SOL ${solUsdStale ? "stale" : "live"} price: $${solUsdPrice.toFixed(2)}`
+      : "USD price loading"
+    : "SOL display";
   const filteredTokens = React.useMemo(() => {
     let tokens = snapshot.tokens;
     const query = tokenSearch.trim().toLowerCase();
@@ -542,6 +571,48 @@ function App() {
   function updatePnlWalletScope(scope: PnlWalletScope) {
     setPnlWalletScope(scope);
     window.localStorage.setItem("cryptoarc_pnl_wallet_scope", scope);
+  }
+
+  function togglePnlCurrency() {
+    setPnlCurrency((current) => {
+      const next = current === "SOL" ? "USD" : "SOL";
+      window.localStorage.setItem("cryptoarc_pnl_currency", next);
+      if (next === "USD" && solUsdPrice <= 0) {
+        refreshSolUsdPrice().catch(() => undefined);
+      }
+      return next;
+    });
+  }
+
+  async function refreshSolUsdPrice() {
+    const quote = await fetchSolUsdPrice();
+    setSolUsdPrice(Number(quote.price || 0));
+    setSolUsdStale(Boolean(quote.stale));
+  }
+
+  async function handleStartBot() {
+    setBotActionStatus("starting");
+    try {
+      setSnapshot(await startBot());
+      setApiError("");
+    } catch (error) {
+      setApiError(`Start failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    } finally {
+      setBotActionStatus("");
+    }
+  }
+
+  async function handleStopBot() {
+    setBotActionStatus("stopping");
+    try {
+      setSnapshot(await stopBot());
+      await refreshPnlData();
+      setApiError("");
+    } catch (error) {
+      setApiError(`Stop failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    } finally {
+      setBotActionStatus("");
+    }
   }
 
   async function saveSettings(nextSettings: BotSettings) {
@@ -705,6 +776,21 @@ function App() {
     setLiveIntents(intentRows);
     setLiveLedger(ledgerState);
     refreshConnectedWalletBalance().catch(() => undefined);
+  }
+
+  async function refreshPnlData() {
+    if (pnlRefreshInFlight.current) return;
+    pnlRefreshInFlight.current = true;
+    try {
+      const [tradeRows, ledgerState] = await Promise.all([
+        fetchTrades(),
+        fetchLiveLedger(selectedLivePnlWallet)
+      ]);
+      setTrades(tradeRows);
+      setLiveLedger(ledgerState);
+    } finally {
+      pnlRefreshInFlight.current = false;
+    }
   }
 
   async function loadReplayTimeline(tokenId: string) {
@@ -950,7 +1036,27 @@ function App() {
   }
 
   React.useEffect(() => {
+    refreshPnlData().catch(() => undefined);
+    refreshSolUsdPrice().catch(() => undefined);
     refreshResearchData().catch(() => undefined);
+  }, []);
+
+  React.useEffect(() => {
+    refreshPnlData().catch(() => undefined);
+  }, [selectedLivePnlWallet]);
+
+  React.useEffect(() => {
+    const interval = window.setInterval(() => {
+      refreshPnlData().catch(() => undefined);
+    }, 3000);
+    return () => window.clearInterval(interval);
+  }, [selectedLivePnlWallet]);
+
+  React.useEffect(() => {
+    const interval = window.setInterval(() => {
+      refreshSolUsdPrice().catch(() => undefined);
+    }, 60000);
+    return () => window.clearInterval(interval);
   }, []);
 
   React.useEffect(() => {
@@ -975,10 +1081,10 @@ function App() {
     <AppLayout
       activePage={workspacePage}
       setActivePage={setWorkspacePage}
-      status={snapshot.status}
+      status={botActionStatus || snapshot.status}
       apiState={apiState}
-      onStart={async () => setSnapshot(await startBot())}
-      onStop={async () => setSnapshot(await stopBot())}
+      onStart={handleStartBot}
+      onStop={handleStopBot}
       onSettingsOpen={() => setSettingsOpen(true)}
       onLiveWalletOpen={() => setLiveWalletOpen(true)}
       walletPublicKey={walletPublicKey}
@@ -989,7 +1095,11 @@ function App() {
         <MonitorPage
           stats={stats}
           pnlHistory={pnlHistory}
-          pnlValue={timeframePnl}
+          pnlValue={displayPnlValue}
+          pnlCurrency={effectivePnlCurrency}
+          pnlCurrencyLabel={pnlCurrencyLabel}
+          solUsdPrice={solUsdPrice}
+          onTogglePnlCurrency={togglePnlCurrency}
           pnlCaption={pnlWalletScope === "paper"
             ? `${timeframeTrades.length} closed paper trades in selected range`
             : `${liveLedger?.summary.open_positions ?? 0} live positions / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"} P&L`}

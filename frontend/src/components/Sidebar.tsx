@@ -19,7 +19,7 @@ import { cn } from "./utils";
 interface SidebarProps {
   activePage: string;
   setActivePage: (page: any) => void;
-  status: "running" | "stopped" | "starting";
+  status: "running" | "stopped" | "starting" | "stopping";
   apiState: string;
   onStart: () => void;
   onStop: () => void;
@@ -68,6 +68,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   walletPublicKey,
   walletBalance
 }) => {
+  const statusPending = status === "starting" || status === "stopping";
+  const statusTone = status === "running" || status === "starting" ? "bg-emerald-500 animate-pulse" : status === "stopping" ? "bg-amber-500 animate-pulse" : "bg-rose-500";
+  const actionLabel = status === "running" ? "Stop" : status === "stopping" ? "Stopping..." : status === "starting" ? "Starting..." : "Start";
   const navItems = [
     { id: "monitor", label: "Monitor", icon: Activity },
     { id: "analysis", label: "Analysis", icon: BarChart3 },
@@ -110,18 +113,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
             <div className="mb-4">
               <div className="flex items-center gap-2">
-                <div className={cn("h-2 w-2 rounded-full", status === "running" ? "bg-emerald-500 animate-pulse" : "bg-rose-500")} />
+                <div className={cn("h-2 w-2 rounded-full", statusTone)} />
                 <span className="text-sm font-bold text-white capitalize">{status}</span>
               </div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <Button
                 size="sm"
-                variant={status === "running" ? "danger" : "primary"}
+                variant={status === "running" || status === "stopping" ? "danger" : "primary"}
                 onClick={status === "running" ? onStop : onStart}
                 className="w-full"
+                disabled={statusPending}
               >
-                {status === "running" ? "Stop" : "Start"}
+                {actionLabel}
               </Button>
               <Button
                 size="sm"

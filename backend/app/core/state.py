@@ -94,6 +94,8 @@ class BotState:
         self.bot_loop_iterations = 0
         self.live_last_poll_at: datetime | None = None
         self.live_last_poll_summary: dict[str, object] = {"checked": 0, "updated": 0, "skipped": True, "reason": "not run"}
+        self.sol_usd_price = 0.0
+        self.sol_usd_price_updated_at: datetime | None = None
         self.recalculate_stats()
 
     def start(self) -> BotSnapshot:
@@ -743,6 +745,50 @@ class BotState:
 
     def trades(self, limit: int = 300) -> list[dict[str, object]]:
         return [trade.to_dict() for trade in self.storage.load_trades(limit)]
+
+    def market_sol_usd(self) -> dict[str, object]:
+        now = utc_now()
+        if self.sol_usd_price > 0 and self.sol_usd_price_updated_at and (now - self.sol_usd_price_updated_at).total_seconds() < 60:
+            return {
+                "symbol": "SOL",
+                "currency": "USD",
+                "price": round(self.sol_usd_price, 4),
+                "updated_at": self.sol_usd_price_updated_at.isoformat(),
+                "source": "coingecko",
+                "stale": False,
+                "error": "",
+            }
+        try:
+            request = urllib.request.Request(
+                "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd",
+                headers={"Accept": "application/json", "User-Agent": "CryptoARC-v2"},
+            )
+            with urllib.request.urlopen(request, timeout=4) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            price = float((body.get("solana") or {}).get("usd") or 0.0)
+            if price <= 0:
+                raise RuntimeError("SOL/USD price unavailable")
+            self.sol_usd_price = price
+            self.sol_usd_price_updated_at = now
+            return {
+                "symbol": "SOL",
+                "currency": "USD",
+                "price": round(price, 4),
+                "updated_at": now.isoformat(),
+                "source": "coingecko",
+                "stale": False,
+                "error": "",
+            }
+        except Exception as exc:
+            return {
+                "symbol": "SOL",
+                "currency": "USD",
+                "price": round(self.sol_usd_price, 4),
+                "updated_at": self.sol_usd_price_updated_at.isoformat() if self.sol_usd_price_updated_at else None,
+                "source": "coingecko",
+                "stale": True,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
 
     def price_observations(self, limit: int = 300) -> list[dict[str, object]]:
         return [observation.to_dict() for observation in self.storage.load_price_observations(limit)]

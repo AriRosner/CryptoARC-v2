@@ -112,6 +112,10 @@ export async function fetchTrades(): Promise<TradeRecord[]> {
   return request("/api/trades");
 }
 
+export async function fetchSolUsdPrice(): Promise<{ symbol: string; currency: "USD"; price: number; updated_at: string | null; source: string; stale: boolean; error: string }> {
+  return request("/api/market/sol-usd");
+}
+
 export async function fetchPriceObservations(): Promise<PriceObservation[]> {
   return request("/api/price-observations");
 }

@@ -4,9 +4,10 @@ import { Area, AreaChart, ReferenceLine, ResponsiveContainer, Tooltip } from "re
 interface PnlChartProps {
   data: number[];
   height?: number;
+  unit?: "SOL" | "USD";
 }
 
-export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100 }) => {
+export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL" }) => {
   const id = React.useId();
   const gradientId = `pnlGradient-${id.replace(/:/g, "")}`;
   const animatedOnceRef = React.useRef(false);
@@ -66,7 +67,7 @@ export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 10
                 return (
                   <div className="rounded-lg border border-white/10 bg-[#090b13] p-2 text-xs shadow-xl">
                     <p className="font-bold text-white">
-                      {payload[0].value?.toLocaleString(undefined, { minimumFractionDigits: 4 })} SOL
+                      {unit === "USD" ? "$" : ""}{payload[0].value?.toLocaleString(undefined, { minimumFractionDigits: unit === "USD" ? 2 : 4, maximumFractionDigits: unit === "USD" ? 2 : 4 })} {unit === "USD" ? "" : "SOL"}
                     </p>
                   </div>
                 );

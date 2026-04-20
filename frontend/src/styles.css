@@ -2482,6 +2482,186 @@ td span {
   padding-bottom: 0;
 }
 
+/* Unified dashboard control skin. Keep this late so it wins over page-level utility classes. */
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea) {
+  color-scheme: dark;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 8px !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
+    rgba(0, 0, 0, 0.46) !important;
+  color: #fff8ec !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.045),
+    0 0 0 0 rgba(232, 154, 74, 0);
+  caret-color: var(--accent);
+  transition:
+    border-color 180ms var(--ease-fluid),
+    box-shadow 180ms var(--ease-fluid),
+    background 180ms var(--ease-fluid),
+    transform 180ms var(--ease-fluid);
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):hover:not(:disabled) {
+  border-color: rgba(232, 154, 74, 0.32) !important;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.016)),
+    rgba(0, 0, 0, 0.52) !important;
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus,
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):focus-visible {
+  outline: none !important;
+  border-color: rgba(232, 154, 74, 0.74) !important;
+  box-shadow:
+    0 0 0 4px rgba(232, 154, 74, 0.12),
+    0 0 24px rgba(232, 154, 74, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06) !important;
+  transform: translateY(-1px);
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea)::placeholder {
+  color: rgba(161, 161, 170, 0.62);
+}
+
+:where(input:not([type="checkbox"]):not([type="radio"]), select, textarea):disabled {
+  cursor: not-allowed;
+  border-color: rgba(255, 255, 255, 0.06) !important;
+  background: rgba(0, 0, 0, 0.24) !important;
+  color: rgba(161, 161, 170, 0.58) !important;
+  opacity: 0.72;
+}
+
+textarea {
+  min-height: 5.5rem;
+  resize: vertical;
+}
+
+select,
+.dashboard-select {
+  background-image:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.012)),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23e89a4a' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") !important;
+  background-position: 0 0, right 0.7rem center !important;
+  background-repeat: repeat, no-repeat !important;
+  background-size: auto, 0.875rem 0.875rem !important;
+  padding-right: 2.15rem !important;
+}
+
+select option {
+  background: #090b13;
+  color: #f6f2ea;
+}
+
+select option:checked {
+  background: #2a2419;
+  color: #f8c47c;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  filter: invert(73%) sepia(56%) saturate(659%) hue-rotate(342deg) brightness(96%) contrast(90%);
+  opacity: 0.9;
+}
+
+input[type="number"] {
+  font-variant-numeric: tabular-nums;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-grid;
+  place-content: center;
+  flex: 0 0 auto;
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14) !important;
+  border-radius: 6px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.012)),
+    rgba(0, 0, 0, 0.52) !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  transition:
+    border-color 160ms var(--ease-fluid),
+    box-shadow 160ms var(--ease-fluid),
+    background 160ms var(--ease-fluid),
+    transform 160ms var(--ease-fluid);
+}
+
+input[type="radio"] {
+  border-radius: 999px;
+}
+
+input[type="checkbox"]::before,
+input[type="radio"]::before {
+  content: "";
+  width: 0.48rem;
+  height: 0.48rem;
+  transform: scale(0);
+  transition: transform 140ms var(--ease-snap);
+  background: var(--accent);
+  box-shadow: 0 0 14px rgba(232, 154, 74, 0.72);
+}
+
+input[type="checkbox"]::before {
+  clip-path: polygon(14% 44%, 0 59%, 39% 100%, 100% 18%, 84% 7%, 37% 69%);
+  width: 0.62rem;
+  height: 0.62rem;
+}
+
+input[type="radio"]::before {
+  border-radius: 999px;
+}
+
+input[type="checkbox"]:hover:not(:disabled),
+input[type="radio"]:hover:not(:disabled) {
+  border-color: rgba(232, 154, 74, 0.58) !important;
+  box-shadow:
+    0 0 0 4px rgba(232, 154, 74, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+
+input[type="checkbox"]:checked,
+input[type="radio"]:checked {
+  border-color: rgba(232, 154, 74, 0.82) !important;
+  background:
+    linear-gradient(180deg, rgba(232, 154, 74, 0.28), rgba(121, 224, 166, 0.08)),
+    rgba(9, 11, 19, 0.92) !important;
+}
+
+input[type="checkbox"]:checked::before,
+input[type="radio"]:checked::before {
+  transform: scale(1);
+}
+
+input[type="checkbox"]:focus-visible,
+input[type="radio"]:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 4px rgba(232, 154, 74, 0.14),
+    0 0 18px rgba(232, 154, 74, 0.1);
+}
+
+input[type="checkbox"]:disabled,
+input[type="radio"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.toggle-line input {
+  width: 42px;
+  height: 22px;
+  border-radius: 999px;
+}
+
+.toggle-line input::before {
+  display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

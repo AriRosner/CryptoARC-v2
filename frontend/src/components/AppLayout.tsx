@@ -7,7 +7,7 @@ interface AppLayoutProps {
   children: React.ReactNode;
   activePage: string;
   setActivePage: (page: any) => void;
-  status: "running" | "stopped" | "starting";
+  status: "running" | "stopped" | "starting" | "stopping";
   apiState: string;
   onStart: () => void;
   onStop: () => void;

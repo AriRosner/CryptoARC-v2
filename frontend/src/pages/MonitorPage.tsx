@@ -1,6 +1,6 @@
 import React from "react";
 import { motion } from "framer-motion";
-import { Activity, LayoutDashboard, TrendingUp } from "lucide-react";
+import { Activity, LayoutDashboard, RefreshCw, TrendingUp } from "lucide-react";
 import { PageHeader } from "../components/PageHeader";
 import { StatsGrid } from "../components/StatsGrid";
 import { Card } from "../components/Card";
@@ -12,6 +12,10 @@ interface MonitorPageProps {
   stats: any;
   pnlHistory: number[];
   pnlValue: number;
+  pnlCurrency: "SOL" | "USD";
+  pnlCurrencyLabel: string;
+  solUsdPrice: number;
+  onTogglePnlCurrency: () => void;
   pnlCaption: string;
   liveWallets: string[];
   walletPublicKey: string;
@@ -37,6 +41,10 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
   stats,
   pnlHistory,
   pnlValue,
+  pnlCurrency,
+  pnlCurrencyLabel,
+  solUsdPrice,
+  onTogglePnlCurrency,
   pnlCaption,
   liveWallets,
   walletPublicKey,
@@ -81,7 +89,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
         </div>
       </PageHeader>
 
-      <StatsGrid stats={stats} />
+      <StatsGrid stats={stats} pnlCurrency={pnlCurrency} solUsdPrice={solUsdPrice} onTogglePnlCurrency={onTogglePnlCurrency} />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         <div className="lg:col-span-2">
@@ -110,16 +118,25 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
                     "text-2xl font-black tracking-tight",
                     pnlValue >= 0 ? "text-emerald-500" : "text-rose-500"
                   )}>
-                    {pnlValue >= 0 ? "+" : ""}{pnlValue.toFixed(4)} SOL
+                    {pnlValue >= 0 ? "+" : ""}{pnlCurrency === "USD" ? `$${pnlValue.toFixed(2)}` : `${pnlValue.toFixed(4)} SOL`}
                   </span>
+                  <button
+                    className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-400 transition hover:border-amber-500/40 hover:text-amber-300"
+                    onClick={onTogglePnlCurrency}
+                    title="Switch P&L currency"
+                    aria-label="Switch P&L currency"
+                  >
+                    <RefreshCw size={14} />
+                  </button>
                 </div>
+                <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-600">{pnlCurrencyLabel}</p>
               </div>
               <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-500/10">
                 <TrendingUp size={20} className="text-emerald-500" />
               </div>
             </div>
             
-            <PnlChart data={pnlHistory} height={160} />
+            <PnlChart data={pnlHistory} height={160} unit={pnlCurrency} />
             
             <div className="mt-6 flex items-center justify-between border-t border-white/5 pt-6">
               <label className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
