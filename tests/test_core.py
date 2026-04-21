@@ -861,6 +861,15 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(health["status_message"], "idle")
             self.assertGreaterEqual(health["health_score"], 80)
 
+    def test_fresh_idle_source_health_is_full_when_bot_is_not_running(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            health = state.source_health()
+
+            self.assertEqual(health["status_message"], "idle")
+            self.assertEqual(health["health_score"], 100)
+
     def test_apply_tuning_suggestion_updates_settings(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))

@@ -32,6 +32,8 @@ const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "w
 };
 
 const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 116px 132px 118px 76px";
+const TOKEN_ROW_HEIGHT = 62;
+const TOKEN_OVERSCAN = 8;
 
 function formatTokenAge(seconds: number): string {
   if (seconds < 60) return `${Math.max(0, Math.floor(seconds))}s`;
@@ -56,6 +58,7 @@ interface TokenRowProps {
   watched: boolean;
   onSelectToken: (id: string) => void;
   onToggleWatch: (token: TokenSignal) => void;
+  animateIn: boolean;
 }
 
 const TokenRow = React.memo(function TokenRow({
@@ -63,7 +66,8 @@ const TokenRow = React.memo(function TokenRow({
   selected,
   watched,
   onSelectToken,
-  onToggleWatch
+  onToggleWatch,
+  animateIn
 }: TokenRowProps) {
   const pnl = token.pnl_sol || 0;
   const ageLabel = formatTokenAge(token.age_seconds || 0);
@@ -71,14 +75,14 @@ const TokenRow = React.memo(function TokenRow({
   return (
     <motion.div
       key={token.id}
-      initial={{ opacity: 0, y: 6 }}
+      initial={animateIn ? { opacity: 0, y: 6 } : false}
       animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -4 }}
+      exit={undefined}
       transition={{ duration: 0.16 }}
       onClick={() => onSelectToken(token.id)}
       style={{ gridTemplateColumns: tokenGridColumns }}
       className={cn(
-        "group grid min-h-[62px] cursor-pointer items-center border-b border-white/5 transition-colors hover:bg-white/[0.03]",
+        "group grid h-[62px] cursor-pointer items-center border-b border-white/5 transition-colors hover:bg-white/[0.03]",
         selected && "bg-amber-500/[0.06] hover:bg-amber-500/[0.09]"
       )}
     >
@@ -175,7 +179,38 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   hideSkipped,
   setHideSkipped
 }) => {
+  const scrollRef = React.useRef<HTMLDivElement | null>(null);
+  const seenRowIdsRef = React.useRef<Set<string>>(new Set());
+  const [scrollTop, setScrollTop] = React.useState(0);
+  const [viewportHeight, setViewportHeight] = React.useState(520);
   const visibleRows = React.useMemo(() => tokens, [tokens]);
+  const totalHeight = visibleRows.length * TOKEN_ROW_HEIGHT;
+  const startIndex = Math.max(0, Math.floor(scrollTop / TOKEN_ROW_HEIGHT) - TOKEN_OVERSCAN);
+  const visibleCount = Math.ceil(viewportHeight / TOKEN_ROW_HEIGHT) + TOKEN_OVERSCAN * 2;
+  const endIndex = Math.min(visibleRows.length, startIndex + visibleCount);
+  const virtualRows = React.useMemo(() => visibleRows.slice(startIndex, endIndex), [visibleRows, startIndex, endIndex]);
+  const topSpacerHeight = startIndex * TOKEN_ROW_HEIGHT;
+  const bottomSpacerHeight = Math.max(0, totalHeight - topSpacerHeight - virtualRows.length * TOKEN_ROW_HEIGHT);
+
+  React.useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return;
+
+    const updateViewport = () => setViewportHeight(node.clientHeight);
+    const handleScroll = () => setScrollTop(node.scrollTop);
+
+    updateViewport();
+    handleScroll();
+
+    node.addEventListener("scroll", handleScroll, { passive: true });
+    const resizeObserver = new ResizeObserver(updateViewport);
+    resizeObserver.observe(node);
+
+    return () => {
+      node.removeEventListener("scroll", handleScroll);
+      resizeObserver.disconnect();
+    };
+  }, []);
 
   return (
     <Card className="flex h-[clamp(520px,calc(100vh-270px),760px)] min-h-[520px] flex-col" hover={false}>
@@ -234,7 +269,7 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
         </label>
       </div>
 
-      <div className="crypto-scrollbar flex-1 overflow-auto">
+      <div ref={scrollRef} className="crypto-scrollbar flex-1 overflow-auto">
         <div className="min-w-[780px]">
           <div
             style={{ gridTemplateColumns: tokenGridColumns }}
@@ -249,18 +284,25 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
             <div className="px-4 text-right">Action</div>
           </div>
           <div>
+            <div style={{ height: topSpacerHeight }} />
             <AnimatePresence initial={false}>
-              {visibleRows.map((token) => (
-                <TokenRow
-                  key={token.id}
-                  token={token}
-                  selected={selectedTokenId === token.id}
-                  watched={watchlist.has(token.mint)}
-                  onSelectToken={onSelectToken}
-                  onToggleWatch={onToggleWatch}
-                />
-              ))}
+              {virtualRows.map((token) => {
+                const animateIn = !seenRowIdsRef.current.has(token.id);
+                seenRowIdsRef.current.add(token.id);
+                return (
+                  <TokenRow
+                    key={token.id}
+                    token={token}
+                    selected={selectedTokenId === token.id}
+                    watched={watchlist.has(token.mint)}
+                    onSelectToken={onSelectToken}
+                    onToggleWatch={onToggleWatch}
+                    animateIn={animateIn}
+                  />
+                );
+              })}
             </AnimatePresence>
+            <div style={{ height: bottomSpacerHeight }} />
           </div>
         </div>
         

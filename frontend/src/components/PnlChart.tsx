@@ -5,12 +5,13 @@ interface PnlChartProps {
   data: number[];
   height?: number;
   unit?: "SOL" | "USD";
+  animationKey?: string;
 }
 
-export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL" }) => {
+export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL", animationKey = "default" }) => {
   const id = React.useId();
   const gradientId = `pnlGradient-${id.replace(/:/g, "")}`;
-  const animatedOnceRef = React.useRef(false);
+  const lastAnimationKeyRef = React.useRef<string | null>(null);
   const hasData = data.length > 0;
   const chartData = React.useMemo(() => {
     if (data.length === 0) return [{ index: 0, value: 0 }, { index: 1, value: 0 }];
@@ -18,11 +19,11 @@ export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 10
     return data.map((value, index) => ({ index, value }));
   }, [data]);
   const isPositive = (data[data.length - 1] || 0) >= (data[0] || 0);
-  const shouldAnimate = !animatedOnceRef.current && data.length > 1 && data.length <= 180;
+  const shouldAnimate = hasData && data.length > 1 && data.length <= 180 && lastAnimationKeyRef.current !== animationKey;
 
   React.useEffect(() => {
-    animatedOnceRef.current = true;
-  }, []);
+    lastAnimationKeyRef.current = animationKey;
+  }, [animationKey]);
 
   return (
     <div className="relative overflow-hidden rounded-lg" style={{ width: "100%", height }}>

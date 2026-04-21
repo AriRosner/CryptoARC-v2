@@ -879,8 +879,8 @@ class BotState:
         if quality_events and ratio < 0.35:
             health -= 20
         health -= min(20, max(0, self.source_status.reconnect_attempts - self.settings.source_max_reconnects) * 4)
-        if source_is_idle and not events:
-            health = min(health, 70)
+        if source_is_idle and not expects_live_source:
+            health = 100
         newest_normalized = normalized[0] if normalized else None
         cutoff = utc_now() - timedelta(minutes=1)
         recent_events = [event for event in events if event.received_at >= cutoff]

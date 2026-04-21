@@ -372,16 +372,15 @@ async def stop_runtime_tasks() -> dict[str, object]:
     if source_task and not source_task.done():
         cancelled_source = True
         source_task.cancel()
-        try:
-            await asyncio.wait_for(source_task, timeout=1.0)
-        except asyncio.CancelledError:
-            pass
-        except asyncio.TimeoutError:
-            source_stop_warning = "Source task did not acknowledge cancellation within 1 second"
-            state.add_event("warning", source_stop_warning)
-        except Exception as exc:
-            source_stop_warning = f"Source stop warning: {exc.__class__.__name__}: {exc}"
-            state.add_event("warning", source_stop_warning)
+        def _consume_source_task_result(task: asyncio.Task) -> None:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                state.add_event("warning", f"Source stop warning: {exc.__class__.__name__}: {exc}")
+
+        source_task.add_done_callback(_consume_source_task_result)
 
     source_task = None
     source_key = None

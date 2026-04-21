@@ -85,6 +85,14 @@ const DataMetric: React.FC<{ label: string; value: string | number; color?: stri
   </div>
 );
 
+function auditLevelTone(level: string): string {
+  const normalized = level.toLowerCase();
+  if (normalized === "error" || normalized === "danger") return "border-rose-500/20 bg-rose-500/10 text-rose-300";
+  if (normalized === "warn" || normalized === "warning") return "border-amber-500/20 bg-amber-500/10 text-amber-300";
+  if (normalized === "success") return "border-emerald-500/20 bg-emerald-500/10 text-emerald-300";
+  return "border-blue-500/20 bg-blue-500/10 text-blue-300";
+}
+
 export const DataPage: React.FC<DataPageProps> = ({
   summary,
   sourceEvents,
@@ -202,10 +210,7 @@ export const DataPage: React.FC<DataPageProps> = ({
                         {new Date(event.created_at).toLocaleTimeString()}
                       </div>
                       <div className="flex items-center px-4">
-                        <span className={cn(
-                          "font-bold uppercase",
-                          event.level === "error" ? "text-rose-500" : event.level === "warn" ? "text-amber-500" : "text-emerald-500"
-                        )}>
+                        <span className={cn("inline-flex items-center rounded-md border px-2 py-1 text-[10px] font-black uppercase tracking-wider", auditLevelTone(event.level))}>
                           {event.level}
                         </span>
                       </div>

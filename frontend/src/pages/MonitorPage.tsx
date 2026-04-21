@@ -39,7 +39,7 @@ interface MonitorPageProps {
   apiState: string;
 }
 
-export const MonitorPage: React.FC<MonitorPageProps> = ({
+export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
   stats,
   pnlHistory,
   pnlValue,
@@ -142,7 +142,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
               </div>
             </div>
             
-            <PnlChart data={pnlHistory} height={160} unit={pnlCurrency} />
+            <PnlChart data={pnlHistory} height={160} unit={pnlCurrency} animationKey={`${timeframe}:${pnlWallet}:${pnlCurrency}`} />
             
             <div className="mt-6 flex items-center justify-between border-t border-white/5 pt-6">
               <label className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
@@ -191,7 +191,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = ({
       </div>
     </div>
   );
-};
+});
 
 import { cn } from "../components/utils";
 

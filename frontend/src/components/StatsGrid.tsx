@@ -16,9 +16,9 @@ interface StatsGridProps {
   onTogglePnlCurrency?: () => void;
 }
 
-export const StatsGrid: React.FC<StatsGridProps> = ({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency }) => {
+export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency }) => {
   const showUsd = pnlCurrency === "USD" && solUsdPrice > 0;
-  const items = [
+  const items = React.useMemo(() => [
     {
       label: "Total P&L",
       value: showUsd ? stats.total_pnl_sol * solUsdPrice : stats.total_pnl_sol,
@@ -63,7 +63,7 @@ export const StatsGrid: React.FC<StatsGridProps> = ({ stats, pnlCurrency = "SOL"
       bg: "bg-purple-500/10",
       canToggle: false
     }
-  ];
+  ], [showUsd, stats.total_pnl_sol, solUsdPrice, stats.win_rate_pct, stats.total_trades, stats.open_positions]);
 
   return (
     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -102,4 +102,4 @@ export const StatsGrid: React.FC<StatsGridProps> = ({ stats, pnlCurrency = "SOL"
       ))}
     </div>
   );
-};
+});

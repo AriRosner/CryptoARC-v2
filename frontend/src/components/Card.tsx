@@ -5,16 +5,17 @@ import { cn } from "./utils";
 interface CardProps extends HTMLMotionProps<"div"> {
   glass?: boolean;
   hover?: boolean;
+  appear?: boolean;
 }
 
 export const Card = React.forwardRef<HTMLDivElement, CardProps>(
-  ({ className, glass = true, hover = true, children, ...props }, ref) => {
+  ({ className, glass = true, hover = true, appear = false, children, ...props }, ref) => {
     return (
       <motion.div
         ref={ref}
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: [0.2, 0.8, 0.2, 1] }}
+        initial={appear ? { opacity: 0, y: 20 } : false}
+        animate={appear ? { opacity: 1, y: 0 } : undefined}
+        transition={appear ? { duration: 0.4, ease: [0.2, 0.8, 0.2, 1] } : undefined}
         whileHover={hover ? { y: -4, transition: { duration: 0.2 } } : undefined}
         className={cn(
           "relative overflow-hidden rounded-xl border border-white/10 bg-[#11131e]",

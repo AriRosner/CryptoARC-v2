@@ -9,7 +9,7 @@ interface AnimatedNumberProps {
   className?: string;
 }
 
-export const AnimatedNumber: React.FC<AnimatedNumberProps> = ({
+export const AnimatedNumber: React.FC<AnimatedNumberProps> = React.memo(({
   value,
   precision = 2,
   prefix = "",
@@ -35,4 +35,4 @@ export const AnimatedNumber: React.FC<AnimatedNumberProps> = ({
       {display}
     </motion.span>
   );
-};
+});

@@ -145,6 +145,8 @@ Frontend: `http://127.0.0.1:5173`
 powershell -ExecutionPolicy Bypass -File scripts\restart-dev.ps1
 ```
 
+`start-dev.ps1` and `restart-dev.ps1` now launch backend/frontend in visible verbose dev windows. Restarting leaves the bot in the stopped state until you explicitly start it.
+
 ## Testing
 
 ```powershell

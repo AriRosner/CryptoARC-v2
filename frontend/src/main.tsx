@@ -1,4 +1,4 @@
-import React from "react";
+import React, { Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { motion } from "framer-motion";
@@ -104,13 +104,15 @@ import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
 import { MonitorPage } from "./pages/MonitorPage";
-import { DataPage, type DataClearTarget } from "./pages/DataPage";
-import { AnalysisPage } from "./pages/AnalysisPage";
-import { BacktestsPage } from "./pages/BacktestsPage";
-import { ReviewPage } from "./pages/ReviewPage";
-import { SettingsModal } from "./components/SettingsModal";
+import type { DataClearTarget } from "./pages/DataPage";
 import { Modal } from "./components/Modal";
-import { TokenDetail as NewTokenDetail } from "./components/TokenDetail";
+
+const AnalysisPage = React.lazy(() => import("./pages/AnalysisPage").then((module) => ({ default: module.AnalysisPage })));
+const BacktestsPage = React.lazy(() => import("./pages/BacktestsPage").then((module) => ({ default: module.BacktestsPage })));
+const ReviewPage = React.lazy(() => import("./pages/ReviewPage").then((module) => ({ default: module.ReviewPage })));
+const DataPage = React.lazy(() => import("./pages/DataPage").then((module) => ({ default: module.DataPage })));
+const SettingsModal = React.lazy(() => import("./components/SettingsModal").then((module) => ({ default: module.SettingsModal })));
+const NewTokenDetail = React.lazy(() => import("./components/TokenDetail").then((module) => ({ default: module.TokenDetail })));
 
 type BrowserSolanaProvider = {
   isPhantom?: boolean;
@@ -342,6 +344,14 @@ function mergeMonitorTokens(current: TokenSignal[], incoming: TokenSignal[]): To
     if (token.status !== "skipped" && !byId.has(token.id)) byId.set(token.id, token);
   }
   return [...byId.values()].sort((left, right) => new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime());
+}
+
+function LazyPanelFallback({ label }: { label: string }) {
+  return (
+    <div className="rounded-xl border border-white/10 bg-[#10121c]/80 p-6 text-sm font-bold text-zinc-400 backdrop-blur-xl">
+      Loading {label}...
+    </div>
+  );
 }
 
 function App() {
@@ -587,23 +597,23 @@ function App() {
     window.localStorage.setItem("cryptoarc_pnl_wallet_scope", replacement);
   }, [liveWallets, pnlWalletScope, walletPublicKey]);
 
-  function toggleWatchlist(token: TokenSignal) {
+  const toggleWatchlist = React.useCallback((token: TokenSignal) => {
     const next = watchSet.has(token.mint) ? watchlist.filter((mint) => mint !== token.mint) : [...watchlist, token.mint];
     setWatchlist(next);
     window.localStorage.setItem("cryptoarc_watchlist", JSON.stringify(next));
-  }
+  }, [watchSet, watchlist]);
 
-  function updatePnlWalletScope(scope: PnlWalletScope) {
+  const updatePnlWalletScope = React.useCallback((scope: PnlWalletScope) => {
     setPnlWalletScope(scope);
     window.localStorage.setItem("cryptoarc_pnl_wallet_scope", scope);
-  }
+  }, []);
 
-  function updateHideSkippedTokens(value: boolean) {
+  const updateHideSkippedTokens = React.useCallback((value: boolean) => {
     setHideSkippedTokens(value);
     window.localStorage.setItem("cryptoarc_hide_skipped_tokens", String(value));
-  }
+  }, []);
 
-  function togglePnlCurrency() {
+  const togglePnlCurrency = React.useCallback(() => {
     setPnlCurrency((current) => {
       const next = current === "SOL" ? "USD" : "SOL";
       window.localStorage.setItem("cryptoarc_pnl_currency", next);
@@ -612,7 +622,7 @@ function App() {
       }
       return next;
     });
-  }
+  }, [solUsdPrice]);
 
   async function refreshSolUsdPrice() {
     try {
@@ -646,7 +656,8 @@ function App() {
       setSnapshot(await stopBot());
       setApiError("");
       refreshPnlData().catch(() => undefined);
-      refreshResearchData().catch(() => undefined);
+      refreshOperationalData().catch(() => undefined);
+      refreshExtendedResearchData().catch(() => undefined);
     } catch (error) {
       setApiError(`Stop failed: ${error instanceof Error ? error.message : "unknown error"}`);
     } finally {
@@ -751,19 +762,11 @@ function App() {
     }
   }
 
-  async function refreshResearchData() {
-    const [runs, events, summary, monitorRows, tradeRows, health, security, observations, decisions, sessions, versions, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, experimentRows, labels, presets, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows, intentRows, ledgerState] = await Promise.all([
-      fetchBacktests(),
-      fetchSourceEvents(),
+  async function refreshOperationalData() {
+    const [summary, health, security, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows] = await Promise.all([
       fetchDataSummary(),
-      fetchMonitorTokens(),
-      fetchTrades(),
       fetchSourceHealth(),
       fetchSecurityStatus(),
-      fetchPriceObservations(),
-      fetchStrategyDecisions(),
-      fetchTradeSessions(),
-      fetchSettingsVersions(),
       fetchPerformanceAnalytics(),
       fetchTuningSuggestions(),
       fetchDataIntegrity(),
@@ -772,30 +775,17 @@ function App() {
       fetchSafetyStatus(),
       fetchReadinessStatus(),
       fetchOperationalMonitoring(),
-      fetchExperiments(),
-      fetchTradeLabels(),
-      fetchStrategyPresets(),
       fetchSourceAdapters(),
       fetchWatchdogStatus(),
       fetchSolanaStatus(),
       fetchLiveRequests(),
       fetchLiveStatus(walletPublicKey),
       fetchLiveAudit(),
-      fetchLivePositions(walletPublicKey),
-      fetchLiveIntents(),
-      fetchLiveLedger(selectedLivePnlWallet)
+      fetchLivePositions(walletPublicKey)
     ]);
-    setBacktests(runs);
-    setSourceEvents(events);
     setDataSummary(summary);
-    setMonitorTokens(monitorRows);
-    setTrades(tradeRows);
     setSourceHealth(health);
     setSecurityStatus(security);
-    setPriceObservations(observations);
-    setStrategyDecisions(decisions);
-    setTradeSessions(sessions);
-    setSettingsVersions(versions);
     setPerformanceAnalytics(analytics);
     setTuningSuggestions(suggestions);
     setDataIntegrity(integrity);
@@ -804,9 +794,6 @@ function App() {
     setSafetyStatus(safety);
     setReadinessStatus(readiness);
     setOpsMonitoring(ops);
-    setExperiments(experimentRows);
-    setTradeLabels(labels);
-    setStrategyPresetsRemote(presets);
     setSourceAdapters(adapters);
     setWatchdogStatus(watchdog);
     setSolanaStatus(solana);
@@ -814,8 +801,37 @@ function App() {
     setLiveStatus(liveState);
     setLiveAudit(auditRows);
     setLivePositions(livePositionRows);
+  }
+
+  async function refreshExtendedResearchData() {
+    const [runs, events, monitorRows, observations, decisions, sessions, versions, experimentRows, labels, presets, intentRows] = await Promise.all([
+      fetchBacktests(),
+      fetchSourceEvents(),
+      fetchMonitorTokens(),
+      fetchPriceObservations(),
+      fetchStrategyDecisions(),
+      fetchTradeSessions(),
+      fetchSettingsVersions(),
+      fetchExperiments(),
+      fetchTradeLabels(),
+      fetchStrategyPresets(),
+      fetchLiveIntents()
+    ]);
+    setBacktests(runs);
+    setSourceEvents(events);
+    setMonitorTokens(monitorRows);
+    setPriceObservations(observations);
+    setStrategyDecisions(decisions);
+    setTradeSessions(sessions);
+    setSettingsVersions(versions);
+    setExperiments(experimentRows);
+    setTradeLabels(labels);
+    setStrategyPresetsRemote(presets);
     setLiveIntents(intentRows);
-    setLiveLedger(ledgerState);
+  }
+
+  async function refreshResearchData() {
+    await Promise.all([refreshPnlData(), refreshOperationalData(), refreshExtendedResearchData()]);
     refreshConnectedWalletBalance().catch(() => undefined);
   }
 
@@ -1117,6 +1133,13 @@ function App() {
 
   React.useEffect(() => {
     const interval = window.setInterval(() => {
+      refreshOperationalData().catch(() => undefined);
+    }, 5000);
+    return () => window.clearInterval(interval);
+  }, [walletPublicKey]);
+
+  React.useEffect(() => {
+    const interval = window.setInterval(() => {
       refreshSolUsdPrice().catch(() => undefined);
     }, solUsdPrice > 0 ? 60000 : 10000);
     return () => window.clearInterval(interval);
@@ -1190,119 +1213,131 @@ function App() {
       )}
 
       {workspacePage === "analysis" && (
-        <AnalysisPage
-          tokens={tokenSource}
-          trades={trades}
-          stats={stats}
-          analytics={performanceAnalytics}
-          suggestions={tuningSuggestions}
-          priceDiagnostics={priceDiagnostics}
-          pumpfunReport={pumpfunReport}
-          safetyStatus={safetyStatus}
-          readinessStatus={readinessStatus}
-          pnlTimeframe={pnlTimeframe}
-          onTimeframeChange={setPnlTimeframe}
-          onApplySuggestion={handleApplyTuningSuggestion}
-        />
+        <Suspense fallback={<LazyPanelFallback label="analysis" />}>
+          <AnalysisPage
+            tokens={tokenSource}
+            trades={trades}
+            stats={stats}
+            analytics={performanceAnalytics}
+            suggestions={tuningSuggestions}
+            priceDiagnostics={priceDiagnostics}
+            pumpfunReport={pumpfunReport}
+            safetyStatus={safetyStatus}
+            readinessStatus={readinessStatus}
+            pnlTimeframe={pnlTimeframe}
+            onTimeframeChange={setPnlTimeframe}
+            onApplySuggestion={handleApplyTuningSuggestion}
+          />
+        </Suspense>
       )}
 
       {workspacePage === "backtests" && (
-        <BacktestsPage
-          runs={backtests}
-          latest={backtestResult}
-          limit={backtestLimit}
-          profile={backtestProfile}
-          dateFrom={backtestDateFrom}
-          dateTo={backtestDateTo}
-          speed={String(backtestSpeed)}
-          onLimitChange={setBacktestLimit}
-          onProfileChange={(p) => setBacktestProfile(p as any)}
-          onDateFromChange={setBacktestDateFrom}
-          onDateToChange={setBacktestDateTo}
-          onSpeedChange={(s) => setBacktestSpeed(parseInt(s))}
-          onRun={replayBacktest}
-          onRawReplay={rawReplayBacktest}
-          onCompare={compareStrategies}
-          onABReplay={abReplayStrategies}
-          onRunV3={runBacktestSuiteV3}
-          onSaveExperiment={saveExperimentFromDashboard}
-          v3Result={backtestV3Result}
-          experiments={experiments}
-        />
+        <Suspense fallback={<LazyPanelFallback label="backtests" />}>
+          <BacktestsPage
+            runs={backtests}
+            latest={backtestResult}
+            limit={backtestLimit}
+            profile={backtestProfile}
+            dateFrom={backtestDateFrom}
+            dateTo={backtestDateTo}
+            speed={String(backtestSpeed)}
+            onLimitChange={setBacktestLimit}
+            onProfileChange={(p) => setBacktestProfile(p as any)}
+            onDateFromChange={setBacktestDateFrom}
+            onDateToChange={setBacktestDateTo}
+            onSpeedChange={(s) => setBacktestSpeed(parseInt(s))}
+            onRun={replayBacktest}
+            onRawReplay={rawReplayBacktest}
+            onCompare={compareStrategies}
+            onABReplay={abReplayStrategies}
+            onRunV3={runBacktestSuiteV3}
+            onSaveExperiment={saveExperimentFromDashboard}
+            v3Result={backtestV3Result}
+            experiments={experiments}
+          />
+        </Suspense>
       )}
 
       {workspacePage === "review" && (
-        <ReviewPage
-          trades={trades}
-          versions={settingsVersions}
-          tokens={tokenSource}
-          analytics={performanceAnalytics}
-          suggestions={tuningSuggestions}
-          selectedTradeId={selectedReviewTradeId}
-          timeline={replayTimeline}
-          detail={tradeReviewDetail}
-          labels={tradeLabels}
-          onApplySuggestion={handleApplyTuningSuggestion}
-          onLabelTrade={async (tokenId, label) => {
-            const saved = await labelTrade(tokenId, label);
-            setTradeLabels((current) => [saved, ...current]);
-          }}
-          onSelectTrade={loadReplayTimeline}
-        />
+        <Suspense fallback={<LazyPanelFallback label="trade review" />}>
+          <ReviewPage
+            trades={trades}
+            versions={settingsVersions}
+            tokens={tokenSource}
+            analytics={performanceAnalytics}
+            suggestions={tuningSuggestions}
+            selectedTradeId={selectedReviewTradeId}
+            timeline={replayTimeline}
+            detail={tradeReviewDetail}
+            labels={tradeLabels}
+            onApplySuggestion={handleApplyTuningSuggestion}
+            onLabelTrade={async (tokenId, label) => {
+              const saved = await labelTrade(tokenId, label);
+              setTradeLabels((current) => [saved, ...current]);
+            }}
+            onSelectTrade={loadReplayTimeline}
+          />
+        </Suspense>
       )}
 
       {workspacePage === "data" && (
-        <DataPage
-          summary={dataSummary}
-          sourceEvents={sourceEvents}
-          sourceHealth={sourceHealth}
-          securityStatus={securityStatus}
-          trades={trades}
-          priceObservations={priceObservations}
-          strategyDecisions={strategyDecisions}
-          tradeSessions={tradeSessions}
-          settingsVersions={settingsVersions}
-          dataIntegrity={dataIntegrity}
-          priceDiagnostics={priceDiagnostics}
-          pumpfunReport={pumpfunReport}
-          safetyStatus={safetyStatus}
-          readinessStatus={readinessStatus}
-          opsMonitoring={opsMonitoring}
-          sourceAdapters={sourceAdapters}
-          watchdogStatus={watchdogStatus}
-          solanaStatus={solanaStatus}
-          liveRequests={liveRequests}
-          liveAudit={liveAudit}
-          auditEvents={snapshot.events}
-          onRefresh={refreshResearchData}
-          onRecover={async () => {
-            const updated = await recoverWatchdog();
-            setSnapshot(updated);
-            await refreshResearchData();
-          }}
-          onReviewLiveRequest={reviewManualLiveRequest}
-          onClear={clearProjectData}
-        />
+        <Suspense fallback={<LazyPanelFallback label="project data" />}>
+          <DataPage
+            summary={dataSummary}
+            sourceEvents={sourceEvents}
+            sourceHealth={sourceHealth}
+            securityStatus={securityStatus}
+            trades={trades}
+            priceObservations={priceObservations}
+            strategyDecisions={strategyDecisions}
+            tradeSessions={tradeSessions}
+            settingsVersions={settingsVersions}
+            dataIntegrity={dataIntegrity}
+            priceDiagnostics={priceDiagnostics}
+            pumpfunReport={pumpfunReport}
+            safetyStatus={safetyStatus}
+            readinessStatus={readinessStatus}
+            opsMonitoring={opsMonitoring}
+            sourceAdapters={sourceAdapters}
+            watchdogStatus={watchdogStatus}
+            solanaStatus={solanaStatus}
+            liveRequests={liveRequests}
+            liveAudit={liveAudit}
+            auditEvents={snapshot.events}
+            onRefresh={refreshResearchData}
+            onRecover={async () => {
+              const updated = await recoverWatchdog();
+              setSnapshot(updated);
+              await refreshResearchData();
+            }}
+            onReviewLiveRequest={reviewManualLiveRequest}
+            onClear={clearProjectData}
+          />
+        </Suspense>
       )}
 
       {settingsOpen && (
-        <SettingsModal
-          isOpen={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          settings={settings}
-          onSave={saveSettings}
-          sourceStatus={snapshot.source_status}
-          serverStrategyPresets={strategyPresetsRemote}
-          onSaveStrategyPreset={saveCurrentStrategyPreset}
-        />
+        <Suspense fallback={<Modal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} title="Settings" description="Loading settings..." className="max-w-5xl"><LazyPanelFallback label="settings" /></Modal>}>
+          <SettingsModal
+            isOpen={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+            settings={settings}
+            onSave={saveSettings}
+            sourceStatus={snapshot.source_status}
+            serverStrategyPresets={strategyPresetsRemote}
+            onSaveStrategyPreset={saveCurrentStrategyPreset}
+          />
+        </Suspense>
       )}
 
       {selectedToken && (
-        <NewTokenDetail
-          token={selectedToken}
-          isOpen={!!selectedToken}
-          onClose={() => setSelectedTokenId(null)}
-        />
+        <Suspense fallback={<Modal isOpen={!!selectedToken} onClose={() => setSelectedTokenId(null)} title="Token Analysis" description="Loading token detail..." className="max-w-3xl"><LazyPanelFallback label="token detail" /></Modal>}>
+          <NewTokenDetail
+            token={selectedToken}
+            isOpen={!!selectedToken}
+            onClose={() => setSelectedTokenId(null)}
+          />
+        </Suspense>
       )}
 
       {liveWalletOpen && (
