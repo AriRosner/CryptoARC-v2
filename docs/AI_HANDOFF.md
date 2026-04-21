@@ -41,6 +41,8 @@ The codebase is not a toy. Preserve existing bot logic, state management, settin
 - Readiness scorecard for paper edge validation.
 - Live Wallet modal with browser-wallet manual flow, caps, blockers, quote preview, simulation warning, sign/send, positions, audit records, and recovery/review.
 - Manual Live Trust Layer: backend-assisted confirmation polling, manual recovery endpoints, and best-effort ledger reconciliation.
+- Wallet-scoped PnL views with paper/live switching and SOL/USD toggle on the dashboard.
+- Stop/start controls now broadcast immediate status changes, and stop actively cancels source runtime work instead of waiting for the next bot tick.
 - Auth with password, session tokens, login lockout, and optional authenticator-app 2FA.
 
 ## Verification Commands

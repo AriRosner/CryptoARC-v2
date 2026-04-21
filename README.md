@@ -18,6 +18,8 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Stability watchdog with loop recovery status for production paper deployments.
 - Solana read-only RPC health and watched-wallet balance checks.
 - Manual browser-wallet live intent workbench with caps, quote previews, simulation warnings, audit records, confirmation recovery, and reconciliation.
+- Wallet-scoped PnL views with paper/live wallet switching and SOL/USD display toggle.
+- Faster start/stop feedback with immediate runtime shutdown of source streaming and queued launch processing.
 - Dashboard auth with optional authenticator-app 2FA.
 - Docker-ready deployment structure with a paper/live safety boundary.
 
@@ -227,6 +229,7 @@ For any deployment beyond localhost, set a strong dashboard password, restrict C
 ## Dashboard Pages
 
 - **Monitor**: live token queue, sidebar PnL, event stream, queue filters, watchlist.
+- **Monitor** also includes wallet-scoped PnL charting, hide-skips filtering, and compact token-monitor controls.
 - **Analysis**: persistent PnL analytics, strategy performance, price diagnostics, Pump.fun intelligence, tuning suggestions.
 - **Backtests**: replay, raw replay, strategy comparison, A/B replay, Backtesting v3 suite.
 - **Trade Review**: closed-trade review, PnL breakdown, decision records, replay timeline.
@@ -241,7 +244,8 @@ Near-term priorities:
 - Improve Pump.fun intelligence with additional trusted source adapters.
 - Add richer replay filters and saved experiment runs.
 - Add strategy-builder UX for cloning and comparing custom rule sets.
-- Keep live execution out of scope until the paper engine, replay data, auth, and audit systems are mature.
+- Continue hardening the manual browser-wallet flow with stronger reconciliation, operator recovery, and richer live ledger accounting.
+- Keep unattended signing and autonomous execution out of scope until a reviewed signer/executor architecture exists.
 
 ## AI Handoff
 

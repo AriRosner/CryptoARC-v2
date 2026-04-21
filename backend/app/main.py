@@ -334,9 +334,60 @@ async def ensure_source_task() -> None:
 
 
 async def drain_launch_queue() -> None:
+    if state.status.value != "running":
+        clear_launch_queue()
+        return
+
     while not launch_queue.empty():
+        if state.status.value != "running":
+            clear_launch_queue()
+            return
         event = await launch_queue.get()
         state.ingest_source_event(event)
+        launch_queue.task_done()
+
+
+def clear_launch_queue() -> int:
+    cleared = 0
+    while not launch_queue.empty():
+        try:
+            launch_queue.get_nowait()
+            launch_queue.task_done()
+            cleared += 1
+        except asyncio.QueueEmpty:
+            break
+    return cleared
+
+
+async def stop_runtime_tasks() -> dict[str, object]:
+    global source_key, source_task
+
+    cancelled_source = False
+    source_stop_warning = ""
+    if source_task and not source_task.done():
+        cancelled_source = True
+        source_task.cancel()
+        try:
+            await asyncio.wait_for(source_task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            source_stop_warning = "Source task did not acknowledge cancellation within 1 second"
+            state.add_event("warning", source_stop_warning)
+        except Exception as exc:
+            source_stop_warning = f"Source stop warning: {exc.__class__.__name__}: {exc}"
+            state.add_event("warning", source_stop_warning)
+
+    source_task = None
+    source_key = None
+    queued_launches_dropped = clear_launch_queue()
+    state.source_status.status = "offline"
+    state.source_status.message = "Source stopped"
+    return {
+        "source_task_cancelled": cancelled_source,
+        "queued_launches_dropped": queued_launches_dropped,
+        "source_stop_warning": source_stop_warning,
+    }
 
 
 @asynccontextmanager
@@ -461,13 +512,21 @@ async def start() -> dict:
     mode = state.settings.mode.value if hasattr(state.settings.mode, "value") else state.settings.mode
     if mode == "live_locked" or state.settings.live_trading_enabled:
         state.add_event("danger", "Live execution is disabled by safety boundary")
+        await broadcast_snapshot()
         return state.snapshot().to_dict()
-    return state.start().to_dict()
+    snapshot = state.start().to_dict()
+    await broadcast_snapshot()
+    return snapshot
 
 
 @app.post("/api/stop", dependencies=[Depends(require_auth)])
 async def stop() -> dict:
-    return state.stop().to_dict()
+    state.stop()
+    runtime = await stop_runtime_tasks()
+    await broadcast_snapshot()
+    payload = state.snapshot().to_dict()
+    payload["stop_runtime"] = runtime
+    return payload
 
 
 @app.patch("/api/settings", dependencies=[Depends(require_auth)])

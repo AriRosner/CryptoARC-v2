@@ -2188,11 +2188,16 @@ class BotState:
         if any(fill.get("audit_id") == audit.id for fill in position.fills):
             return self._reconcile_live_audit(audit)
         amount_sol = 0.0
+        token_amount = 0.0
+        denominated_in_sol = bool(audit.request.get("denominated_in_sol")) if isinstance(audit.request, dict) else False
         try:
             if audit.action == "buy" and not str(audit.amount).endswith("%"):
                 amount_sol = float(audit.amount)
+            elif audit.action == "sell" and not denominated_in_sol and not str(audit.amount).endswith("%"):
+                token_amount = float(audit.amount)
         except ValueError:
             amount_sol = 0.0
+            token_amount = 0.0
         priority_fee = float(audit.quote.get("priority_fee_sol", 0.0) or 0.0) if isinstance(audit.quote, dict) else 0.0
         fill = LiveFill(
             id=new_id("fill"),
@@ -2203,7 +2208,7 @@ class BotState:
             mint=audit.mint,
             amount=audit.amount,
             amount_sol=amount_sol,
-            token_amount=0.0,
+            token_amount=token_amount,
             fee_sol=0.0,
             priority_fee_sol=priority_fee,
             signature=audit.transaction_signature,
@@ -2215,12 +2220,7 @@ class BotState:
             position.cost_basis_sol = round(position.cost_basis_sol + amount_sol + priority_fee, 9)
             position.status = "open"
         else:
-            sale_fraction = 1.0 if str(audit.amount).endswith("%") else 0.0
-            try:
-                if str(audit.amount).endswith("%"):
-                    sale_fraction = min(1.0, max(0.0, float(str(audit.amount).replace("%", "")) / 100))
-            except ValueError:
-                sale_fraction = 1.0
+            sale_fraction = self._live_sale_fraction(position, audit, token_amount, denominated_in_sol)
             realized_basis = position.cost_basis_sol * sale_fraction
             estimated_proceeds = (position.token_balance * mark_price * sale_fraction) if mark_price > 0 and position.token_balance > 0 else 0.0
             position.realized_pnl_sol = round(position.realized_pnl_sol + estimated_proceeds - realized_basis - priority_fee, 9)
@@ -2251,6 +2251,7 @@ class BotState:
             position.token_balance = float(balance.get("token_balance") or 0.0)
             position.reconciliation_status = "matched"
             audit.reconciliation_status = "matched"
+            self._normalize_live_position_status(position)
         self._refresh_live_position_estimate(position)
         position.updated_at = utc_now()
         audit.updated_at = utc_now()
@@ -2264,6 +2265,7 @@ class BotState:
             positions = [position for position in positions if position.wallet_public_key == wallet_public_key.strip()]
         refreshed: list[LiveLedgerPosition] = []
         for position in positions:
+            self._normalize_live_position_status(position)
             self._refresh_live_position_estimate(position)
             self.storage.save_live_ledger_position(position)
             refreshed.append(position)
@@ -2277,6 +2279,26 @@ class BotState:
             position.average_entry_price_sol = round(position.cost_basis_sol / position.token_balance, 12) if position.token_balance else 0.0
         elif position.status == "closed" or position.token_balance <= 0:
             position.unrealized_pnl_sol = 0.0
+
+    def _live_sale_fraction(self, position: LiveLedgerPosition, audit: LiveExecutionAudit, token_amount: float, denominated_in_sol: bool) -> float:
+        amount_text = str(audit.amount).strip()
+        if amount_text.endswith("%"):
+            try:
+                return min(1.0, max(0.0, float(amount_text.replace("%", "")) / 100))
+            except ValueError:
+                return 1.0
+        if not denominated_in_sol and token_amount > 0 and position.token_balance > 0:
+            return min(1.0, max(0.0, token_amount / position.token_balance))
+        return 0.0
+
+    def _normalize_live_position_status(self, position: LiveLedgerPosition) -> None:
+        has_sell_fill = any(str(fill.get("action", "")).lower() == "sell" for fill in position.fills)
+        if position.token_balance <= 0:
+            position.token_balance = 0.0
+            if has_sell_fill:
+                position.status = "closed"
+        elif position.fills:
+            position.status = "open"
 
     def _latest_live_mark_price(self, mint: str) -> float:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)

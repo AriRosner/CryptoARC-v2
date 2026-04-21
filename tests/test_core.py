@@ -784,6 +784,34 @@ class CoreLogicTests(unittest.TestCase):
             self.assertGreater(ledger["summary"]["unrealized_pnl_sol"], 0)
             self.assertEqual(other_wallet["positions"], [])
 
+    def test_live_full_token_amount_sell_closes_position(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            token = self.make_token()
+            token.mint = "MintClose"
+            token.current_price = 0.00002
+            state.storage.save_token(token)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            balances = iter([10.0, 10.0, 0.0])
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": next(balances), "error": ""}
+
+            buy_intent = state.create_live_intent("buy", "MintClose", "0.001", True, "WalletClose")
+            buy_quote = state.quote_live_intent(True, buy_intent["id"], 1, 0.00001, "pump")
+            state.live_submit(buy_quote["id"], "sigbuy")
+            state.live_confirm(buy_quote["id"], "confirmed")
+
+            sell_intent = state.create_live_intent("sell", "MintClose", "10", False, "WalletClose")
+            sell_quote = state.quote_live_intent(True, sell_intent["id"], 1, 0.00001, "pump")
+            state.live_submit(sell_quote["id"], "sigsell")
+            state.live_confirm(sell_quote["id"], "confirmed")
+            ledger = state.live_ledger("WalletClose")
+
+            self.assertEqual(len(ledger["positions"]), 1)
+            self.assertEqual(ledger["positions"][0]["status"], "closed")
+            self.assertEqual(ledger["positions"][0]["token_balance"], 0.0)
+            self.assertEqual(ledger["summary"]["open_positions"], 0)
+
     def test_snapshot_keeps_all_non_skipped_tokens_for_monitor_filters(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
