@@ -202,6 +202,8 @@ class TradeEvent:
     level: str
     message: str
     token_id: str | None = None
+    subsystem: str = "app"
+    operator_action: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -269,9 +271,18 @@ class SignerStatus:
     mode: str
     connected: bool
     wallet_public_key: str = ""
+    healthy: bool = False
     can_sign: bool = False
     can_unattended_sign: bool = False
+    supports_auto_sell: bool = False
+    supports_auto_buy: bool = False
+    disabled_reason: str = ""
     message: str = ""
+    endpoint: str = ""
+    transport: str = "manual"
+    version: str = ""
+    last_heartbeat_at: str = ""
+    auth_configured: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -312,6 +323,11 @@ class LiveExecutionIntent:
     expires_at: datetime | None = None
     stale: bool = False
     warnings: list[str] = field(default_factory=list)
+    autonomy_blocked: bool = False
+    autonomy_blockers: list[str] = field(default_factory=list)
+    operator_recommendation: str = ""
+    priority_reason: str = ""
+    generated_from_position: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

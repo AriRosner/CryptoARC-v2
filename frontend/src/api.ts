@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -389,6 +389,26 @@ export async function fetchSourceAdapters(): Promise<SourceAdapterStatus[]> {
 
 export async function backupDatabase(): Promise<{ status: string; path: string }> {
   return request("/api/data/backup", { method: "POST" });
+}
+
+export async function createBackupArtifact(): Promise<{ filename: string; artifact: Record<string, unknown> }> {
+  return request("/api/data/backup-artifact", { method: "POST" });
+}
+
+export async function previewRestoreArtifact(artifact: Record<string, unknown>): Promise<RestoreArtifactPreview> {
+  return request("/api/data/restore/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ artifact })
+  });
+}
+
+export async function confirmRestoreArtifact(artifact: Record<string, unknown>): Promise<RestoreArtifactPreview> {
+  return request("/api/data/restore/confirm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ artifact })
+  });
 }
 
 export async function fetchSourceHealth(): Promise<SourceHealth> {

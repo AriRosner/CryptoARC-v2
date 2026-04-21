@@ -40,6 +40,7 @@ class DataIntegrityAnalyzer:
         token_ids = {token.id for token in tokens}
         trade_token_ids = {trade.token_id for trade in trades}
         decision_token_ids = {decision.token_id for decision in decisions}
+        token_mints_by_id = {token.id: token.mint for token in tokens}
         observations_by_mint = Counter(observation.mint for observation in observations)
         duplicate_mints = sum(count - 1 for count in Counter(token.mint for token in tokens).values() if count > 1)
         malformed_source = len([event for event in source_events if event.status == "raw"])
@@ -47,7 +48,13 @@ class DataIntegrityAnalyzer:
         missing_trade_tokens = len([trade for trade in trades if trade.token_id not in token_ids])
         missing_decisions = len([trade for trade in trades if trade.token_id not in decision_token_ids])
         closed_without_exit = len([trade for trade in trades if trade.lifecycle_status == "closed" and not trade.exit_reason])
-        trades_without_price = len([trade for trade in trades if trade.token_id in token_ids and not observations_by_mint])
+        trades_without_price = len(
+            [
+                trade
+                for trade in trades
+                if trade.token_id in token_ids and not observations_by_mint.get(token_mints_by_id.get(trade.token_id, ""), 0)
+            ]
+        )
 
         if duplicate_mints:
             issues.append(IntegrityIssue("warning", "tokens", "Duplicate token mints detected", duplicate_mints))
@@ -66,7 +73,7 @@ class DataIntegrityAnalyzer:
 
         score = 100
         for issue in issues:
-            score -= {"danger": 20, "warning": 10, "info": 3}.get(issue.severity, 5) * min(issue.count, 5)
+            score -= {"danger": 20, "warning": 10, "info": 1}.get(issue.severity, 5) * min(issue.count, 5)
 
         return {
             "score": max(0, min(100, score)),

@@ -15,9 +15,12 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Data Integrity reports for replay confidence, missing records, rejected prices, and malformed source events.
 - Pump.fun intelligence summaries for creator behavior, metadata coverage, bonding curve fields, and launch quality.
 - Operational monitoring for backend state, source health, storage counts, warnings, and safety guard state.
+- Formal ordered SQLite migrations with startup status reporting.
 - Stability watchdog with loop recovery status for production paper deployments.
 - Solana read-only RPC health and watched-wallet balance checks.
 - Manual browser-wallet live intent workbench with caps, quote previews, simulation warnings, audit records, confirmation recovery, and reconciliation.
+- Local backup artifacts plus dashboard import/restore preview and confirm flows for SQLite state recovery.
+- Design-only localhost signer-daemon readiness contract with capability, health, and auth scaffold visibility.
 - Wallet-scoped PnL views with paper/live wallet switching and SOL/USD display toggle.
 - Faster start/stop feedback with immediate runtime shutdown of source streaming and queued launch processing.
 - Dashboard auth with optional authenticator-app 2FA.
@@ -62,7 +65,7 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 
 - Data integrity and replay-confidence reports.
 - SQLite schema metadata and runtime migration status.
-- Local database backup endpoint.
+- Local database backup endpoint plus downloadable restore artifacts and dashboard restore preview/confirm flow.
 - Operational monitoring for backend state, source health, storage counts, warnings, and errors.
 - Watchdog status for stale bot ticks, source events, launch ingestion age, and recover action.
 - Solana read-only status for RPC health and public wallet balance checks.

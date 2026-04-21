@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 from contextlib import contextmanager
@@ -12,11 +13,17 @@ from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, Li
 
 
 class Storage:
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 7
+    BACKUP_FORMAT_VERSION = 1
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._migration_status: dict[str, Any] = {
+            "status": "pending",
+            "startup_error": "",
+            "startup_completed_at": None,
+        }
         self._ensure_schema()
 
     @contextmanager
@@ -30,173 +37,275 @@ class Storage:
             connection.close()
 
     def _ensure_schema(self) -> None:
-        with self._connect() as connection:
+        try:
+            with self._connect() as connection:
+                self._prepare_schema_migration_table(connection)
+                self._apply_migrations(connection)
+            self._migration_status = {
+                "status": "ok",
+                "startup_error": "",
+                "startup_completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+        except Exception as exc:
+            self._migration_status = {
+                "status": "failed",
+                "startup_error": f"{exc.__class__.__name__}: {exc}",
+                "startup_completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            raise
+
+    def _prepare_schema_migration_table(self, connection: sqlite3.Connection) -> None:
+        table_exists = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if not table_exists:
+            self._create_schema_migration_table(connection)
+            return
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(schema_migrations)").fetchall()
+        }
+        if "migration_id" in columns:
+            return
+        legacy_rows = connection.execute(
+            "SELECT version, applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_legacy")
+        self._create_schema_migration_table(connection)
+        max_legacy_version = max([int(row["version"]) for row in legacy_rows], default=0)
+        applied_at_by_version = {int(row["version"]): row["applied_at"] for row in legacy_rows}
+        for version, migration_id, description, _ in self._migrations():
+            if version > max_legacy_version:
+                continue
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                )
-                """
+                INSERT OR IGNORE INTO schema_migrations (migration_id, version, description, applied_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    migration_id,
+                    version,
+                    description,
+                    applied_at_by_version.get(version) or datetime.now(timezone.utc).isoformat(),
+                ),
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    payload TEXT NOT NULL
-                )
-                """
+
+    def _create_schema_migration_table(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                description TEXT NOT NULL,
+                applied_at TEXT NOT NULL
             )
+            """
+        )
+
+    def _apply_migrations(self, connection: sqlite3.Connection) -> None:
+        applied_ids = {
+            str(row["migration_id"])
+            for row in connection.execute("SELECT migration_id FROM schema_migrations").fetchall()
+        }
+        for version, migration_id, description, migration_fn in self._migrations():
+            if migration_id in applied_ids:
+                continue
+            migration_fn(connection)
             connection.execute(
                 """
-                CREATE TABLE IF NOT EXISTS tokens (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    detected_at TEXT NOT NULL
-                )
-                """
+                INSERT INTO schema_migrations (migration_id, version, description, applied_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (migration_id, version, description, datetime.now(timezone.utc).isoformat()),
             )
+
+    def _migrations(self) -> list[tuple[int, str, str, Any]]:
+        return [
+            (1, "001_initial_core", "initial core storage tables", self._migration_001_initial_core),
+            (2, "002_research_tables", "research and replay tables", self._migration_002_research_tables),
+            (3, "003_experiments_presets", "experiments, labels, and presets", self._migration_003_experiments_presets),
+            (4, "004_live_manual_tables", "manual live workflow tables", self._migration_004_live_manual_tables),
+            (5, "005_indexes", "timestamp and lookup indexes", self._migration_005_indexes),
+            (6, "006_backup_restore_history", "backup and restore history tracking", self._migration_006_backup_restore_history),
+            (7, "007_foundation_indexes", "foundation release supporting indexes", self._migration_007_foundation_indexes),
+        ]
+
+    def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tokens (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                detected_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_events (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trades (
+                id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                opened_at TEXT,
+                closed_at TEXT
+            )
+            """
+        )
+
+    def _migration_002_research_tables(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_observations (
+                id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                observed_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_decisions (
+                id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_sessions (
+                id TEXT PRIMARY KEY,
+                token_id TEXT NOT NULL,
+                mint TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                opened_at TEXT,
+                closed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings_versions (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migration_003_experiments_presets(self, connection: sqlite3.Connection) -> None:
+        for table in ("experiment_runs", "trade_labels", "strategy_presets"):
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS events (
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
                     id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+
+    def _migration_004_live_manual_tables(self, connection: sqlite3.Connection) -> None:
+        for table in ("live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions"):
             connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS source_events (
-                    id TEXT PRIMARY KEY,
-                    source TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    received_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS backtest_runs (
+                f"""
+                CREATE TABLE IF NOT EXISTS {table} (
                     id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trades (
-                    id TEXT PRIMARY KEY,
-                    token_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    opened_at TEXT,
-                    closed_at TEXT
-                )
-                """
+
+    def _migration_005_indexes(self, connection: sqlite3.Connection) -> None:
+        statements = [
+            "CREATE INDEX IF NOT EXISTS idx_tokens_detected_at ON tokens(detected_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_source_events_received_at ON source_events(received_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_price_observations_mint_observed_at ON price_observations(mint, observed_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_strategy_decisions_token_created_at ON strategy_decisions(token_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_trade_sessions_token_closed_at ON trade_sessions(token_id, closed_at DESC)",
+        ]
+        for statement in statements:
+            connection.execute(statement)
+
+    def _migration_006_backup_restore_history(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_restore_history (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS price_observations (
-                    id TEXT PRIMARY KEY,
-                    mint TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    observed_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS strategy_decisions (
-                    id TEXT PRIMARY KEY,
-                    token_id TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS trade_sessions (
-                    id TEXT PRIMARY KEY,
-                    token_id TEXT NOT NULL,
-                    mint TEXT NOT NULL,
-                    payload TEXT NOT NULL,
-                    opened_at TEXT,
-                    closed_at TEXT
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings_versions (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            for table in ("experiment_runs", "trade_labels", "strategy_presets"):
-                connection.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {table} (
-                        id TEXT PRIMARY KEY,
-                        payload TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS live_execution_requests (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS live_sessions (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS live_execution_audits (
-                    id TEXT PRIMARY KEY,
-                    payload TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            for table in ("live_intents", "live_ledger_positions"):
-                connection.execute(
-                    f"""
-                    CREATE TABLE IF NOT EXISTS {table} (
-                        id TEXT PRIMARY KEY,
-                        payload TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-            connection.execute(
-                "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
-                (self.SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
-            )
+            """
+        )
+
+    def _migration_007_foundation_indexes(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_backup_restore_history_created_at ON backup_restore_history(created_at DESC)"
+        )
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
-            rows = connection.execute("SELECT version, applied_at FROM schema_migrations ORDER BY version").fetchall()
+            rows = connection.execute(
+                "SELECT migration_id, version, description, applied_at FROM schema_migrations ORDER BY version"
+            ).fetchall()
         current = max([int(row["version"]) for row in rows], default=0)
         return {
             "current_version": current,
             "expected_version": self.SCHEMA_VERSION,
-            "ok": current >= self.SCHEMA_VERSION,
-            "migrations": [{"version": int(row["version"]), "applied_at": row["applied_at"]} for row in rows],
+            "ok": current >= self.SCHEMA_VERSION and self._migration_status.get("status") == "ok",
+            "status": self._migration_status.get("status", "unknown"),
+            "startup_error": self._migration_status.get("startup_error", ""),
+            "startup_completed_at": self._migration_status.get("startup_completed_at"),
+            "migrations": [
+                {
+                    "migration_id": str(row["migration_id"]),
+                    "version": int(row["version"]),
+                    "description": row["description"],
+                    "applied_at": row["applied_at"],
+                }
+                for row in rows
+            ],
         }
 
     def backup(self) -> dict[str, str]:
@@ -204,7 +313,149 @@ class Storage:
             return {"status": "missing", "path": ""}
         backup_path = self.path.with_suffix(f".backup-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{self.path.suffix}")
         backup_path.write_bytes(self.path.read_bytes())
+        self.save_backup_restore_history(
+            {
+                "id": f"backup_copy_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "action": "backup_copy",
+                "status": "created",
+                "path": str(backup_path),
+                "operator_action": "Keep this local SQLite snapshot for manual rollback.",
+            }
+        )
         return {"status": "created", "path": str(backup_path)}
+
+    def create_backup_artifact(self) -> dict[str, Any]:
+        if not self.path.exists():
+            raise FileNotFoundError("Database file does not exist")
+        summary = self._summary_counts()
+        artifact = {
+            "artifact_type": "cryptoarc_local_backup",
+            "format_version": self.BACKUP_FORMAT_VERSION,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "database_name": self.path.name,
+            "schema": self.schema_status(),
+            "summary": summary,
+            "database_base64": base64.b64encode(self.path.read_bytes()).decode("ascii"),
+        }
+        self.save_backup_restore_history(
+            {
+                "id": f"backup_artifact_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                "created_at": artifact["created_at"],
+                "action": "backup_artifact",
+                "status": "created",
+                "summary": summary,
+                "operator_action": "Store the artifact safely before trying a restore.",
+            }
+        )
+        return artifact
+
+    def preview_restore_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        warnings: list[str] = []
+        if artifact.get("artifact_type") != "cryptoarc_local_backup":
+            raise ValueError("Unsupported restore artifact type")
+        if int(artifact.get("format_version") or 0) != self.BACKUP_FORMAT_VERSION:
+            raise ValueError("Unsupported restore artifact format version")
+        encoded = str(artifact.get("database_base64") or "")
+        if not encoded.strip():
+            raise ValueError("Restore artifact is missing database payload")
+        try:
+            decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError("Restore artifact payload is not valid base64") from exc
+        schema = artifact.get("schema") if isinstance(artifact.get("schema"), dict) else {}
+        artifact_version = int(schema.get("current_version") or 0)
+        if artifact_version > self.SCHEMA_VERSION:
+            raise ValueError("Restore artifact was created by a newer schema version")
+        if str(artifact.get("database_name") or "") != self.path.name:
+            warnings.append("Artifact database name differs from the current local database path.")
+        if artifact_version < self.SCHEMA_VERSION:
+            warnings.append("Artifact will be migrated forward after restore.")
+        warnings.append("Restore replaces the local SQLite state. A safety backup copy will be created first.")
+        return {
+            "compatible": True,
+            "artifact_type": artifact["artifact_type"],
+            "format_version": int(artifact["format_version"]),
+            "created_at": artifact.get("created_at"),
+            "database_name": artifact.get("database_name"),
+            "schema_version": artifact_version,
+            "current_schema_version": self.SCHEMA_VERSION,
+            "summary": artifact.get("summary", {}),
+            "warnings": warnings,
+            "payload_bytes": len(decoded),
+        }
+
+    def restore_backup_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+        preview = self.preview_restore_artifact(artifact)
+        backup_result = self.backup()
+        decoded = base64.b64decode(str(artifact["database_base64"]).encode("ascii"))
+        temp_path = self.path.with_suffix(".restore.tmp")
+        temp_path.write_bytes(decoded)
+        temp_path.replace(self.path)
+        self._ensure_schema()
+        history_entry = {
+            "id": f"restore_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "action": "restore",
+            "status": "restored",
+            "artifact_created_at": preview.get("created_at"),
+            "artifact_database_name": preview.get("database_name"),
+            "backup_path": backup_result.get("path", ""),
+            "operator_action": "Review migration, runtime, and wallet state after restore before trading.",
+        }
+        self.save_backup_restore_history(history_entry)
+        return {**preview, "status": "restored", "backup_path": backup_result.get("path", "")}
+
+    def load_backup_restore_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM backup_restore_history ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_backup_restore_history(self, payload: dict[str, Any]) -> None:
+        created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+        item_id = str(payload.get("id") or f"backup_restore_{created_at}")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO backup_restore_history (id, payload, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (item_id, json.dumps(payload), created_at),
+            )
+
+    def backup_restore_status(self) -> dict[str, Any]:
+        history = self.load_backup_restore_history(10)
+        latest_backup = next((item for item in history if str(item.get("action", "")).startswith("backup")), None)
+        latest_restore = next((item for item in history if item.get("action") == "restore"), None)
+        return {
+            "history": history,
+            "latest_backup": latest_backup,
+            "latest_restore": latest_restore,
+        }
+
+    def _summary_counts(self) -> dict[str, int]:
+        return {
+            "tokens": self.count_tokens(),
+            "events": self.count_events(),
+            "source_events": self.count_source_events(),
+            "backtests": self.count_backtest_runs(),
+            "trades": self.count_trades(),
+            "price_observations": self.count_price_observations(),
+            "strategy_decisions": self.count_strategy_decisions(),
+            "trade_sessions": self.count_trade_sessions(),
+            "settings_versions": self.count_settings_versions(),
+            "experiments": self.count_experiment_runs(),
+            "trade_labels": self.count_trade_labels(),
+            "strategy_presets": self.count_strategy_presets(),
+            "live_execution_requests": self.count_live_execution_requests(),
+            "live_sessions": self.count_live_sessions(),
+            "live_execution_audits": self.count_live_execution_audits(),
+            "live_intents": self.count_live_intents(),
+            "live_ledger_positions": self.count_live_ledger_positions(),
+        }
     def load_settings(self) -> BotSettings:
         with self._connect() as connection:
             row = connection.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
@@ -268,6 +519,9 @@ class Storage:
 
     def count_live_ledger_positions(self) -> int:
         return self._count_table("live_ledger_positions")
+
+    def count_backup_restore_history(self) -> int:
+        return self._count_table("backup_restore_history")
 
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
@@ -630,6 +884,10 @@ class Storage:
     def clear_live_ledger_positions(self) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM live_ledger_positions")
+
+    def clear_backup_restore_history(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM backup_restore_history")
 
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])

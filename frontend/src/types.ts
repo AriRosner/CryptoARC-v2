@@ -163,6 +163,8 @@ export interface TradeEvent {
   level: "info" | "warning" | "success" | "danger" | string;
   message: string;
   token_id: string | null;
+  subsystem?: string;
+  operator_action?: string;
 }
 
 export interface BotStats {
@@ -261,6 +263,7 @@ export interface DataSummary {
   live_intents: number;
   live_ledger_positions: number;
   live_execution_audits: number;
+  backup_restore_history?: number;
 }
 
 export interface TradeRecord {
@@ -517,8 +520,17 @@ export interface OperationalMonitoring {
   backend: Record<string, string | number | boolean>;
   source: SourceHealth;
   storage: DataSummary;
+  schema: MigrationStatus;
+  backup_restore?: BackupRestoreStatus;
+  signer_daemon?: SignerStatus;
+  live_recovery?: {
+    last_poll_at: string | null;
+    summary: Record<string, unknown>;
+    unresolved_audits: number;
+  };
   recent_errors: TradeEvent[];
   recent_warnings: TradeEvent[];
+  events_by_subsystem?: Record<string, TradeEvent[]>;
 }
 
 export interface BacktestV3Result {
@@ -619,9 +631,65 @@ export interface SignerStatus {
   mode: "browser_wallet" | "local_signer_daemon";
   connected: boolean;
   wallet_public_key: string;
+  healthy: boolean;
   can_sign: boolean;
   can_unattended_sign: boolean;
+  supports_auto_sell: boolean;
+  supports_auto_buy: boolean;
+  disabled_reason: string;
   message: string;
+  endpoint: string;
+  transport: string;
+  version: string;
+  last_heartbeat_at: string;
+  auth_configured: boolean;
+}
+
+export interface MigrationStatus {
+  current_version: number;
+  expected_version: number;
+  ok: boolean;
+  status: string;
+  startup_error: string;
+  startup_completed_at: string | null;
+  migrations: Array<{
+    migration_id: string;
+    version: number;
+    description: string;
+    applied_at: string;
+  }>;
+}
+
+export interface BackupRestoreHistoryEntry {
+  id?: string;
+  created_at?: string;
+  action?: string;
+  status?: string;
+  path?: string;
+  backup_path?: string;
+  operator_action?: string;
+  [key: string]: unknown;
+}
+
+export interface BackupRestoreStatus {
+  history: BackupRestoreHistoryEntry[];
+  latest_backup: BackupRestoreHistoryEntry | null;
+  latest_restore: BackupRestoreHistoryEntry | null;
+}
+
+export interface RestoreArtifactPreview {
+  compatible: boolean;
+  artifact_type: string;
+  format_version: number;
+  created_at: string | null;
+  database_name: string | null;
+  schema_version: number;
+  current_schema_version: number;
+  summary: Record<string, number>;
+  warnings: string[];
+  payload_bytes: number;
+  status?: string;
+  backup_path?: string;
 }
 
 export interface LiveStatus {
@@ -638,6 +706,7 @@ export interface LiveStatus {
   local_desktop_only: boolean;
   autonomous_live_available: boolean;
   auto_sell_available: boolean;
+  auto_buy_available: boolean;
   autonomy_blockers: string[];
   active_intent_count: number;
   stale_quote_count: number;
@@ -670,6 +739,9 @@ export interface WalletAdapterStatus {
   manual_approval_required: boolean;
   can_sign: boolean;
   can_unattended_sign: boolean;
+  supports_auto_sell: boolean;
+  supports_auto_buy: boolean;
+  disabled_reason: string;
 }
 
 export interface LiveQuotePreview {
@@ -723,6 +795,11 @@ export interface LiveIntent {
   expires_at: string | null;
   stale: boolean;
   warnings: string[];
+  autonomy_blocked: boolean;
+  autonomy_blockers: string[];
+  operator_recommendation: string;
+  priority_reason: string;
+  generated_from_position: boolean;
 }
 
 export interface LiveExecutionAudit {

@@ -4,6 +4,7 @@ import { Activity, Search, Filter, Eye, Pin } from "lucide-react";
 import { Card } from "./Card";
 import { Badge } from "./Badge";
 import { Button } from "./Button";
+import { Skeleton } from "./Skeleton";
 import { cn } from "./utils";
 import type { TokenSignal } from "../types";
 
@@ -21,6 +22,7 @@ interface TokenTableProps {
   setSort: (s: any) => void;
   hideSkipped: boolean;
   setHideSkipped: (value: boolean) => void;
+  loading?: boolean;
 }
 
 const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "warning" | "info" | "neutral" => {
@@ -177,7 +179,8 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   sort,
   setSort,
   hideSkipped,
-  setHideSkipped
+  setHideSkipped,
+  loading = false
 }) => {
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
   const seenRowIdsRef = React.useRef<Set<string>>(new Set());
@@ -284,29 +287,59 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
             <div className="px-4 text-right">Action</div>
           </div>
           <div>
-            <div style={{ height: topSpacerHeight }} />
-            <AnimatePresence initial={false}>
-              {virtualRows.map((token) => {
-                const animateIn = !seenRowIdsRef.current.has(token.id);
-                seenRowIdsRef.current.add(token.id);
-                return (
-                  <TokenRow
-                    key={token.id}
-                    token={token}
-                    selected={selectedTokenId === token.id}
-                    watched={watchlist.has(token.mint)}
-                    onSelectToken={onSelectToken}
-                    onToggleWatch={onToggleWatch}
-                    animateIn={animateIn}
-                  />
-                );
-              })}
-            </AnimatePresence>
-            <div style={{ height: bottomSpacerHeight }} />
+            {loading ? (
+              <div className="space-y-0">
+                {Array.from({ length: 8 }).map((_, index) => (
+                  <div
+                    key={index}
+                    style={{ gridTemplateColumns: tokenGridColumns }}
+                    className="grid h-[62px] items-center border-b border-white/5 px-0"
+                  >
+                    <div className="px-4 py-2.5">
+                      <div className="flex items-center gap-3">
+                        <Skeleton className="h-8 w-8 rounded-lg" />
+                        <div className="min-w-0 flex-1 space-y-2">
+                          <Skeleton className="h-3.5 w-24 rounded-full" />
+                          <Skeleton className="h-2.5 w-32 rounded-full" />
+                        </div>
+                      </div>
+                    </div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-7 w-[76px] rounded-lg" /></div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-20 rounded-full" /></div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-6 w-20 rounded-full" /></div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-14 rounded-full" /></div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-16 rounded-full" /></div>
+                    <div className="px-4 py-2.5 text-right"><Skeleton className="ml-auto h-8 w-8 rounded-lg" /></div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <>
+                <div style={{ height: topSpacerHeight }} />
+                <AnimatePresence initial={false}>
+                  {virtualRows.map((token) => {
+                    const animateIn = !seenRowIdsRef.current.has(token.id);
+                    seenRowIdsRef.current.add(token.id);
+                    return (
+                      <TokenRow
+                        key={token.id}
+                        token={token}
+                        selected={selectedTokenId === token.id}
+                        watched={watchlist.has(token.mint)}
+                        onSelectToken={onSelectToken}
+                        onToggleWatch={onToggleWatch}
+                        animateIn={animateIn}
+                      />
+                    );
+                  })}
+                </AnimatePresence>
+                <div style={{ height: bottomSpacerHeight }} />
+              </>
+            )}
           </div>
         </div>
         
-        {tokens.length === 0 && (
+        {!loading && tokens.length === 0 && (
           <div className="flex h-64 flex-col items-center justify-center text-center">
             <div className="mb-4 rounded-full bg-white/5 p-4 text-zinc-600">
               <Filter size={32} />

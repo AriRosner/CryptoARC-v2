@@ -17,6 +17,8 @@ class AppConfig(BaseSettings):
     watch_wallet_address: str = Field(default="", alias="WATCH_WALLET_ADDRESS")
     database_path: str = Field(default="data/cryptoarc.db", alias="DATABASE_PATH")
     live_trading_enabled: bool = Field(default=False, alias="LIVE_TRADING_ENABLED")
+    live_signer_daemon_url: str = Field(default="http://127.0.0.1:8799", alias="LIVE_SIGNER_DAEMON_URL")
+    live_signer_daemon_auth_token: str = Field(default="", alias="LIVE_SIGNER_DAEMON_AUTH_TOKEN")
     allowed_origins: str = Field(default="http://127.0.0.1:5173,http://localhost:5173", alias="ALLOWED_ORIGINS")
     dashboard_password: str = Field(default="", alias="DASHBOARD_PASSWORD")
     dashboard_totp_secret: str = Field(default="", alias="DASHBOARD_TOTP_SECRET")

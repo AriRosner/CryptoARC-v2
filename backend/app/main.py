@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
@@ -152,6 +153,10 @@ class ApplyTuningSuggestionRequest(BaseModel):
     suggested_value: bool | int | float | str
 
 
+class RestoreArtifactPayload(BaseModel):
+    artifact: dict[str, object]
+
+
 class StrategyPresetRequest(BaseModel):
     name: str
     description: str = ""
@@ -246,17 +251,27 @@ state = BotState(
     default_source=config.pumpfun_source,
     default_solana_rpc_url=config.solana_rpc_url,
     default_watch_wallet_address=config.watch_wallet_address,
+    signer_daemon_url=config.live_signer_daemon_url,
+    signer_daemon_auth_token=config.live_signer_daemon_auth_token,
 )
 clients: set[WebSocket] = set()
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
+last_broadcast_payload: str | None = None
 
 
-async def broadcast_snapshot() -> None:
+async def broadcast_snapshot(force: bool = False) -> None:
+    global last_broadcast_payload
+    if not clients:
+        return
     payload = state.snapshot().to_dict()
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if not force and serialized == last_broadcast_payload:
+        return
+    last_broadcast_payload = serialized
     disconnected: list[WebSocket] = []
-    for websocket in clients:
+    for websocket in list(clients):
         try:
             await websocket.send_json(payload)
         except Exception:
@@ -940,6 +955,29 @@ async def source_adapters() -> list[dict]:
 @app.post("/api/data/backup", dependencies=[Depends(require_auth)])
 async def backup_database() -> dict:
     return state.storage.backup()
+
+
+@app.post("/api/data/backup-artifact", dependencies=[Depends(require_auth)])
+async def backup_artifact() -> dict:
+    return state.backup_artifact()
+
+
+@app.post("/api/data/restore/preview", dependencies=[Depends(require_auth)])
+async def preview_restore_artifact(payload: RestoreArtifactPayload) -> dict:
+    try:
+        return state.preview_restore_artifact(payload.artifact)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/data/restore/confirm", dependencies=[Depends(require_auth)])
+async def confirm_restore_artifact(payload: RestoreArtifactPayload) -> dict:
+    try:
+        result = state.confirm_restore_artifact(payload.artifact)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await broadcast_snapshot()
+    return result
 
 
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])

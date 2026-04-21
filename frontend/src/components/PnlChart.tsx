@@ -1,14 +1,16 @@
 import React from "react";
 import { Area, AreaChart, ReferenceLine, ResponsiveContainer, Tooltip } from "recharts";
+import { Skeleton } from "./Skeleton";
 
 interface PnlChartProps {
   data: number[];
   height?: number;
   unit?: "SOL" | "USD";
   animationKey?: string;
+  loading?: boolean;
 }
 
-export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL", animationKey = "default" }) => {
+export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL", animationKey = "default", loading = false }) => {
   const id = React.useId();
   const gradientId = `pnlGradient-${id.replace(/:/g, "")}`;
   const lastAnimationKeyRef = React.useRef<string | null>(null);
@@ -27,11 +29,27 @@ export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 10
 
   return (
     <div className="relative overflow-hidden rounded-lg" style={{ width: "100%", height }}>
-      {!hasData ? (
+      {loading ? (
+        <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#090b13]/78 backdrop-blur-sm">
+          <div className="w-[min(86%,320px)] space-y-3 rounded-xl border border-white/10 bg-[#0d1018]/88 px-4 py-4 shadow-[0_18px_50px_rgba(0,0,0,0.35)]">
+            <div className="flex items-center gap-3 text-[10px] font-black uppercase tracking-[0.24em] text-[#00ffbd]">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-[#00ffbd] shadow-[0_0_12px_rgba(0,255,189,0.75)]" />
+              Loading P&amp;L Stream
+            </div>
+            <Skeleton className="h-3 w-24 rounded-full" />
+            <Skeleton className="h-16 w-full rounded-xl" />
+            <div className="grid grid-cols-3 gap-2">
+              <Skeleton className="h-2.5 rounded-full" />
+              <Skeleton className="h-2.5 rounded-full" />
+              <Skeleton className="h-2.5 rounded-full" />
+            </div>
+          </div>
+        </div>
+      ) : !hasData ? (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#090b13]/70 backdrop-blur-sm">
           <div className="flex items-center gap-3 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[10px] font-black uppercase tracking-widest text-amber-300">
             <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400 shadow-[0_0_12px_rgba(232,154,74,0.8)]" />
-            Loading P&L
+            Awaiting P&amp;L Data
           </div>
         </div>
       ) : null}

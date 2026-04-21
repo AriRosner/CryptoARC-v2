@@ -1,9 +1,11 @@
+import json
+import sqlite3
 import unittest
 from collections import deque
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
+from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.risk import RiskEngine
@@ -11,6 +13,7 @@ from app.core.scoring import ScoringEngine
 from app.core.sources import normalize_pumpportal_new_token, normalize_pumpportal_trade
 from app.core.storage import Storage
 from app.core.state import BotState
+from app.core.integrity import DataIntegrityAnalyzer
 
 
 class CoreLogicTests(unittest.TestCase):
@@ -131,6 +134,53 @@ class CoreLogicTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("buy velocity", decision.reason)
 
+    def test_integrity_info_penalty_stays_light_for_rejected_prices(self) -> None:
+        token = self.make_token()
+        trade = TradeRecord(
+            id="trade_integrity",
+            token_id=token.id,
+            mode="paper",
+            strategy_profile="balanced",
+            entry_price=0.00001,
+            exit_price=0.00002,
+            amount_sol=0.1,
+            pnl_sol=0.01,
+            entry_reason="test",
+            exit_reason="take profit",
+            opened_at=utc_now(),
+            closed_at=utc_now(),
+            lifecycle_status="closed",
+        )
+        observations = [
+            PriceObservation(
+                id=f"px_{index}",
+                source="pumpportal",
+                mint=token.mint,
+                observed_at=utc_now(),
+                price=0.00001,
+                price_source="direct",
+                confidence=0.2,
+                accepted=False,
+                token_id=token.id,
+            )
+            for index in range(13)
+        ]
+        decision = StrategyDecisionRecord(
+            id="decision_integrity",
+            token_id=token.id,
+            mint=token.mint,
+            created_at=utc_now(),
+            engine_version="strategy-v3",
+            profile="balanced",
+            score=88,
+            allowed=True,
+            action="paper_buy",
+            reason="test",
+            risk_reason="passed",
+        )
+        report = DataIntegrityAnalyzer().report([token], [trade], observations, [], [decision])
+        self.assertEqual(report["score"], 95)
+
     def test_paper_trade_closes_at_take_profit(self) -> None:
         token = self.make_token()
         settings = BotSettings(trade_size_sol=0.1, take_profit_pct=50, stop_loss_pct=30, paper_fee_bps=0, paper_price_impact_pct=0)
@@ -141,6 +191,29 @@ class CoreLogicTests(unittest.TestCase):
         self.assertEqual(token.status, TokenStatus.PAPER_SOLD)
         self.assertAlmostEqual(token.pnl_sol or 0, 0.052)
         self.assertEqual(token.exit_reason, "take profit")
+
+    def test_losing_sell_event_is_warning_not_danger(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.status = TokenStatus.MONITORING
+            token.entry_price = 0.00001
+            token.current_price = 0.00001
+            token.amount_sol = 0.1
+            token.opened_at = utc_now()
+            state.tokens.append(token)
+            def close_with_loss(token_arg, settings_arg, delta_pct):
+                token_arg.status = TokenStatus.PAPER_SOLD
+                token_arg.exit_reason = "stop loss"
+                token_arg.closed_at = utc_now()
+                token_arg.pnl_sol = -0.01
+                return True
+            state.paper.tick = close_with_loss  # type: ignore[method-assign]
+
+            state.tick()
+
+            sell_event = next(event for event in state.storage.load_all_events(20) if "Paper sold" in event.message)
+            self.assertEqual(sell_event.level, "warning")
 
     def test_paper_trade_can_delay_fill_and_charge_fees(self) -> None:
         token = self.make_token()
@@ -185,12 +258,73 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(loaded.id, token.id)
             self.assertEqual(loaded.score_breakdown, ["clean metadata"])
 
+    def test_storage_initializes_via_migration_runner(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+
+            schema = storage.schema_status()
+
+            self.assertEqual(schema["status"], "ok")
+            self.assertEqual(schema["current_version"], storage.SCHEMA_VERSION)
+            self.assertTrue(schema["migrations"])
+
+    def test_storage_upgrades_legacy_schema_marker(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.db"
+            connection = sqlite3.connect(path)
+            connection.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            connection.execute("INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)", (utc_now().isoformat(),))
+            connection.execute("CREATE TABLE settings (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL)")
+            connection.commit()
+            connection.close()
+
+            storage = Storage(str(path))
+
+            schema = storage.schema_status()
+            self.assertEqual(schema["current_version"], storage.SCHEMA_VERSION)
+            self.assertTrue(any(item["migration_id"] == "006_backup_restore_history" for item in schema["migrations"]))
+
+    def test_restore_artifact_preview_rejects_invalid_payload(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+
+            with self.assertRaises(ValueError):
+                storage.preview_restore_artifact({"artifact_type": "cryptoarc_local_backup", "format_version": 1, "database_base64": "not-valid-base64"})
+
+    def test_restore_artifact_replaces_local_state_and_records_history(self) -> None:
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "test.db"
+            state = BotState(database_path=str(path))
+            token = self.make_token()
+            state.storage.save_token(token)
+            artifact = state.storage.create_backup_artifact()
+            state.storage.clear_tokens()
+
+            result = state.confirm_restore_artifact(artifact)
+
+            self.assertEqual(result["status"], "restored")
+            restored_ids = [item.id for item in state.storage.load_tokens()]
+            self.assertIn(token.id, restored_ids)
+            self.assertTrue(state.storage.load_backup_restore_history())
+
     def test_fresh_state_defaults_to_pumpportal_source(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
 
             self.assertEqual(state.settings.launch_source, "pumpportal")
             self.assertEqual(state.source_status.source, "pumpportal")
+
+    def test_local_signer_daemon_status_reports_contract_only_defaults(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            status = state.signer_status("local_signer_daemon", "")
+
+            self.assertEqual(status["mode"], "local_signer_daemon")
+            self.assertEqual(status["transport"], "localhost_http")
+            self.assertFalse(status["connected"])
+            self.assertFalse(status["healthy"])
+            self.assertFalse(status["auth_configured"])
 
     def test_storage_round_trip_source_event_and_backtest(self) -> None:
         with TemporaryDirectory() as directory:
@@ -555,6 +689,25 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("no connected signer", status["blockers"])
             self.assertTrue(any("max_trade_sol" in blocker for blocker in status["blockers"]))
 
+    def test_live_status_reports_future_signer_capabilities(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+
+            browser = state.live_status(env_live_enabled=True, wallet_public_key="Wallet111")
+            daemon = state.live_status(env_live_enabled=True, wallet_public_key="", signer_mode="local_signer_daemon")
+
+            self.assertFalse(browser["signer"]["can_unattended_sign"])
+            self.assertFalse(browser["signer"]["supports_auto_sell"])
+            self.assertFalse(browser["signer"]["supports_auto_buy"])
+            self.assertIn("manual signing only", browser["signer"]["disabled_reason"].lower())
+            self.assertFalse(browser["auto_sell_available"])
+            self.assertFalse(browser["auto_buy_available"])
+            self.assertIn("Paper readiness is", " ".join(browser["autonomy_blockers"]))
+            self.assertFalse(daemon["signer"]["connected"])
+            self.assertIn("disabled in v1", daemon["signer"]["disabled_reason"])
+            self.assertFalse(daemon["wallet_adapter"]["supports_auto_sell"])
+
     def test_browser_wallet_live_quote_creates_blocked_audit_when_env_disabled(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
@@ -650,6 +803,42 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(state.readiness_status()["status"], "not_enough_data")
             self.assertEqual(quote["status"], "ready")
+
+    def test_live_position_risk_exit_generates_priority_sell_intent_with_soft_autonomy_block(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            token = self.make_token()
+            token.mint = "MintRisk"
+            token.symbol = "RISK"
+            token.current_price = 0.000007
+            token.sell_pressure = 0.9
+            token.hold_duration_seconds = 120
+            state.storage.save_token(token)
+            state.storage.save_live_ledger_position(
+                LiveLedgerPosition(
+                    id="livepos_risk",
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                    mint="MintRisk",
+                    wallet_public_key="WalletRisk",
+                    symbol="RISK",
+                    status="open",
+                    token_balance=100.0,
+                    cost_basis_sol=0.001,
+                    average_entry_price_sol=0.00001,
+                )
+            )
+
+            intents = state.generate_live_intents("WalletRisk")
+            sell_intent = next(intent for intent in intents if intent["action"] == "sell")
+
+            self.assertTrue(sell_intent["generated_from_position"])
+            self.assertEqual(sell_intent["source"], "live_position_rules")
+            self.assertIn("stop-loss", sell_intent["reason"].lower())
+            self.assertTrue(sell_intent["autonomy_blocked"])
+            self.assertTrue(any("readiness" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
+            self.assertTrue(any("manual signing only" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
 
     def test_live_kill_switch_blocks_new_intent_quotes(self) -> None:
         with TemporaryDirectory() as directory:

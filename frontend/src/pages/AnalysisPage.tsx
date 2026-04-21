@@ -14,6 +14,7 @@ import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { PnlChart } from "../components/PnlChart";
+import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
 import type { 
   TokenSignal, 
@@ -41,10 +42,10 @@ interface AnalysisPageProps {
   onApplySuggestion: (suggestion: TuningSuggestion) => Promise<void>;
 }
 
-const AnalysisMetric: React.FC<{ label: string; value: string | number; color?: string }> = ({ label, value, color = "text-white" }) => (
+const AnalysisMetric: React.FC<{ label: string; value: string | number; color?: string; loading?: boolean }> = ({ label, value, color = "text-white", loading = false }) => (
   <div className="flex flex-col gap-1 rounded-xl border border-white/5 bg-white/[0.02] p-4 transition-colors hover:bg-white/[0.04]">
     <span className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</span>
-    <span className={cn("text-xl font-black tracking-tight", color)}>{value}</span>
+    {loading ? <Skeleton className="h-7 w-24" /> : <span className={cn("text-xl font-black tracking-tight", color)}>{value}</span>}
   </div>
 );
 
@@ -77,6 +78,7 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   onTimeframeChange,
   onApplySuggestion
 }) => {
+  const loadingAnalytics = !analytics || !priceDiagnostics || !pumpfunReport || !safetyStatus || !readinessStatus;
   const closed = trades.filter(t => t.lifecycle_status === "closed" && t.pnl_sol !== null);
   const timeframePnl = closed.reduce((total, t) => total + (t.pnl_sol || 0), 0);
   const scratchThreshold = stats.scratch_threshold_sol ?? 0.001;
@@ -115,8 +117,8 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
         <AnalysisMetric label="Range P&L" value={`${timeframePnl.toFixed(4)} SOL`} color={timeframePnl >= 0 ? "text-emerald-500" : "text-rose-500"} />
         <AnalysisMetric label="W / L" value={`${wins} / ${losses}`} />
         <AnalysisMetric label="Avg Hold" value={`${Math.round(avgHold)}s`} />
-        <AnalysisMetric label="Readiness" value={`${readinessStatus?.score ?? 0}%`} color="text-amber-500" />
-        <AnalysisMetric label="Safety" value={safetyStatus?.entries_allowed ? "OK" : "GUARD"} color={safetyStatus?.entries_allowed ? "text-emerald-500" : "text-rose-500"} />
+        <AnalysisMetric label="Readiness" value={`${readinessStatus?.score ?? 0}%`} color="text-amber-500" loading={!readinessStatus} />
+        <AnalysisMetric label="Safety" value={safetyStatus?.entries_allowed ? "OK" : "GUARD"} color={safetyStatus?.entries_allowed ? "text-emerald-500" : "text-rose-500"} loading={!safetyStatus} />
         <AnalysisMetric label="Open" value={stats.open_positions} />
         <AnalysisMetric label="Best" value={`${stats.best_trade_sol.toFixed(3)}`} color="text-emerald-500" />
         <AnalysisMetric label="Win Rate" value={`${stats.win_rate_pct}%`} color="text-amber-500" />
@@ -141,11 +143,19 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                 <Gauge size={16} />
                 Price Engine v3
               </h3>
-              <div className="space-y-5">
-                <BarMetric label="Acceptance Rate" value={Math.round((priceDiagnostics?.acceptance_rate ?? 0) * 100)} max={100} color="bg-emerald-500/50" />
-                <BarMetric label="Jump Warnings" value={priceDiagnostics?.impossible_jump_warnings ?? 0} max={20} color="bg-rose-500/50" />
-                <BarMetric label="Observation Density" value={priceDiagnostics?.observations ?? 0} max={1000} color="bg-blue-500/50" />
-              </div>
+              {!priceDiagnostics ? (
+                <div className="space-y-4">
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                  <Skeleton className="h-8 w-full" />
+                </div>
+              ) : (
+                <div className="space-y-5">
+                  <BarMetric label="Acceptance Rate" value={Math.round((priceDiagnostics?.acceptance_rate ?? 0) * 100)} max={100} color="bg-emerald-500/50" />
+                  <BarMetric label="Jump Warnings" value={priceDiagnostics?.impossible_jump_warnings ?? 0} max={20} color="bg-rose-500/50" />
+                  <BarMetric label="Observation Density" value={priceDiagnostics?.observations ?? 0} max={1000} color="bg-blue-500/50" />
+                </div>
+              )}
             </Card>
 
             <Card className="p-6" hover={false}>
@@ -169,7 +179,12 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
               Auto-Tuning Engine
             </h3>
             <div className="space-y-4">
-              {suggestions.slice(0, 4).map((item, i) => (
+              {!suggestions.length && loadingAnalytics ? (
+                <>
+                  <Skeleton className="h-28 w-full" />
+                  <Skeleton className="h-28 w-full" />
+                </>
+              ) : suggestions.slice(0, 4).map((item, i) => (
                 <div key={i} className="rounded-xl border border-white/5 bg-white/[0.02] p-4 transition-all hover:bg-white/[0.04]">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-[11px] font-black text-white uppercase tracking-tight">{item.title}</span>
@@ -200,7 +215,13 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
               Strategy Performance
             </h3>
             <div className="space-y-4">
-              {analytics?.by_strategy.slice(0, 3).map((item, i) => (
+              {!analytics ? (
+                <>
+                  <Skeleton className="h-14 w-full" />
+                  <Skeleton className="h-14 w-full" />
+                  <Skeleton className="h-14 w-full" />
+                </>
+              ) : analytics.by_strategy.slice(0, 3).map((item, i) => (
                 <div key={i} className="space-y-1.5">
                   <div className="flex justify-between text-[10px] font-bold uppercase tracking-tight">
                     <span className="text-zinc-400">{item.label}</span>

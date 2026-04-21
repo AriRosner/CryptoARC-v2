@@ -2,6 +2,7 @@ import React from "react";
 import { Activity, RefreshCw, TrendingUp, TrendingDown, Target, Zap } from "lucide-react";
 import { Card } from "./Card";
 import { AnimatedNumber } from "./AnimatedNumber";
+import { Skeleton } from "./Skeleton";
 import { cn } from "./utils";
 
 interface StatsGridProps {
@@ -14,9 +15,10 @@ interface StatsGridProps {
   pnlCurrency?: "SOL" | "USD";
   solUsdPrice?: number;
   onTogglePnlCurrency?: () => void;
+  loading?: boolean;
 }
 
-export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency }) => {
+export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency, loading = false }) => {
   const showUsd = pnlCurrency === "USD" && solUsdPrice > 0;
   const items = React.useMemo(() => [
     {
@@ -72,18 +74,29 @@ export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurre
           <div className="flex items-center justify-between">
             <div>
               <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">{item.label}</p>
-              <div className="mt-2 flex items-baseline gap-1">
-                <AnimatedNumber
-                  value={item.value}
-                  precision={item.precision}
-                  prefix={item.prefix}
-                  suffix={item.suffix}
-                  className={cn("text-2xl font-black tracking-tight", item.color)}
-                />
-              </div>
-              {item.canToggle ? <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-600">{showUsd ? "USD display" : "SOL display"}</p> : null}
+              {loading ? (
+                <div className="mt-2 space-y-2">
+                  <Skeleton className="h-8 w-28 rounded-lg" />
+                  <Skeleton className="h-3 w-20 rounded-full" />
+                </div>
+              ) : (
+                <>
+                  <div className="mt-2 flex items-baseline gap-1">
+                    <AnimatedNumber
+                      value={item.value}
+                      precision={item.precision}
+                      prefix={item.prefix}
+                      suffix={item.suffix}
+                      className={cn("text-2xl font-black tracking-tight", item.color)}
+                    />
+                  </div>
+                  {item.canToggle ? <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-600">{showUsd ? "USD display" : "SOL display"}</p> : null}
+                </>
+              )}
             </div>
-            {item.canToggle && onTogglePnlCurrency ? (
+            {loading ? (
+              <Skeleton className="h-12 w-12 rounded-2xl" />
+            ) : item.canToggle && onTogglePnlCurrency ? (
               <button
                 className={cn("flex h-12 w-12 items-center justify-center rounded-2xl transition hover:scale-105", item.bg)}
                 onClick={onTogglePnlCurrency}
