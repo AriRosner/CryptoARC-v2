@@ -836,6 +836,69 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(len(non_skipped), 14)
 
+    def test_idle_source_health_uses_historical_quality_without_offline_penalty(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            for index in range(12):
+                event = SourceEvent(
+                    id=f"src_{index}",
+                    source="pumpportal",
+                    received_at=utc_now(),
+                    raw_payload={"mint": f"Mint{index}"},
+                    normalized_token_id=f"tok_{index}",
+                    status="normalized",
+                    message="normalized",
+                )
+                state.storage.save_source_event(event)
+
+            state.source_status.status = "offline"
+            state.source_status.message = "Source is idle"
+            state.source_status.raw_events_seen = 0
+            state.source_status.normalized_events = 0
+
+            health = state.source_health()
+
+            self.assertEqual(health["status_message"], "idle")
+            self.assertGreaterEqual(health["health_score"], 80)
+
+    def test_apply_tuning_suggestion_updates_settings(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            result = state.apply_tuning_suggestion("cooldown_after_loss_enabled", True)
+
+            self.assertTrue(state.settings.cooldown_after_loss_enabled)
+            self.assertEqual(result["setting"], "cooldown_after_loss_enabled")
+            self.assertTrue(result["suggested_value"])
+
+    def test_orphaned_open_token_is_recovered_on_startup(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            state = BotState(database_path=str(database_path))
+            for index in range(85):
+                token = self.make_token()
+                token.id = f"tok_recent_{index}"
+                token.mint = f"MintRecent{index}"
+                token.detected_at = utc_now()
+                token.status = TokenStatus.SKIPPED
+                state.storage.save_token(token)
+            orphan = self.make_token()
+            orphan.id = "tok_orphan"
+            orphan.mint = "MintOrphan"
+            orphan.detected_at = utc_now().replace(year=2025)
+            orphan.status = TokenStatus.MONITORING
+            orphan.entry_price = 0.00001
+            orphan.current_price = 0.000011
+            orphan.amount_sol = 0.1
+            orphan.opened_at = utc_now().replace(year=2025)
+            state.storage.save_token(orphan)
+
+            reloaded = BotState(database_path=str(database_path))
+            recovered = next(token for token in reloaded.storage.load_all_tokens(5000) if token.id == "tok_orphan")
+
+            self.assertEqual(recovered.status, TokenStatus.PAPER_SOLD)
+            self.assertEqual(recovered.exit_reason, "orphaned state recovery")
+
     def test_no_private_key_fields_are_added_to_settings_or_live_audit(self) -> None:
         settings_keys = set(BotSettings.__dataclass_fields__.keys())
         audit_keys = set(LiveExecutionAudit.__dataclass_fields__.keys())

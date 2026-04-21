@@ -147,6 +147,11 @@ class TradeLabelRequest(BaseModel):
     note: str = ""
 
 
+class ApplyTuningSuggestionRequest(BaseModel):
+    setting: str = Field(min_length=1, max_length=100)
+    suggested_value: bool | int | float | str
+
+
 class StrategyPresetRequest(BaseModel):
     name: str
     description: str = ""
@@ -632,6 +637,16 @@ async def performance_analytics() -> dict:
 @app.get("/api/analytics/suggestions", dependencies=[Depends(require_auth)])
 async def tuning_suggestions() -> list[dict]:
     return state.tuning_suggestions()
+
+
+@app.post("/api/analytics/suggestions/apply", dependencies=[Depends(require_auth)])
+async def apply_tuning_suggestion(payload: ApplyTuningSuggestionRequest) -> dict:
+    try:
+        result = state.apply_tuning_suggestion(payload.setting, payload.suggested_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await broadcast_snapshot()
+    return result
 
 
 @app.get("/api/experiments", dependencies=[Depends(require_auth)])

@@ -53,6 +53,7 @@ import {
   fetchPriceDiagnostics,
   fetchPriceObservations,
   fetchPumpFunReport,
+  applyTuningSuggestion,
   fetchReadinessStatus,
   fetchReplayTimeline,
   fetchSafetyStatus,
@@ -108,6 +109,7 @@ import { AnalysisPage } from "./pages/AnalysisPage";
 import { BacktestsPage } from "./pages/BacktestsPage";
 import { ReviewPage } from "./pages/ReviewPage";
 import { SettingsModal } from "./components/SettingsModal";
+import { Modal } from "./components/Modal";
 import { TokenDetail as NewTokenDetail } from "./components/TokenDetail";
 
 type BrowserSolanaProvider = {
@@ -417,6 +419,8 @@ function App() {
   const [hideSkippedTokens, setHideSkippedTokens] = React.useState(() => window.localStorage.getItem("cryptoarc_hide_skipped_tokens") === "true");
   const [watchlist, setWatchlist] = React.useState<string[]>(() => JSON.parse(window.localStorage.getItem("cryptoarc_watchlist") || "[]"));
   const [apiError, setApiError] = React.useState("");
+  const [pendingSuggestion, setPendingSuggestion] = React.useState<TuningSuggestion | null>(null);
+  const [applyingSuggestion, setApplyingSuggestion] = React.useState(false);
   const [authRequired, setAuthRequired] = React.useState(false);
   const [authed, setAuthed] = React.useState(false);
   const [totpRequired, setTotpRequired] = React.useState(false);
@@ -640,8 +644,9 @@ function App() {
     setBotActionStatus("stopping");
     try {
       setSnapshot(await stopBot());
-      await refreshPnlData();
       setApiError("");
+      refreshPnlData().catch(() => undefined);
+      refreshResearchData().catch(() => undefined);
     } catch (error) {
       setApiError(`Stop failed: ${error instanceof Error ? error.message : "unknown error"}`);
     } finally {
@@ -812,6 +817,28 @@ function App() {
     setLiveIntents(intentRows);
     setLiveLedger(ledgerState);
     refreshConnectedWalletBalance().catch(() => undefined);
+  }
+
+  function handleApplyTuningSuggestion(suggestion: TuningSuggestion) {
+    if (suggestion.suggested_value === undefined) return Promise.resolve();
+    setPendingSuggestion(suggestion);
+    return Promise.resolve();
+  }
+
+  async function confirmApplyTuningSuggestion() {
+    if (!pendingSuggestion || pendingSuggestion.suggested_value === undefined) return;
+    setApplyingSuggestion(true);
+    try {
+      const result = await applyTuningSuggestion(pendingSuggestion.setting, pendingSuggestion.suggested_value);
+      setSnapshot(result.snapshot);
+      await refreshResearchData();
+      setPendingSuggestion(null);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Suggestion apply failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    } finally {
+      setApplyingSuggestion(false);
+    }
   }
 
   async function refreshPnlData() {
@@ -1175,6 +1202,7 @@ function App() {
           readinessStatus={readinessStatus}
           pnlTimeframe={pnlTimeframe}
           onTimeframeChange={setPnlTimeframe}
+          onApplySuggestion={handleApplyTuningSuggestion}
         />
       )}
 
@@ -1207,12 +1235,14 @@ function App() {
         <ReviewPage
           trades={trades}
           versions={settingsVersions}
+          tokens={tokenSource}
           analytics={performanceAnalytics}
           suggestions={tuningSuggestions}
           selectedTradeId={selectedReviewTradeId}
           timeline={replayTimeline}
           detail={tradeReviewDetail}
           labels={tradeLabels}
+          onApplySuggestion={handleApplyTuningSuggestion}
           onLabelTrade={async (tokenId, label) => {
             const saved = await labelTrade(tokenId, label);
             setTradeLabels((current) => [saved, ...current]);
@@ -1315,6 +1345,50 @@ function App() {
           onRecoverLiveAudit={recoverSingleLiveAudit}
         />
       )}
+
+      <Modal
+        isOpen={!!pendingSuggestion}
+        onClose={() => !applyingSuggestion && setPendingSuggestion(null)}
+        title="Implement Tuning Suggestion"
+        description="Review the exact setting change before applying it to the active dashboard configuration."
+        className="max-w-xl"
+      >
+        <div className="space-y-4">
+          <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4">
+            <div className="text-sm font-black text-white">{pendingSuggestion?.title}</div>
+            <div className="mt-2 text-sm leading-relaxed text-zinc-400">{pendingSuggestion?.reason}</div>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="rounded-xl border border-white/5 bg-black/30 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-zinc-500">Setting</div>
+              <div className="mt-1 break-all text-sm font-black text-white">{pendingSuggestion?.setting || "-"}</div>
+            </div>
+            <div className="rounded-xl border border-white/5 bg-black/30 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-zinc-500">New Value</div>
+              <div className="mt-1 break-all text-sm font-black text-amber-300">{pendingSuggestion?.suggested_value === undefined ? "-" : String(pendingSuggestion.suggested_value)}</div>
+            </div>
+          </div>
+          <div className="rounded-xl border border-amber-400/20 bg-amber-500/[0.04] p-4 text-[11px] leading-relaxed text-zinc-300">
+            This will update the live dashboard settings immediately and refresh the research surfaces. It does not place trades or change the paper/live safety boundary.
+          </div>
+          <div className="flex justify-end gap-3">
+            <button
+              className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-black uppercase tracking-widest text-zinc-300 transition hover:bg-white/[0.06]"
+              onClick={() => setPendingSuggestion(null)}
+              disabled={applyingSuggestion}
+            >
+              Cancel
+            </button>
+            <button
+              className="rounded-lg border border-amber-400/30 bg-amber-400 px-4 py-2 text-xs font-black uppercase tracking-widest text-[#160f08] transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
+              onClick={confirmApplyTuningSuggestion}
+              disabled={applyingSuggestion || !pendingSuggestion}
+            >
+              {applyingSuggestion ? "Applying" : "Confirm Change"}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </AppLayout>
   );
 }

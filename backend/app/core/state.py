@@ -74,7 +74,7 @@ class BotState:
             if default_watch_wallet_address:
                 self.settings.watch_wallet_address = default_watch_wallet_address
         self.stats = BotStats()
-        self.tokens: deque[TokenSignal] = deque(self.storage.load_tokens(), maxlen=80)
+        self.tokens: deque[TokenSignal] = deque(self._hydrate_active_tokens(), maxlen=80)
         self.events: deque[TradeEvent] = deque(self.storage.load_events(), maxlen=30)
         self.backtest_runs: deque[BacktestRun] = deque(self.storage.load_backtest_runs(), maxlen=20)
         self.source_status = SourceStatus(source=self.settings.launch_source, status="offline")
@@ -88,6 +88,7 @@ class BotState:
         self.simulator = LaunchSimulator()
         self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
         self.current_settings_version_id = self.ensure_settings_version("startup", [])
+        self._recover_orphaned_open_tokens()
         self.last_bot_tick_at: datetime | None = None
         self.last_ingested_launch_at: datetime | None = None
         self.last_tick_error: str = ""
@@ -107,6 +108,36 @@ class BotState:
         self.status = BotStatus.STOPPED
         self.add_event("warning", "Paper trading loop stopped")
         return self.snapshot()
+
+    def _hydrate_active_tokens(self) -> list[TokenSignal]:
+        recent = self.storage.load_tokens()
+        open_statuses = {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}
+        open_tokens = [token for token in self.storage.load_all_tokens(5000) if token.status in open_statuses]
+        open_by_id: dict[str, TokenSignal] = {token.id: token for token in sorted(open_tokens, key=lambda token: token.detected_at, reverse=True)}
+        recent_without_open = [token for token in recent if token.id not in open_by_id]
+        keep_recent = max(0, 80 - len(open_by_id))
+        tokens = [*recent_without_open[:keep_recent], *open_by_id.values()]
+        return sorted(tokens, key=lambda token: token.detected_at, reverse=True)
+
+    def _recover_orphaned_open_tokens(self) -> None:
+        recent_ids = {token.id for token in self.storage.load_tokens()}
+        recovered = 0
+        for token in self.tokens:
+            if token.id in recent_ids:
+                continue
+            if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
+                continue
+            if token.entry_price is None or token.current_price is None:
+                token.status = TokenStatus.SKIPPED
+                token.reason = "orphaned state recovery"
+            else:
+                self.paper.close(token, self.settings, "orphaned state recovery")
+                self.storage.save_trade(self.trade_from_token(token))
+                self.storage.save_trade_session(self.session_from_token(token, "closed"))
+            self.storage.save_token(token)
+            recovered += 1
+        if recovered:
+            self.add_event("warning", f"Recovered {recovered} orphaned paper position{'s' if recovered != 1 else ''}")
 
     def update_settings(self, patch: dict[str, object]) -> BotSnapshot:
         current = asdict(self.settings)
@@ -823,27 +854,43 @@ class BotState:
         events = self.storage.load_source_events(300)
         normalized = [event for event in events if event.status == "normalized"]
         failures = len([event for event in events if event.status == "raw"])
+        quality_events = len(normalized) + failures
         last_age = None
         if self.source_status.last_event_at:
             last_age = max(0, int((utc_now() - self.source_status.last_event_at).total_seconds()))
-        raw = max(1, self.source_status.raw_events_seen)
-        ratio = self.source_status.normalized_events / raw
+        if self.source_status.raw_events_seen > 0:
+            raw = max(1, self.source_status.raw_events_seen)
+            ratio = self.source_status.normalized_events / raw
+        else:
+            ratio = len(normalized) / max(1, quality_events)
+        expects_live_source = self.status.value == "running" and self.settings.detect_new_tokens
+        source_is_idle = (
+            self.source_status.status == "offline"
+            and self.source_status.message == "Source is idle"
+            and self.source_status.last_event_at is None
+            and self.source_status.raw_events_seen == 0
+            and self.source_status.normalized_events == 0
+        )
         health = 100
-        if self.source_status.status != "connected":
+        if self.source_status.status != "connected" and not source_is_idle:
             health -= 35
-        if last_age is not None and last_age > self.settings.source_stale_seconds:
+        if expects_live_source and last_age is not None and last_age > self.settings.source_stale_seconds:
             health -= 25
-        if ratio < 0.35:
+        if quality_events and ratio < 0.35:
             health -= 20
         health -= min(20, max(0, self.source_status.reconnect_attempts - self.settings.source_max_reconnects) * 4)
+        if source_is_idle and not events:
+            health = min(health, 70)
         newest_normalized = normalized[0] if normalized else None
         cutoff = utc_now() - timedelta(minutes=1)
         recent_events = [event for event in events if event.received_at >= cutoff]
         recent_normalized = [event for event in recent_events if event.status == "normalized"]
         status_message = "healthy"
+        if source_is_idle:
+            status_message = "idle"
         if health < 50:
             status_message = "degraded"
-        if self.source_status.status != "connected":
+        if self.source_status.status != "connected" and not source_is_idle:
             status_message = "offline"
         return {
             "status": self.source_status.status,
@@ -913,6 +960,19 @@ class BotState:
         if not suggestions:
             suggestions.append({"title": "Keep current profile", "reason": "No single failure pattern dominates the closed trade set yet.", "setting": "strategy_profile", "suggested_value": self.settings.strategy_profile, "confidence": 0.52})
         return suggestions
+
+    def apply_tuning_suggestion(self, setting: str, suggested_value: object) -> dict[str, object]:
+        current = asdict(self.settings)
+        if setting not in current:
+            raise ValueError(f"unknown setting: {setting}")
+        coerced_value = self._coerce_setting_value(setting, suggested_value, current[setting])
+        snapshot = self.update_settings({setting: coerced_value})
+        self.add_event("info", f"Applied tuning suggestion: {setting} -> {coerced_value}")
+        return {
+            "setting": setting,
+            "suggested_value": coerced_value,
+            "snapshot": snapshot.to_dict(),
+        }
 
     def experiments(self) -> list[dict[str, object]]:
         return [run.to_dict() for run in self.storage.load_experiment_runs(100)]
@@ -2514,6 +2574,29 @@ class BotState:
         current["strategy_profile"] = profile
         return BotSettings(**current)
 
+    def _coerce_setting_value(self, setting: str, value: object, current_value: object) -> object:
+        if isinstance(current_value, bool):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes", "on"}:
+                    return True
+                if lowered in {"false", "0", "no", "off"}:
+                    return False
+            raise ValueError(f"invalid boolean value for {setting}")
+        if isinstance(current_value, int) and not isinstance(current_value, bool):
+            if isinstance(value, (int, float, str)):
+                return int(float(value))
+            raise ValueError(f"invalid integer value for {setting}")
+        if isinstance(current_value, float):
+            if isinstance(value, (int, float, str)):
+                return float(value)
+            raise ValueError(f"invalid numeric value for {setting}")
+        if isinstance(current_value, str):
+            return str(value)
+        return value
+
     def _estimated_replay_pnl(self, token: TokenSignal, settings: BotSettings) -> float:
         edge = (token.score - 50) / 1000
         flow = (token.buy_velocity - token.sell_pressure) * 0.015
@@ -2681,6 +2764,7 @@ class BotState:
         return sum(1 for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING})
 
     def recalculate_stats(self) -> None:
+        self._normalize_active_tokens()
         skipped = [token for token in self.tokens if token.status == TokenStatus.SKIPPED]
         open_tokens = [token for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}]
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
@@ -2730,6 +2814,18 @@ class BotState:
             max_drawdown_sol=round(max_drawdown, 6),
             avg_hold_seconds=int(sum(hold_durations) / len(hold_durations)) if hold_durations else 0,
         )
+
+    def _normalize_active_tokens(self) -> None:
+        changed = False
+        for token in self.tokens:
+            if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
+                continue
+            if token.closed_at is not None:
+                token.status = TokenStatus.PAPER_SOLD
+                changed = True
+                self.storage.save_token(token)
+        if changed:
+            self.tokens = deque(sorted(self.tokens, key=lambda token: token.detected_at, reverse=True), maxlen=80)
 
     def snapshot(self) -> BotSnapshot:
         return BotSnapshot(

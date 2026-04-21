@@ -127,6 +127,18 @@ export const DataPage: React.FC<DataPageProps> = ({
     "live_execution_requests", "live_sessions", "live_execution_audits", 
     "live_intents", "live_ledger_positions", "all"
   ];
+  const readinessTone =
+    readinessStatus?.status === "ready"
+      ? "success"
+      : readinessStatus?.status === "warning" || readinessStatus?.status === "not_enough_data"
+        ? "warning"
+        : "danger";
+  const sourceHealthTone =
+    (sourceHealth?.health_score ?? 0) >= 70
+      ? "text-emerald-500"
+      : (sourceHealth?.health_score ?? 0) >= 50
+        ? "text-amber-400"
+        : "text-rose-400";
 
   return (
     <div className="space-y-6">
@@ -158,7 +170,7 @@ export const DataPage: React.FC<DataPageProps> = ({
           <DataMetric label="Prices" value={summary?.price_observations ?? 0} />
           <DataMetric label="Readiness" value={`${readinessStatus?.score ?? 0}%`} color="text-amber-500" />
           <DataMetric label="Integrity" value={`${dataIntegrity?.score ?? 0}%`} color="text-emerald-500" />
-          <DataMetric label="Health" value={`${sourceHealth?.health_score ?? 0}%`} color="text-blue-500" />
+          <DataMetric label="Health" value={`${sourceHealth?.health_score ?? 0}% ${sourceHealth?.status_message ? `| ${sourceHealth.status_message}` : ""}`} color={sourceHealthTone} />
           <DataMetric label="RPC" value={solanaStatus?.health ?? "unknown"} color={solanaStatus?.health === "ok" ? "text-emerald-500" : "text-rose-500"} />
           <DataMetric label="Watchdog" value={watchdogStatus?.status ?? "unknown"} />
           <DataMetric label="Live Reqs" value={liveRequests.length} color="text-rose-500" />
@@ -177,33 +189,31 @@ export const DataPage: React.FC<DataPageProps> = ({
               <Badge variant="info">{auditEvents.length} Events</Badge>
             </div>
             <div className="flex-1 overflow-auto p-0 scrollbar-thin scrollbar-thumb-white/10">
-              <table className="w-full border-collapse text-left text-[11px]">
-                <thead className="sticky top-0 z-10 bg-[#10121c] after:absolute after:bottom-0 after:left-0 after:h-px after:w-full after:bg-white/5">
-                  <tr>
-                    <th className="px-4 py-2 font-black text-zinc-600">Timestamp</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Level</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Message</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5 font-mono">
+              <div className="min-w-[560px] text-[11px]">
+                <div className="sticky top-0 z-10 grid h-10 grid-cols-[140px_88px_minmax(0,1fr)] border-b border-white/5 bg-[#10121c]">
+                  <div className="flex items-center px-4 font-black text-zinc-600">Timestamp</div>
+                  <div className="flex items-center px-4 font-black text-zinc-600">Level</div>
+                  <div className="flex items-center px-4 font-black text-zinc-600">Message</div>
+                </div>
+                <div className="divide-y divide-white/5 font-mono">
                   {auditEvents.map((event) => (
-                    <tr key={event.id} className="hover:bg-white/[0.02]">
-                      <td className="whitespace-nowrap px-4 py-2 text-zinc-500">
+                    <div key={event.id} className="grid min-h-10 grid-cols-[140px_88px_minmax(0,1fr)] hover:bg-white/[0.02]">
+                      <div className="flex items-center whitespace-nowrap px-4 text-zinc-500">
                         {new Date(event.created_at).toLocaleTimeString()}
-                      </td>
-                      <td className="px-4 py-2">
+                      </div>
+                      <div className="flex items-center px-4">
                         <span className={cn(
                           "font-bold uppercase",
                           event.level === "error" ? "text-rose-500" : event.level === "warn" ? "text-amber-500" : "text-emerald-500"
                         )}>
                           {event.level}
                         </span>
-                      </td>
-                      <td className="px-4 py-2 text-zinc-300">{event.message}</td>
-                    </tr>
+                      </div>
+                      <div className="flex items-center px-4 py-2 text-zinc-300">{event.message}</div>
+                    </div>
                   ))}
-                </tbody>
-              </table>
+                </div>
+              </div>
             </div>
           </Card>
 
@@ -216,13 +226,20 @@ export const DataPage: React.FC<DataPageProps> = ({
               <Badge variant="warning">{liveRequests.length} Requests</Badge>
             </div>
             <div className="max-h-[320px] overflow-auto p-0 scrollbar-thin scrollbar-thumb-white/10">
-              <table className="w-full border-collapse text-left text-[11px]">
+              <table className="min-w-full table-fixed border-collapse text-left text-[11px]">
+                <colgroup>
+                  <col className="w-28" />
+                  <col className="w-20" />
+                  <col className="w-24" />
+                  <col className="w-24" />
+                  <col />
+                </colgroup>
                 <thead className="sticky top-0 z-10 bg-[#10121c]">
-                  <tr>
-                    <th className="px-4 py-2 font-black text-zinc-600">Created</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Action</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Amount</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Status</th>
+                  <tr className="border-b border-white/5">
+                    <th className="w-28 px-4 py-2 font-black text-zinc-600">Created</th>
+                    <th className="w-20 px-4 py-2 font-black text-zinc-600">Action</th>
+                    <th className="w-24 px-4 py-2 font-black text-zinc-600">Amount</th>
+                    <th className="w-24 px-4 py-2 font-black text-zinc-600">Status</th>
                     <th className="px-4 py-2 font-black text-zinc-600 text-right">Review</th>
                   </tr>
                 </thead>
@@ -258,13 +275,20 @@ export const DataPage: React.FC<DataPageProps> = ({
               <Badge variant="info">{liveAudit.length} Rows</Badge>
             </div>
             <div className="max-h-[360px] overflow-auto p-0 scrollbar-thin scrollbar-thumb-white/10">
-              <table className="w-full border-collapse text-left text-[11px]">
+              <table className="min-w-full table-fixed border-collapse text-left text-[11px]">
+                <colgroup>
+                  <col className="w-28" />
+                  <col className="w-20" />
+                  <col className="w-52" />
+                  <col className="w-24" />
+                  <col />
+                </colgroup>
                 <thead className="sticky top-0 z-10 bg-[#10121c]">
-                  <tr>
-                    <th className="px-4 py-2 font-black text-zinc-600">Created</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Action</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Mint</th>
-                    <th className="px-4 py-2 font-black text-zinc-600">Status</th>
+                  <tr className="border-b border-white/5">
+                    <th className="w-28 px-4 py-2 font-black text-zinc-600">Created</th>
+                    <th className="w-20 px-4 py-2 font-black text-zinc-600">Action</th>
+                    <th className="w-52 px-4 py-2 font-black text-zinc-600">Mint</th>
+                    <th className="w-24 px-4 py-2 font-black text-zinc-600">Status</th>
                     <th className="px-4 py-2 font-black text-zinc-600">Signature</th>
                   </tr>
                 </thead>
@@ -294,13 +318,13 @@ export const DataPage: React.FC<DataPageProps> = ({
                 <Trash2 size={14} className="text-rose-500" />
                 Data Purge
               </h3>
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-2 gap-1.5">
                 {clearTargets.map((target) => (
                   <Button 
                     key={target} 
                     variant="ghost" 
                     size="sm" 
-                    className="justify-start text-[10px] h-8 border border-white/5 bg-white/[0.02] hover:bg-rose-500/10 hover:text-rose-500 hover:border-rose-500/20"
+                    className="h-8 justify-start border border-white/5 bg-white/[0.02] px-3 py-1.5 text-[10px] font-bold tracking-normal text-zinc-400 hover:border-rose-500/20 hover:bg-rose-500/10 hover:text-rose-500"
                     onClick={() => onClear(target)}
                   >
                     {target.replace(/_/g, " ")}
@@ -339,8 +363,8 @@ export const DataPage: React.FC<DataPageProps> = ({
                 <Shield size={16} />
                 Readiness
               </h3>
-              <Badge variant={readinessStatus?.entries_allowed ? "success" : "danger"}>
-                {readinessStatus?.entries_allowed ? "Ready" : "Halted"}
+              <Badge variant={readinessTone}>
+                {readinessStatus?.status?.replace(/_/g, " ") || "unknown"}
               </Badge>
             </div>
             <div className="space-y-4">
@@ -348,18 +372,29 @@ export const DataPage: React.FC<DataPageProps> = ({
                 <div key={gate.id} className="flex flex-col gap-1">
                   <div className="flex items-center justify-between text-[11px]">
                     <span className="font-bold text-zinc-400">{gate.label}</span>
-                    <span className={cn("font-black", gate.status === "pass" ? "text-emerald-500" : "text-rose-500")}>
+                    <span className={cn("font-black", gate.status === "pass" ? "text-emerald-500" : gate.status === "warn" ? "text-amber-400" : "text-rose-500")}>
                       {String(gate.value)} / {gate.target}
                     </span>
                   </div>
                   <div className="h-1 w-full rounded-full bg-white/5">
                     <div 
-                      className={cn("h-full rounded-full", gate.status === "pass" ? "bg-emerald-500" : "bg-rose-500")}
-                      style={{ width: `${Math.min(100, (Number(gate.value) / Number(gate.target)) * 100)}%` }}
+                      className={cn("h-full rounded-full", gate.status === "pass" ? "bg-emerald-500" : gate.status === "warn" ? "bg-amber-400" : "bg-rose-500")}
+                      style={{ width: `${gate.status === "pass" ? 100 : gate.status === "warn" ? 60 : 28}%` }}
                     />
                   </div>
+                  <span className="text-[10px] text-zinc-600">{gate.reason}</span>
                 </div>
               ))}
+              {readinessStatus?.recommended_actions?.length ? (
+                <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-400">
+                  {readinessStatus.recommended_actions.slice(0, 3).map((action) => (
+                    <div key={action} className="flex gap-2 py-1">
+                      <ChevronRight size={12} className="mt-0.5 shrink-0 text-amber-300" />
+                      <span>{action}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
             </div>
           </Card>
 
@@ -375,7 +410,7 @@ export const DataPage: React.FC<DataPageProps> = ({
               </div>
               <div className="flex items-center justify-between rounded-xl bg-white/[0.02] p-3 text-[11px]">
                 <span className="text-zinc-500">Source Health</span>
-                <span className="font-black text-emerald-500">{sourceHealth?.health_score}%</span>
+                <span className={cn("font-black", sourceHealthTone)}>{sourceHealth?.health_score}%</span>
               </div>
               <div className="flex items-center justify-between rounded-xl bg-white/[0.02] p-3 text-[11px]">
                 <span className="text-zinc-500">RPC Health</span>

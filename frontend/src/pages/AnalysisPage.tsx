@@ -12,6 +12,7 @@ import {
 import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
+import { Button } from "../components/Button";
 import { PnlChart } from "../components/PnlChart";
 import { cn } from "../components/utils";
 import type { 
@@ -37,6 +38,7 @@ interface AnalysisPageProps {
   readinessStatus: ReadinessStatus | null;
   pnlTimeframe: string;
   onTimeframeChange: (t: any) => void;
+  onApplySuggestion: (suggestion: TuningSuggestion) => Promise<void>;
 }
 
 const AnalysisMetric: React.FC<{ label: string; value: string | number; color?: string }> = ({ label, value, color = "text-white" }) => (
@@ -72,7 +74,8 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   safetyStatus,
   readinessStatus,
   pnlTimeframe,
-  onTimeframeChange
+  onTimeframeChange,
+  onApplySuggestion
 }) => {
   const closed = trades.filter(t => t.lifecycle_status === "closed" && t.pnl_sol !== null);
   const timeframePnl = closed.reduce((total, t) => total + (t.pnl_sol || 0), 0);
@@ -177,6 +180,15 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                     <span className="text-[9px] font-bold text-zinc-600 uppercase">Suggested</span>
                     <span className="text-[10px] font-black text-amber-500 uppercase">{String(item.suggested_value)}</span>
                   </div>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="mt-3 w-full"
+                    onClick={() => onApplySuggestion(item)}
+                    disabled={item.suggested_value === undefined}
+                  >
+                    Implement
+                  </Button>
                 </div>
               ))}
             </div>

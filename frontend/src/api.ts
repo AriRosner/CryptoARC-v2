@@ -144,6 +144,14 @@ export async function fetchTuningSuggestions(): Promise<TuningSuggestion[]> {
   return request("/api/analytics/suggestions");
 }
 
+export async function applyTuningSuggestion(setting: string, suggested_value: string | number | boolean): Promise<{ setting: string; suggested_value: string | number | boolean; snapshot: BotSnapshot }> {
+  return request("/api/analytics/suggestions/apply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ setting, suggested_value })
+  });
+}
+
 export async function fetchReplayTimeline(tokenId: string): Promise<ReplayTimelineEvent[]> {
   return request(`/api/replay/timeline/${encodeURIComponent(tokenId)}`);
 }

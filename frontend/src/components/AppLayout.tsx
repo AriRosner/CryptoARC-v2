@@ -1,7 +1,6 @@
 import React from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Sidebar } from "./Sidebar";
-import { cn } from "./utils";
 
 interface AppLayoutProps {
   children: React.ReactNode;
@@ -32,6 +31,13 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
   walletBalance,
   toasts
 }) => {
+  const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => window.localStorage.getItem("cryptoarc_sidebar_collapsed") === "true");
+  const sidebarWidth = sidebarCollapsed ? 92 : 310;
+
+  React.useEffect(() => {
+    window.localStorage.setItem("cryptoarc_sidebar_collapsed", String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
+
   return (
     <div className="flex min-h-screen bg-[#08090f] text-zinc-100 selection:bg-amber-500/30 selection:text-white">
       {/* Dynamic Background */}
@@ -52,9 +58,16 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
         onLiveWalletOpen={onLiveWalletOpen}
         walletPublicKey={walletPublicKey}
         walletBalance={walletBalance}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={() => setSidebarCollapsed((current) => !current)}
       />
 
-      <main className="relative ml-[310px] flex-1 p-8">
+      <motion.main
+        layout
+        className="relative flex-1 p-8"
+        animate={{ marginLeft: sidebarWidth }}
+        transition={{ type: "spring", stiffness: 400, damping: 32 }}
+      >
         <AnimatePresence mode="wait">
           <motion.div
             key={activePage}
@@ -66,7 +79,7 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
             {children}
           </motion.div>
         </AnimatePresence>
-      </main>
+      </motion.main>
 
       {/* Toast Notifications */}
       <div className="fixed right-6 top-6 z-50 flex flex-col gap-3 w-80">

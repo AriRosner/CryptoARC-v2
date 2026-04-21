@@ -31,7 +31,24 @@ const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "w
   return "neutral";
 };
 
-const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 132px 118px 76px";
+const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 116px 132px 118px 76px";
+
+function formatTokenAge(seconds: number): string {
+  if (seconds < 60) return `${Math.max(0, Math.floor(seconds))}s`;
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    const remain = Math.floor(seconds % 60);
+    return remain ? `${minutes}m ${remain}s` : `${minutes}m`;
+  }
+  if (seconds < 86400) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  }
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  return hours ? `${days}d ${hours}h` : `${days}d`;
+}
 
 interface TokenRowProps {
   token: TokenSignal;
@@ -49,6 +66,7 @@ const TokenRow = React.memo(function TokenRow({
   onToggleWatch
 }: TokenRowProps) {
   const pnl = token.pnl_sol || 0;
+  const ageLabel = formatTokenAge(token.age_seconds || 0);
 
   return (
     <motion.div
@@ -112,6 +130,9 @@ const TokenRow = React.memo(function TokenRow({
         </Badge>
       </div>
       <div className="px-3 py-2.5">
+        <span className="whitespace-nowrap text-xs font-bold text-zinc-400">{ageLabel}</span>
+      </div>
+      <div className="px-3 py-2.5">
         <span className={cn(
           "whitespace-nowrap text-xs font-black tracking-tight",
           pnl > 0 ? "text-emerald-500" : pnl < 0 ? "text-rose-500" : "text-zinc-500"
@@ -135,6 +156,7 @@ const TokenRow = React.memo(function TokenRow({
   prev.token.name === next.token.name &&
   prev.token.score === next.token.score &&
   prev.token.status === next.token.status &&
+  prev.token.age_seconds === next.token.age_seconds &&
   prev.token.pnl_sol === next.token.pnl_sol
 ));
 
@@ -222,6 +244,7 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
             <div className="px-3">Watch</div>
             <div className="px-3">Score</div>
             <div className="px-3">Status</div>
+            <div className="px-3">Age</div>
             <div className="px-3">P&L (SOL)</div>
             <div className="px-4 text-right">Action</div>
           </div>
