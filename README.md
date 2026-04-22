@@ -1,8 +1,8 @@
 # CryptoARC v2
 
-CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting, and paper-trading dashboard. It is built to help study token-launch strategies without custody, private keys, or live transaction execution.
+CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting, paper-trading, and gated live-execution dashboard. It is built for single-user localhost operation with a paper-first workflow, wallet-scoped live controls, and explicit safety gates around any live activity.
 
-> Status: active paper-trading research platform. Live trading is intentionally blocked by default.
+> Status: active local research and trading workstation. Paper trading is the default, and live execution remains gated and disabled by default.
 
 ## Highlights
 
@@ -18,9 +18,12 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 - Formal ordered SQLite migrations with startup status reporting.
 - Stability watchdog with loop recovery status for production paper deployments.
 - Solana read-only RPC health and watched-wallet balance checks.
-- Manual browser-wallet live intent workbench with caps, quote previews, simulation warnings, audit records, confirmation recovery, and reconciliation.
+- Guided live-wallet workbench with wallet manager, active wallet selector, assisted browser-wallet flow, encrypted local hot-wallet flow, quote previews, simulation warnings, audit records, confirmation recovery, and reconciliation.
+- One armed live backend per session with wallet-scoped readiness, blockers, caps, and operator controls.
+- Encrypted-at-rest local hot wallet import/unlock/lock/clear flow for localhost unattended execution.
+- Autonomous live control plane with gated entries/exits, protective-exit allowance, kill switch support, and full audit chaining.
 - Local backup artifacts plus dashboard import/restore preview and confirm flows for SQLite state recovery.
-- Design-only localhost signer-daemon readiness contract with capability, health, and auth scaffold visibility.
+- Localhost signer-daemon health/capability scaffold with backend wiring for a separate signer service contract.
 - Wallet-scoped PnL views with paper/live wallet switching and SOL/USD display toggle.
 - Faster start/stop feedback with immediate runtime shutdown of source streaming and queued launch processing.
 - Dashboard auth with optional authenticator-app 2FA.
@@ -74,18 +77,19 @@ CryptoARC v2 is a local-first Pump.fun launch monitoring, research, backtesting,
 
 ## Safety Boundary
 
-CryptoARC v2 is paper-first. Live-money support is limited to a local manual browser-wallet flow that requires explicit environment enablement, user-set caps, and wallet approval for every transaction. The backend does not store signer material and does not autonomously sign, send, or resubmit transactions.
+CryptoARC v2 is still paper-first, but the current localhost build also includes gated live execution paths. Browser-wallet live remains assisted/manual, encrypted local hot-wallet execution is available for localhost use, and every live path stays behind environment, settings, cap, readiness, audit, and operator-arming controls.
 
 Default safety assumptions:
 
-- No private-key storage.
-- No automatic wallet signing or unattended live execution.
+- Encrypted local hot-wallet storage is supported for localhost use only.
+- Seed phrases remain out of scope.
 - `LIVE_TRADING_ENABLED=false` in normal use.
 - Dashboard password should be set before any network deployment.
 - Optional TOTP 2FA is available.
 - Paper-only mode remains the default and recommended mode.
-- Browser-wallet live actions are manual and audited; legacy manual live requests remain audit records only.
-- Autonomous live mode remains blocked until a reviewed executor, signer flow, and risk controller exist.
+- Browser-wallet live actions are assisted/manual unless the wallet environment explicitly supports unattended approval.
+- Autonomous live requires explicit settings enablement, a single armed backend, and passing readiness/risk gates.
+- Local signer-daemon execution should remain localhost-only and depends on an external daemon implementing the expected health and execute contract.
 
 ## Architecture
 
@@ -98,7 +102,8 @@ backend/
     core/
       models.py             Dataclasses and API payload shapes
       state.py              Bot state, replay, analytics, safety, monitoring
-      storage.py            SQLite persistence
+      storage.py            SQLite persistence, migrations, backup/restore
+      hot_wallet.py         Encrypted local hot-wallet vault
       strategy.py           Strategy Engine v3
       risk.py               Entry risk guardrails
       paper_trader.py       Paper position lifecycle and exits
@@ -108,7 +113,8 @@ backend/
       pumpfun_intelligence.py Pump.fun field research
 frontend/
   src/
-    main.tsx                Dashboard, settings, review, analysis, data pages
+    App.tsx                 Main dashboard shell and live-wallet workspace
+    main.tsx                Bootstrap entrypoint
     api.ts                  API client
     types.ts                Shared frontend types
 tests/
@@ -244,18 +250,16 @@ For any deployment beyond localhost, set a strong dashboard password, restrict C
 
 Near-term priorities:
 
-- Add formal database migrations.
-- Add import/export restore flows for full local backups.
 - Improve Pump.fun intelligence with additional trusted source adapters.
 - Add richer replay filters and saved experiment runs.
 - Add strategy-builder UX for cloning and comparing custom rule sets.
-- Continue hardening the manual browser-wallet flow with stronger reconciliation, operator recovery, and richer live ledger accounting.
-- Keep unattended signing and autonomous execution out of scope until a reviewed signer/executor architecture exists.
+- Continue hardening live reconciliation, operator recovery, and richer wallet-ledger accounting.
+- Mature the localhost signer-daemon contract and verification story without weakening the localhost-only boundary.
 
 ## AI Handoff
 
-If another AI agent takes over this repo, start with [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). It summarizes the architecture, current safety boundary, verification commands, and the rules for preserving the paper-first/manual-only live trading model.
+If another AI agent takes over this repo, start with [docs/AI_HANDOFF.md](docs/AI_HANDOFF.md). It summarizes the architecture, current safety boundary, verification commands, and the rules for preserving the paper-first, localhost-only live model.
 
 ## Disclaimer
 
-CryptoARC v2 is research software. It is not financial advice, does not guarantee profitable trading, and currently does not provide live execution. Token launches can be risky, volatile, manipulated, or illiquid. Use paper mode for research and validation.
+CryptoARC v2 is research software. It is not financial advice and does not guarantee profitable trading. Token launches can be risky, volatile, manipulated, or illiquid. Paper mode remains the recommended validation path, and any live use should stay localhost-only with conservative caps and explicit operator supervision.

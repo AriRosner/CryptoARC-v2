@@ -1923,11 +1923,11 @@ function App() {
             <p className="mt-3 text-xs leading-5 text-zinc-300">This removes the wallet from the active selector and resets the dashboard back to paper if that wallet is currently selected. It does not delete on-chain funds.</p>
           </div>
           <div className="flex justify-end gap-3">
-            <button className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-black uppercase tracking-widest text-zinc-300 transition hover:bg-white/[0.06]" onClick={() => setWalletPendingRemoval(null)}>
+            <button className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-bold tracking-wide text-zinc-300 transition hover:bg-white/[0.06]" onClick={() => setWalletPendingRemoval(null)}>
               Cancel
             </button>
             <button
-              className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-xs font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20"
+              className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-xs font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20"
               onClick={() => {
                 if (!walletPendingRemoval) return;
                 removeTrackedWallet(walletPendingRemoval);
@@ -1967,14 +1967,14 @@ function App() {
           </div>
           <div className="flex justify-end gap-3">
             <button
-              className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-black uppercase tracking-widest text-zinc-300 transition hover:bg-white/[0.06]"
+              className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-bold tracking-wide text-zinc-300 transition hover:bg-white/[0.06]"
               onClick={() => setPendingSuggestion(null)}
               disabled={applyingSuggestion}
             >
               Cancel
             </button>
             <button
-              className="rounded-lg border border-amber-400/30 bg-amber-400 px-4 py-2 text-xs font-black uppercase tracking-widest text-[#160f08] transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
+              className="rounded-lg border border-amber-400/30 bg-amber-400 px-4 py-2 text-xs font-bold tracking-wide text-[#160f08] transition hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-60"
               onClick={confirmApplyTuningSuggestion}
               disabled={applyingSuggestion || !pendingSuggestion}
             >
@@ -2518,31 +2518,31 @@ function GuidedLiveWalletModal({
 
   const primaryWorkspaceButtons = [
     !settings.live_session_acknowledged ? (
-      <button key="acknowledge" className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20" onClick={() => setPendingWorkspaceAction("acknowledge")}>
+      <button key="acknowledge" className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20" onClick={() => setPendingWorkspaceAction("acknowledge")}>
         Confirm Session
       </button>
     ) : null,
     activeBackend?.armed ? (
-      <button key="disarm" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("disarm")}>
+      <button key="disarm" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("disarm")}>
         Disarm
       </button>
     ) : (
-      <button key="arm" className="h-8 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-emerald-100 transition hover:bg-emerald-500/20" onClick={() => setPendingWorkspaceAction("arm")}>
+      <button key="arm" className="h-8 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 text-[10px] font-bold tracking-wide text-emerald-100 transition hover:bg-emerald-500/20" onClick={() => setPendingWorkspaceAction("arm")}>
         Arm Backend
       </button>
     ),
     method === "browser_wallet" ? (
-      <button key="reconnect" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("reconnect")}>
+      <button key="reconnect" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("reconnect")}>
         Reconnect
       </button>
     ) : null,
     method === "local_hot_wallet" && hotWalletStatus?.unlocked ? (
-      <button key="lock" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("lock")}>
+      <button key="lock" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("lock")}>
         Lock
       </button>
     ) : null,
     method === "local_hot_wallet" && hotWalletStatus?.imported ? (
-      <button key="clear" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("clear")}>
+      <button key="clear" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("clear")}>
         Clear Stored Key
       </button>
     ) : null
@@ -2627,7 +2627,7 @@ function GuidedLiveWalletModal({
                       <div className="rounded-2xl border border-white/5 bg-black/20 p-4">
                         <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Browser wallet connection</p>
                         <p className="mt-2 text-xs text-zinc-400">Connect the browser wallet now. The next step will review the public key, assisted mode, and current readiness state.</p>
-                        <button className="mt-4 h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20" onClick={handleStepPrimary} disabled={busyAction === "step"}>
+                        <button className="mt-4 h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20" onClick={handleStepPrimary} disabled={busyAction === "step"}>
                           {busyAction === "step" ? "Connecting" : walletPublicKey ? "Continue with Connected Wallet" : "Connect Browser Wallet"}
                         </button>
                       </div>
@@ -2637,7 +2637,7 @@ function GuidedLiveWalletModal({
                         <input className="h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletLabel} onChange={(event) => onHotWalletLabelChange(event.target.value)} placeholder="Wallet label (optional)" />
                         {!hotWalletStatus?.imported ? <textarea className="min-h-[88px] w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletPrivateKey} onChange={(event) => onHotWalletPrivateKeyChange(event.target.value)} placeholder="Base58 private key or byte array" /> : null}
                         <input className="h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" type="password" value={hotWalletPassword} onChange={(event) => onHotWalletPasswordChange(event.target.value)} placeholder={hotWalletStatus?.imported ? "Unlock password" : "Encryption password"} />
-                        <button className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={busyAction === "step" || (!hotWalletStatus?.imported && (!hotWalletPrivateKey.trim() || !hotWalletPassword.trim())) || (hotWalletStatus?.imported && !hotWalletStatus?.unlocked && !hotWalletPassword.trim())}>
+                        <button className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={busyAction === "step" || (!hotWalletStatus?.imported && (!hotWalletPrivateKey.trim() || !hotWalletPassword.trim())) || (hotWalletStatus?.imported && !hotWalletStatus?.unlocked && !hotWalletPassword.trim())}>
                           {busyAction === "step" ? (hotWalletStatus?.imported ? "Unlocking" : "Importing") : hotWalletStatus?.unlocked ? "Continue with Unlocked Wallet" : hotWalletStatus?.imported ? "Unlock Hot Wallet" : "Import & Encrypt"}
                         </button>
                       </div>
@@ -2655,7 +2655,7 @@ function GuidedLiveWalletModal({
                             <p className="mt-1 text-xs font-bold text-white">{connectionReady ? "healthy" : "not ready"}</p>
                           </div>
                         </div>
-                        <button className="mt-4 h-10 rounded-xl border border-sky-400/30 bg-sky-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-sky-100 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={!connectionReady}>
+                        <button className="mt-4 h-10 rounded-xl border border-sky-400/30 bg-sky-500/10 px-4 text-[10px] font-bold tracking-wide text-sky-100 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={!connectionReady}>
                           Continue with Daemon
                         </button>
                       </div>
@@ -2832,10 +2832,10 @@ function GuidedLiveWalletModal({
                     </div>
                     <div className="mt-4 flex flex-wrap gap-2">
                       {primaryWorkspaceButtons}
-                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
+                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
                         Switch Path
                       </button>
-                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(1); }}>
+                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(1); }}>
                         Edit Setup
                       </button>
                     </div>
@@ -2857,10 +2857,10 @@ function GuidedLiveWalletModal({
                           </div>
                         </div>
                         <div className="mt-4 flex flex-wrap gap-2">
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmWorkspaceAction} disabled={busyAction === pendingWorkspaceAction}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmWorkspaceAction} disabled={busyAction === pendingWorkspaceAction}>
                             {busyAction === pendingWorkspaceAction ? "Working" : "Confirm"}
                           </button>
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => setPendingWorkspaceAction(null)}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={() => setPendingWorkspaceAction(null)}>
                             Cancel
                           </button>
                         </div>
@@ -2903,7 +2903,7 @@ function GuidedLiveWalletModal({
                                         onChange={(event) => setPendingFixValues((current) => ({ ...current, [field.key]: event.target.value }))}
                                       />
                                       <button
-                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-zinc-200 transition hover:bg-white/10"
+                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-zinc-200 transition hover:bg-white/10"
                                         onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: String(field.recommended) }))}
                                       >
                                         Use Recommended
@@ -2912,19 +2912,19 @@ function GuidedLiveWalletModal({
                                   ) : (
                                     <div className="mt-3 flex flex-wrap gap-2">
                                       <button
-                                        className={`h-8 rounded-lg border px-3 text-[10px] font-black uppercase tracking-widest transition ${Boolean(pendingFixValues[field.key]) ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                                        className={`h-8 rounded-lg border px-3 text-[10px] font-bold tracking-wide transition ${Boolean(pendingFixValues[field.key]) ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
                                         onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: true }))}
                                       >
                                         Enabled
                                       </button>
                                       <button
-                                        className={`h-8 rounded-lg border px-3 text-[10px] font-black uppercase tracking-widest transition ${!Boolean(pendingFixValues[field.key]) ? "border-rose-500/30 bg-rose-500/10 text-rose-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                                        className={`h-8 rounded-lg border px-3 text-[10px] font-bold tracking-wide transition ${!Boolean(pendingFixValues[field.key]) ? "border-rose-500/30 bg-rose-500/10 text-rose-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
                                         onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: false }))}
                                       >
                                         Disabled
                                       </button>
                                       <button
-                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-zinc-200 transition hover:bg-white/10"
+                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-zinc-200 transition hover:bg-white/10"
                                         onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: Boolean(field.recommended) }))}
                                       >
                                         Use Recommended
@@ -2940,10 +2940,10 @@ function GuidedLiveWalletModal({
                           </div>
                         ) : null}
                         <div className="mt-4 flex flex-wrap gap-2">
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmBlockerFix} disabled={busyAction === `fix:${pendingFixBlocker}`}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmBlockerFix} disabled={busyAction === `fix:${pendingFixBlocker}`}>
                             {busyAction === `fix:${pendingFixBlocker}` ? "Applying" : blockerFixDescriptor(pendingFixBlocker)?.confirmLabel || blockerFixDescriptor(pendingFixBlocker)?.label || "Apply"}
                           </button>
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => { setPendingFixBlocker(null); setPendingFixValues({}); }}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={() => { setPendingFixBlocker(null); setPendingFixValues({}); }}>
                             Cancel
                           </button>
                         </div>
@@ -2958,7 +2958,7 @@ function GuidedLiveWalletModal({
                               <div key={warning} className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-3">
                                 <p className="text-xs font-bold text-amber-100">{warning}</p>
                                 {fix ? (
-                                  <button className="mt-3 h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15" onClick={() => openBlockerFix(warning)}>
+                                  <button className="mt-3 h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/15" onClick={() => openBlockerFix(warning)}>
                                     Fix
                                   </button>
                                 ) : null}
@@ -3004,8 +3004,8 @@ function GuidedLiveWalletModal({
                     <Bot size={18} className="text-amber-400" />
                   </div>
                   <div className="mb-4 flex flex-wrap gap-2">
-                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Create Manual Intent</button>
-                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Strategy Intents</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Create Manual Intent</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Strategy Intents</button>
                   </div>
                   <div className="max-h-[26rem] space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
                     {liveIntents.slice(0, 10).map((intent) => (
@@ -3020,8 +3020,8 @@ function GuidedLiveWalletModal({
                         <p className="mt-2 text-xs text-zinc-400">{intent.reason || "Live intent candidate"}</p>
                         {intent.autonomy_blocked ? <div className="mt-2 flex flex-wrap gap-2">{intent.autonomy_blockers.map((blocker) => <span key={blocker} className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.2em] text-amber-100">{blocker}</span>)}</div> : null}
                         <div className="mt-3 flex flex-wrap gap-2">
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
-                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
                         </div>
                       </article>
                     ))}
@@ -3047,9 +3047,9 @@ function GuidedLiveWalletModal({
                     <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Pool<select className="dashboard-select mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" value={livePool} onChange={(event) => onLivePoolChange(event.target.value)}>{["pump", "auto", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk"].map((pool) => <option key={pool} value={pool}>{pool}</option>)}</select></label>
                   </div>
                   <div className="mt-4 flex flex-wrap gap-2">
-                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
-                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                    <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
+                    <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                   </div>
                   {!envEnabled ? <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Live env is disabled, so quotes and signing are blocked. Wallet checks and setup still work.</p> : null}
                   {activeLiveAudit ? (
@@ -3071,7 +3071,7 @@ function GuidedLiveWalletModal({
                     <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Recovery & Review</h3>
                     <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
                   </div>
-                  <button className="h-9 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onRecoverAllLiveAudits} disabled={!reviewAudits.length}>Recover Unresolved</button>
+                  <button className="h-9 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onRecoverAllLiveAudits} disabled={!reviewAudits.length}>Recover Unresolved</button>
                 </div>
                 <div className="mb-3 grid gap-2 sm:grid-cols-4">
                   <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Unresolved <strong className="block pt-1 text-xs text-white">{liveStatus?.unresolved_audit_count ?? reviewAudits.length}</strong></span>
@@ -3088,7 +3088,7 @@ function GuidedLiveWalletModal({
                           <strong className="block truncate text-xs font-black uppercase tracking-[0.18em] text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
                           <span className="mt-1 block truncate text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500">{audit.transaction_signature || "missing signature"}</span>
                         </div>
-                        <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
+                        <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
                       </div>
                       <div className="mt-2 grid gap-2 text-[11px] text-zinc-400 sm:grid-cols-3">
                         <span>RPC: {audit.confirmation_status || String(audit.confirmation?.confirmation_status ?? "unknown")}</span>
@@ -3160,10 +3160,10 @@ function GuidedLiveWalletModal({
         {!workspaceVisible ? (
           <div className="border-t border-white/10 bg-[#0d0f18]/95 px-5 py-4 backdrop-blur-xl">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={stepIndex === 0 ? onClose : () => setStepIndex((current) => Math.max(0, current - 1))}>{stepIndex === 0 ? "Cancel" : "Back"}</button>
+              <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={stepIndex === 0 ? onClose : () => setStepIndex((current) => Math.max(0, current - 1))}>{stepIndex === 0 ? "Cancel" : "Back"}</button>
               <div className="flex flex-wrap gap-2">
-                {stepIndex === 4 ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setStepIndex(0)}>Switch Path</button> : null}
-                <button className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={(stepIndex === 1 && method === "local_signer_daemon" && !connectionReady) || busyAction === "step" || busyAction === "confirm"}>
+                {stepIndex === 4 ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setStepIndex(0)}>Switch Path</button> : null}
+                <button className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={(stepIndex === 1 && method === "local_signer_daemon" && !connectionReady) || busyAction === "step" || busyAction === "confirm"}>
                   {stepIndex === 0 ? "Continue" : stepIndex === 1 ? method === "browser_wallet" ? busyAction === "step" ? "Connecting" : walletPublicKey ? "Continue" : "Connect" : method === "local_hot_wallet" ? busyAction === "step" ? hotWalletStatus?.imported ? "Unlocking" : "Importing" : hotWalletStatus?.unlocked ? "Continue" : hotWalletStatus?.imported ? "Unlock" : "Import" : "Continue" : stepIndex === 2 ? "Continue" : stepIndex === 3 ? busyAction === "confirm" ? "Confirming" : "Confirm" : "Enter Workspace"}
                 </button>
               </div>
@@ -3382,7 +3382,7 @@ function LegacyLiveWalletModal({
                   <Wallet size={18} className="text-amber-400" />
                 </div>
                 <button
-                  className="mb-4 h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="mb-4 h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                   onClick={onConnectWallet}
                   disabled={method !== "browser_wallet"}
                 >
@@ -3396,10 +3396,10 @@ function LegacyLiveWalletModal({
                     ) : null}
                     <input className="h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" type="password" value={hotWalletPassword} onChange={(event) => onHotWalletPasswordChange(event.target.value)} placeholder={hotWalletStatus?.imported ? "Unlock password" : "Encryption password"} />
                     <div className="flex flex-wrap gap-2">
-                      {!hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onImportHotWallet}>Import & Encrypt</button> : null}
-                      {hotWalletStatus?.imported && !hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onUnlockHotWallet}>Unlock</button> : null}
-                      {hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={onLockHotWallet}>Lock</button> : null}
-                      {hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200" onClick={onClearHotWallet}>Clear Stored Key</button> : null}
+                      {!hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-200" onClick={onImportHotWallet}>Import & Encrypt</button> : null}
+                      {hotWalletStatus?.imported && !hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-200" onClick={onUnlockHotWallet}>Unlock</button> : null}
+                      {hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white" onClick={onLockHotWallet}>Lock</button> : null}
+                      {hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200" onClick={onClearHotWallet}>Clear Stored Key</button> : null}
                     </div>
                   </div>
                 ) : null}
@@ -3443,19 +3443,19 @@ function LegacyLiveWalletModal({
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
-                    className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
+                    className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10"
                     onClick={onAcknowledgeLive}
                   >
                     Acknowledge Risk
                   </button>
                   <button
-                    className="h-8 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-emerald-200 transition hover:bg-emerald-500/20"
+                    className="h-8 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 text-[10px] font-bold tracking-wide text-emerald-200 transition hover:bg-emerald-500/20"
                     onClick={onArmBackend}
                   >
                     Arm Backend
                   </button>
                   <button
-                    className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20"
+                    className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200 transition hover:bg-rose-500/20"
                     onClick={onDisarmBackend}
                   >
                     Disarm
@@ -3525,8 +3525,8 @@ function LegacyLiveWalletModal({
                   <Sparkles size={18} className="text-amber-400" />
                 </div>
                 <div className="mb-3 flex flex-wrap gap-2">
-                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
-                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Add Manual Intent</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Add Manual Intent</button>
                 </div>
                 <div className="mb-3 grid gap-2 sm:grid-cols-4">
                   <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Active <strong className="block pt-1 text-xs text-white">{liveStatus?.active_intent_count ?? liveIntents.length}</strong></span>
@@ -3557,8 +3557,8 @@ function LegacyLiveWalletModal({
                       ) : null}
                       {intent.operator_recommendation ? <p className="mt-2 text-xs text-zinc-500">{intent.operator_recommendation}</p> : null}
                       <div className="mt-3 flex gap-2">
-                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
-                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
+                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
+                        <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
                       </div>
                     </article>
                   ))}
@@ -3606,9 +3606,9 @@ function LegacyLiveWalletModal({
                   </label>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
-                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                  <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
+                  <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
                 {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and backend status checks still work.</p> : null}
                 {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness warnings now hard-block autonomous entries only when the backend gates require it. Manual/assisted flows can still be reviewed here.</p> : null}
@@ -3631,7 +3631,7 @@ function LegacyLiveWalletModal({
                 <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
               </div>
               <button
-                className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                 onClick={onRecoverAllLiveAudits}
                 disabled={!reviewAudits.length}
               >
@@ -3656,7 +3656,7 @@ function LegacyLiveWalletModal({
                       <strong className="block truncate text-xs font-black uppercase tracking-widest text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
                       <span className="mt-1 block truncate text-[10px] font-bold uppercase tracking-widest text-zinc-500">{audit.transaction_signature || "missing signature"}</span>
                     </div>
-                    <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
+                    <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
                   </div>
                   <div className="mt-2 grid gap-2 text-[11px] text-zinc-400 sm:grid-cols-3">
                     <span>RPC: {audit.confirmation_status || String(audit.confirmation?.confirmation_status ?? "unknown")}</span>

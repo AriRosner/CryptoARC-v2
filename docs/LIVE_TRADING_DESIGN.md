@@ -1,64 +1,84 @@
 # Live Trading Design
 
-CryptoARC v2 currently has no private-key storage, signer, or transaction sender. This document defines the intended path from paper trading to live trading without weakening the paper-only boundary.
+CryptoARC v2 now includes a localhost live-execution control plane in addition to its paper-trading workflow. This document describes what exists today, what is still constrained, and which safety boundaries must remain intact.
 
-## Phase 1: Read-Only Solana Integration
+## Current Runtime Model
 
-Implemented foundation:
+Implemented today:
 
-- Configure a Solana RPC URL from Settings.
-- Configure a public wallet address for balance checks.
-- Check RPC health and wallet SOL balance.
-- Never request, store, or derive private keys.
-- Never build, sign, simulate, or submit a transaction.
+- `LIVE_TRADING_ENABLED=false` remains the default environment posture.
+- Live execution is wallet-scoped and local-first.
+- One active live backend can be armed per session.
+- Browser-wallet execution is assisted/manual unless the wallet environment exposes unattended approval.
+- Encrypted local hot-wallet execution is available for localhost use after explicit private-key import and password unlock.
+- Local signer-daemon support is localhost-only and depends on an external daemon implementing the expected health and execute contract.
+- Every live path runs through intent, quote, simulation, submission, audit, confirmation, and reconciliation state.
 
-## Phase 2: Manual Live Execution MVP
+## Backend Paths
 
-Current MVP:
+### Browser Wallet
 
-- Dashboard/backend can store a manual live request with action, mint, amount, status, and reason.
-- Requests are audit-only and blocked by default.
-- Requests are subject to a manual amount cap.
-- Requests record why execution did not happen.
+Current behavior:
 
-Future manual execution requirements:
+- Best for assisted/manual live review.
+- Browser approval is still expected in normal environments.
+- Useful for quote preview, simulation review, manual signing, reconciliation, and audit visibility.
 
-- Environment-level `LIVE_TRADING_ENABLED=true`.
-- Explicit dashboard setting for manual live requests.
-- Strong dashboard password and 2FA.
-- Hardware wallet or external signer. No raw private keys in app storage.
-- Transaction simulation before signing.
-- Human confirmation for every transaction.
-- Durable audit record with simulation result, signer address, transaction signature, and final confirmation status.
+### Local Hot Wallet
 
-## Phase 3: Live Executor Module
+Current behavior:
 
-The executor should be a separate backend module with a narrow interface:
+- Private-key import only. Seed phrases remain out of scope.
+- Key material is encrypted at rest in the local vault.
+- Unlock is required each app start.
+- Can support localhost unattended execution once the operator explicitly enables autonomy, configures caps, acknowledges risk, and arms the backend.
+
+### Local Signer Daemon
+
+Current behavior:
+
+- Must stay localhost-only.
+- CryptoARC can probe daemon health/capability state and route through the daemon contract.
+- The repo does not ship the external signer daemon itself.
+- This path should be treated as infrastructure-dependent until the external daemon is present and validated.
+
+## Execution Flow
+
+Live execution is intentionally explicit:
 
 ```text
-prepare_quote(request) -> quote
-simulate_transaction(quote) -> simulation
-request_signature(simulation) -> signed_transaction
-submit_transaction(signed_transaction) -> signature
-confirm_transaction(signature) -> final_status
+strategy decision / operator action
+  -> live intent
+  -> quote creation
+  -> simulation
+  -> signing backend
+  -> submission
+  -> confirmation polling
+  -> reconciliation
+  -> audit + ledger update
 ```
 
-The strategy engine should never call the executor directly. It should create an execution intent that the safety controller reviews.
+The strategy layer should continue to create intents, not bypass the live control plane.
 
-## Phase 4: Autonomous Live Mode Later
+## Autonomy Gates
 
-Autonomous live mode stays disabled until all of these are true:
+Autonomous live is possible only when all of these are true:
 
-- At least 30 days of stable production paper trading.
-- Replay confidence and price-observation coverage stay above configured thresholds.
-- Manual live execution has been tested with tiny amounts and full audit logs.
-- Source reliability has alerting and fallback behavior.
-- A separate risk controller can halt entries, exits, and all live actions.
-- Deployment has HTTPS, auth, 2FA, backup, monitoring, and incident recovery.
+- `LIVE_TRADING_ENABLED=true`
+- dashboard live settings enable the required live mode
+- a single backend is armed
+- the requested wallet matches the armed live wallet
+- readiness, caps, and kill-switch checks pass
+- the selected backend reports the required signing capability
 
-## Non-Negotiable Safety Boundary
+Protective exits may still proceed when entry autonomy is halted, as long as the active backend can still execute them.
 
-- Paper mode remains the default.
-- `LIVE_TRADING_ENABLED=false` must be the default environment value.
-- Autonomous live mode must require both environment and dashboard gates.
-- Any future live path must produce an audit record before and after every action.
+## Non-Negotiable Safety Boundaries
+
+- Paper mode remains the default and recommended mode.
+- Live execution should remain localhost-only.
+- Seed phrases must not be added.
+- Remote signer exposure must not be added.
+- Any future signer-daemon work must preserve localhost-only endpoint enforcement.
+- Live actions must continue to produce durable audit and reconciliation records.
+- Browser-wallet execution should continue to degrade gracefully to assisted/manual behavior when unattended approval is unavailable.

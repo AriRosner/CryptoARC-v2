@@ -1,6 +1,6 @@
 # Production Paper Deployment
 
-CryptoARC v2 should be deployed as a paper-trading research app until the live execution design is complete, reviewed, and tested with tiny manual transactions.
+CryptoARC v2 should still be deployed as a paper-trading research app for any network-reachable environment. The repo now includes localhost live-execution capabilities, but those are intended for single-user localhost operation only.
 
 ## Paper Production Checklist
 
@@ -18,9 +18,9 @@ CryptoARC v2 should be deployed as a paper-trading research app until the live e
 ## Runtime Expectations
 
 - The bot can monitor PumpPortal, paper trade, replay, and backtest.
-- The Solana integration is read-only and only checks RPC health plus a public wallet balance.
-- Manual live requests are audit records only. They do not sign or submit transactions.
-- Autonomous live mode is a roadmap item, not a runtime feature.
+- The Solana integration includes read-only RPC checks plus gated live-wallet execution surfaces.
+- Assisted browser-wallet execution, encrypted local hot-wallet execution, and active-backend arming exist for localhost use.
+- Network deployment should still keep `LIVE_TRADING_ENABLED=false` and treat live execution as out of scope.
 
 ## Recovery Flow
 
@@ -36,4 +36,4 @@ If the dashboard stops showing detections:
 
 - Create a full restore artifact before upgrades or risky data operations.
 - Restore preview now validates the embedded SQLite payload itself, not just the artifact metadata.
-- After any restore, review schema status, source health, readiness, and live-wallet recovery status before resuming active monitoring.
+- After any restore, review schema status, source health, readiness, armed-backend state, and live-wallet recovery status before resuming active monitoring.
