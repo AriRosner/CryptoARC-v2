@@ -46,6 +46,28 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(() => window.localStorage.getItem("cryptoarc_sidebar_collapsed") === "true");
   const sidebarWidth = sidebarCollapsed ? 92 : 310;
 
+  const toastTone = (level: string) => {
+    if (level === "success") {
+      return {
+        border: "border-emerald-500/20",
+        rail: "bg-emerald-500",
+        title: "text-emerald-100"
+      };
+    }
+    if (level === "danger" || level === "error") {
+      return {
+        border: "border-rose-500/20",
+        rail: "bg-rose-500",
+        title: "text-rose-100"
+      };
+    }
+    return {
+      border: "border-amber-500/20",
+      rail: "bg-amber-500",
+      title: "text-white"
+    };
+  };
+
   React.useEffect(() => {
     window.localStorage.setItem("cryptoarc_sidebar_collapsed", String(sidebarCollapsed));
   }, [sidebarCollapsed]);
@@ -93,10 +115,10 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
               initial={{ opacity: 0, x: 50, scale: 0.9 }}
               animate={{ opacity: 1, x: 0, scale: 1 }}
               exit={{ opacity: 0, x: 20, scale: 0.95 }}
-              className="group relative overflow-hidden rounded-xl border border-white/10 bg-[#10121c]/90 p-4 shadow-2xl backdrop-blur-xl"
+              className={`group relative overflow-hidden rounded-xl border bg-[#10121c]/90 p-4 shadow-2xl backdrop-blur-xl ${toastTone(toast.level).border}`}
             >
-              <div className="absolute inset-y-0 left-0 w-1 bg-amber-500" />
-              <p className="text-xs font-bold text-white leading-tight">{toast.message}</p>
+              <div className={`absolute inset-y-0 left-0 w-1 ${toastTone(toast.level).rail}`} />
+              <p className={`text-xs font-bold leading-tight ${toastTone(toast.level).title}`}>{toast.message}</p>
               <p className="mt-1 text-[10px] text-zinc-500">
                 {new Date(toast.created_at).toLocaleTimeString()}
               </p>

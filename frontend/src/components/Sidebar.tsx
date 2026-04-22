@@ -282,7 +282,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     <select
                       value={activeWallet}
                       onChange={(event) => onActiveWalletChange(event.target.value)}
-                      className="dashboard-select rounded-lg border border-white/10 bg-black/50 px-2 py-2 text-xs font-bold normal-case tracking-normal text-white"
+                      className="dashboard-select h-8 rounded-lg border border-white/10 bg-black/50 px-2 py-1 text-xs font-bold normal-case tracking-normal text-white"
                     >
                       {walletOptions.map((wallet) => (
                         <option key={wallet.value} value={wallet.value}>{wallet.label}</option>

@@ -543,6 +543,21 @@ function App() {
   const liveWalletCoreRefreshInFlight = React.useRef(false);
   const liveWalletDetailRefreshInFlight = React.useRef(false);
 
+  const pushToast = React.useCallback((message: string, level: TradeEvent["level"] = "info") => {
+    const toast: TradeEvent = {
+      id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      created_at: new Date().toISOString(),
+      message,
+      level,
+      token_id: null,
+      subsystem: "ui"
+    };
+    setToasts((current) => [toast, ...current].slice(0, 4));
+  }, []);
+
+  const pushSuccessToast = React.useCallback((message: string) => pushToast(message, "success"), [pushToast]);
+  const pushErrorToast = React.useCallback((message: string) => pushToast(message, "danger"), [pushToast]);
+
   React.useEffect(() => {
     let closed = false;
     let retryTimer = 0;
@@ -818,8 +833,11 @@ function App() {
       setSnapshot(updated);
       setSettingsOpen(false);
       setApiError("");
+      pushSuccessToast("Settings saved");
     } catch (error) {
-      setApiError(`Save failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      const message = `Save failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
     }
   }
 
@@ -890,8 +908,11 @@ function App() {
     try {
       const preset = await saveStrategyPreset(`Preset ${new Date().toLocaleTimeString()}`, "Saved from Strategy Builder");
       setStrategyPresetsRemote((current) => [preset, ...current]);
+      pushSuccessToast("Strategy preset saved");
     } catch (error) {
-      setApiError(`Preset save failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      const message = `Preset save failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
     }
   }
 
@@ -1143,8 +1164,11 @@ function App() {
       await refreshAfterMutation({ page: workspacePage });
       setPendingSuggestion(null);
       setApiError("");
+      pushSuccessToast("Setting suggestion applied");
     } catch (error) {
-      setApiError(`Suggestion apply failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      const message = `Suggestion apply failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
     } finally {
       setApplyingSuggestion(false);
     }
@@ -1233,32 +1257,48 @@ function App() {
     }
   }
 
-  async function applyLiveQuickFix(kind: "enable_env" | "configure_caps" | "disable_kill_switch"): Promise<boolean> {
+  async function applyLiveQuickFix(
+    kind: "enable_env" | "configure_caps" | "disable_kill_switch",
+    overrides: Partial<{
+      live_trading_enabled: boolean;
+      manual_live_enabled: boolean;
+      live_max_trade_sol: number;
+      live_daily_loss_cap_sol: number;
+      live_wallet_exposure_cap_sol: number;
+      live_max_open_positions: number;
+      live_max_slippage_pct: number;
+      live_priority_fee_cap_sol: number;
+      kill_switch_enabled: boolean;
+    }> = {}
+  ): Promise<boolean> {
     try {
       const patch: Record<string, number | boolean | string> = {};
       if (kind === "enable_env") {
-        patch.live_trading_enabled = true;
-        patch.manual_live_enabled = true;
+        patch.live_trading_enabled = overrides.live_trading_enabled ?? true;
+        patch.manual_live_enabled = overrides.manual_live_enabled ?? true;
       }
       if (kind === "configure_caps") {
-        patch.manual_live_enabled = true;
-        patch.live_max_trade_sol = settings.live_max_trade_sol > 0 ? settings.live_max_trade_sol : 0.01;
-        patch.live_daily_loss_cap_sol = settings.live_daily_loss_cap_sol > 0 ? settings.live_daily_loss_cap_sol : 0.05;
-        patch.live_wallet_exposure_cap_sol = settings.live_wallet_exposure_cap_sol > 0 ? settings.live_wallet_exposure_cap_sol : 0.1;
-        patch.live_max_open_positions = settings.live_max_open_positions > 0 ? settings.live_max_open_positions : 2;
-        patch.live_max_slippage_pct = settings.live_max_slippage_pct > 0 ? settings.live_max_slippage_pct : 5;
-        patch.live_priority_fee_cap_sol = settings.live_priority_fee_cap_sol > 0 ? settings.live_priority_fee_cap_sol : 0.0001;
+        patch.manual_live_enabled = overrides.manual_live_enabled ?? true;
+        patch.live_max_trade_sol = overrides.live_max_trade_sol ?? (settings.live_max_trade_sol > 0 ? settings.live_max_trade_sol : 0.01);
+        patch.live_daily_loss_cap_sol = overrides.live_daily_loss_cap_sol ?? (settings.live_daily_loss_cap_sol > 0 ? settings.live_daily_loss_cap_sol : 0.05);
+        patch.live_wallet_exposure_cap_sol = overrides.live_wallet_exposure_cap_sol ?? (settings.live_wallet_exposure_cap_sol > 0 ? settings.live_wallet_exposure_cap_sol : 0.1);
+        patch.live_max_open_positions = overrides.live_max_open_positions ?? (settings.live_max_open_positions > 0 ? settings.live_max_open_positions : 2);
+        patch.live_max_slippage_pct = overrides.live_max_slippage_pct ?? (settings.live_max_slippage_pct > 0 ? settings.live_max_slippage_pct : 5);
+        patch.live_priority_fee_cap_sol = overrides.live_priority_fee_cap_sol ?? (settings.live_priority_fee_cap_sol > 0 ? settings.live_priority_fee_cap_sol : 0.0001);
       }
       if (kind === "disable_kill_switch") {
-        patch.kill_switch_enabled = false;
+        patch.kill_switch_enabled = overrides.kill_switch_enabled ?? false;
       }
       const updated = await patchSettings(patch);
       setSnapshot(updated);
       await refreshLiveExecutionSurfaces();
       setApiError("");
+      pushSuccessToast(kind === "configure_caps" ? "Live cap settings updated" : kind === "enable_env" ? "Live environment settings updated" : "Kill switch setting updated");
       return true;
     } catch (error) {
-      setApiError(`Live quick fix failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      const message = `Live quick fix failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
       return false;
     }
   }
@@ -2024,7 +2064,20 @@ function GuidedLiveWalletModal({
   onAcknowledgeLive: () => Promise<boolean>;
   onArmBackend: () => Promise<boolean>;
   onDisarmBackend: () => Promise<boolean>;
-  onApplyQuickFix: (kind: "enable_env" | "configure_caps" | "disable_kill_switch") => Promise<boolean>;
+  onApplyQuickFix: (
+    kind: "enable_env" | "configure_caps" | "disable_kill_switch",
+    overrides?: Partial<{
+      live_trading_enabled: boolean;
+      manual_live_enabled: boolean;
+      live_max_trade_sol: number;
+      live_daily_loss_cap_sol: number;
+      live_wallet_exposure_cap_sol: number;
+      live_max_open_positions: number;
+      live_max_slippage_pct: number;
+      live_priority_fee_cap_sol: number;
+      kill_switch_enabled: boolean;
+    }>
+  ) => Promise<boolean>;
   hotWalletStatus: HotWalletStatus | null;
   hotWalletPrivateKey: string;
   hotWalletPassword: string;
@@ -2053,12 +2106,32 @@ function GuidedLiveWalletModal({
   onRecoverLiveAudit: (auditId: string) => Promise<void>;
 }) {
   type WorkspaceAction = "acknowledge" | "arm" | "disarm" | "reconnect" | "lock" | "clear";
+  type BlockerFixField = {
+    key: string;
+    label: string;
+    kind: "number" | "toggle";
+    recommended: string | number | boolean;
+    current: string | number | boolean;
+    help: string;
+    min?: number;
+    step?: number;
+  };
+  type BlockerFixDescriptor = {
+    label: string;
+    title: string;
+    body: string;
+    tone: string;
+    confirmLabel?: string;
+    fields?: BlockerFixField[];
+    run: (values: Record<string, string | number | boolean>) => Promise<boolean> | boolean;
+  };
 
   const [stepIndex, setStepIndex] = React.useState(initialView === "workspace" ? 4 : 0);
   const [workspaceVisible, setWorkspaceVisible] = React.useState(initialView === "workspace");
   const [busyAction, setBusyAction] = React.useState("");
   const [pendingWorkspaceAction, setPendingWorkspaceAction] = React.useState<WorkspaceAction | null>(null);
   const [pendingFixBlocker, setPendingFixBlocker] = React.useState<string | null>(null);
+  const [pendingFixValues, setPendingFixValues] = React.useState<Record<string, string | number | boolean>>({});
   const [completionStamp, setCompletionStamp] = React.useState(0);
 
   React.useEffect(() => {
@@ -2066,6 +2139,7 @@ function GuidedLiveWalletModal({
     setWorkspaceVisible(initialView === "workspace");
     setPendingWorkspaceAction(null);
     setPendingFixBlocker(null);
+    setPendingFixValues({});
     setBusyAction("");
     setCompletionStamp(0);
   }, [initialView]);
@@ -2217,7 +2291,7 @@ function GuidedLiveWalletModal({
     }
   };
 
-  function blockerFixDescriptor(blocker: string): { label: string; title: string; body: string; tone: string; run: () => Promise<boolean> | boolean } | null {
+  function blockerFixDescriptor(blocker: string): BlockerFixDescriptor | null {
     const lower = blocker.toLowerCase();
     if (lower.includes("live_trading_enabled is false") || lower.includes("environment flag is disabled")) {
       return {
@@ -2225,7 +2299,29 @@ function GuidedLiveWalletModal({
         title: "Enable live execution environment",
         body: "This turns on the local live-trading environment flag and manual live support so the current backend can continue through readiness checks.",
         tone: "border-amber-400/20 bg-amber-500/10",
-        run: () => onApplyQuickFix("enable_env")
+        confirmLabel: "Apply Environment",
+        fields: [
+          {
+            key: "live_trading_enabled",
+            label: "Live trading enabled",
+            kind: "toggle",
+            recommended: true,
+            current: settings.live_trading_enabled,
+            help: "Recommended on so the active backend can pass environment gating."
+          },
+          {
+            key: "manual_live_enabled",
+            label: "Manual live enabled",
+            kind: "toggle",
+            recommended: true,
+            current: settings.manual_live_enabled,
+            help: "Recommended on so manual review and assisted flows remain available."
+          }
+        ],
+        run: (values) => onApplyQuickFix("enable_env", {
+          live_trading_enabled: Boolean(values.live_trading_enabled),
+          manual_live_enabled: Boolean(values.manual_live_enabled)
+        })
       };
     }
     if (lower.includes("live session acknowledgement")) {
@@ -2243,7 +2339,78 @@ function GuidedLiveWalletModal({
         title: "Apply recommended live caps",
         body: "This fills in missing live caps with conservative defaults so the backend can pass basic execution checks without opening the settings screen.",
         tone: "border-amber-400/20 bg-amber-500/10",
-        run: () => onApplyQuickFix("configure_caps")
+        confirmLabel: "Apply Cap Set",
+        fields: [
+          {
+            key: "live_max_trade_sol",
+            label: "Max trade SOL",
+            kind: "number",
+            recommended: 0.01,
+            current: settings.live_max_trade_sol,
+            help: "Recommended conservative ceiling for one live trade.",
+            min: 0.001,
+            step: 0.001
+          },
+          {
+            key: "live_daily_loss_cap_sol",
+            label: "Daily loss cap SOL",
+            kind: "number",
+            recommended: 0.05,
+            current: settings.live_daily_loss_cap_sol,
+            help: "Recommended maximum realized loss before entries halt.",
+            min: 0.001,
+            step: 0.001
+          },
+          {
+            key: "live_wallet_exposure_cap_sol",
+            label: "Wallet exposure SOL",
+            kind: "number",
+            recommended: 0.1,
+            current: settings.live_wallet_exposure_cap_sol,
+            help: "Recommended total wallet exposure cap across open positions.",
+            min: 0.001,
+            step: 0.001
+          },
+          {
+            key: "live_max_open_positions",
+            label: "Max open positions",
+            kind: "number",
+            recommended: 2,
+            current: settings.live_max_open_positions,
+            help: "Recommended compact live position count for safer operation.",
+            min: 1,
+            step: 1
+          },
+          {
+            key: "live_max_slippage_pct",
+            label: "Max slippage %",
+            kind: "number",
+            recommended: 5,
+            current: settings.live_max_slippage_pct,
+            help: "Recommended upper slippage bound for quote checks.",
+            min: 0.1,
+            step: 0.1
+          },
+          {
+            key: "live_priority_fee_cap_sol",
+            label: "Priority fee cap SOL",
+            kind: "number",
+            recommended: 0.0001,
+            current: settings.live_priority_fee_cap_sol,
+            help: "Recommended upper bound for priority fee spend per order.",
+            min: 0.00001,
+            step: 0.00001
+          }
+        ],
+        run: (values) => onApplyQuickFix("configure_caps", {
+          manual_live_enabled: true,
+          live_max_trade_sol: Number(values.live_max_trade_sol),
+          live_daily_loss_cap_sol: Number(values.live_daily_loss_cap_sol),
+          live_wallet_exposure_cap_sol: Number(values.live_wallet_exposure_cap_sol),
+          live_max_open_positions: Number(values.live_max_open_positions),
+          live_max_slippage_pct: Number(values.live_max_slippage_pct),
+          live_priority_fee_cap_sol: Number(values.live_priority_fee_cap_sol)
+        })
       };
     }
     if (lower.includes("kill switch")) {
@@ -2252,7 +2419,20 @@ function GuidedLiveWalletModal({
         title: "Disable manual kill switch",
         body: "This turns off the kill switch in dashboard settings so live execution can resume. Use only if you intentionally want the live backend to operate again.",
         tone: "border-rose-500/20 bg-rose-500/10",
-        run: () => onApplyQuickFix("disable_kill_switch")
+        confirmLabel: "Update Kill Switch",
+        fields: [
+          {
+            key: "kill_switch_enabled",
+            label: "Kill switch enabled",
+            kind: "toggle",
+            recommended: false,
+            current: settings.kill_switch_enabled,
+            help: "Recommended off only when you intentionally want live execution to resume."
+          }
+        ],
+        run: (values) => onApplyQuickFix("disable_kill_switch", {
+          kill_switch_enabled: Boolean(values.kill_switch_enabled)
+        })
       };
     }
     if (lower.includes("wallet public key is required") || lower.includes("no connected signer")) {
@@ -2304,6 +2484,19 @@ function GuidedLiveWalletModal({
     return null;
   }
 
+  function openBlockerFix(blocker: string) {
+    const descriptor = blockerFixDescriptor(blocker);
+    if (!descriptor) return;
+    const nextValues = Object.fromEntries(
+      (descriptor.fields ?? []).map((field) => [
+        field.key,
+        field.current !== "" && field.current !== 0 ? field.current : field.recommended
+      ])
+    );
+    setPendingFixValues(nextValues);
+    setPendingFixBlocker(blocker);
+  }
+
   async function confirmBlockerFix() {
     if (!pendingFixBlocker) return;
     const descriptor = blockerFixDescriptor(pendingFixBlocker);
@@ -2313,8 +2506,11 @@ function GuidedLiveWalletModal({
     }
     setBusyAction(`fix:${pendingFixBlocker}`);
     try {
-      const ok = await Promise.resolve(descriptor.run());
-      if (ok) setPendingFixBlocker(null);
+      const ok = await Promise.resolve(descriptor.run(pendingFixValues));
+      if (ok) {
+        setPendingFixBlocker(null);
+        setPendingFixValues({});
+      }
     } finally {
       setBusyAction("");
     }
@@ -2322,31 +2518,31 @@ function GuidedLiveWalletModal({
 
   const primaryWorkspaceButtons = [
     !settings.live_session_acknowledged ? (
-      <button key="acknowledge" className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20" onClick={() => setPendingWorkspaceAction("acknowledge")}>
+      <button key="acknowledge" className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20" onClick={() => setPendingWorkspaceAction("acknowledge")}>
         Confirm Session
       </button>
     ) : null,
     activeBackend?.armed ? (
-      <button key="disarm" className="h-10 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("disarm")}>
+      <button key="disarm" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("disarm")}>
         Disarm
       </button>
     ) : (
-      <button key="arm" className="h-10 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-emerald-100 transition hover:bg-emerald-500/20" onClick={() => setPendingWorkspaceAction("arm")}>
+      <button key="arm" className="h-8 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-emerald-100 transition hover:bg-emerald-500/20" onClick={() => setPendingWorkspaceAction("arm")}>
         Arm Backend
       </button>
     ),
     method === "browser_wallet" ? (
-      <button key="reconnect" className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("reconnect")}>
+      <button key="reconnect" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("reconnect")}>
         Reconnect
       </button>
     ) : null,
     method === "local_hot_wallet" && hotWalletStatus?.unlocked ? (
-      <button key="lock" className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("lock")}>
+      <button key="lock" className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("lock")}>
         Lock
       </button>
     ) : null,
     method === "local_hot_wallet" && hotWalletStatus?.imported ? (
-      <button key="clear" className="h-10 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("clear")}>
+      <button key="clear" className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("clear")}>
         Clear Stored Key
       </button>
     ) : null
@@ -2636,10 +2832,10 @@ function GuidedLiveWalletModal({
                     </div>
                     <div className="mt-4 flex flex-wrap gap-2">
                       {primaryWorkspaceButtons}
-                      <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
+                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
                         Switch Path
                       </button>
-                      <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(1); }}>
+                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(1); }}>
                         Edit Setup
                       </button>
                     </div>
@@ -2661,10 +2857,10 @@ function GuidedLiveWalletModal({
                           </div>
                         </div>
                         <div className="mt-4 flex flex-wrap gap-2">
-                          <button className="h-10 rounded-xl border border-white/10 bg-white/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmWorkspaceAction} disabled={busyAction === pendingWorkspaceAction}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmWorkspaceAction} disabled={busyAction === pendingWorkspaceAction}>
                             {busyAction === pendingWorkspaceAction ? "Working" : "Confirm"}
                           </button>
-                          <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/10" onClick={() => setPendingWorkspaceAction(null)}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => setPendingWorkspaceAction(null)}>
                             Cancel
                           </button>
                         </div>
@@ -2678,11 +2874,76 @@ function GuidedLiveWalletModal({
                           <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Current blocker</p>
                           <p className="mt-1 text-xs font-bold text-white">{pendingFixBlocker}</p>
                         </div>
+                        {(blockerFixDescriptor(pendingFixBlocker)?.fields ?? []).length ? (
+                          <div className="mt-4 space-y-3 rounded-xl border border-white/5 bg-black/20 p-3">
+                            <div className="flex items-center justify-between">
+                              <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Customize values</p>
+                              <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-amber-200">Recommended defaults shown</p>
+                            </div>
+                            <div className="grid gap-3">
+                              {(blockerFixDescriptor(pendingFixBlocker)?.fields ?? []).map((field) => (
+                                <div key={field.key} className="rounded-xl border border-white/5 bg-[#0d1018] p-3">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <p className="text-[10px] font-black uppercase tracking-[0.22em] text-white">{field.label}</p>
+                                      <p className="mt-1 text-[11px] leading-5 text-zinc-400">{field.help}</p>
+                                    </div>
+                                    <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.2em] text-amber-100">
+                                      Recommended {String(field.recommended)}
+                                    </span>
+                                  </div>
+                                  {field.kind === "number" ? (
+                                    <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]">
+                                      <input
+                                        className="h-10 rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white"
+                                        type="number"
+                                        min={field.min}
+                                        step={field.step}
+                                        value={String(pendingFixValues[field.key] ?? field.recommended)}
+                                        onChange={(event) => setPendingFixValues((current) => ({ ...current, [field.key]: event.target.value }))}
+                                      />
+                                      <button
+                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-zinc-200 transition hover:bg-white/10"
+                                        onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: String(field.recommended) }))}
+                                      >
+                                        Use Recommended
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                      <button
+                                        className={`h-8 rounded-lg border px-3 text-[10px] font-black uppercase tracking-widest transition ${Boolean(pendingFixValues[field.key]) ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                                        onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: true }))}
+                                      >
+                                        Enabled
+                                      </button>
+                                      <button
+                                        className={`h-8 rounded-lg border px-3 text-[10px] font-black uppercase tracking-widest transition ${!Boolean(pendingFixValues[field.key]) ? "border-rose-500/30 bg-rose-500/10 text-rose-100" : "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10"}`}
+                                        onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: false }))}
+                                      >
+                                        Disabled
+                                      </button>
+                                      <button
+                                        className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-zinc-200 transition hover:bg-white/10"
+                                        onClick={() => setPendingFixValues((current) => ({ ...current, [field.key]: Boolean(field.recommended) }))}
+                                      >
+                                        Use Recommended
+                                      </button>
+                                    </div>
+                                  )}
+                                  <p className="mt-2 text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500">
+                                    Current {String(field.current || (field.kind === "toggle" ? false : 0))}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
                         <div className="mt-4 flex flex-wrap gap-2">
-                          <button className="h-10 rounded-xl border border-white/10 bg-white/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmBlockerFix} disabled={busyAction === `fix:${pendingFixBlocker}`}>
-                            {busyAction === `fix:${pendingFixBlocker}` ? "Applying" : blockerFixDescriptor(pendingFixBlocker)?.label || "Apply"}
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmBlockerFix} disabled={busyAction === `fix:${pendingFixBlocker}`}>
+                            {busyAction === `fix:${pendingFixBlocker}` ? "Applying" : blockerFixDescriptor(pendingFixBlocker)?.confirmLabel || blockerFixDescriptor(pendingFixBlocker)?.label || "Apply"}
                           </button>
-                          <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/10" onClick={() => setPendingFixBlocker(null)}>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={() => { setPendingFixBlocker(null); setPendingFixValues({}); }}>
                             Cancel
                           </button>
                         </div>
@@ -2697,8 +2958,8 @@ function GuidedLiveWalletModal({
                               <div key={warning} className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-3">
                                 <p className="text-xs font-bold text-amber-100">{warning}</p>
                                 {fix ? (
-                                  <button className="mt-3 h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white transition hover:bg-white/15" onClick={() => setPendingFixBlocker(warning)}>
-                                    {fix.label}
+                                  <button className="mt-3 h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/15" onClick={() => openBlockerFix(warning)}>
+                                    Fix
                                   </button>
                                 ) : null}
                               </div>
@@ -2899,10 +3160,10 @@ function GuidedLiveWalletModal({
         {!workspaceVisible ? (
           <div className="border-t border-white/10 bg-[#0d0f18]/95 px-5 py-4 backdrop-blur-xl">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={stepIndex === 0 ? onClose : () => setStepIndex((current) => Math.max(0, current - 1))}>{stepIndex === 0 ? "Cancel" : "Back"}</button>
+              <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={stepIndex === 0 ? onClose : () => setStepIndex((current) => Math.max(0, current - 1))}>{stepIndex === 0 ? "Cancel" : "Back"}</button>
               <div className="flex flex-wrap gap-2">
-                {stepIndex === 4 ? <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setStepIndex(0)}>Switch Path</button> : null}
-                <button className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={(stepIndex === 1 && method === "local_signer_daemon" && !connectionReady) || busyAction === "step" || busyAction === "confirm"}>
+                {stepIndex === 4 ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setStepIndex(0)}>Switch Path</button> : null}
+                <button className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={(stepIndex === 1 && method === "local_signer_daemon" && !connectionReady) || busyAction === "step" || busyAction === "confirm"}>
                   {stepIndex === 0 ? "Continue" : stepIndex === 1 ? method === "browser_wallet" ? busyAction === "step" ? "Connecting" : walletPublicKey ? "Continue" : "Connect" : method === "local_hot_wallet" ? busyAction === "step" ? hotWalletStatus?.imported ? "Unlocking" : "Importing" : hotWalletStatus?.unlocked ? "Continue" : hotWalletStatus?.imported ? "Unlock" : "Import" : "Continue" : stepIndex === 2 ? "Continue" : stepIndex === 3 ? busyAction === "confirm" ? "Confirming" : "Confirm" : "Enter Workspace"}
                 </button>
               </div>
@@ -3121,7 +3382,7 @@ function LegacyLiveWalletModal({
                   <Wallet size={18} className="text-amber-400" />
                 </div>
                 <button
-                  className="mb-4 h-10 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 text-xs font-black uppercase tracking-widest text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  className="mb-4 h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                   onClick={onConnectWallet}
                   disabled={method !== "browser_wallet"}
                 >
@@ -3135,10 +3396,10 @@ function LegacyLiveWalletModal({
                     ) : null}
                     <input className="h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" type="password" value={hotWalletPassword} onChange={(event) => onHotWalletPasswordChange(event.target.value)} placeholder={hotWalletStatus?.imported ? "Unlock password" : "Encryption password"} />
                     <div className="flex flex-wrap gap-2">
-                      {!hotWalletStatus?.imported ? <button className="h-9 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onImportHotWallet}>Import & Encrypt</button> : null}
-                      {hotWalletStatus?.imported && !hotWalletStatus?.unlocked ? <button className="h-9 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onUnlockHotWallet}>Unlock</button> : null}
-                      {hotWalletStatus?.unlocked ? <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={onLockHotWallet}>Lock</button> : null}
-                      {hotWalletStatus?.imported ? <button className="h-9 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200" onClick={onClearHotWallet}>Clear Stored Key</button> : null}
+                      {!hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onImportHotWallet}>Import & Encrypt</button> : null}
+                      {hotWalletStatus?.imported && !hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onUnlockHotWallet}>Unlock</button> : null}
+                      {hotWalletStatus?.unlocked ? <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={onLockHotWallet}>Lock</button> : null}
+                      {hotWalletStatus?.imported ? <button className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200" onClick={onClearHotWallet}>Clear Stored Key</button> : null}
                     </div>
                   </div>
                 ) : null}
@@ -3182,19 +3443,19 @@ function LegacyLiveWalletModal({
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
-                    className="h-10 rounded-lg border border-white/10 bg-white/5 px-4 text-xs font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
+                    className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
                     onClick={onAcknowledgeLive}
                   >
                     Acknowledge Risk
                   </button>
                   <button
-                    className="h-10 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-4 text-xs font-black uppercase tracking-widest text-emerald-200 transition hover:bg-emerald-500/20"
+                    className="h-8 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-emerald-200 transition hover:bg-emerald-500/20"
                     onClick={onArmBackend}
                   >
                     Arm Backend
                   </button>
                   <button
-                    className="h-10 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 text-xs font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20"
+                    className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20"
                     onClick={onDisarmBackend}
                   >
                     Disarm
@@ -3264,8 +3525,8 @@ function LegacyLiveWalletModal({
                   <Sparkles size={18} className="text-amber-400" />
                 </div>
                 <div className="mb-3 flex flex-wrap gap-2">
-                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
-                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Add Manual Intent</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Add Manual Intent</button>
                 </div>
                 <div className="mb-3 grid gap-2 sm:grid-cols-4">
                   <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Active <strong className="block pt-1 text-xs text-white">{liveStatus?.active_intent_count ?? liveIntents.length}</strong></span>
@@ -3345,9 +3606,9 @@ function LegacyLiveWalletModal({
                   </label>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
-                  <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                  <button className="h-9 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
+                  <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
+                  <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
                 {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and backend status checks still work.</p> : null}
                 {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness warnings now hard-block autonomous entries only when the backend gates require it. Manual/assisted flows can still be reviewed here.</p> : null}
@@ -3370,7 +3631,7 @@ function LegacyLiveWalletModal({
                 <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
               </div>
               <button
-                className="h-9 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                 onClick={onRecoverAllLiveAudits}
                 disabled={!reviewAudits.length}
               >
