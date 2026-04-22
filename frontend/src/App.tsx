@@ -3371,7 +3371,7 @@ function LegacyLiveWalletModal({
             </button>
           </div>
 
-          <div className="mt-4 grid gap-4 xl:grid-cols-[0.85fr_1.15fr]">
+          <div className="mt-4 grid gap-4 xl:grid-cols-[0.92fr_1.08fr]">
             <div className="space-y-4">
               <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
                 <div className="mb-4 flex items-start justify-between gap-3">
@@ -3379,7 +3379,9 @@ function LegacyLiveWalletModal({
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Backend Access</h3>
                     <p className="mt-1 text-xs text-zinc-400">Use the wallet path that matches how you want execution to happen: assisted browser approval, encrypted local signing, or a separate localhost signer daemon.</p>
                   </div>
-                  <Wallet size={18} className="text-amber-400" />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                    <Wallet size={18} />
+                  </div>
                 </div>
                 <button
                   className="mb-4 h-8 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-300 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
@@ -3403,16 +3405,28 @@ function LegacyLiveWalletModal({
                     </div>
                   </div>
                 ) : null}
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="mb-2 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
                   {[
                     ["Wallet", shortAddress(walletDisplay || "")],
                     ["SOL balance", walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`],
+                    ["Signer mode", method.replace(/_/g, " ")],
+                    ["Readiness", `${readinessScore}% / ${readinessState}`]
+                  ].map(([label, value]) => (
+                    <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
+                      <p className="mt-1 truncate text-xs font-bold text-white">{value}</p>
+                    </div>
+                  ))}
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {[
                     ["Live env", envEnabled ? "enabled" : "disabled"],
                     ["Caps", capsSet ? "set" : "required"],
                     ["Acknowledgement", settings.live_session_acknowledged ? "done" : "needed"],
                     ["Live gates", liveStatus?.live_execution_available ? "open" : "blocked"],
                     ["Auto-sell", liveStatus?.auto_sell_available ? "available" : "blocked"],
-                    ["Auto-buy", liveStatus?.auto_buy_available ? "available" : "blocked"]
+                    ["Auto-buy", liveStatus?.auto_buy_available ? "available" : "blocked"],
+                    ["Armed backend", activeBackend?.armed ? shortAddress(activeBackend.wallet_public_key) : "not armed"]
                   ].map(([label, value]) => (
                     <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
                       <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
@@ -3428,7 +3442,9 @@ function LegacyLiveWalletModal({
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Blockers & Caps</h3>
                     <p className="mt-1 text-xs text-zinc-400">Review the current gate state before creating a quote preview.</p>
                   </div>
-                  <Shield size={18} className="text-amber-400" />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                    <Shield size={18} />
+                  </div>
                 </div>
                 <div className="space-y-2">
                   {blockers.length ? blockers.map((blocker) => (
@@ -3469,9 +3485,11 @@ function LegacyLiveWalletModal({
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Autonomy Control Plane</h3>
                     <p className="mt-1 text-xs text-zinc-400">One backend can be armed at a time. New entries stop when gates fail; protective exits can still flow if the active backend can execute them.</p>
                   </div>
-                  <Bot size={18} className="text-amber-400" />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                    <Bot size={18} />
+                  </div>
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
+                <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                   {[
                     ["Manual signing", liveStatus?.signer?.can_sign ? "available" : "not connected"],
                     ["Backend health", liveStatus?.signer?.healthy ? "healthy" : "degraded"],
@@ -3522,7 +3540,9 @@ function LegacyLiveWalletModal({
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Intent Queue</h3>
                     <p className="mt-1 text-xs text-zinc-400">Paper-promoted, watchlist, manual, and risk-generated live-position intents. Quotes expire after 30 seconds.</p>
                   </div>
-                  <Sparkles size={18} className="text-amber-400" />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                    <Sparkles size={18} />
+                  </div>
                 </div>
                 <div className="mb-3 flex flex-wrap gap-2">
                   <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Intents</button>
@@ -3572,7 +3592,9 @@ function LegacyLiveWalletModal({
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Quote Preview</h3>
                     <p className="mt-1 text-xs text-zinc-400">Quotes use PumpPortal local transactions. Browser wallet stays assisted/manual; hot wallet and daemon paths can sign, submit, and reconcile through the backend.</p>
                   </div>
-                  <Target size={18} className="text-amber-400" />
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                    <Target size={18} />
+                  </div>
                 </div>
                 <div className="grid gap-3 md:grid-cols-3">
                   <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
@@ -3630,13 +3652,18 @@ function LegacyLiveWalletModal({
                 <h3 className="text-sm font-black uppercase tracking-widest text-white">Recovery & Review</h3>
                 <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
               </div>
-              <button
-                className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-                onClick={onRecoverAllLiveAudits}
-                disabled={!reviewAudits.length}
-              >
-                Recover unresolved
-              </button>
+              <div className="flex items-center gap-2">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-300">
+                  <Activity size={18} />
+                </div>
+                <button
+                  className="h-8 rounded-lg border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-bold tracking-wide text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={onRecoverAllLiveAudits}
+                  disabled={!reviewAudits.length}
+                >
+                  Recover unresolved
+                </button>
+              </div>
             </div>
             <div className="mb-3 grid gap-2 sm:grid-cols-4">
               <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Unresolved <strong className="block pt-1 text-xs text-white">{liveStatus?.unresolved_audit_count ?? reviewAudits.length}</strong></span>
