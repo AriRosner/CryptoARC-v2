@@ -1003,17 +1003,18 @@ class BotState:
         return [run.to_dict() for run in self.storage.load_experiment_runs(100)]
 
     def create_experiment(self, name: str, profile: str | None = None, limit: int | None = None, notes: str = "") -> dict[str, object]:
+        clean_name = name.strip() or f"Experiment {utc_now().strftime('%H:%M:%S')}"
         result = self.backtest_v3(limit=limit or self.settings.backtest_replay_limit)
         run = ExperimentRun(
             id=new_id("exp"),
-            name=name or f"Experiment {utc_now().strftime('%H:%M:%S')}",
+            name=clean_name,
             created_at=utc_now(),
             settings_version_id=self.current_settings_version_id,
             profile=profile or self.settings.strategy_profile,
             replay_source="backtest_v3",
             result=result,
             fingerprint=str(result.get("determinism_fingerprint", "")),
-            notes=notes,
+            notes=notes.strip(),
         )
         self.storage.save_experiment_run(run)
         self.add_event("info", f"Experiment saved: {run.name}")
@@ -1045,16 +1046,32 @@ class BotState:
         return builtins + saved
 
     def save_strategy_preset(self, name: str, description: str = "") -> dict[str, object]:
+        clean_name = name.strip() or f"Preset {utc_now().strftime('%H:%M:%S')}"
         preset = StrategyPreset(
             id=new_id("strat"),
-            name=name,
+            name=clean_name,
             created_at=utc_now(),
             settings=asdict(self.settings),
-            description=description,
+            description=description.strip(),
         )
         self.storage.save_strategy_preset(preset)
-        self.add_event("info", f"Strategy preset saved: {name}")
+        self.add_event("info", f"Strategy preset saved: {clean_name}")
         return preset.to_dict()
+
+    def monitor_pnl_summary(self, timeframe: str = "all") -> dict[str, object]:
+        closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        filtered = self._filter_trades_by_timeframe(closed, timeframe)
+        curve = self._pnl_curve(filtered)
+        history = [0.0, *[float(point["pnl_sol"]) for point in curve]]
+        if len(history) > 40:
+            history = [0.0, *history[-39:]]
+        pnl_sol = round(sum((trade.pnl_sol or 0.0) for trade in filtered), 6)
+        return {
+            "timeframe": timeframe,
+            "closed_trade_count": len(filtered),
+            "pnl_sol": pnl_sol,
+            "history": history if history else [0.0],
+        }
 
     def ab_strategy_replay(self, limit: int = 120) -> BacktestRun:
         return self.compare_strategies(limit=limit)
@@ -2901,6 +2918,19 @@ class BotState:
         except ValueError:
             return None
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=utc_now().tzinfo)
+
+    def _filter_trades_by_timeframe(self, trades: list[TradeRecord], timeframe: str) -> list[TradeRecord]:
+        timeframe_windows = {
+            "5m": timedelta(minutes=5),
+            "15m": timedelta(minutes=15),
+            "1h": timedelta(hours=1),
+            "24h": timedelta(hours=24),
+        }
+        window = timeframe_windows.get(str(timeframe))
+        if window is None:
+            return trades
+        cutoff = utc_now() - window
+        return [trade for trade in trades if (trade.closed_at or trade.opened_at or utc_now()) >= cutoff]
 
     def export_data(self, target: str) -> dict[str, object]:
         if target == "tokens":

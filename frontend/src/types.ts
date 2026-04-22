@@ -416,6 +416,13 @@ export interface PerformanceAnalytics {
   recent_curve: Array<{ at: string; pnl_sol: number; trade_id: string }>;
 }
 
+export interface MonitorPnlSummary {
+  timeframe: "5m" | "15m" | "1h" | "24h" | "all" | string;
+  closed_trade_count: number;
+  pnl_sol: number;
+  history: number[];
+}
+
 export interface TuningSuggestion {
   title: string;
   reason: string;
@@ -675,6 +682,12 @@ export interface BackupRestoreStatus {
   history: BackupRestoreHistoryEntry[];
   latest_backup: BackupRestoreHistoryEntry | null;
   latest_restore: BackupRestoreHistoryEntry | null;
+  latest_failed_restore?: BackupRestoreHistoryEntry | null;
+  database_exists?: boolean;
+  database_path?: string;
+  database_size_bytes?: number;
+  history_count?: number;
+  recommended_action?: string;
 }
 
 export interface RestoreArtifactPreview {

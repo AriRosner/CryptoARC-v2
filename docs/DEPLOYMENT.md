@@ -31,3 +31,9 @@ If the dashboard stops showing detections:
 3. Click `Recover Bot` once.
 4. If the watchdog still reports stale ticks, restart the backend service.
 5. Export source events and trades before clearing data.
+
+## Local Backup / Restore Notes
+
+- Create a full restore artifact before upgrades or risky data operations.
+- Restore preview now validates the embedded SQLite payload itself, not just the artifact metadata.
+- After any restore, review schema status, source health, readiness, and live-wallet recovery status before resuming active monitoring.

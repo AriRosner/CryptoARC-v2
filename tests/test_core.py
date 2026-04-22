@@ -291,6 +291,18 @@ class CoreLogicTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 storage.preview_restore_artifact({"artifact_type": "cryptoarc_local_backup", "format_version": 1, "database_base64": "not-valid-base64"})
 
+    def test_restore_artifact_preview_rejects_non_sqlite_payload(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+            artifact = {
+                "artifact_type": "cryptoarc_local_backup",
+                "format_version": 1,
+                "database_base64": "bm90IGEgc3FsaXRlIGRhdGFiYXNl",
+            }
+
+            with self.assertRaises(ValueError):
+                storage.preview_restore_artifact(artifact)
+
     def test_restore_artifact_replaces_local_state_and_records_history(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "test.db"
@@ -306,6 +318,51 @@ class CoreLogicTests(unittest.TestCase):
             restored_ids = [item.id for item in state.storage.load_tokens()]
             self.assertIn(token.id, restored_ids)
             self.assertTrue(state.storage.load_backup_restore_history())
+
+    def test_monitor_pnl_summary_filters_by_timeframe(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            recent = TradeRecord(
+                id="trade_recent",
+                token_id="tok_recent",
+                mode="paper",
+                strategy_profile="balanced",
+                entry_price=0.00001,
+                exit_price=0.00002,
+                amount_sol=0.1,
+                pnl_sol=0.02,
+                entry_reason="test",
+                exit_reason="tp",
+                opened_at=now,
+                closed_at=now,
+                lifecycle_status="closed",
+            )
+            old = TradeRecord(
+                id="trade_old",
+                token_id="tok_old",
+                mode="paper",
+                strategy_profile="balanced",
+                entry_price=0.00001,
+                exit_price=0.000009,
+                amount_sol=0.1,
+                pnl_sol=-0.01,
+                entry_reason="test",
+                exit_reason="sl",
+                opened_at=now.replace(year=2025),
+                closed_at=now.replace(year=2025),
+                lifecycle_status="closed",
+            )
+            state.storage.save_trade(recent)
+            state.storage.save_trade(old)
+
+            summary_recent = state.monitor_pnl_summary("5m")
+            summary_all = state.monitor_pnl_summary("all")
+
+            self.assertEqual(summary_recent["closed_trade_count"], 1)
+            self.assertAlmostEqual(float(summary_recent["pnl_sol"]), 0.02)
+            self.assertEqual(summary_all["closed_trade_count"], 2)
+            self.assertAlmostEqual(float(summary_all["pnl_sol"]), 0.01)
 
     def test_fresh_state_defaults_to_pumpportal_source(self) -> None:
         with TemporaryDirectory() as directory:

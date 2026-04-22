@@ -1,5 +1,4 @@
 import React, { Suspense } from "react";
-import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
 import { motion } from "framer-motion";
 import {
   Activity,
@@ -45,8 +44,8 @@ import {
   fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
-  fetchMonitorTokens,
   fetchDataIntegrity,
+  fetchMonitorPnlSummary,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
   fetchPriceDiagnostics,
@@ -98,7 +97,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
@@ -119,8 +118,8 @@ type BrowserSolanaProvider = {
   publicKey?: { toString(): string };
   connect: () => Promise<{ publicKey: { toString(): string } }>;
   disconnect?: () => Promise<void>;
-  signAndSendTransaction?: (transaction: VersionedTransaction) => Promise<{ signature: string }>;
-  signTransaction?: (transaction: VersionedTransaction) => Promise<VersionedTransaction>;
+  signAndSendTransaction?: (transaction: any) => Promise<{ signature: string }>;
+  signTransaction?: (transaction: any) => Promise<any>;
 };
 
 declare global {
@@ -337,13 +336,75 @@ function buildLivePnlHistory(ledger: LiveLedger | null, timeframe: PnlTimeframe)
   return [0, current];
 }
 
+function simpleEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index += 1) {
+      if (!simpleEqual(left[index], right[index])) return false;
+    }
+    return true;
+  }
+  if (left && right && typeof left === "object" && typeof right === "object") {
+    const leftEntries = Object.entries(left as Record<string, unknown>);
+    const rightEntries = Object.entries(right as Record<string, unknown>);
+    if (leftEntries.length !== rightEntries.length) return false;
+    for (const [key, value] of leftEntries) {
+      if (!simpleEqual(value, (right as Record<string, unknown>)[key])) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function tokensEquivalent(left: TokenSignal, right: TokenSignal): boolean {
+  const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+  for (const key of keys) {
+    if (key === "age_seconds") continue;
+    if (!simpleEqual((left as unknown as Record<string, unknown>)[key], (right as unknown as Record<string, unknown>)[key])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function mergeMonitorTokens(current: TokenSignal[], incoming: TokenSignal[]): TokenSignal[] {
+  const currentById = new Map(current.map((token) => [token.id, token]));
   const byId = new Map<string, TokenSignal>();
-  for (const token of incoming) byId.set(token.id, token);
+  for (const token of incoming) {
+    const existing = currentById.get(token.id);
+    byId.set(token.id, existing && tokensEquivalent(existing, token) ? existing : token);
+  }
   for (const token of current) {
     if (token.status !== "skipped" && !byId.has(token.id)) byId.set(token.id, token);
   }
-  return [...byId.values()].sort((left, right) => new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime());
+  const merged = [...byId.values()].sort((left, right) => new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime());
+  if (merged.length === current.length && merged.every((token, index) => token === current[index])) {
+    return current;
+  }
+  return merged;
+}
+
+function mergeSnapshotState(current: BotSnapshot, incoming: BotSnapshot): BotSnapshot {
+  const mergedTokens = mergeMonitorTokens(current.tokens, incoming.tokens);
+  const sameEvents =
+    current.events.length === incoming.events.length &&
+    current.events.every((event, index) => simpleEqual(event, incoming.events[index]));
+  const sameStats = simpleEqual(current.stats, incoming.stats);
+  const sameSettings = simpleEqual(current.settings, incoming.settings);
+  const sameSource = simpleEqual(current.source_status, incoming.source_status);
+  const sameStatus = current.status === incoming.status;
+  if (sameStatus && sameSettings && sameStats && sameSource && sameEvents && mergedTokens === current.tokens) {
+    return current;
+  }
+  return {
+    ...incoming,
+    tokens: mergedTokens,
+    events: sameEvents ? current.events : incoming.events,
+    stats: sameStats ? current.stats : incoming.stats,
+    settings: sameSettings ? current.settings : incoming.settings,
+    source_status: sameSource ? current.source_status : incoming.source_status,
+  };
 }
 
 function LazyPanelFallback({ label }: { label: string }) {
@@ -364,6 +425,10 @@ function LazyPanelFallback({ label }: { label: string }) {
       </div>
     </div>
   );
+}
+
+async function loadSolanaWeb3() {
+  return import("@solana/web3.js");
 }
 
 function App() {
@@ -387,6 +452,7 @@ function App() {
   const [monitorTokens, setMonitorTokens] = React.useState<TokenSignal[]>([]);
   const [dataSummary, setDataSummary] = React.useState<DataSummary | null>(null);
   const [trades, setTrades] = React.useState<TradeRecord[]>([]);
+  const [paperPnlSummary, setPaperPnlSummary] = React.useState<MonitorPnlSummary | null>(null);
   const [priceObservations, setPriceObservations] = React.useState<PriceObservation[]>([]);
   const [strategyDecisions, setStrategyDecisions] = React.useState<StrategyDecisionRecord[]>([]);
   const [tradeSessions, setTradeSessions] = React.useState<TradeSession[]>([]);
@@ -448,18 +514,15 @@ function App() {
   const [totpRequired, setTotpRequired] = React.useState(false);
   const seenToastIds = React.useRef<Set<string>>(new Set());
   const readyForToasts = React.useRef(false);
-  const researchRefreshTimer = React.useRef<number | null>(null);
+  const monitorRefreshTimer = React.useRef<number | null>(null);
   const pnlRefreshInFlight = React.useRef(false);
-  const operationalRefreshInFlight = React.useRef(false);
-  const extendedRefreshInFlight = React.useRef(false);
-
-  function scheduleResearchRefresh() {
-    if (researchRefreshTimer.current !== null) return;
-    researchRefreshTimer.current = window.setTimeout(() => {
-      researchRefreshTimer.current = null;
-      refreshResearchData().catch(() => undefined);
-    }, 750);
-  }
+  const analysisRefreshInFlight = React.useRef(false);
+  const dataRefreshInFlight = React.useRef(false);
+  const backtestsRefreshInFlight = React.useRef(false);
+  const reviewRefreshInFlight = React.useRef(false);
+  const strategyPresetsRefreshInFlight = React.useRef(false);
+  const liveWalletCoreRefreshInFlight = React.useRef(false);
+  const liveWalletDetailRefreshInFlight = React.useRef(false);
 
   React.useEffect(() => {
     let closed = false;
@@ -478,7 +541,7 @@ function App() {
     fetchSnapshot()
       .then((data) => {
         data.events.forEach((event) => seenToastIds.current.add(event.id));
-        setSnapshot(data);
+        setSnapshot((current) => mergeSnapshotState(current, data));
         setMonitorTokens((current) => mergeMonitorTokens(current, data.tokens));
         setApiState("connected");
       })
@@ -489,7 +552,7 @@ function App() {
 
     function connect() {
       socket = openSnapshotSocket((data) => {
-        setSnapshot(data);
+        setSnapshot((current) => mergeSnapshotState(current, data));
         setMonitorTokens((current) => mergeMonitorTokens(current, data.tokens));
         retryDelay = 1000;
         if (!readyForToasts.current) {
@@ -504,7 +567,7 @@ function App() {
           .slice(0, 3);
         if (tradeEvents.length) {
           tradeEvents.forEach((event) => seenToastIds.current.add(event.id));
-          scheduleResearchRefresh();
+          scheduleMonitorRefresh();
           if (data.settings.enable_trade_toasts) {
             setToasts((current) => [...tradeEvents, ...current].slice(0, 4));
           }
@@ -526,8 +589,8 @@ function App() {
     return () => {
       closed = true;
       window.clearTimeout(retryTimer);
-      if (researchRefreshTimer.current !== null) {
-        window.clearTimeout(researchRefreshTimer.current);
+      if (monitorRefreshTimer.current !== null) {
+        window.clearTimeout(monitorRefreshTimer.current);
       }
       socket?.close();
     };
@@ -537,30 +600,27 @@ function App() {
   const stats = snapshot.stats;
   const tokenSource = monitorTokens.length ? monitorTokens : snapshot.tokens;
   const monitorLoading = apiState !== "connected" && tokenSource.length === 0 && trades.length === 0;
-  const pnlLoading = apiState !== "connected" && trades.length === 0 && !liveLedger;
+  const pnlLoading = apiState !== "connected" && !paperPnlSummary && !liveLedger;
   const tokenLoading = apiState !== "connected" && tokenSource.length === 0;
   const selectedLivePnlWallet = pnlWalletScope === "paper" ? "" : pnlWalletScope;
   const selectedToken = tokenSource.find((token) => token.id === selectedTokenId) ?? null;
   const effectiveBotStatus = botActionStatus || snapshot.status;
   const shouldPollPnl = workspacePage === "monitor" || liveWalletOpen;
-  const shouldPollResearch = workspacePage === "analysis" || workspacePage === "review" || workspacePage === "data" || liveWalletOpen;
-  const shouldFetchLiveOps = liveWalletOpen || workspacePage === "data" || Boolean(walletPublicKey);
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
-  const timeframeTrades = React.useMemo(() => timeframeClosedTrades(trades, pnlTimeframe), [pnlTimeframe, trades]);
-  const paperTimeframePnl = timeframeTrades.reduce((total, token) => total + (token.pnl_sol || 0), 0);
+  const paperTimeframePnl = Number((paperPnlSummary?.pnl_sol ?? stats.total_pnl_sol ?? 0).toFixed(6));
   const liveTimeframePnl = Number(((liveLedger?.summary.realized_pnl_sol ?? 0) + (liveLedger?.summary.unrealized_pnl_sol ?? 0)).toFixed(6));
   const timeframePnlSol = pnlWalletScope === "paper" ? paperTimeframePnl : liveTimeframePnl;
   const effectivePnlCurrency: PnlCurrency = pnlCurrency === "USD" && solUsdPrice > 0 ? "USD" : "SOL";
   const pnlDisplayMultiplier = effectivePnlCurrency === "USD" ? solUsdPrice : 1;
   const displayPnlValue = Number((timeframePnlSol * pnlDisplayMultiplier).toFixed(effectivePnlCurrency === "USD" ? 2 : 6));
   const paperPnlHistory = React.useMemo(() => {
-    const history = buildPnlHistory(trades, pnlTimeframe);
+    const history = paperPnlSummary?.history ?? [];
     if (history.length) return history;
     if (stats.closed_trades > 0 || stats.total_pnl_sol !== 0) {
       return [0, Number(stats.total_pnl_sol.toFixed(6))];
     }
     return [0, 0];
-  }, [trades, pnlTimeframe, stats.closed_trades, stats.total_pnl_sol]);
+  }, [paperPnlSummary?.history, stats.closed_trades, stats.total_pnl_sol]);
   const livePnlHistory = React.useMemo(() => {
     const history = buildLivePnlHistory(liveLedger, pnlTimeframe);
     if (history.length) return history;
@@ -576,9 +636,10 @@ function App() {
         ? "USD quote retrying; showing SOL"
         : "USD price loading"
     : "SOL display";
+  const deferredTokenSearch = React.useDeferredValue(tokenSearch);
   const filteredTokens = React.useMemo(() => {
     let tokens = tokenSource;
-    const query = tokenSearch.trim().toLowerCase();
+    const query = deferredTokenSearch.trim().toLowerCase();
     if (query) {
       tokens = tokens.filter((token) =>
         [token.symbol, token.name, token.mint, token.creator, token.reason, ...(token.intelligence_tags || [])]
@@ -609,7 +670,7 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, tokenSource, tokenSearch, showWatchlistOnly, hideSkippedTokens, watchSet]);
+  }, [deferredTokenSearch, queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, tokenSource, showWatchlistOnly, hideSkippedTokens, watchSet]);
 
   React.useEffect(() => {
     if (pnlWalletScope !== "live") return;
@@ -677,8 +738,12 @@ function App() {
       setSnapshot(await stopBot());
       setApiError("");
       refreshPnlData().catch(() => undefined);
-      refreshOperationalData().catch(() => undefined);
-      refreshExtendedResearchData().catch(() => undefined);
+      if (liveWalletOpen) {
+        refreshLiveWalletCoreData().catch(() => undefined);
+      }
+      if (workspacePage !== "monitor") {
+        refreshWorkspaceData(workspacePage).catch(() => undefined);
+      }
     } catch (error) {
       setApiError(`Stop failed: ${error instanceof Error ? error.message : "unknown error"}`);
     } finally {
@@ -769,30 +834,143 @@ function App() {
     }
   }
 
-  async function refreshConnectedWalletBalance(publicKey = walletPublicKey) {
+  const refreshConnectedWalletBalance = React.useCallback(async (publicKey = walletPublicKey) => {
     if (!publicKey) {
       setWalletBalanceSol(null);
       return;
     }
     try {
+      const { Connection, PublicKey } = await loadSolanaWeb3();
       const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
       const lamports = await connection.getBalance(new PublicKey(publicKey));
       setWalletBalanceSol(lamports / 1_000_000_000);
     } catch {
       setWalletBalanceSol(null);
     }
-  }
+  }, [snapshot.settings.solana_rpc_url, walletPublicKey]);
 
-  async function refreshOperationalData(includeLive = shouldFetchLiveOps) {
-    if (operationalRefreshInFlight.current) return;
-    operationalRefreshInFlight.current = true;
+  const refreshLiveWalletCoreData = React.useCallback(async (publicKey = walletPublicKey) => {
+    if (!publicKey && !liveWalletOpen) return;
+    if (liveWalletCoreRefreshInFlight.current) return;
+    liveWalletCoreRefreshInFlight.current = true;
     try {
-      const [summary, health, security, analytics, suggestions, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, liveState, auditRows, livePositionRows] = await Promise.all([
+      const [status, positions] = await Promise.all([
+        fetchLiveStatus(publicKey, liveWalletMethod),
+        publicKey ? fetchLivePositions(publicKey) : Promise.resolve([])
+      ]);
+      setLiveStatus(status);
+      setLivePositions(positions);
+      if (publicKey) {
+        refreshConnectedWalletBalance(publicKey).catch(() => undefined);
+      }
+    } finally {
+      liveWalletCoreRefreshInFlight.current = false;
+    }
+  }, [liveWalletMethod, liveWalletOpen, refreshConnectedWalletBalance, walletPublicKey]);
+
+  const refreshLiveWalletDetailData = React.useCallback(async (force = false) => {
+    if (!force && !liveWalletOpen) return;
+    if (liveWalletDetailRefreshInFlight.current) return;
+    liveWalletDetailRefreshInFlight.current = true;
+    try {
+      const [audits, intents, ledger] = await Promise.all([
+        fetchLiveAudit(),
+        fetchLiveIntents(),
+        selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(emptyLiveLedger())
+      ]);
+      setLiveAudit(audits);
+      setLiveIntents(intents);
+      setLiveLedger(ledger);
+    } finally {
+      liveWalletDetailRefreshInFlight.current = false;
+    }
+  }, [liveWalletOpen, selectedLivePnlWallet]);
+
+  const refreshAnalysisData = React.useCallback(async () => {
+    if (analysisRefreshInFlight.current) return;
+    analysisRefreshInFlight.current = true;
+    try {
+      const [analytics, suggestions, integrity, price, pumpfun, safety, readiness] = await Promise.all([
+        fetchPerformanceAnalytics(),
+        fetchTuningSuggestions(),
+        fetchDataIntegrity(),
+        fetchPriceDiagnostics(),
+        fetchPumpFunReport(),
+        fetchSafetyStatus(),
+        fetchReadinessStatus()
+      ]);
+      setPerformanceAnalytics(analytics);
+      setTuningSuggestions(suggestions);
+      setDataIntegrity(integrity);
+      setPriceDiagnostics(price);
+      setPumpfunReport(pumpfun);
+      setSafetyStatus(safety);
+      setReadinessStatus(readiness);
+    } finally {
+      analysisRefreshInFlight.current = false;
+    }
+  }, []);
+
+  const refreshStrategyPresetData = React.useCallback(async () => {
+    if (strategyPresetsRefreshInFlight.current) return;
+    strategyPresetsRefreshInFlight.current = true;
+    try {
+      setStrategyPresetsRemote(await fetchStrategyPresets());
+    } finally {
+      strategyPresetsRefreshInFlight.current = false;
+    }
+  }, []);
+
+  const refreshBacktestsData = React.useCallback(async () => {
+    if (backtestsRefreshInFlight.current) return;
+    backtestsRefreshInFlight.current = true;
+    try {
+      const [runs, experimentRows] = await Promise.all([
+        fetchBacktests(),
+        fetchExperiments()
+      ]);
+      setBacktests(runs);
+      setExperiments(experimentRows);
+    } finally {
+      backtestsRefreshInFlight.current = false;
+    }
+  }, []);
+
+  const refreshReviewData = React.useCallback(async () => {
+    if (reviewRefreshInFlight.current) return;
+    reviewRefreshInFlight.current = true;
+    try {
+      const [events, observations, decisions, sessions, versions, labels, analytics, suggestions] = await Promise.all([
+        fetchSourceEvents(),
+        fetchPriceObservations(),
+        fetchStrategyDecisions(),
+        fetchTradeSessions(),
+        fetchSettingsVersions(),
+        fetchTradeLabels(),
+        fetchPerformanceAnalytics(),
+        fetchTuningSuggestions()
+      ]);
+      setSourceEvents(events);
+      setPriceObservations(observations);
+      setStrategyDecisions(decisions);
+      setTradeSessions(sessions);
+      setSettingsVersions(versions);
+      setTradeLabels(labels);
+      setPerformanceAnalytics(analytics);
+      setTuningSuggestions(suggestions);
+    } finally {
+      reviewRefreshInFlight.current = false;
+    }
+  }, []);
+
+  const refreshDataPageData = React.useCallback(async () => {
+    if (dataRefreshInFlight.current) return;
+    dataRefreshInFlight.current = true;
+    try {
+      const [summary, health, security, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, audits, events, observations, decisions, sessions, versions, tradeRows] = await Promise.all([
         fetchDataSummary(),
         fetchSourceHealth(),
         fetchSecurityStatus(),
-        fetchPerformanceAnalytics(),
-        fetchTuningSuggestions(),
         fetchDataIntegrity(),
         fetchPriceDiagnostics(),
         fetchPumpFunReport(),
@@ -802,16 +980,18 @@ function App() {
         fetchSourceAdapters(),
         fetchWatchdogStatus(),
         fetchSolanaStatus(),
-        includeLive ? fetchLiveRequests() : Promise.resolve(null),
-        includeLive ? fetchLiveStatus(walletPublicKey, liveWalletMethod) : Promise.resolve(null),
-        includeLive ? fetchLiveAudit() : Promise.resolve(null),
-        includeLive ? fetchLivePositions(walletPublicKey) : Promise.resolve(null)
+        fetchLiveRequests(),
+        fetchLiveAudit(),
+        fetchSourceEvents(),
+        fetchPriceObservations(),
+        fetchStrategyDecisions(),
+        fetchTradeSessions(),
+        fetchSettingsVersions(),
+        fetchTrades()
       ]);
       setDataSummary(summary);
       setSourceHealth(health);
       setSecurityStatus(security);
-      setPerformanceAnalytics(analytics);
-      setTuningSuggestions(suggestions);
       setDataIntegrity(integrity);
       setPriceDiagnostics(price);
       setPumpfunReport(pumpfun);
@@ -821,51 +1001,61 @@ function App() {
       setSourceAdapters(adapters);
       setWatchdogStatus(watchdog);
       setSolanaStatus(solana);
-      if (liveRows) setLiveRequests(liveRows);
-      if (liveState) setLiveStatus(liveState);
-      if (auditRows) setLiveAudit(auditRows);
-      if (livePositionRows) setLivePositions(livePositionRows);
-    } finally {
-      operationalRefreshInFlight.current = false;
-    }
-  }
-
-  async function refreshExtendedResearchData() {
-    if (extendedRefreshInFlight.current) return;
-    extendedRefreshInFlight.current = true;
-    try {
-      const [runs, events, monitorRows, observations, decisions, sessions, versions, experimentRows, labels, presets, intentRows] = await Promise.all([
-        fetchBacktests(),
-        fetchSourceEvents(),
-        fetchMonitorTokens(),
-        fetchPriceObservations(),
-        fetchStrategyDecisions(),
-        fetchTradeSessions(),
-        fetchSettingsVersions(),
-        fetchExperiments(),
-        fetchTradeLabels(),
-        fetchStrategyPresets(),
-        fetchLiveIntents()
-      ]);
-      setBacktests(runs);
+      setLiveRequests(liveRows);
+      setLiveAudit(audits);
       setSourceEvents(events);
-      setMonitorTokens(monitorRows);
+      setTrades(tradeRows);
       setPriceObservations(observations);
       setStrategyDecisions(decisions);
       setTradeSessions(sessions);
       setSettingsVersions(versions);
-      setExperiments(experimentRows);
-      setTradeLabels(labels);
-      setStrategyPresetsRemote(presets);
-      setLiveIntents(intentRows);
     } finally {
-      extendedRefreshInFlight.current = false;
+      dataRefreshInFlight.current = false;
     }
-  }
+  }, []);
 
-  async function refreshResearchData() {
-    await Promise.all([refreshPnlData(), refreshOperationalData(), refreshExtendedResearchData()]);
+  const refreshWorkspaceData = React.useCallback(async (page = workspacePage) => {
+    if (page === "analysis") {
+      await refreshAnalysisData();
+      return;
+    }
+    if (page === "backtests") {
+      await refreshBacktestsData();
+      return;
+    }
+    if (page === "review") {
+      await refreshReviewData();
+      return;
+    }
+    if (page === "data") {
+      await refreshDataPageData();
+    }
+  }, [refreshAnalysisData, refreshBacktestsData, refreshDataPageData, refreshReviewData, workspacePage]);
+
+  const refreshAfterMutation = React.useCallback(async (options?: { includeLiveWalletDetail?: boolean; includeSnapshot?: boolean; page?: WorkspacePage }) => {
+    const page = options?.page ?? workspacePage;
+    await Promise.all([
+      refreshPnlData(),
+      liveWalletOpen ? refreshLiveWalletCoreData() : Promise.resolve(),
+      options?.includeLiveWalletDetail && liveWalletOpen ? refreshLiveWalletDetailData(true) : Promise.resolve(),
+      page !== "monitor" ? refreshWorkspaceData(page) : Promise.resolve(),
+      options?.includeSnapshot ? fetchSnapshot().then((data) => setSnapshot((current) => mergeSnapshotState(current, data))) : Promise.resolve()
+    ]);
     refreshConnectedWalletBalance().catch(() => undefined);
+  }, [liveWalletOpen, refreshConnectedWalletBalance, refreshLiveWalletCoreData, refreshLiveWalletDetailData, refreshPnlData, refreshWorkspaceData, workspacePage]);
+
+  function scheduleMonitorRefresh() {
+    if (monitorRefreshTimer.current !== null) return;
+    monitorRefreshTimer.current = window.setTimeout(() => {
+      monitorRefreshTimer.current = null;
+      refreshPnlData().catch(() => undefined);
+      if (liveWalletOpen) {
+        refreshLiveWalletCoreData().catch(() => undefined);
+      }
+      if (workspacePage !== "monitor") {
+        refreshWorkspaceData(workspacePage).catch(() => undefined);
+      }
+    }, 500);
   }
 
   function handleApplyTuningSuggestion(suggestion: TuningSuggestion) {
@@ -880,7 +1070,7 @@ function App() {
     try {
       const result = await applyTuningSuggestion(pendingSuggestion.setting, pendingSuggestion.suggested_value);
       setSnapshot(result.snapshot);
-      await refreshResearchData();
+      await refreshAfterMutation({ page: workspacePage });
       setPendingSuggestion(null);
       setApiError("");
     } catch (error) {
@@ -894,12 +1084,11 @@ function App() {
     if (pnlRefreshInFlight.current) return;
     pnlRefreshInFlight.current = true;
     try {
-      const [tradeRows, ledgerState] = await Promise.all([
-        fetchTrades(),
-        selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(emptyLiveLedger())
-      ]);
-      setTrades(tradeRows);
-      setLiveLedger(ledgerState);
+      if (selectedLivePnlWallet) {
+        setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
+        return;
+      }
+      setPaperPnlSummary(await fetchMonitorPnlSummary(pnlTimeframe));
     } finally {
       pnlRefreshInFlight.current = false;
     }
@@ -920,8 +1109,7 @@ function App() {
     try {
       const summary = await clearData(target);
       setDataSummary(summary);
-      await refreshResearchData();
-      setSnapshot(await fetchSnapshot());
+      await refreshAfterMutation({ includeSnapshot: true, page: workspacePage });
     } catch (error) {
       setApiError(`Clear failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -931,7 +1119,7 @@ function App() {
     try {
       const updated = await reviewLiveRequest(requestId, status, "Dashboard audit review");
       setLiveRequests((current) => current.map((request) => request.id === requestId ? updated : request));
-      await refreshResearchData();
+      await refreshAfterMutation({ page: workspacePage });
     } catch (error) {
       setApiError(`Live request review failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -950,9 +1138,10 @@ function App() {
       const nextWallets = [publicKey, ...liveWallets.filter((wallet) => wallet !== publicKey)].slice(0, 8);
       setLiveWallets(nextWallets);
       window.localStorage.setItem("cryptoarc_live_wallets", JSON.stringify(nextWallets));
-      setLiveStatus(await fetchLiveStatus(publicKey, liveWalletMethod));
-      setLivePositions(await fetchLivePositions(publicKey));
-      await refreshConnectedWalletBalance(publicKey);
+      await Promise.all([
+        refreshLiveWalletCoreData(publicKey),
+        liveWalletOpen ? refreshLiveWalletDetailData(true) : Promise.resolve()
+      ]);
       setApiError("");
     } catch (error) {
       setApiError(`Wallet connect failed: ${error instanceof Error ? error.message : "unknown error"}`);
@@ -964,7 +1153,7 @@ function App() {
       await acknowledgeLiveSession();
       const updated = await fetchSnapshot();
       setSnapshot(updated);
-      setLiveStatus(await fetchLiveStatus(walletPublicKey, liveWalletMethod));
+      await refreshLiveWalletCoreData();
     } catch (error) {
       setApiError(`Live acknowledgement failed: ${error instanceof Error ? error.message : "unknown error"}`);
     }
@@ -1028,7 +1217,7 @@ function App() {
       setActiveLiveAudit(audit);
       setActiveLiveIntentId(intentId);
       setLiveAudit((current) => [audit, ...current.filter((item) => item.id !== audit.id)]);
-      setLiveIntents(await fetchLiveIntents());
+      refreshLiveWalletDetailData(true).catch(() => undefined);
       setApiError("");
     } catch (error) {
       setApiError(`Intent quote failed: ${error instanceof Error ? error.message : "unknown error"}`);
@@ -1050,6 +1239,7 @@ function App() {
     try {
       const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
       if (!encoded) throw new Error("No unsigned transaction is available");
+      const { Connection, VersionedTransaction } = await loadSolanaWeb3();
       const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
       const transaction = VersionedTransaction.deserialize(bytes);
       const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
@@ -1064,7 +1254,7 @@ function App() {
       const updated = await recordLiveSimulation(activeLiveAudit.id, ok, warning, "", result);
       setActiveLiveAudit(updated);
       setLiveAudit((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
-      setLiveIntents(await fetchLiveIntents());
+      refreshLiveWalletDetailData(true).catch(() => undefined);
       setApiError("");
     } catch (error) {
       const updated = await recordLiveSimulation(activeLiveAudit.id, false, "RPC simulation could not complete; manual signing remains available.", error instanceof Error ? error.message : "unknown error", {});
@@ -1079,6 +1269,7 @@ function App() {
       if (!window.solana) throw new Error("Browser wallet not connected");
       const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
       if (!encoded) throw new Error("No unsigned transaction is available");
+      const { Connection, VersionedTransaction } = await loadSolanaWeb3();
       const bytes = Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0));
       const transaction = VersionedTransaction.deserialize(bytes);
       let signature = "";
@@ -1097,12 +1288,11 @@ function App() {
       const confirmed = await confirmLiveAudit(submitted.id, confirmation.value.err ? "failed" : "confirmed", confirmation.value.err ? JSON.stringify(confirmation.value.err) : "");
       setActiveLiveAudit(confirmed);
       setLiveAudit((current) => [confirmed, ...current.filter((item) => item.id !== confirmed.id)]);
-      setLivePositions(await fetchLivePositions(walletPublicKey));
-      setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
-      setLiveIntents(await fetchLiveIntents());
+      await refreshLiveWalletCoreData();
+      await refreshLiveWalletDetailData(true);
       if (activeLiveIntentId) {
         await reconcileLiveIntent(activeLiveIntentId).catch(() => undefined);
-        setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
+        await refreshLiveWalletDetailData(true);
       }
     } catch (error) {
       setApiError(`Wallet submit failed: ${error instanceof Error ? error.message : "unknown error"}`);
@@ -1110,20 +1300,11 @@ function App() {
   }
 
   async function refreshLiveExecutionSurfaces() {
-    const [status, audits, positions, intents, ledger] = await Promise.all([
-      fetchLiveStatus(walletPublicKey, liveWalletMethod),
-      fetchLiveAudit(),
-      fetchLivePositions(walletPublicKey),
-      fetchLiveIntents(),
-      fetchLiveLedger(selectedLivePnlWallet)
+    await Promise.all([
+      refreshLiveWalletCoreData(),
+      refreshLiveWalletDetailData(true)
     ]);
-    setLiveStatus(status);
-    setLiveAudit(audits);
-    setLivePositions(positions);
-    setLiveIntents(intents);
-    setLiveLedger(ledger);
   }
-
   async function recoverAllLiveAudits() {
     try {
       const result = await recoverUnresolvedLiveAudit();
@@ -1150,39 +1331,63 @@ function App() {
   React.useEffect(() => {
     refreshPnlData().catch(() => undefined);
     refreshSolUsdPrice().catch(() => undefined);
-    refreshResearchData().catch(() => undefined);
-  }, []);
+    refreshStrategyPresetData().catch(() => undefined);
+    if (workspacePage !== "monitor") {
+      refreshWorkspaceData(workspacePage).catch(() => undefined);
+    }
+  }, [refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, workspacePage]);
+
+  React.useEffect(() => {
+    if (!settingsOpen) return;
+    refreshStrategyPresetData().catch(() => undefined);
+  }, [refreshStrategyPresetData, settingsOpen]);
 
   React.useEffect(() => {
     if (!shouldPollPnl && !selectedLivePnlWallet) return;
     refreshPnlData().catch(() => undefined);
-  }, [selectedLivePnlWallet, shouldPollPnl]);
+  }, [pnlTimeframe, selectedLivePnlWallet, shouldPollPnl]);
 
   React.useEffect(() => {
     if (!shouldPollPnl) return;
     const interval = window.setInterval(() => {
       refreshPnlData().catch(() => undefined);
-    }, effectiveBotStatus === "running" ? 3000 : 12000);
+    }, effectiveBotStatus === "running" ? 5000 : 15000);
     return () => window.clearInterval(interval);
-  }, [effectiveBotStatus, selectedLivePnlWallet, shouldPollPnl]);
-
-  React.useEffect(() => {
-    const intervalMs = shouldPollResearch
-      ? (effectiveBotStatus === "running" ? 5000 : 15000)
-      : (effectiveBotStatus === "running" ? 12000 : 30000);
-    const interval = window.setInterval(() => {
-      refreshOperationalData().catch(() => undefined);
-    }, intervalMs);
-    return () => window.clearInterval(interval);
-  }, [effectiveBotStatus, shouldFetchLiveOps, shouldPollResearch, walletPublicKey, liveWalletMethod]);
+  }, [effectiveBotStatus, pnlTimeframe, selectedLivePnlWallet, shouldPollPnl]);
 
   React.useEffect(() => {
     if (workspacePage === "monitor" && !liveWalletOpen) return;
-    refreshOperationalData().catch(() => undefined);
-    if (workspacePage !== "monitor") {
-      refreshExtendedResearchData().catch(() => undefined);
+    const intervalMs = workspacePage === "monitor"
+      ? (effectiveBotStatus === "running" ? 8000 : 18000)
+      : (effectiveBotStatus === "running" ? 9000 : 22000);
+    const interval = window.setInterval(() => {
+      if (liveWalletOpen) {
+        refreshLiveWalletCoreData().catch(() => undefined);
+      }
+      if (workspacePage !== "monitor") {
+        refreshWorkspaceData(workspacePage).catch(() => undefined);
+      }
+    }, intervalMs);
+    return () => window.clearInterval(interval);
+  }, [effectiveBotStatus, liveWalletOpen, refreshLiveWalletCoreData, refreshWorkspaceData, workspacePage]);
+
+  React.useEffect(() => {
+    if (liveWalletOpen) {
+      refreshLiveWalletCoreData().catch(() => undefined);
+      refreshLiveWalletDetailData(true).catch(() => undefined);
     }
-  }, [workspacePage, liveWalletOpen, liveWalletMethod]);
+    if (workspacePage !== "monitor") {
+      refreshWorkspaceData(workspacePage).catch(() => undefined);
+    }
+  }, [liveWalletOpen, refreshLiveWalletCoreData, refreshLiveWalletDetailData, refreshWorkspaceData, workspacePage]);
+
+  React.useEffect(() => {
+    if (!liveWalletOpen) return;
+    const interval = window.setInterval(() => {
+      refreshLiveWalletDetailData().catch(() => undefined);
+    }, effectiveBotStatus === "running" ? 9000 : 20000);
+    return () => window.clearInterval(interval);
+  }, [effectiveBotStatus, liveWalletOpen, refreshLiveWalletDetailData]);
 
   React.useEffect(() => {
     const interval = window.setInterval(() => {
@@ -1197,13 +1402,10 @@ function App() {
       return;
     }
     Promise.all([
-      fetchLiveStatus(walletPublicKey, liveWalletMethod).then(setLiveStatus),
-      fetchLivePositions(walletPublicKey).then(setLivePositions),
-      fetchLiveIntents().then(setLiveIntents),
-      (selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(emptyLiveLedger())).then(setLiveLedger),
-      refreshConnectedWalletBalance(walletPublicKey)
+      refreshLiveWalletCoreData(walletPublicKey),
+      liveWalletOpen ? refreshLiveWalletDetailData(true) : Promise.resolve(),
     ]).catch(() => undefined);
-  }, [walletPublicKey, selectedLivePnlWallet, snapshot.settings.solana_rpc_url, liveWalletMethod]);
+  }, [liveWalletOpen, refreshLiveWalletCoreData, refreshLiveWalletDetailData, walletPublicKey]);
 
   if (authRequired && !authed) {
     return <AuthGate totpRequired={totpRequired} onAuthed={() => setAuthed(true)} onError={setApiError} error={apiError} />;
@@ -1233,7 +1435,7 @@ function App() {
           solUsdPrice={solUsdPrice}
           onTogglePnlCurrency={togglePnlCurrency}
           pnlCaption={pnlWalletScope === "paper"
-            ? `${timeframeTrades.length} closed paper trades in selected range`
+            ? `${paperPnlSummary?.closed_trade_count ?? 0} closed paper trades in selected range`
             : `${liveLedger?.summary.open_positions ?? 0} live positions / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"} P&L`}
           liveWallets={liveWallets}
           walletPublicKey={walletPublicKey}
@@ -1353,11 +1555,11 @@ function App() {
             liveRequests={liveRequests}
             liveAudit={liveAudit}
             auditEvents={snapshot.events}
-            onRefresh={refreshResearchData}
+            onRefresh={() => refreshWorkspaceData("data")}
             onRecover={async () => {
               const updated = await recoverWatchdog();
               setSnapshot(updated);
-              await refreshResearchData();
+              await refreshAfterMutation({ page: "data" });
             }}
             onReviewLiveRequest={reviewManualLiveRequest}
             onClear={clearProjectData}

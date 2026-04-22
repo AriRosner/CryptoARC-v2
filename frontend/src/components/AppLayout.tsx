@@ -1,5 +1,5 @@
 import React from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import { Sidebar } from "./Sidebar";
 
 interface AppLayoutProps {
@@ -62,24 +62,9 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
         onToggleCollapsed={() => setSidebarCollapsed((current) => !current)}
       />
 
-      <motion.main
-        layout
-        className="relative flex-1 p-8"
-        animate={{ marginLeft: sidebarWidth }}
-        transition={{ type: "spring", stiffness: 400, damping: 32 }}
-      >
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activePage}
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -10 }}
-            transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
-          >
-            {children}
-          </motion.div>
-        </AnimatePresence>
-      </motion.main>
+      <main className="relative flex-1 p-8" style={{ marginLeft: sidebarWidth }}>
+        {children}
+      </main>
 
       {/* Toast Notifications */}
       <div className="fixed right-6 top-6 z-50 flex flex-col gap-3 w-80">

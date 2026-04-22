@@ -648,6 +648,11 @@ async def performance_analytics() -> dict:
     return state.performance_analytics()
 
 
+@app.get("/api/monitor/pnl", dependencies=[Depends(require_auth)])
+async def monitor_pnl(timeframe: Literal["5m", "15m", "1h", "24h", "all"] = "all") -> dict:
+    return state.monitor_pnl_summary(timeframe)
+
+
 @app.get("/api/analytics/suggestions", dependencies=[Depends(require_auth)])
 async def tuning_suggestions() -> list[dict]:
     return state.tuning_suggestions()

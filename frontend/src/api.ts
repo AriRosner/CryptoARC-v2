@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -138,6 +138,10 @@ export async function fetchSettingsVersions(): Promise<SettingsVersion[]> {
 
 export async function fetchPerformanceAnalytics(): Promise<PerformanceAnalytics> {
   return request("/api/analytics/performance");
+}
+
+export async function fetchMonitorPnlSummary(timeframe: string): Promise<MonitorPnlSummary> {
+  return request(`/api/monitor/pnl?timeframe=${encodeURIComponent(timeframe)}`);
 }
 
 export async function fetchTuningSuggestions(): Promise<TuningSuggestion[]> {

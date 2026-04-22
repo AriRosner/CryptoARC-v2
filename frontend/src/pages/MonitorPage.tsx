@@ -1,6 +1,5 @@
 import React from "react";
-import { motion } from "framer-motion";
-import { Activity, LayoutDashboard, RefreshCw, TrendingUp } from "lucide-react";
+import { Activity, RefreshCw, TrendingUp } from "lucide-react";
 import { PageHeader } from "../components/PageHeader";
 import { StatsGrid } from "../components/StatsGrid";
 import { Card } from "../components/Card";
@@ -8,6 +7,7 @@ import { PnlChart } from "../components/PnlChart";
 import { TokenTable } from "../components/TokenTable";
 import { Badge } from "../components/Badge";
 import { Skeleton } from "../components/Skeleton";
+import { cn } from "../components/utils";
 
 interface MonitorPageProps {
   stats: any;
@@ -78,8 +78,8 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
 }) => {
   return (
     <div className="space-y-6">
-      <PageHeader 
-        title="Live Monitor" 
+      <PageHeader
+        title="Live Monitor"
         description="Real-time surveillance of PumpPortal token launches and paper trading performance."
       >
         <div className="flex items-center gap-2 rounded-xl bg-white/5 p-1">
@@ -89,8 +89,8 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
               onClick={() => setTimeframe(t)}
               className={cn(
                 "rounded-lg px-3 py-1.5 text-[10px] font-black uppercase tracking-widest transition-all",
-                timeframe === t 
-                  ? "bg-amber-500 text-[#160f08] shadow-lg shadow-amber-500/20" 
+                timeframe === t
+                  ? "bg-amber-500 text-[#160f08] shadow-lg shadow-amber-500/20"
                   : "text-zinc-500 hover:text-white"
               )}
             >
@@ -162,9 +162,9 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
                 </div>
               )}
             </div>
-            
+
             <PnlChart data={pnlHistory} height={160} unit={pnlCurrency} animationKey={`${timeframe}:${pnlWallet}:${pnlCurrency}`} loading={pnlLoading} />
-            
+
             <div className="mt-6 flex items-center justify-between border-t border-white/5 pt-6">
               <label className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
                 Wallet Scope
@@ -225,8 +225,6 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
     </div>
   );
 });
-
-import { cn } from "../components/utils";
 
 function shortAddress(value: string): string {
   return value ? `${value.slice(0, 6)}...${value.slice(-4)}` : "not connected";

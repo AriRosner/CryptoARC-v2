@@ -1,5 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
-import { motion, useSpring, useTransform } from "framer-motion";
+import React from "react";
 
 interface AnimatedNumberProps {
   value: number;
@@ -16,23 +15,5 @@ export const AnimatedNumber: React.FC<AnimatedNumberProps> = React.memo(({
   suffix = "",
   className
 }) => {
-  const spring = useSpring(value, {
-    stiffness: 100,
-    damping: 30,
-    restDelta: 0.001
-  });
-
-  useEffect(() => {
-    spring.set(value);
-  }, [value, spring]);
-
-  const display = useTransform(spring, (current) => {
-    return `${prefix}${current.toFixed(precision)}${suffix}`;
-  });
-
-  return (
-    <motion.span className={className}>
-      {display}
-    </motion.span>
-  );
+  return <span className={className}>{`${prefix}${value.toFixed(precision)}${suffix}`}</span>;
 });

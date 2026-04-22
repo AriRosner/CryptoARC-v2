@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any, Iterator
 
 from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
@@ -15,6 +16,27 @@ from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, Li
 class Storage:
     SCHEMA_VERSION = 7
     BACKUP_FORMAT_VERSION = 1
+    BACKUP_TABLES = (
+        "settings",
+        "tokens",
+        "events",
+        "source_events",
+        "backtest_runs",
+        "trades",
+        "price_observations",
+        "strategy_decisions",
+        "trade_sessions",
+        "settings_versions",
+        "experiment_runs",
+        "trade_labels",
+        "strategy_presets",
+        "live_execution_requests",
+        "live_sessions",
+        "live_execution_audits",
+        "live_intents",
+        "live_ledger_positions",
+        "backup_restore_history",
+    )
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
         self.path = Path(path)
@@ -363,14 +385,21 @@ class Storage:
             decoded = base64.b64decode(encoded.encode("ascii"), validate=True)
         except Exception as exc:
             raise ValueError("Restore artifact payload is not valid base64") from exc
+        inspection = self._inspect_sqlite_payload(decoded)
         schema = artifact.get("schema") if isinstance(artifact.get("schema"), dict) else {}
-        artifact_version = int(schema.get("current_version") or 0)
+        artifact_version = int(schema.get("current_version") or inspection.get("schema_version") or 0)
         if artifact_version > self.SCHEMA_VERSION:
             raise ValueError("Restore artifact was created by a newer schema version")
+        metadata_summary = artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}
+        actual_summary = inspection.get("table_counts", {})
         if str(artifact.get("database_name") or "") != self.path.name:
             warnings.append("Artifact database name differs from the current local database path.")
         if artifact_version < self.SCHEMA_VERSION:
             warnings.append("Artifact will be migrated forward after restore.")
+        if schema and int(schema.get("current_version") or 0) != int(inspection.get("schema_version") or 0):
+            warnings.append("Artifact metadata schema version differs from the embedded database and was ignored.")
+        if metadata_summary and metadata_summary != actual_summary:
+            warnings.append("Artifact metadata summary differs from the embedded database counts.")
         warnings.append("Restore replaces the local SQLite state. A safety backup copy will be created first.")
         return {
             "compatible": True,
@@ -380,9 +409,11 @@ class Storage:
             "database_name": artifact.get("database_name"),
             "schema_version": artifact_version,
             "current_schema_version": self.SCHEMA_VERSION,
-            "summary": artifact.get("summary", {}),
+            "summary": actual_summary,
             "warnings": warnings,
             "payload_bytes": len(decoded),
+            "integrity_check": str(inspection.get("integrity_check") or "unknown"),
+            "detected_tables": inspection.get("tables", []),
         }
 
     def restore_backup_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
@@ -391,8 +422,28 @@ class Storage:
         decoded = base64.b64decode(str(artifact["database_base64"]).encode("ascii"))
         temp_path = self.path.with_suffix(".restore.tmp")
         temp_path.write_bytes(decoded)
-        temp_path.replace(self.path)
-        self._ensure_schema()
+        try:
+            self._inspect_sqlite_file(temp_path)
+            temp_path.replace(self.path)
+            self._ensure_schema()
+        except Exception as exc:
+            self.save_backup_restore_history(
+                {
+                    "id": f"restore_failed_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "action": "restore",
+                    "status": "failed",
+                    "artifact_created_at": preview.get("created_at"),
+                    "artifact_database_name": preview.get("database_name"),
+                    "backup_path": backup_result.get("path", ""),
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "operator_action": "Keep the safety backup and inspect the artifact before retrying restore.",
+                }
+            )
+            raise
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
         history_entry = {
             "id": f"restore_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -430,11 +481,74 @@ class Storage:
         history = self.load_backup_restore_history(10)
         latest_backup = next((item for item in history if str(item.get("action", "")).startswith("backup")), None)
         latest_restore = next((item for item in history if item.get("action") == "restore"), None)
+        latest_failed_restore = next((item for item in history if item.get("action") == "restore" and item.get("status") == "failed"), None)
+        database_exists = self.path.exists()
+        database_size_bytes = self.path.stat().st_size if database_exists else 0
+        recommended_action = "Create a backup artifact before upgrades or restore operations."
+        if latest_failed_restore:
+            recommended_action = "Inspect the failed restore entry and keep the latest safety backup before retrying."
+        elif latest_restore:
+            recommended_action = "Review runtime readiness, source health, and wallet state after the latest restore."
         return {
             "history": history,
             "latest_backup": latest_backup,
             "latest_restore": latest_restore,
+            "latest_failed_restore": latest_failed_restore,
+            "database_exists": database_exists,
+            "database_path": str(self.path),
+            "database_size_bytes": database_size_bytes,
+            "history_count": self.count_backup_restore_history(),
+            "recommended_action": recommended_action,
         }
+
+    def _inspect_sqlite_payload(self, payload: bytes) -> dict[str, Any]:
+        with NamedTemporaryFile(prefix="cryptoarc-restore-preview-", suffix=".db", delete=False) as handle:
+            temp_path = Path(handle.name)
+            handle.write(payload)
+        try:
+            return self._inspect_sqlite_file(temp_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _inspect_sqlite_file(self, path: Path) -> dict[str, Any]:
+        try:
+            connection = sqlite3.connect(path)
+            connection.row_factory = sqlite3.Row
+        except sqlite3.Error as exc:
+            raise ValueError("Restore artifact database could not be opened") from exc
+        try:
+            row = connection.execute("PRAGMA quick_check").fetchone()
+            integrity_check = str(row[0] if row else "unknown")
+            if integrity_check.lower() != "ok":
+                raise ValueError("Restore artifact database failed SQLite integrity checks")
+            tables = [
+                str(item["name"])
+                for item in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                ).fetchall()
+            ]
+            required_tables = {"schema_migrations", "settings", "tokens", "events", "trades"}
+            missing_tables = sorted(required_tables - set(tables))
+            if missing_tables:
+                raise ValueError(f"Restore artifact database is missing required tables: {', '.join(missing_tables)}")
+            schema_rows = connection.execute("SELECT version FROM schema_migrations ORDER BY version").fetchall()
+            schema_version = max([int(item["version"]) for item in schema_rows], default=0)
+            table_counts: dict[str, int] = {}
+            for table in self.BACKUP_TABLES:
+                if table not in tables:
+                    continue
+                count_row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                table_counts[table] = int(count_row["count"] if count_row else 0)
+            return {
+                "integrity_check": integrity_check,
+                "schema_version": schema_version,
+                "tables": tables,
+                "table_counts": table_counts,
+            }
+        except sqlite3.Error as exc:
+            raise ValueError("Restore artifact database is not a valid SQLite backup") from exc
+        finally:
+            connection.close()
 
     def _summary_counts(self) -> dict[str, int]:
         return {

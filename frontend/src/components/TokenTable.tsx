@@ -1,5 +1,4 @@
 import React from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import { Activity, Search, Filter, Eye, Pin } from "lucide-react";
 import { Card } from "./Card";
 import { Badge } from "./Badge";
@@ -54,13 +53,19 @@ function formatTokenAge(seconds: number): string {
   return hours ? `${days}d ${hours}h` : `${days}d`;
 }
 
+function tokenAgeFromDetectedAt(detectedAt: string, nowMs: number): number {
+  const detectedMs = new Date(detectedAt).getTime();
+  if (Number.isNaN(detectedMs)) return 0;
+  return Math.max(0, Math.floor((nowMs - detectedMs) / 1000));
+}
+
 interface TokenRowProps {
   token: TokenSignal;
   selected: boolean;
   watched: boolean;
   onSelectToken: (id: string) => void;
   onToggleWatch: (token: TokenSignal) => void;
-  animateIn: boolean;
+  nowMs: number;
 }
 
 const TokenRow = React.memo(function TokenRow({
@@ -69,18 +74,13 @@ const TokenRow = React.memo(function TokenRow({
   watched,
   onSelectToken,
   onToggleWatch,
-  animateIn
+  nowMs
 }: TokenRowProps) {
   const pnl = token.pnl_sol || 0;
-  const ageLabel = formatTokenAge(token.age_seconds || 0);
+  const ageLabel = formatTokenAge(tokenAgeFromDetectedAt(token.detected_at, nowMs));
 
   return (
-    <motion.div
-      key={token.id}
-      initial={animateIn ? { opacity: 0, y: 6 } : false}
-      animate={{ opacity: 1, y: 0 }}
-      exit={undefined}
-      transition={{ duration: 0.16 }}
+    <div
       onClick={() => onSelectToken(token.id)}
       style={{ gridTemplateColumns: tokenGridColumns }}
       className={cn(
@@ -151,18 +151,19 @@ const TokenRow = React.memo(function TokenRow({
           <Eye size={14} />
         </Button>
       </div>
-    </motion.div>
+    </div>
   );
 }, (prev, next) => (
   prev.selected === next.selected &&
   prev.watched === next.watched &&
+  prev.nowMs === next.nowMs &&
   prev.token.id === next.token.id &&
   prev.token.mint === next.token.mint &&
   prev.token.symbol === next.token.symbol &&
   prev.token.name === next.token.name &&
   prev.token.score === next.token.score &&
   prev.token.status === next.token.status &&
-  prev.token.age_seconds === next.token.age_seconds &&
+  prev.token.detected_at === next.token.detected_at &&
   prev.token.pnl_sol === next.token.pnl_sol
 ));
 
@@ -183,9 +184,9 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   loading = false
 }) => {
   const scrollRef = React.useRef<HTMLDivElement | null>(null);
-  const seenRowIdsRef = React.useRef<Set<string>>(new Set());
   const [scrollTop, setScrollTop] = React.useState(0);
   const [viewportHeight, setViewportHeight] = React.useState(520);
+  const [nowMs, setNowMs] = React.useState(() => Date.now());
   const visibleRows = React.useMemo(() => tokens, [tokens]);
   const totalHeight = visibleRows.length * TOKEN_ROW_HEIGHT;
   const startIndex = Math.max(0, Math.floor(scrollTop / TOKEN_ROW_HEIGHT) - TOKEN_OVERSCAN);
@@ -194,6 +195,11 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
   const virtualRows = React.useMemo(() => visibleRows.slice(startIndex, endIndex), [visibleRows, startIndex, endIndex]);
   const topSpacerHeight = startIndex * TOKEN_ROW_HEIGHT;
   const bottomSpacerHeight = Math.max(0, totalHeight - topSpacerHeight - virtualRows.length * TOKEN_ROW_HEIGHT);
+
+  React.useEffect(() => {
+    const interval = window.setInterval(() => setNowMs(Date.now()), 5000);
+    return () => window.clearInterval(interval);
+  }, []);
 
   React.useEffect(() => {
     const node = scrollRef.current;
@@ -316,23 +322,17 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
             ) : (
               <>
                 <div style={{ height: topSpacerHeight }} />
-                <AnimatePresence initial={false}>
-                  {virtualRows.map((token) => {
-                    const animateIn = !seenRowIdsRef.current.has(token.id);
-                    seenRowIdsRef.current.add(token.id);
-                    return (
-                      <TokenRow
-                        key={token.id}
-                        token={token}
-                        selected={selectedTokenId === token.id}
-                        watched={watchlist.has(token.mint)}
-                        onSelectToken={onSelectToken}
-                        onToggleWatch={onToggleWatch}
-                        animateIn={animateIn}
-                      />
-                    );
-                  })}
-                </AnimatePresence>
+                {virtualRows.map((token) => (
+                  <TokenRow
+                    key={token.id}
+                    token={token}
+                    selected={selectedTokenId === token.id}
+                    watched={watchlist.has(token.mint)}
+                    onSelectToken={onSelectToken}
+                    onToggleWatch={onToggleWatch}
+                    nowMs={nowMs}
+                  />
+                ))}
                 <div style={{ height: bottomSpacerHeight }} />
               </>
             )}
