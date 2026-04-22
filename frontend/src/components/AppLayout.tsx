@@ -11,7 +11,13 @@ interface AppLayoutProps {
   onStart: () => void;
   onStop: () => void;
   onSettingsOpen: () => void;
-  onLiveWalletOpen: () => void;
+  onAddWalletOpen: () => void;
+  onManageWalletOpen: () => void;
+  walletOptions: Array<{ value: string; label: string }>;
+  activeWallet: string;
+  canRemoveActiveWallet: boolean;
+  onActiveWalletChange: (wallet: string) => void;
+  onRemoveWallet: () => void;
   walletPublicKey: string;
   walletBalance: number | null;
   toasts: Array<{ id: string; created_at: string; message: string; level: string }>;
@@ -26,7 +32,13 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
   onStart,
   onStop,
   onSettingsOpen,
-  onLiveWalletOpen,
+  onAddWalletOpen,
+  onManageWalletOpen,
+  walletOptions,
+  activeWallet,
+  canRemoveActiveWallet,
+  onActiveWalletChange,
+  onRemoveWallet,
   walletPublicKey,
   walletBalance,
   toasts
@@ -55,7 +67,13 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
         onStart={onStart}
         onStop={onStop}
         onSettingsOpen={onSettingsOpen}
-        onLiveWalletOpen={onLiveWalletOpen}
+        onAddWalletOpen={onAddWalletOpen}
+        onManageWalletOpen={onManageWalletOpen}
+        walletOptions={walletOptions}
+        activeWallet={activeWallet}
+        canRemoveActiveWallet={canRemoveActiveWallet}
+        onActiveWalletChange={onActiveWalletChange}
+        onRemoveWallet={onRemoveWallet}
         walletPublicKey={walletPublicKey}
         walletBalance={walletBalance}
         collapsed={sidebarCollapsed}

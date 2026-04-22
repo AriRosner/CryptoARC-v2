@@ -18,8 +18,7 @@ interface MonitorPageProps {
   solUsdPrice: number;
   onTogglePnlCurrency: () => void;
   pnlCaption: string;
-  liveWallets: string[];
-  walletPublicKey: string;
+  walletOptions: Array<{ value: string; label: string }>;
   timeframe: string;
   setTimeframe: (t: any) => void;
   pnlWallet: string;
@@ -52,8 +51,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
   solUsdPrice,
   onTogglePnlCurrency,
   pnlCaption,
-  liveWallets,
-  walletPublicKey,
+  walletOptions,
   timeframe,
   setTimeframe,
   pnlWallet,
@@ -167,7 +165,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
 
             <div className="mt-6 flex items-center justify-between border-t border-white/5 pt-6">
               <label className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
-                Wallet Scope
+                Active Wallet
                 {pnlLoading ? (
                   <Skeleton className="h-8 min-w-44 rounded-lg" />
                 ) : (
@@ -176,13 +174,9 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
                     onChange={(event) => setPnlWallet(event.target.value)}
                     className="dashboard-select min-w-44 rounded-lg border border-white/10 bg-black/50 px-2 py-1 text-xs font-bold normal-case tracking-normal text-white"
                   >
-                    <option value="paper">Paper wallet</option>
-                    {liveWallets.map((wallet) => (
-                      <option key={wallet} value={wallet}>Live {shortAddress(wallet)}</option>
+                    {walletOptions.map((wallet) => (
+                      <option key={wallet.value} value={wallet.value}>{wallet.label}</option>
                     ))}
-                    {walletPublicKey && !liveWallets.includes(walletPublicKey) ? (
-                      <option value={walletPublicKey}>Live {shortAddress(walletPublicKey)}</option>
-                    ) : null}
                   </select>
                 )}
               </label>

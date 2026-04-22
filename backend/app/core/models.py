@@ -123,6 +123,11 @@ class BotSettings:
     live_priority_fee_cap_sol: float = 0.0
     live_session_acknowledged: bool = False
     live_signer_mode: str = "browser_wallet"
+    live_active_backend_armed: bool = False
+    live_active_wallet_public_key: str = ""
+    live_hot_wallet_enabled: bool = False
+    live_hot_wallet_public_key: str = ""
+    live_hot_wallet_label: str = ""
 
 
 @dataclass(slots=True)

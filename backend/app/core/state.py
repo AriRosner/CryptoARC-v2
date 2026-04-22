@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import urllib.error
 import urllib.request
 from collections import Counter, deque
@@ -44,6 +45,7 @@ from app.core.models import (
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.integrity import DataIntegrityAnalyzer
+from app.core.hot_wallet import HotWalletVault
 from app.core.pumpfun_intelligence import PumpFunIntelligence
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
@@ -65,6 +67,8 @@ class BotState:
         signer_daemon_auth_token: str = "",
     ) -> None:
         self.storage = Storage(database_path)
+        database_file = self.storage.path
+        self.hot_wallet = HotWalletVault(str(database_file.with_suffix(".hotwallet.json")))
         self.signer_daemon_url = signer_daemon_url.strip()
         self.signer_daemon_auth_token = signer_daemon_auth_token.strip()
         self._cached_signer_status: dict[str, object] | None = None
@@ -75,8 +79,11 @@ class BotState:
         if self.settings.max_position_ticks == 12:
             self.settings.max_position_ticks = 40
             self.storage.save_settings(self.settings)
-        if self.settings.live_signer_mode not in {"browser_wallet", "local_signer_daemon"}:
+        if self.settings.live_signer_mode not in {"browser_wallet", "local_hot_wallet", "local_signer_daemon"}:
             self.settings.live_signer_mode = "browser_wallet"
+        self.settings.live_hot_wallet_enabled = self.hot_wallet.status()["imported"]
+        if self.settings.live_hot_wallet_enabled and not self.settings.live_hot_wallet_public_key:
+            self.settings.live_hot_wallet_public_key = self.hot_wallet.wallet_public_key()
         if self.settings.launch_source not in {"mock", "pumpportal"}:
             self.settings.launch_source = default_source
         elif not has_saved_settings and self.settings.launch_source == "mock" and default_source != "mock":
@@ -1351,12 +1358,9 @@ class BotState:
             stop_reasons.append("max open positions reached")
         if self.settings.stop_on_source_degraded and self.source_health().get("health_score", 100) < 50:
             stop_reasons.append("source health degraded")
-        if self.settings.live_trading_enabled:
-            stop_reasons.append("live trading request remains blocked by paper boundary")
-        if self.settings.manual_live_enabled:
-            stop_reasons.append("manual live execution is audit-only")
-        if self.settings.autonomous_live_enabled:
-            stop_reasons.append("autonomous live mode is not implemented")
+        live_runtime_enabled = self.settings.manual_live_enabled or self.settings.autonomous_live_enabled
+        if live_runtime_enabled and not self.settings.live_session_acknowledged:
+            stop_reasons.append("live session acknowledgement is required")
         if self.settings.max_consecutive_losses_enabled and consecutive_losses >= self.settings.max_consecutive_losses:
             stop_reasons.append("consecutive loss halt")
         if self.settings.halt_on_low_replay_confidence and replay_confidence < self.settings.min_replay_confidence:
@@ -1365,7 +1369,7 @@ class BotState:
         if readiness_halt:
             stop_reasons.append(readiness_halt)
         return {
-            "paper_only": True,
+            "paper_only": not live_runtime_enabled,
             "entries_allowed": not stop_reasons,
             "stop_reasons": stop_reasons,
             "consecutive_losses": consecutive_losses,
@@ -1375,12 +1379,12 @@ class BotState:
             "kill_switch_available": True,
             "kill_switch_enabled": self.settings.kill_switch_enabled,
             "replay_confidence": replay_confidence,
-            "manual_live_ready": False,
-            "autonomous_live_ready": False,
+            "manual_live_ready": self.settings.live_session_acknowledged,
+            "autonomous_live_ready": self.settings.autonomous_live_enabled and self.settings.live_active_backend_armed,
             "live_blockers": [
-                "no signer or transaction executor is present",
-                "paper engine and replay confidence must stay production-stable first",
-                "manual live requests are stored for review only",
+                "configure Solana RPC, live caps, and wallet backend before turning on execution",
+                "manual kill switch and wallet-scoped caps still apply to live entries",
+                "browser wallet autonomy is capability-based and may remain assisted/manual",
             ],
         }
 
@@ -1458,6 +1462,25 @@ class BotState:
                 message="Browser wallet requires manual approval for each transaction" if connected else "Browser wallet is not connected",
                 transport="browser_extension",
             ).to_dict()
+        if mode == "local_hot_wallet":
+            hot_wallet = self.hot_wallet.status()
+            imported = bool(hot_wallet["imported"])
+            unlocked = bool(hot_wallet["unlocked"])
+            return SignerStatus(
+                mode="local_hot_wallet",
+                connected=imported,
+                wallet_public_key=str(hot_wallet["wallet_public_key"] or ""),
+                healthy=imported,
+                can_sign=unlocked,
+                can_unattended_sign=unlocked,
+                supports_auto_sell=unlocked,
+                supports_auto_buy=unlocked,
+                disabled_reason="" if unlocked else "Unlock the encrypted local hot wallet to enable unattended execution." if imported else "Import an encrypted local hot wallet first.",
+                message="Encrypted local hot wallet is unlocked and ready." if unlocked else "Encrypted local hot wallet is imported but locked." if imported else "No local hot wallet is imported.",
+                transport="encrypted_local_file",
+                version="v1",
+                last_heartbeat_at=str(hot_wallet["last_unlock_at"] or ""),
+            ).to_dict()
         return self._local_signer_daemon_status()
 
     def _local_signer_daemon_status(self) -> dict[str, object]:
@@ -1504,17 +1527,100 @@ class BotState:
             base.can_unattended_sign = bool(payload.get("can_unattended_sign", False))
             base.supports_auto_sell = bool(payload.get("supports_auto_sell", False))
             base.supports_auto_buy = bool(payload.get("supports_auto_buy", False))
-            base.disabled_reason = str(payload.get("disabled_reason") or "Local signer daemon is still disabled in this phase")
-            base.message = str(payload.get("message") or "Local signer daemon responded, but unattended execution stays disabled in this phase.")
+            base.disabled_reason = str(payload.get("disabled_reason") or "")
+            base.message = str(payload.get("message") or "Local signer daemon responded.")
             base.version = str(payload.get("version") or "")
             base.last_heartbeat_at = str(payload.get("last_heartbeat_at") or now.isoformat())
         except Exception as exc:
-            base.disabled_reason = "Local signer daemon is unavailable and disabled in v1"
+            base.disabled_reason = "Local signer daemon is unavailable."
             base.message = f"Daemon status check failed: {exc.__class__.__name__}"
         result = base.to_dict()
         self._cached_signer_status = result
         self._cached_signer_status_at = now
         return result
+
+    def hot_wallet_status(self) -> dict[str, object]:
+        status = self.hot_wallet.status()
+        self.settings.live_hot_wallet_enabled = bool(status["imported"])
+        self.settings.live_hot_wallet_public_key = str(status["wallet_public_key"] or "")
+        if status.get("label"):
+            self.settings.live_hot_wallet_label = str(status["label"] or "")
+        self.storage.save_settings(self.settings)
+        return status
+
+    def import_hot_wallet(self, private_key: str, password: str, label: str = "") -> dict[str, object]:
+        status = self.hot_wallet.import_private_key(private_key, password, label)
+        self.settings.live_hot_wallet_enabled = True
+        self.settings.live_hot_wallet_public_key = str(status["wallet_public_key"] or "")
+        self.settings.live_hot_wallet_label = str(status["label"] or "")
+        self.settings.live_signer_mode = "local_hot_wallet"
+        self.storage.save_settings(self.settings)
+        self.add_event("warning", "Encrypted local hot wallet imported and unlocked", subsystem="live", operator_action="Verify caps and arm the backend before unattended execution.")
+        return status
+
+    def unlock_hot_wallet(self, password: str) -> dict[str, object]:
+        status = self.hot_wallet.unlock(password)
+        self.settings.live_hot_wallet_enabled = bool(status["imported"])
+        self.settings.live_hot_wallet_public_key = str(status["wallet_public_key"] or "")
+        self.storage.save_settings(self.settings)
+        self.add_event("info", "Encrypted local hot wallet unlocked for this app session", subsystem="live")
+        return status
+
+    def lock_hot_wallet(self) -> dict[str, object]:
+        status = self.hot_wallet.lock()
+        if self.settings.live_signer_mode == "local_hot_wallet" and self.settings.live_active_backend_armed:
+            self.settings.live_active_backend_armed = False
+            self.settings.live_active_wallet_public_key = ""
+        self.storage.save_settings(self.settings)
+        self.add_event("warning", "Encrypted local hot wallet locked", subsystem="live")
+        return status
+
+    def clear_hot_wallet(self) -> dict[str, object]:
+        previous_wallet = self.settings.live_hot_wallet_public_key
+        status = self.hot_wallet.clear()
+        self.settings.live_hot_wallet_enabled = False
+        self.settings.live_hot_wallet_public_key = ""
+        self.settings.live_hot_wallet_label = ""
+        if self.settings.live_signer_mode == "local_hot_wallet":
+            self.settings.live_signer_mode = "browser_wallet"
+        if self.settings.live_active_backend_armed and self.settings.live_active_wallet_public_key == previous_wallet:
+            self.settings.live_active_backend_armed = False
+            self.settings.live_active_wallet_public_key = ""
+        self.storage.save_settings(self.settings)
+        self.add_event("warning", "Encrypted local hot wallet cleared from local storage", subsystem="live")
+        return status
+
+    def arm_live_backend(self, env_live_enabled: bool, signer_mode: str, wallet_public_key: str = "") -> dict[str, object]:
+        wallet = self._resolve_backend_wallet(signer_mode, wallet_public_key)
+        status = self.live_status(env_live_enabled, wallet, signer_mode)
+        blockers = list(status.get("blockers") or [])
+        if blockers:
+            raise ValueError(", ".join(blockers))
+        self.settings.live_signer_mode = signer_mode
+        self.settings.live_active_backend_armed = True
+        self.settings.live_active_wallet_public_key = wallet
+        self.storage.save_settings(self.settings)
+        session = LiveSession(
+            id=new_id("liveses"),
+            created_at=utc_now(),
+            status="armed",
+            signer_mode=signer_mode,
+            wallet_public_key=wallet,
+            caps_snapshot=self.live_caps_snapshot(),
+            acknowledged_at=utc_now() if self.settings.live_session_acknowledged else None,
+        )
+        self.storage.save_live_session(session)
+        self.add_event("warning", f"Live backend armed: {signer_mode} / {wallet}", subsystem="live", operator_action="Use the kill switch or disarm control to halt new autonomous entries.")
+        return {"armed": True, "wallet_public_key": wallet, "signer_mode": signer_mode, "live_status": self.live_status(env_live_enabled, wallet, signer_mode)}
+
+    def disarm_live_backend(self) -> dict[str, object]:
+        mode = self.settings.live_signer_mode
+        wallet = self.settings.live_active_wallet_public_key
+        self.settings.live_active_backend_armed = False
+        self.settings.live_active_wallet_public_key = ""
+        self.storage.save_settings(self.settings)
+        self.add_event("warning", f"Live backend disarmed: {mode} / {wallet or 'no wallet'}", subsystem="live", operator_action="Protective exits can still be handled manually if needed.")
+        return {"armed": False, "wallet_public_key": wallet, "signer_mode": mode}
 
     def live_caps_snapshot(self) -> dict[str, object]:
         return {
@@ -1526,21 +1632,43 @@ class BotState:
             "priority_fee_cap_sol": self.settings.live_priority_fee_cap_sol,
         }
 
-    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None) -> dict[str, object]:
-        signer_mode = signer_mode or self.settings.live_signer_mode
+    def _resolve_backend_wallet(self, signer_mode: str, wallet_public_key: str = "") -> str:
+        wallet = wallet_public_key.strip()
+        if signer_mode == "local_hot_wallet":
+            return wallet or self.hot_wallet.wallet_public_key() or self.settings.live_hot_wallet_public_key
+        if signer_mode == "local_signer_daemon":
+            signer = self._local_signer_daemon_status()
+            return wallet or str(signer.get("wallet_public_key") or "")
+        return wallet
+
+    def _wallet_live_metrics(self, wallet_public_key: str) -> dict[str, float]:
+        positions = self._live_ledger_positions(wallet_public_key)
+        realized = round(sum(position.realized_pnl_sol for position in positions), 6)
+        unrealized = round(sum(position.unrealized_pnl_sol for position in positions), 6)
+        cost_basis = round(sum(position.cost_basis_sol for position in positions), 6)
+        open_positions = len([position for position in positions if position.status == "open"])
+        return {
+            "realized_pnl_sol": realized,
+            "unrealized_pnl_sol": unrealized,
+            "cost_basis_sol": cost_basis,
+            "open_positions": float(open_positions),
+        }
+
+    def _live_execution_blockers(
+        self,
+        env_live_enabled: bool,
+        action: str,
+        wallet_public_key: str,
+        signer_mode: str,
+        autonomous: bool = False,
+    ) -> list[str]:
         signer = self.signer_status(signer_mode, wallet_public_key)
         caps = self.live_caps_snapshot()
         blockers: list[str] = []
         if not env_live_enabled:
             blockers.append("LIVE_TRADING_ENABLED is false")
-        if self.settings.kill_switch_enabled:
-            blockers.append("manual kill switch enabled")
-        if signer_mode == "local_signer_daemon":
-            if not signer.get("connected"):
-                blockers.append("local signer daemon is not connected")
-            elif not signer.get("healthy"):
-                blockers.append("local signer daemon is unhealthy")
-            blockers.append("local signer daemon execution path is still disabled in this phase")
+        if not wallet_public_key.strip():
+            blockers.append("wallet public key is required")
         if not signer.get("connected"):
             blockers.append("no connected signer")
         if not self.settings.live_session_acknowledged:
@@ -1550,6 +1678,61 @@ class BotState:
                 blockers.append(f"{key} must be set")
         if not self.settings.solana_rpc_url:
             blockers.append("Solana RPC URL is not configured")
+        if signer_mode != "browser_wallet" and not signer.get("can_sign"):
+            blockers.append(str(signer.get("disabled_reason") or f"{signer_mode.replace('_', ' ')} cannot sign transactions right now"))
+
+        wallet_metrics = self._wallet_live_metrics(wallet_public_key)
+        if action == "buy":
+            if self.settings.kill_switch_enabled:
+                blockers.append("manual kill switch enabled")
+            if not signer.get("healthy"):
+                blockers.append(f"{signer_mode.replace('_', ' ')} is unhealthy")
+            if wallet_metrics["cost_basis_sol"] >= float(self.settings.live_wallet_exposure_cap_sol or 0):
+                blockers.append("wallet exposure cap reached")
+            if wallet_metrics["realized_pnl_sol"] + wallet_metrics["unrealized_pnl_sol"] <= -abs(float(self.settings.live_daily_loss_cap_sol or 0)):
+                blockers.append("wallet daily loss cap reached")
+            if wallet_metrics["open_positions"] >= float(self.settings.live_max_open_positions or 0):
+                blockers.append("wallet max open positions reached")
+        else:
+            if not signer.get("can_sign"):
+                blockers.append(f"{signer_mode.replace('_', ' ')} cannot execute protective exits")
+
+        if autonomous:
+            if not self.settings.autonomous_live_enabled:
+                blockers.append("autonomous live is disabled in settings")
+            if not self.settings.live_active_backend_armed:
+                blockers.append("no active backend is armed")
+            if self.settings.live_signer_mode != signer_mode:
+                blockers.append("requested backend is not the active live backend")
+            if self.settings.live_active_wallet_public_key != wallet_public_key:
+                blockers.append("requested wallet is not the armed live wallet")
+            if not signer.get("can_unattended_sign"):
+                blockers.append(str(signer.get("disabled_reason") or "backend cannot sign unattended transactions"))
+            if action == "buy" and not signer.get("supports_auto_buy"):
+                blockers.append("active backend does not support autonomous entries")
+            if action == "sell" and not signer.get("supports_auto_sell"):
+                blockers.append("active backend does not support protective exits")
+            readiness_halt = self.readiness_halt_reason()
+            if readiness_halt and action == "buy":
+                blockers.append(readiness_halt)
+
+        return list(dict.fromkeys(blockers))
+
+    def _active_backend_snapshot(self) -> dict[str, object]:
+        return {
+            "armed": self.settings.live_active_backend_armed,
+            "mode": self.settings.live_signer_mode,
+            "wallet_public_key": self.settings.live_active_wallet_public_key,
+        }
+
+    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None) -> dict[str, object]:
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
+        signer = self.signer_status(signer_mode, wallet_public_key)
+        caps = self.live_caps_snapshot()
+        blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=False)
+        autonomy_buy_blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=True)
+        autonomy_sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=True)
         readiness = self.readiness_status()
         intents = self._decorate_live_intents(self._mark_stale_live_intents(self.storage.load_live_intents(200)), readiness)
         ledger = self._live_ledger_positions(wallet_public_key)
@@ -1558,16 +1741,17 @@ class BotState:
         recoverable = [audit for audit in unresolved if audit.transaction_signature]
         stale_quotes = sum(1 for intent in intents if intent.stale and intent.quote_id)
         latest_reconciliation = next((position.reconciliation_status for position in ledger), "pending")
-        autonomy_blockers = self._future_autonomy_blockers(signer, readiness)
-        live_pnl = {
-            "realized_pnl_sol": round(sum(position.realized_pnl_sol for position in ledger), 6),
-            "unrealized_pnl_sol": round(sum(position.unrealized_pnl_sol for position in ledger), 6),
-            "cost_basis_sol": round(sum(position.cost_basis_sol for position in ledger), 6),
-            "approximate": True,
+        autonomy_blockers = list(dict.fromkeys([*autonomy_buy_blockers, *autonomy_sell_blockers]))
+        live_metrics = self._wallet_live_metrics(wallet_public_key)
+        live_pnl = {**live_metrics, "open_positions": int(live_metrics["open_positions"]), "approximate": True}
+        backend_capabilities = {
+            "browser_wallet": self.signer_status("browser_wallet", wallet_public_key if signer_mode == "browser_wallet" else ""),
+            "local_hot_wallet": self.signer_status("local_hot_wallet", self.hot_wallet.wallet_public_key()),
+            "local_signer_daemon": self.signer_status("local_signer_daemon", ""),
         }
         return {
-            "mode": "manual_browser_wallet_v1",
-            "paper_default": True,
+            "mode": "autonomous_live_v1",
+            "paper_default": False,
             "live_execution_available": not blockers,
             "env_live_enabled": env_live_enabled,
             "effective_live_enabled": not blockers,
@@ -1577,9 +1761,9 @@ class BotState:
             "session_acknowledged": self.settings.live_session_acknowledged,
             "readiness": readiness,
             "local_desktop_only": True,
-            "autonomous_live_available": False,
-            "auto_sell_available": bool(signer.get("supports_auto_sell")) and bool(signer.get("can_unattended_sign")),
-            "auto_buy_available": bool(signer.get("supports_auto_buy")) and bool(signer.get("can_unattended_sign")),
+            "autonomous_live_available": not autonomy_buy_blockers or not autonomy_sell_blockers,
+            "auto_sell_available": not autonomy_sell_blockers,
+            "auto_buy_available": not autonomy_buy_blockers,
             "autonomy_blockers": autonomy_blockers,
             "active_intent_count": len([intent for intent in intents if intent.status not in {"cancelled", "executed", "expired"}]),
             "stale_quote_count": stale_quotes,
@@ -1591,7 +1775,7 @@ class BotState:
             "latest_reconciliation_status": latest_reconciliation,
             "wallet_adapter": {
                 "mode": signer_mode,
-                "manual_approval_required": True,
+                "manual_approval_required": signer_mode == "browser_wallet",
                 "can_sign": bool(signer.get("can_sign")),
                 "can_unattended_sign": bool(signer.get("can_unattended_sign")),
                 "supports_auto_sell": bool(signer.get("supports_auto_sell")),
@@ -1607,9 +1791,15 @@ class BotState:
             },
             "live_pnl": live_pnl,
             "readiness_warnings": readiness.get("recommended_actions", []) if readiness.get("status") != "ready" else [],
+            "hot_wallet": self.hot_wallet.status(),
+            "active_backend": self._active_backend_snapshot(),
+            "backend_capabilities": backend_capabilities,
+            "entry_autonomy_available": not autonomy_buy_blockers,
+            "exit_autonomy_available": not autonomy_sell_blockers,
         }
 
     def start_live_session(self, env_live_enabled: bool, wallet_public_key: str, signer_mode: str = "browser_wallet") -> dict[str, object]:
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
         session = LiveSession(
             id=new_id("liveses"),
@@ -1623,9 +1813,9 @@ class BotState:
         self.storage.save_live_session(session)
         self.add_event(
             "warning",
-            f"Live session {session.status}: {', '.join(status['blockers']) or 'manual browser-wallet mode'}",
+            f"Live session {session.status}: {', '.join(status['blockers']) or f'{signer_mode} ready'}",
             subsystem="live",
-            operator_action="Resolve live blockers before requesting quotes or signatures.",
+            operator_action="Resolve live blockers, then arm the backend if you want autonomous execution.",
         )
         return {**session.to_dict(), "live_status": status}
 
@@ -1726,6 +1916,7 @@ class BotState:
     ) -> dict[str, object]:
         if action not in {"buy", "sell"}:
             raise ValueError("action must be buy or sell")
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         now = utc_now()
         intent = LiveExecutionIntent(
             id=new_id("intent"),
@@ -1751,6 +1942,7 @@ class BotState:
         return intent.to_dict()
 
     def generate_live_intents(self, wallet_public_key: str, signer_mode: str = "browser_wallet", include_watchlist: list[str] | None = None) -> list[dict[str, object]]:
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         existing = [intent for intent in self.storage.load_live_intents(200) if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
         existing_keys = {(intent.action, intent.mint) for intent in existing}
         candidates: list[LiveExecutionIntent] = []
@@ -1862,8 +2054,9 @@ class BotState:
         wallet_public_key: str,
         signer_mode: str = "browser_wallet",
     ) -> dict[str, object]:
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
-        blockers = list(status["blockers"])
+        blockers = self._live_execution_blockers(env_live_enabled, action, wallet_public_key, signer_mode, autonomous=False)
         validation_error = self._validate_live_order(action, amount, denominated_in_sol, slippage_pct, priority_fee_sol, wallet_public_key, signer_mode)
         if validation_error:
             blockers.append(validation_error)
@@ -2022,14 +2215,32 @@ class BotState:
 
     def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
-        if audit.signer_mode == "browser_wallet" and not signature.strip():
-            raise ValueError("browser wallet submit requires a transaction signature")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
         expires_at = audit.quote.get("expires_at")
         if expires_at and datetime.fromisoformat(str(expires_at)) < utc_now():
             raise ValueError("cannot submit a stale live quote")
-        audit.transaction_signature = signature.strip()
+        if audit.signer_mode == "browser_wallet":
+            if not signature.strip():
+                raise ValueError("browser wallet submit requires a transaction signature")
+            audit.transaction_signature = signature.strip()
+        else:
+            execution = self._execute_backend_audit(audit)
+            audit.transaction_signature = str(execution.get("signature") or execution.get("transaction_signature") or "")
+            simulation = execution.get("simulation")
+            if isinstance(simulation, dict):
+                audit.simulation = {
+                    "source": audit.signer_mode,
+                    "status": "ok" if simulation.get("ok") else "warning" if simulation.get("warning") else "error",
+                    "ok": bool(simulation.get("ok")),
+                    "warning": str(simulation.get("warning") or ""),
+                    "error": str(simulation.get("error") or ""),
+                    "result": simulation.get("result") or {},
+                }
+                if simulation.get("warning"):
+                    self._append_unique(audit.warnings, str(simulation.get("warning")))
+                if simulation.get("error"):
+                    self._append_unique(audit.errors, str(simulation.get("error")))
         audit.status = "submitted"
         audit.final_status = "submitted"
         audit.updated_at = utc_now()
@@ -2040,7 +2251,9 @@ class BotState:
                 intent.status = "submitted"
                 intent.updated_at = utc_now()
                 self.storage.save_live_intent(intent)
-        self.add_event("warning", f"Live {audit.action} submitted: {signature[:10]}")
+        self.add_event("warning", f"Live {audit.action} submitted: {audit.transaction_signature[:10]}")
+        if audit.signer_mode != "browser_wallet":
+            return self.recover_live_audit(audit.id)
         return audit.to_dict()
 
     def live_confirm(self, audit_id: str, confirmation_status: str, error: str = "") -> dict[str, object]:
@@ -2073,6 +2286,33 @@ class BotState:
             audit.updated_at = utc_now()
             self.storage.save_live_execution_audit(audit)
         return audit.to_dict()
+
+    def _execute_backend_audit(self, audit: LiveExecutionAudit) -> dict[str, object]:
+        unsigned_transaction_base64 = str(audit.quote.get("unsigned_transaction_base64") or "")
+        if audit.signer_mode == "local_hot_wallet":
+            return self.hot_wallet.simulate_and_submit(unsigned_transaction_base64, self.settings.solana_rpc_url)
+        if audit.signer_mode == "local_signer_daemon":
+            endpoint = (self.signer_daemon_url or "http://127.0.0.1:8799").rstrip("/") + "/execute"
+            payload = json.dumps(
+                {
+                    "unsigned_transaction_base64": unsigned_transaction_base64,
+                    "rpc_url": self.settings.solana_rpc_url,
+                    "mint": audit.mint,
+                    "action": audit.action,
+                }
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                endpoint,
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    **({"Authorization": f"Bearer {self.signer_daemon_auth_token}"} if self.signer_daemon_auth_token else {}),
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=8) as response:
+                return json.loads(response.read().decode("utf-8") or "{}")
+        raise ValueError(f"unsupported backend execution mode: {audit.signer_mode}")
 
     def recover_unresolved_live_audits(self, limit: int = 25) -> dict[str, object]:
         audits = [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500)) if self._is_unresolved_live_audit(audit)]
@@ -2131,6 +2371,40 @@ class BotState:
         self.live_last_poll_at = utc_now()
         self.live_last_poll_summary = summary
         return summary
+
+    def run_live_autonomy(self, env_live_enabled: bool) -> dict[str, object]:
+        if not env_live_enabled:
+            return {"status": "disabled", "reason": "LIVE_TRADING_ENABLED is false"}
+        if not self.settings.live_active_backend_armed:
+            return {"status": "idle", "reason": "no active backend armed"}
+        wallet = self.settings.live_active_wallet_public_key
+        signer_mode = self.settings.live_signer_mode
+        if not wallet:
+            return {"status": "idle", "reason": "no armed live wallet"}
+        generated = self.generate_live_intents(wallet, signer_mode)
+        intents = [
+            intent
+            for intent in self._rank_live_intents(self._decorate_live_intents(self._mark_stale_live_intents(self.storage.load_live_intents(200))))
+            if intent.wallet_public_key == wallet and intent.signer_mode == signer_mode and intent.status in {"open", "quoted", "simulated", "simulation_warning"}
+        ]
+        executed = []
+        for intent in intents[:3]:
+            blockers = self._live_execution_blockers(env_live_enabled, intent.action, wallet, signer_mode, autonomous=True)
+            if blockers:
+                intent.autonomy_blocked = True
+                intent.autonomy_blockers = blockers
+                intent.updated_at = utc_now()
+                self.storage.save_live_intent(intent)
+                continue
+            try:
+                audit = self.quote_live_intent(env_live_enabled, intent.id, self.settings.live_max_slippage_pct, self.settings.live_priority_fee_cap_sol, "pump")
+                result = self.live_submit(str(audit["id"]), "")
+                executed.append({"intent_id": intent.id, "audit_id": str(result.get("id") or audit["id"]), "status": str(result.get("status") or "")})
+                if intent.action == "buy":
+                    break
+            except Exception as exc:
+                self.add_event("warning", f"Autonomous {intent.action} failed for {intent.symbol or intent.mint[:8]}: {exc}", subsystem="live")
+        return {"status": "ok", "generated": len(generated), "executed": executed}
 
     def recover_live_audit(self, audit_id: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
@@ -2230,10 +2504,11 @@ class BotState:
     def _validate_live_order(self, action: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, wallet_public_key: str, signer_mode: str) -> str:
         if action not in {"buy", "sell"}:
             return "action must be buy or sell"
-        if signer_mode == "browser_wallet" and not wallet_public_key.strip():
-            return "browser wallet is not connected"
-        if signer_mode == "local_signer_daemon":
-            return "local signer daemon is disabled in v1"
+        if not wallet_public_key.strip():
+            return "wallet public key is required"
+        signer = self.signer_status(signer_mode, wallet_public_key)
+        if not signer.get("connected"):
+            return str(signer.get("disabled_reason") or "selected live backend is not connected")
         try:
             numeric_amount = float(str(amount).replace("%", ""))
         except ValueError:
@@ -2350,13 +2625,16 @@ class BotState:
         return intents
 
     def _future_autonomy_blockers(self, signer: dict[str, object], readiness: dict[str, object]) -> list[str]:
-        blockers: list[str] = []
-        disabled_reason = str(signer.get("disabled_reason") or "").strip()
-        if not bool(signer.get("supports_auto_sell")) or not bool(signer.get("can_unattended_sign")):
-            blockers.append(disabled_reason or "This signer does not support unattended auto-sell.")
-        if readiness.get("status") != "ready":
-            blockers.append(f"Paper readiness is {readiness.get('status')} ({readiness.get('score')}); future autonomy stays gated.")
-        return list(dict.fromkeys(blockers))
+        wallet = str(signer.get("wallet_public_key") or self.settings.live_active_wallet_public_key or "")
+        mode = str(signer.get("mode") or self.settings.live_signer_mode or "browser_wallet")
+        return list(
+            dict.fromkeys(
+                [
+                    *self._live_execution_blockers(True, "buy", wallet, mode, autonomous=True),
+                    *self._live_execution_blockers(True, "sell", wallet, mode, autonomous=True),
+                ]
+            )
+        )
 
     def _decorate_live_intents(self, intents: list[LiveExecutionIntent], readiness: dict[str, object] | None = None) -> list[LiveExecutionIntent]:
         shared_readiness = readiness or self.readiness_status()
@@ -2366,27 +2644,17 @@ class BotState:
 
     def _decorate_live_intent(self, intent: LiveExecutionIntent, readiness: dict[str, object] | None = None) -> LiveExecutionIntent:
         readiness = readiness or self.readiness_status()
-        signer = self.signer_status(intent.signer_mode, intent.wallet_public_key)
-        blockers: list[str] = []
-        disabled_reason = str(signer.get("disabled_reason") or "").strip()
+        blockers = self._live_execution_blockers(True, intent.action, intent.wallet_public_key, intent.signer_mode, autonomous=True)
         previous_blocked = intent.autonomy_blocked
         previous_blockers = list(intent.autonomy_blockers)
         previous_recommendation = intent.operator_recommendation
-        if intent.action == "sell":
-            if not bool(signer.get("supports_auto_sell")) or not bool(signer.get("can_unattended_sign")):
-                blockers.append(disabled_reason or "This signer does not support unattended auto-sell.")
-            if intent.source == "live_position_rules" and readiness.get("status") != "ready":
-                blockers.append(f"Paper readiness is {readiness.get('status')} ({readiness.get('score')}); future auto-sell stays soft-blocked.")
-        else:
-            if not bool(signer.get("supports_auto_buy")) or not bool(signer.get("can_unattended_sign")):
-                blockers.append(disabled_reason or "This signer does not support unattended auto-buy.")
         intent.autonomy_blocked = bool(blockers)
         intent.autonomy_blockers = list(dict.fromkeys(blockers))
         if not intent.operator_recommendation.strip():
             intent.operator_recommendation = (
-                "Manual quote/sign remains available; future autonomy is still gated."
+                "Manual quote/sign remains available while this intent is blocked from autonomous execution."
                 if intent.autonomy_blocked
-                else "Intent is eligible for future autonomous execution once a supported signer exists."
+                else "Intent is eligible for autonomous execution on the armed backend."
             )
         changed = (
             previous_blocked != intent.autonomy_blocked

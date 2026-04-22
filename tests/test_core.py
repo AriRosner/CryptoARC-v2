@@ -5,6 +5,8 @@ from collections import deque
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
+from solders.keypair import Keypair
+
 from app.core.models import BacktestRun, BotSettings, BotStats, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
@@ -760,10 +762,39 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("manual signing only", browser["signer"]["disabled_reason"].lower())
             self.assertFalse(browser["auto_sell_available"])
             self.assertFalse(browser["auto_buy_available"])
-            self.assertIn("Paper readiness is", " ".join(browser["autonomy_blockers"]))
+            self.assertIn("autonomous live is disabled", " ".join(browser["autonomy_blockers"]).lower())
             self.assertFalse(daemon["signer"]["connected"])
-            self.assertIn("disabled in v1", daemon["signer"]["disabled_reason"])
+            self.assertIn("unavailable", daemon["signer"]["disabled_reason"].lower())
             self.assertFalse(daemon["wallet_adapter"]["supports_auto_sell"])
+
+    def test_hot_wallet_import_lock_unlock_and_status(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            keypair = Keypair()
+
+            imported = state.import_hot_wallet(str(keypair), "password123", "ops")
+            locked = state.lock_hot_wallet()
+            unlocked = state.unlock_hot_wallet("password123")
+
+            self.assertTrue(imported["imported"])
+            self.assertTrue(imported["unlocked"])
+            self.assertEqual(imported["wallet_public_key"], str(keypair.pubkey()))
+            self.assertFalse(locked["unlocked"])
+            self.assertTrue(unlocked["unlocked"])
+            self.assertEqual(state.signer_status("local_hot_wallet", "")["wallet_public_key"], str(keypair.pubkey()))
+
+    def test_hot_wallet_backend_can_be_armed_for_autonomy(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.import_hot_wallet(str(Keypair()), "password123", "ops")
+
+            armed = state.arm_live_backend(True, "local_hot_wallet")
+            live_status = state.live_status(True, signer_mode="local_hot_wallet")
+
+            self.assertTrue(armed["armed"])
+            self.assertTrue(live_status["active_backend"]["armed"])
+            self.assertEqual(live_status["active_backend"]["mode"], "local_hot_wallet")
 
     def test_browser_wallet_live_quote_creates_blocked_audit_when_env_disabled(self) -> None:
         with TemporaryDirectory() as directory:
@@ -785,7 +816,7 @@ class CoreLogicTests(unittest.TestCase):
             daemon = state.live_quote(True, "buy", "Mint111", "0.001", True, 1, 0.00001, "pump", "Wallet111", signer_mode="local_signer_daemon")
 
             self.assertTrue(any("amount exceeds live max trade cap" in error for error in too_large["errors"]))
-            self.assertIn("local signer daemon is disabled in v1", daemon["errors"])
+            self.assertTrue(any("connected signer" in error.lower() or "unavailable" in error.lower() for error in daemon["errors"]))
             self.assertFalse(state.signer_status("browser_wallet", "Wallet111")["can_unattended_sign"])
 
     def test_live_simulation_submit_and_confirm_update_audit(self) -> None:
@@ -894,8 +925,43 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(sell_intent["source"], "live_position_rules")
             self.assertIn("stop-loss", sell_intent["reason"].lower())
             self.assertTrue(sell_intent["autonomy_blocked"])
-            self.assertTrue(any("readiness" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
-            self.assertTrue(any("manual signing only" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
+            self.assertTrue(any("autonomous live is disabled" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
+            self.assertTrue(any("manual signing only" in blocker.lower() or "unattended" in blocker.lower() for blocker in sell_intent["autonomy_blockers"]))
+
+    def test_run_live_autonomy_executes_hot_wallet_intent(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.autonomous_live_enabled = True
+            state.import_hot_wallet(str(Keypair()), "password123", "ops")
+            state.arm_live_backend(True, "local_hot_wallet")
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: {  # type: ignore[method-assign]
+                "signature": "sighot111",
+                "transaction_signature": "sighot111",
+                "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
+            }
+            state._signature_status = lambda signature: {
+                "ok": True,
+                "found": True,
+                "signature": signature,
+                "confirmation_status": "confirmed",
+                "err": None,
+                "slot": 123,
+            }
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 100.0, "error": ""}
+            token = self.make_token()
+            token.id = "tok_live_auto"
+            token.mint = "MintAuto"
+            token.symbol = "AUTO"
+            token.score = 95
+            state.tokens.appendleft(token)
+
+            result = state.run_live_autonomy(True)
+
+            self.assertEqual(result["status"], "ok")
+            self.assertGreaterEqual(len(result["executed"]), 1)
+            self.assertGreaterEqual(state.storage.count_live_execution_audits(), 1)
 
     def test_live_kill_switch_blocks_new_intent_quotes(self) -> None:
         with TemporaryDirectory() as directory:

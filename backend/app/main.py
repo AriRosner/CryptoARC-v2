@@ -109,7 +109,12 @@ class SettingsPatch(BaseModel):
     live_max_slippage_pct: float | None = Field(default=None, ge=0, le=100)
     live_priority_fee_cap_sol: float | None = Field(default=None, ge=0, le=1)
     live_session_acknowledged: bool | None = None
-    live_signer_mode: Literal["browser_wallet", "local_signer_daemon"] | None = None
+    live_signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] | None = None
+    live_active_backend_armed: bool | None = None
+    live_active_wallet_public_key: str | None = Field(default=None, max_length=100)
+    live_hot_wallet_enabled: bool | None = None
+    live_hot_wallet_public_key: str | None = Field(default=None, max_length=100)
+    live_hot_wallet_label: str | None = Field(default=None, max_length=120)
 
 
 class BacktestRequest(BaseModel):
@@ -175,7 +180,7 @@ class LiveExecutionReviewPayload(BaseModel):
 
 class LiveSessionStartPayload(BaseModel):
     wallet_public_key: str = Field(default="", max_length=100)
-    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
 
 
 class LiveQuotePayload(BaseModel):
@@ -187,7 +192,7 @@ class LiveQuotePayload(BaseModel):
     priority_fee_sol: float = Field(ge=0, le=1)
     pool: Literal["pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto"] = "pump"
     wallet_public_key: str = Field(default="", max_length=100)
-    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
 
 
 class LiveIntentPayload(BaseModel):
@@ -196,7 +201,7 @@ class LiveIntentPayload(BaseModel):
     amount: str = Field(min_length=1, max_length=40)
     denominated_in_sol: bool = True
     wallet_public_key: str = Field(default="", max_length=100)
-    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
     source: str = Field(default="manual", max_length=40)
     reason: str = Field(default="", max_length=500)
     symbol: str = Field(default="", max_length=40)
@@ -205,8 +210,23 @@ class LiveIntentPayload(BaseModel):
 
 class LiveIntentGeneratePayload(BaseModel):
     wallet_public_key: str = Field(default="", max_length=100)
-    signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet"
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
     watchlist: list[str] = Field(default_factory=list, max_length=50)
+
+
+class LiveHotWalletImportPayload(BaseModel):
+    private_key: str = Field(min_length=1, max_length=4096)
+    password: str = Field(min_length=8, max_length=200)
+    label: str = Field(default="", max_length=120)
+
+
+class LiveHotWalletUnlockPayload(BaseModel):
+    password: str = Field(min_length=8, max_length=200)
+
+
+class LiveBackendArmPayload(BaseModel):
+    wallet_public_key: str = Field(default="", max_length=100)
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
 
 
 class LiveIntentQuotePayload(BaseModel):
@@ -225,7 +245,7 @@ class LiveSimulationPayload(BaseModel):
 
 class LiveSubmitPayload(BaseModel):
     audit_id: str
-    signature: str = Field(min_length=1, max_length=200)
+    signature: str = Field(default="", max_length=200)
 
 
 class LiveConfirmPayload(BaseModel):
@@ -287,6 +307,7 @@ async def bot_loop() -> None:
             await ensure_source_task()
             await drain_launch_queue()
             state.tick()
+            state.run_live_autonomy(config.live_trading_enabled)
             await broadcast_snapshot()
         except Exception as exc:
             state.record_bot_loop_error(exc)
@@ -762,7 +783,7 @@ async def live_requests() -> list[dict]:
 
 
 @app.get("/api/live/status", dependencies=[Depends(require_auth)])
-async def live_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
+async def live_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
     return state.live_status(config.live_trading_enabled, wallet_public_key, signer_mode)
 
 
@@ -849,13 +870,57 @@ async def live_ledger(wallet_public_key: str = "") -> dict:
 
 
 @app.get("/api/live/wallet/status", dependencies=[Depends(require_auth)])
-async def live_wallet_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
+async def live_wallet_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
     return state.signer_status(signer_mode, wallet_public_key)
+
+
+@app.get("/api/live/hot-wallet/status", dependencies=[Depends(require_auth)])
+async def live_hot_wallet_status() -> dict:
+    return state.hot_wallet_status()
+
+
+@app.post("/api/live/hot-wallet/import", dependencies=[Depends(require_auth)])
+async def live_hot_wallet_import(payload: LiveHotWalletImportPayload) -> dict:
+    try:
+        return state.import_hot_wallet(payload.private_key, payload.password, payload.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/hot-wallet/unlock", dependencies=[Depends(require_auth)])
+async def live_hot_wallet_unlock(payload: LiveHotWalletUnlockPayload) -> dict:
+    try:
+        return state.unlock_hot_wallet(payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/hot-wallet/lock", dependencies=[Depends(require_auth)])
+async def live_hot_wallet_lock() -> dict:
+    return state.lock_hot_wallet()
+
+
+@app.post("/api/live/hot-wallet/clear", dependencies=[Depends(require_auth)])
+async def live_hot_wallet_clear() -> dict:
+    return state.clear_hot_wallet()
 
 
 @app.post("/api/live/session/start", dependencies=[Depends(require_auth)])
 async def live_session_start(payload: LiveSessionStartPayload) -> dict:
     return state.start_live_session(config.live_trading_enabled, payload.wallet_public_key, payload.signer_mode)
+
+
+@app.post("/api/live/backend/arm", dependencies=[Depends(require_auth)])
+async def live_backend_arm(payload: LiveBackendArmPayload) -> dict:
+    try:
+        return state.arm_live_backend(config.live_trading_enabled, payload.signer_mode, payload.wallet_public_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/backend/disarm", dependencies=[Depends(require_auth)])
+async def live_backend_disarm() -> dict:
+    return state.disarm_live_backend()
 
 
 @app.post("/api/live/session/acknowledge", dependencies=[Depends(require_auth)])

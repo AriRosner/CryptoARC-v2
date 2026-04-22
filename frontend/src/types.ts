@@ -93,7 +93,12 @@ export interface BotSettings {
   live_max_slippage_pct: number;
   live_priority_fee_cap_sol: number;
   live_session_acknowledged: boolean;
-  live_signer_mode: "browser_wallet" | "local_signer_daemon";
+  live_signer_mode: "browser_wallet" | "local_hot_wallet" | "local_signer_daemon";
+  live_active_backend_armed: boolean;
+  live_active_wallet_public_key: string;
+  live_hot_wallet_enabled: boolean;
+  live_hot_wallet_public_key: string;
+  live_hot_wallet_label: string;
 }
 
 export interface TokenSignal {
@@ -635,7 +640,7 @@ export interface LiveExecutionRequest {
 }
 
 export interface SignerStatus {
-  mode: "browser_wallet" | "local_signer_daemon";
+  mode: "browser_wallet" | "local_hot_wallet" | "local_signer_daemon";
   connected: boolean;
   wallet_public_key: string;
   healthy: boolean;
@@ -650,6 +655,17 @@ export interface SignerStatus {
   version: string;
   last_heartbeat_at: string;
   auth_configured: boolean;
+}
+
+export interface HotWalletStatus {
+  imported: boolean;
+  unlocked: boolean;
+  wallet_public_key: string;
+  label: string;
+  imported_at: string;
+  last_unlock_at: string;
+  file_path: string;
+  version: number;
 }
 
 export interface MigrationStatus {
@@ -740,9 +756,19 @@ export interface LiveStatus {
     realized_pnl_sol: number;
     unrealized_pnl_sol: number;
     cost_basis_sol: number;
+    open_positions?: number;
     approximate: boolean;
   };
   readiness_warnings: string[];
+  hot_wallet: HotWalletStatus;
+  active_backend: {
+    armed: boolean;
+    mode: string;
+    wallet_public_key: string;
+  };
+  backend_capabilities: Record<string, SignerStatus>;
+  entry_autonomy_available: boolean;
+  exit_autonomy_available: boolean;
 }
 
 export type LiveIntentSource = "manual" | "watchlist" | "paper_promoted" | "live_position_rules" | string;

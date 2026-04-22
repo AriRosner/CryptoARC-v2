@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -218,6 +218,46 @@ export async function startLiveSession(wallet_public_key: string, signer_mode = 
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ wallet_public_key, signer_mode })
   });
+}
+
+export async function fetchHotWalletStatus(): Promise<HotWalletStatus> {
+  return request("/api/live/hot-wallet/status");
+}
+
+export async function importHotWallet(private_key: string, password: string, label = ""): Promise<HotWalletStatus> {
+  return request("/api/live/hot-wallet/import", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ private_key, password, label })
+  });
+}
+
+export async function unlockHotWallet(password: string): Promise<HotWalletStatus> {
+  return request("/api/live/hot-wallet/unlock", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password })
+  });
+}
+
+export async function lockHotWallet(): Promise<HotWalletStatus> {
+  return request("/api/live/hot-wallet/lock", { method: "POST" });
+}
+
+export async function clearHotWallet(): Promise<HotWalletStatus> {
+  return request("/api/live/hot-wallet/clear", { method: "POST" });
+}
+
+export async function armLiveBackend(wallet_public_key: string, signer_mode = "browser_wallet"): Promise<Record<string, unknown>> {
+  return request("/api/live/backend/arm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ wallet_public_key, signer_mode })
+  });
+}
+
+export async function disarmLiveBackend(): Promise<Record<string, unknown>> {
+  return request("/api/live/backend/disarm", { method: "POST" });
 }
 
 export interface LiveQuoteRequest {

@@ -28,7 +28,13 @@ interface SidebarProps {
   onStart: () => void;
   onStop: () => void;
   onSettingsOpen: () => void;
-  onLiveWalletOpen: () => void;
+  onAddWalletOpen: () => void;
+  onManageWalletOpen: () => void;
+  walletOptions: Array<{ value: string; label: string }>;
+  activeWallet: string;
+  canRemoveActiveWallet: boolean;
+  onActiveWalletChange: (wallet: string) => void;
+  onRemoveWallet: () => void;
   walletPublicKey: string;
   walletBalance: number | null;
   collapsed: boolean;
@@ -82,7 +88,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onStart,
   onStop,
   onSettingsOpen,
-  onLiveWalletOpen,
+  onAddWalletOpen,
+  onManageWalletOpen,
+  walletOptions,
+  activeWallet,
+  canRemoveActiveWallet,
+  onActiveWalletChange,
+  onRemoveWallet,
   walletPublicKey,
   walletBalance,
   collapsed,
@@ -246,7 +258,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {!collapsed ? (
               <>
                 <div className="mb-3 flex items-center justify-between">
-                  <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Live Wallet</span>
+                  <span className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Wallet Manage</span>
                   <Wallet size={14} className="text-zinc-500" />
                 </div>
                 {walletPublicKey ? (
@@ -260,32 +272,44 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     </div>
                   </div>
                 ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="w-full border-amber-500/30 text-amber-500 hover:bg-amber-500/10"
-                    onClick={onLiveWalletOpen}
-                  >
-                    Connect Wallet
-                  </Button>
+                  <div className="rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-zinc-500">
+                    No browser wallet connected
+                  </div>
                 )}
-                {walletPublicKey ? (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    className="mt-3 w-full"
-                    onClick={onLiveWalletOpen}
-                  >
-                    Manage Live Wallet
-                  </Button>
-                ) : null}
+                <div className="mt-3 space-y-3">
+                  <label className="flex flex-col gap-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
+                    Active Wallet
+                    <select
+                      value={activeWallet}
+                      onChange={(event) => onActiveWalletChange(event.target.value)}
+                      className="dashboard-select rounded-lg border border-white/10 bg-black/50 px-2 py-2 text-xs font-bold normal-case tracking-normal text-white"
+                    >
+                      {walletOptions.map((wallet) => (
+                        <option key={wallet.value} value={wallet.value}>{wallet.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {canRemoveActiveWallet ? (
+                    <Button variant="ghost" size="sm" className="w-full border border-rose-500/20 text-rose-200 hover:bg-rose-500/10" onClick={onRemoveWallet}>
+                      Remove Selected Wallet
+                    </Button>
+                  ) : null}
+                  <div className="grid grid-cols-2 gap-2">
+                    <Button variant="outline" size="sm" className="w-full border-amber-500/30 text-amber-500 hover:bg-amber-500/10" onClick={onAddWalletOpen}>
+                      Add Wallet
+                    </Button>
+                    <Button variant="secondary" size="sm" className="w-full" onClick={onManageWalletOpen}>
+                      Manage
+                    </Button>
+                  </div>
+                </div>
               </>
             ) : (
               <div className="flex min-w-0 flex-col items-center justify-center gap-2">
-                <Tooltip label={walletPublicKey ? `Wallet ${walletPublicKey}` : "Live Wallet"}>
+                <Tooltip label={walletPublicKey ? `Wallet ${walletPublicKey}` : "Manage Wallets"}>
                   <button
                     type="button"
-                    onClick={onLiveWalletOpen}
+                    onClick={onManageWalletOpen}
                     className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 transition-colors hover:border-amber-500/30 hover:text-amber-300"
                   >
                     <Wallet size={16} />
@@ -302,6 +326,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 ) : (
                   <div className="text-center text-[9px] font-bold uppercase tracking-wider leading-none text-zinc-600">Wallet</div>
                 )}
+                <Tooltip label="Add Wallet">
+                  <button
+                    type="button"
+                    onClick={onAddWalletOpen}
+                    className="flex h-8 w-8 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-200 transition-colors hover:bg-amber-500/20"
+                  >
+                    <PlusIcon />
+                  </button>
+                </Tooltip>
               </div>
             )}
           </Card>
@@ -310,4 +343,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
     </motion.aside>
   );
 };
+
+function PlusIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 5v14M5 12h14" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+    </svg>
+  );
+}
 

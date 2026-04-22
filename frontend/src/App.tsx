@@ -26,7 +26,9 @@ import {
 import {
   backupDatabase,
   acknowledgeLiveSession,
+  armLiveBackend,
   clearData,
+  clearHotWallet,
   confirmLiveAudit,
   cancelLiveIntent,
   createLiveIntent,
@@ -44,6 +46,7 @@ import {
   fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
+  fetchHotWalletStatus,
   fetchDataIntegrity,
   fetchMonitorPnlSummary,
   fetchOperationalMonitoring,
@@ -72,6 +75,7 @@ import {
   fetchTuningSuggestions,
   fetchWatchdogStatus,
   login,
+  lockHotWallet,
   logout,
   openSnapshotSocket,
   patchSettings,
@@ -91,13 +95,17 @@ import {
   runReplayBacktest,
   runStrategyComparison,
   startBot,
+  startLiveSession,
   stopBot,
+  importHotWallet,
   setupTotp,
   saveStrategyPreset,
+  disarmLiveBackend,
+  unlockHotWallet,
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
@@ -222,7 +230,12 @@ const fallbackSnapshot: BotSnapshot = {
     live_max_slippage_pct: 0,
     live_priority_fee_cap_sol: 0,
     live_session_acknowledged: false,
-    live_signer_mode: "browser_wallet"
+    live_signer_mode: "browser_wallet",
+    live_active_backend_armed: false,
+    live_active_wallet_public_key: "",
+    live_hot_wallet_enabled: false,
+    live_hot_wallet_public_key: "",
+    live_hot_wallet_label: ""
   },
   tokens: [],
   events: [],
@@ -278,7 +291,7 @@ type PnlTimeframe = "5m" | "15m" | "1h" | "24h" | "all";
 type QueueFilter = "all" | "open" | "profitable" | "losses";
 type QueueSort = "newest" | "score" | "pnl" | "creator";
 type WorkspacePage = "monitor" | "analysis" | "backtests" | "review" | "data";
-type LiveWalletMethod = "browser_wallet" | "local_signer_daemon";
+type LiveWalletMethod = "browser_wallet" | "local_hot_wallet" | "local_signer_daemon";
 type PnlWalletScope = "paper" | string;
 type PnlCurrency = "SOL" | "USD";
 type BotActionStatus = "starting" | "stopping" | "";
@@ -488,7 +501,12 @@ function App() {
   const [pnlWalletScope, setPnlWalletScope] = React.useState<PnlWalletScope>(() => window.localStorage.getItem("cryptoarc_pnl_wallet_scope") || "paper");
   const [walletBalanceSol, setWalletBalanceSol] = React.useState<number | null>(null);
   const [liveWalletOpen, setLiveWalletOpen] = React.useState(false);
-  const [liveWalletMethod, setLiveWalletMethod] = React.useState<LiveWalletMethod>("browser_wallet");
+  const [liveWalletOpenMode, setLiveWalletOpenMode] = React.useState<"setup" | "workspace">("setup");
+  const [liveWalletMethod, setLiveWalletMethod] = React.useState<LiveWalletMethod>((window.localStorage.getItem("cryptoarc_live_wallet_method") as LiveWalletMethod) || "browser_wallet");
+  const [hotWalletStatus, setHotWalletStatus] = React.useState<HotWalletStatus | null>(null);
+  const [hotWalletPrivateKey, setHotWalletPrivateKey] = React.useState("");
+  const [hotWalletPassword, setHotWalletPassword] = React.useState("");
+  const [hotWalletLabel, setHotWalletLabel] = React.useState("");
   const [liveAction, setLiveAction] = React.useState<"buy" | "sell">("buy");
   const [liveMint, setLiveMint] = React.useState("");
   const [liveAmount, setLiveAmount] = React.useState("0.001");
@@ -509,6 +527,7 @@ function App() {
   const [apiError, setApiError] = React.useState("");
   const [pendingSuggestion, setPendingSuggestion] = React.useState<TuningSuggestion | null>(null);
   const [applyingSuggestion, setApplyingSuggestion] = React.useState(false);
+  const [walletPendingRemoval, setWalletPendingRemoval] = React.useState<string | null>(null);
   const [authRequired, setAuthRequired] = React.useState(false);
   const [authed, setAuthed] = React.useState(false);
   const [totpRequired, setTotpRequired] = React.useState(false);
@@ -637,6 +656,24 @@ function App() {
         : "USD price loading"
     : "SOL display";
   const deferredTokenSearch = React.useDeferredValue(tokenSearch);
+  const walletScopeOptions = React.useMemo(() => {
+    const options = [{ value: "paper", label: "Paper Wallet" }];
+    const seen = new Set<string>(["paper"]);
+    const candidates = [
+      walletPublicKey,
+      ...liveWallets,
+      hotWalletStatus?.wallet_public_key || "",
+      liveStatus?.signer?.wallet_public_key || "",
+      snapshot.settings.live_active_wallet_public_key || "",
+    ];
+    for (const wallet of candidates) {
+      const clean = wallet.trim();
+      if (!clean || seen.has(clean)) continue;
+      seen.add(clean);
+      options.push({ value: clean, label: `Live ${shortAddress(clean)}` });
+    }
+    return options;
+  }, [hotWalletStatus?.wallet_public_key, liveStatus?.signer?.wallet_public_key, liveWallets, snapshot.settings.live_active_wallet_public_key, walletPublicKey]);
   const filteredTokens = React.useMemo(() => {
     let tokens = tokenSource;
     const query = deferredTokenSearch.trim().toLowerCase();
@@ -689,6 +726,30 @@ function App() {
     setPnlWalletScope(scope);
     window.localStorage.setItem("cryptoarc_pnl_wallet_scope", scope);
   }, []);
+
+  const openAddWalletFlow = React.useCallback(() => {
+    setLiveWalletOpenMode("setup");
+    setLiveWalletOpen(true);
+  }, []);
+
+  const openManageWalletFlow = React.useCallback(() => {
+    setLiveWalletOpenMode("workspace");
+    setLiveWalletOpen(true);
+  }, []);
+
+  const removeTrackedWallet = React.useCallback((wallet: string) => {
+    const nextWallets = liveWallets.filter((entry) => entry !== wallet);
+    setLiveWallets(nextWallets);
+    window.localStorage.setItem("cryptoarc_live_wallets", JSON.stringify(nextWallets));
+    if (walletPublicKey === wallet) {
+      setWalletPublicKey("");
+      window.localStorage.removeItem("cryptoarc_wallet_public_key");
+      setWalletBalanceSol(null);
+    }
+    if (pnlWalletScope === wallet) {
+      updatePnlWalletScope("paper");
+    }
+  }, [liveWallets, pnlWalletScope, updatePnlWalletScope, walletPublicKey]);
 
   const updateHideSkippedTokens = React.useCallback((value: boolean) => {
     setHideSkippedTokens(value);
@@ -849,24 +910,33 @@ function App() {
     }
   }, [snapshot.settings.solana_rpc_url, walletPublicKey]);
 
+  React.useEffect(() => {
+    window.localStorage.setItem("cryptoarc_live_wallet_method", liveWalletMethod);
+  }, [liveWalletMethod]);
+
   const refreshLiveWalletCoreData = React.useCallback(async (publicKey = walletPublicKey) => {
     if (!publicKey && !liveWalletOpen) return;
     if (liveWalletCoreRefreshInFlight.current) return;
     liveWalletCoreRefreshInFlight.current = true;
     try {
-      const [status, positions] = await Promise.all([
-        fetchLiveStatus(publicKey, liveWalletMethod),
-        publicKey ? fetchLivePositions(publicKey) : Promise.resolve([])
-      ]);
+      const hotStatusPromise = fetchHotWalletStatus().catch(() => null);
+      const requestedWallet = liveWalletMethod === "local_hot_wallet"
+        ? hotWalletStatus?.wallet_public_key || snapshot.settings.live_hot_wallet_public_key || publicKey
+        : publicKey;
+      const status = await fetchLiveStatus(requestedWallet, liveWalletMethod);
+      const hotStatus = await hotStatusPromise;
+      const resolvedWallet = String(status.signer?.wallet_public_key || requestedWallet || "");
+      const positions = resolvedWallet ? await fetchLivePositions(resolvedWallet) : [];
       setLiveStatus(status);
+      setHotWalletStatus(hotStatus);
       setLivePositions(positions);
-      if (publicKey) {
-        refreshConnectedWalletBalance(publicKey).catch(() => undefined);
+      if (resolvedWallet) {
+        refreshConnectedWalletBalance(resolvedWallet).catch(() => undefined);
       }
     } finally {
       liveWalletCoreRefreshInFlight.current = false;
     }
-  }, [liveWalletMethod, liveWalletOpen, refreshConnectedWalletBalance, walletPublicKey]);
+  }, [hotWalletStatus?.wallet_public_key, liveWalletMethod, liveWalletOpen, refreshConnectedWalletBalance, snapshot.settings.live_hot_wallet_public_key, walletPublicKey]);
 
   const refreshLiveWalletDetailData = React.useCallback(async (force = false) => {
     if (!force && !liveWalletOpen) return;
@@ -1125,11 +1195,11 @@ function App() {
     }
   }
 
-  async function connectBrowserWallet() {
+  async function connectBrowserWallet(): Promise<boolean> {
     try {
       if (!window.solana) {
         setApiError("Browser wallet not found. Install or unlock Phantom/Solflare and refresh.");
-        return;
+        return false;
       }
       const result = await window.solana.connect();
       const publicKey = result.publicKey.toString();
@@ -1143,24 +1213,154 @@ function App() {
         liveWalletOpen ? refreshLiveWalletDetailData(true) : Promise.resolve()
       ]);
       setApiError("");
+      return true;
     } catch (error) {
       setApiError(`Wallet connect failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
     }
   }
 
-  async function acknowledgeLiveRisk() {
+  async function acknowledgeLiveRisk(): Promise<boolean> {
     try {
       await acknowledgeLiveSession();
       const updated = await fetchSnapshot();
       setSnapshot(updated);
       await refreshLiveWalletCoreData();
+      return true;
     } catch (error) {
       setApiError(`Live acknowledgement failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function applyLiveQuickFix(kind: "enable_env" | "configure_caps" | "disable_kill_switch"): Promise<boolean> {
+    try {
+      const patch: Record<string, number | boolean | string> = {};
+      if (kind === "enable_env") {
+        patch.live_trading_enabled = true;
+        patch.manual_live_enabled = true;
+      }
+      if (kind === "configure_caps") {
+        patch.manual_live_enabled = true;
+        patch.live_max_trade_sol = settings.live_max_trade_sol > 0 ? settings.live_max_trade_sol : 0.01;
+        patch.live_daily_loss_cap_sol = settings.live_daily_loss_cap_sol > 0 ? settings.live_daily_loss_cap_sol : 0.05;
+        patch.live_wallet_exposure_cap_sol = settings.live_wallet_exposure_cap_sol > 0 ? settings.live_wallet_exposure_cap_sol : 0.1;
+        patch.live_max_open_positions = settings.live_max_open_positions > 0 ? settings.live_max_open_positions : 2;
+        patch.live_max_slippage_pct = settings.live_max_slippage_pct > 0 ? settings.live_max_slippage_pct : 5;
+        patch.live_priority_fee_cap_sol = settings.live_priority_fee_cap_sol > 0 ? settings.live_priority_fee_cap_sol : 0.0001;
+      }
+      if (kind === "disable_kill_switch") {
+        patch.kill_switch_enabled = false;
+      }
+      const updated = await patchSettings(patch);
+      setSnapshot(updated);
+      await refreshLiveExecutionSurfaces();
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Live quick fix failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  function resolvedLiveWallet(method = liveWalletMethod): string {
+    if (method === "local_hot_wallet") {
+      return hotWalletStatus?.wallet_public_key || snapshot.settings.live_hot_wallet_public_key || "";
+    }
+    if (method === "local_signer_daemon") {
+      return liveStatus?.signer?.wallet_public_key || snapshot.settings.live_active_wallet_public_key || "";
+    }
+    return walletPublicKey;
+  }
+
+  async function importEncryptedHotWallet(): Promise<boolean> {
+    try {
+      const status = await importHotWallet(hotWalletPrivateKey, hotWalletPassword, hotWalletLabel);
+      setHotWalletStatus(status);
+      setLiveWalletMethod("local_hot_wallet");
+      setHotWalletPrivateKey("");
+      await Promise.all([refreshLiveWalletCoreData(status.wallet_public_key), refreshLiveWalletDetailData(true)]);
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Hot wallet import failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function unlockEncryptedHotWallet(): Promise<boolean> {
+    try {
+      const status = await unlockHotWallet(hotWalletPassword);
+      setHotWalletStatus(status);
+      setLiveWalletMethod("local_hot_wallet");
+      await refreshLiveWalletCoreData(status.wallet_public_key);
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Hot wallet unlock failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function lockEncryptedHotWallet(): Promise<boolean> {
+    try {
+      const status = await lockHotWallet();
+      setHotWalletStatus(status);
+      await refreshLiveWalletCoreData();
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Hot wallet lock failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function clearEncryptedHotWallet(): Promise<boolean> {
+    try {
+      const status = await clearHotWallet();
+      setHotWalletStatus(status);
+      await refreshLiveWalletCoreData();
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Hot wallet clear failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function armSelectedLiveBackend(): Promise<boolean> {
+    try {
+      const wallet = resolvedLiveWallet();
+      await startLiveSession(wallet, liveWalletMethod);
+      await armLiveBackend(wallet, liveWalletMethod);
+      const updated = await fetchSnapshot();
+      setSnapshot(updated);
+      await refreshLiveExecutionSurfaces();
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Live backend arm failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function disarmSelectedLiveBackend(): Promise<boolean> {
+    try {
+      await disarmLiveBackend();
+      const updated = await fetchSnapshot();
+      setSnapshot(updated);
+      await refreshLiveExecutionSurfaces();
+      setApiError("");
+      return true;
+    } catch (error) {
+      setApiError(`Live backend disarm failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
     }
   }
 
   async function createLivePreview() {
     try {
+      const requestWallet = resolvedLiveWallet();
       const audit = await createLiveQuote({
         action: liveAction,
         mint: liveMint,
@@ -1169,10 +1369,12 @@ function App() {
         slippage_pct: liveSlippage,
         priority_fee_sol: livePriorityFee,
         pool: livePool,
-        wallet_public_key: walletPublicKey,
+        wallet_public_key: requestWallet,
         signer_mode: liveWalletMethod
       });
-      const simulated = await recordLiveSimulation(audit.id, false, "Browser wallet simulation must be reviewed before signing.");
+      const simulated = liveWalletMethod === "browser_wallet"
+        ? await recordLiveSimulation(audit.id, false, "Browser wallet simulation must be reviewed before signing.")
+        : audit;
       setActiveLiveAudit(simulated);
       setLiveAudit((current) => [simulated, ...current.filter((item) => item.id !== simulated.id)]);
       setApiError("");
@@ -1183,12 +1385,13 @@ function App() {
 
   async function createManualIntent() {
     try {
+      const requestWallet = resolvedLiveWallet();
       const intent = await createLiveIntent({
         action: liveAction,
         mint: liveMint,
         amount: liveAmount,
         denominated_in_sol: liveAction === "buy",
-        wallet_public_key: walletPublicKey,
+        wallet_public_key: requestWallet,
         signer_mode: liveWalletMethod,
         source: "manual",
         reason: "Manual Live Wallet workbench intent"
@@ -1203,7 +1406,7 @@ function App() {
 
   async function generateWorkbenchIntents() {
     try {
-      const intents = await generateLiveIntents(walletPublicKey, liveWalletMethod, watchlist);
+      const intents = await generateLiveIntents(resolvedLiveWallet(), liveWalletMethod, watchlist);
       setLiveIntents(intents);
       setApiError("");
     } catch (error) {
@@ -1237,6 +1440,12 @@ function App() {
   async function simulateActiveLiveAudit() {
     if (!activeLiveAudit) return;
     try {
+      if (liveWalletMethod !== "browser_wallet") {
+        const updated = await recordLiveSimulation(activeLiveAudit.id, true, "", "", { backend: liveWalletMethod, note: "Backend execution path performs its own simulation and submission checks." });
+        setActiveLiveAudit(updated);
+        setLiveAudit((current) => [updated, ...current.filter((item) => item.id !== updated.id)]);
+        return;
+      }
       const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
       if (!encoded) throw new Error("No unsigned transaction is available");
       const { Connection, VersionedTransaction } = await loadSolanaWeb3();
@@ -1266,6 +1475,14 @@ function App() {
   async function signAndSendLiveAudit() {
     if (!activeLiveAudit) return;
     try {
+      if (liveWalletMethod !== "browser_wallet") {
+        const executed = await submitLiveAudit(activeLiveAudit.id, "");
+        setActiveLiveAudit(executed);
+        setLiveAudit((current) => [executed, ...current.filter((item) => item.id !== executed.id)]);
+        await refreshLiveWalletCoreData();
+        await refreshLiveWalletDetailData(true);
+        return;
+      }
       if (!window.solana) throw new Error("Browser wallet not connected");
       const encoded = String(activeLiveAudit.quote.unsigned_transaction_base64 || "");
       if (!encoded) throw new Error("No unsigned transaction is available");
@@ -1420,7 +1637,13 @@ function App() {
       onStart={handleStartBot}
       onStop={handleStopBot}
       onSettingsOpen={() => setSettingsOpen(true)}
-      onLiveWalletOpen={() => setLiveWalletOpen(true)}
+      onAddWalletOpen={openAddWalletFlow}
+      onManageWalletOpen={openManageWalletFlow}
+      walletOptions={walletScopeOptions}
+      activeWallet={pnlWalletScope}
+      canRemoveActiveWallet={pnlWalletScope !== "paper" && (liveWallets.includes(pnlWalletScope) || walletPublicKey === pnlWalletScope)}
+      onActiveWalletChange={updatePnlWalletScope}
+      onRemoveWallet={() => setWalletPendingRemoval(pnlWalletScope === "paper" ? null : pnlWalletScope)}
       walletPublicKey={walletPublicKey}
       walletBalance={walletBalanceSol}
       toasts={toasts}
@@ -1437,8 +1660,7 @@ function App() {
           pnlCaption={pnlWalletScope === "paper"
             ? `${paperPnlSummary?.closed_trade_count ?? 0} closed paper trades in selected range`
             : `${liveLedger?.summary.open_positions ?? 0} live positions / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"} P&L`}
-          liveWallets={liveWallets}
-          walletPublicKey={walletPublicKey}
+          walletOptions={walletScopeOptions}
           timeframe={pnlTimeframe}
           setTimeframe={setPnlTimeframe}
           pnlWallet={pnlWalletScope}
@@ -1592,7 +1814,8 @@ function App() {
       )}
 
       {liveWalletOpen && (
-        <LiveWalletModal
+        <GuidedLiveWalletModal
+          initialView={liveWalletOpenMode}
           method={liveWalletMethod}
           onMethodChange={setLiveWalletMethod}
           walletPublicKey={walletPublicKey}
@@ -1614,6 +1837,20 @@ function App() {
           onClose={() => setLiveWalletOpen(false)}
           onConnectWallet={connectBrowserWallet}
           onAcknowledgeLive={acknowledgeLiveRisk}
+          onArmBackend={armSelectedLiveBackend}
+          onDisarmBackend={disarmSelectedLiveBackend}
+          onApplyQuickFix={applyLiveQuickFix}
+          hotWalletStatus={hotWalletStatus}
+          hotWalletPrivateKey={hotWalletPrivateKey}
+          hotWalletPassword={hotWalletPassword}
+          hotWalletLabel={hotWalletLabel}
+          onHotWalletPrivateKeyChange={setHotWalletPrivateKey}
+          onHotWalletPasswordChange={setHotWalletPassword}
+          onHotWalletLabelChange={setHotWalletLabel}
+          onImportHotWallet={importEncryptedHotWallet}
+          onUnlockHotWallet={unlockEncryptedHotWallet}
+          onLockHotWallet={lockEncryptedHotWallet}
+          onClearHotWallet={clearEncryptedHotWallet}
           onLiveActionChange={setLiveAction}
           onLiveMintChange={setLiveMint}
           onLiveAmountChange={setLiveAmount}
@@ -1631,6 +1868,37 @@ function App() {
           onRecoverLiveAudit={recoverSingleLiveAudit}
         />
       )}
+
+      <Modal
+        isOpen={!!walletPendingRemoval}
+        onClose={() => setWalletPendingRemoval(null)}
+        title="Remove Wallet"
+        description="Review the selected wallet before removing it from the dashboard selector."
+        className="max-w-lg"
+      >
+        <div className="space-y-4">
+          <div className="rounded-xl border border-rose-500/20 bg-rose-500/[0.05] p-4">
+            <p className="text-[10px] font-black uppercase tracking-[0.24em] text-zinc-500">Selected wallet</p>
+            <p className="mt-2 break-all text-sm font-black text-white">{walletPendingRemoval || "-"}</p>
+            <p className="mt-3 text-xs leading-5 text-zinc-300">This removes the wallet from the active selector and resets the dashboard back to paper if that wallet is currently selected. It does not delete on-chain funds.</p>
+          </div>
+          <div className="flex justify-end gap-3">
+            <button className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-xs font-black uppercase tracking-widest text-zinc-300 transition hover:bg-white/[0.06]" onClick={() => setWalletPendingRemoval(null)}>
+              Cancel
+            </button>
+            <button
+              className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-xs font-black uppercase tracking-widest text-rose-100 transition hover:bg-rose-500/20"
+              onClick={() => {
+                if (!walletPendingRemoval) return;
+                removeTrackedWallet(walletPendingRemoval);
+                setWalletPendingRemoval(null);
+              }}
+            >
+              Remove Wallet
+            </button>
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         isOpen={!!pendingSuggestion}
@@ -1679,7 +1947,8 @@ function App() {
   );
 }
 
-function LiveWalletModal({
+function GuidedLiveWalletModal({
+  initialView,
   method,
   onMethodChange,
   walletPublicKey,
@@ -1701,6 +1970,985 @@ function LiveWalletModal({
   onClose,
   onConnectWallet,
   onAcknowledgeLive,
+  onArmBackend,
+  onDisarmBackend,
+  onApplyQuickFix,
+  hotWalletStatus,
+  hotWalletPrivateKey,
+  hotWalletPassword,
+  hotWalletLabel,
+  onHotWalletPrivateKeyChange,
+  onHotWalletPasswordChange,
+  onHotWalletLabelChange,
+  onImportHotWallet,
+  onUnlockHotWallet,
+  onLockHotWallet,
+  onClearHotWallet,
+  onLiveActionChange,
+  onLiveMintChange,
+  onLiveAmountChange,
+  onLiveSlippageChange,
+  onLivePriorityFeeChange,
+  onLivePoolChange,
+  onCreateLivePreview,
+  onCreateManualIntent,
+  onGenerateIntents,
+  onQuoteIntent,
+  onCancelIntent,
+  onSimulateActiveAudit,
+  onSignAndSendLive,
+  onRecoverAllLiveAudits,
+  onRecoverLiveAudit
+}: {
+  initialView: "setup" | "workspace";
+  method: LiveWalletMethod;
+  onMethodChange: (method: LiveWalletMethod) => void;
+  walletPublicKey: string;
+  walletBalanceSol: number | null;
+  settings: BotSettings;
+  liveStatus: LiveStatus | null;
+  liveAudit: LiveExecutionAudit[];
+  livePositions: LivePosition[];
+  liveIntents: LiveIntent[];
+  liveLedger: LiveLedger | null;
+  liveAction: "buy" | "sell";
+  liveMint: string;
+  liveAmount: string;
+  liveSlippage: number;
+  livePriorityFee: number;
+  livePool: string;
+  activeLiveAudit: LiveExecutionAudit | null;
+  activeLiveIntentId: string;
+  onClose: () => void;
+  onConnectWallet: () => Promise<boolean>;
+  onAcknowledgeLive: () => Promise<boolean>;
+  onArmBackend: () => Promise<boolean>;
+  onDisarmBackend: () => Promise<boolean>;
+  onApplyQuickFix: (kind: "enable_env" | "configure_caps" | "disable_kill_switch") => Promise<boolean>;
+  hotWalletStatus: HotWalletStatus | null;
+  hotWalletPrivateKey: string;
+  hotWalletPassword: string;
+  hotWalletLabel: string;
+  onHotWalletPrivateKeyChange: (value: string) => void;
+  onHotWalletPasswordChange: (value: string) => void;
+  onHotWalletLabelChange: (value: string) => void;
+  onImportHotWallet: () => Promise<boolean>;
+  onUnlockHotWallet: () => Promise<boolean>;
+  onLockHotWallet: () => Promise<boolean>;
+  onClearHotWallet: () => Promise<boolean>;
+  onLiveActionChange: (action: "buy" | "sell") => void;
+  onLiveMintChange: (mint: string) => void;
+  onLiveAmountChange: (amount: string) => void;
+  onLiveSlippageChange: (slippage: number) => void;
+  onLivePriorityFeeChange: (fee: number) => void;
+  onLivePoolChange: (pool: string) => void;
+  onCreateLivePreview: () => Promise<void>;
+  onCreateManualIntent: () => Promise<void>;
+  onGenerateIntents: () => Promise<void>;
+  onQuoteIntent: (intentId: string) => Promise<void>;
+  onCancelIntent: (intentId: string) => Promise<void>;
+  onSimulateActiveAudit: () => Promise<void>;
+  onSignAndSendLive: () => Promise<void>;
+  onRecoverAllLiveAudits: () => Promise<void>;
+  onRecoverLiveAudit: (auditId: string) => Promise<void>;
+}) {
+  type WorkspaceAction = "acknowledge" | "arm" | "disarm" | "reconnect" | "lock" | "clear";
+
+  const [stepIndex, setStepIndex] = React.useState(initialView === "workspace" ? 4 : 0);
+  const [workspaceVisible, setWorkspaceVisible] = React.useState(initialView === "workspace");
+  const [busyAction, setBusyAction] = React.useState("");
+  const [pendingWorkspaceAction, setPendingWorkspaceAction] = React.useState<WorkspaceAction | null>(null);
+  const [pendingFixBlocker, setPendingFixBlocker] = React.useState<string | null>(null);
+  const [completionStamp, setCompletionStamp] = React.useState(0);
+
+  React.useEffect(() => {
+    setStepIndex(initialView === "workspace" ? 4 : 0);
+    setWorkspaceVisible(initialView === "workspace");
+    setPendingWorkspaceAction(null);
+    setPendingFixBlocker(null);
+    setBusyAction("");
+    setCompletionStamp(0);
+  }, [initialView]);
+
+  const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
+  const envEnabled = Boolean(liveStatus?.env_live_enabled);
+  const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
+  const quoteBlocked = !envEnabled;
+  const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
+  const activeQuoteStale = activeLiveAudit?.status === "stale" || Boolean(activeLiveAudit?.quote?.stale);
+  const recoverableAuditStatuses = new Set(["submitted", "failed", "needs_review", "stale"]);
+  const reviewAudits = liveAudit.filter((audit) => recoverableAuditStatuses.has(audit.status) || audit.reconciliation_status === "needs_review");
+  const recoverySummary = liveStatus?.recovery_summary;
+  const autonomyBlockers = liveStatus?.autonomy_blockers ?? [];
+  const readinessScore = liveStatus?.readiness?.score ?? 0;
+  const readinessState = liveStatus?.readiness?.status?.replace(/_/g, " ") ?? "unknown";
+  const signerDisabledReason = liveStatus?.signer?.disabled_reason || liveStatus?.wallet_adapter?.disabled_reason || "";
+  const signerSupportsAutoSell = Boolean(liveStatus?.signer?.supports_auto_sell);
+  const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
+  const activeBackend = liveStatus?.active_backend;
+  const connectionReady = method === "browser_wallet"
+    ? Boolean(walletPublicKey)
+    : method === "local_hot_wallet"
+      ? Boolean(hotWalletStatus?.unlocked)
+      : Boolean(liveStatus?.backend_capabilities?.local_signer_daemon?.healthy);
+  const backendHealth = method === "browser_wallet"
+    ? (walletPublicKey ? "connected" : "disconnected")
+    : method === "local_hot_wallet"
+      ? (hotWalletStatus?.unlocked ? "unlocked" : hotWalletStatus?.imported ? "locked" : "not imported")
+      : (connectionReady ? "healthy" : "offline");
+  const methodLabel = method === "browser_wallet" ? "Browser Wallet" : method === "local_hot_wallet" ? "Local Hot Wallet" : "Local Signer Daemon";
+  const modeLabel = method === "browser_wallet"
+    ? "Assisted approvals"
+    : method === "local_hot_wallet"
+      ? "Encrypted unattended signing"
+      : "Daemon-backed unattended signing";
+  const setupSteps = [
+    "Choose Path",
+    method === "browser_wallet" ? "Connect" : method === "local_hot_wallet" ? (hotWalletStatus?.imported ? "Unlock" : "Import") : "Check Daemon",
+    "Review",
+    "Confirm",
+    "Ready"
+  ];
+  const setupHelper = [
+    "Pick the execution path you want for this session. The control plane stays the same, but the signing experience changes by backend.",
+    method === "browser_wallet"
+      ? "Connect the browser wallet first, then review the exact assisted mode before entering the workspace."
+      : method === "local_hot_wallet"
+        ? "Import or unlock your encrypted hot wallet, then review the mode and current safety context."
+        : "Check daemon health and detected wallet first, then confirm this path for the session.",
+    "Review the selected backend, wallet context, readiness state, and warnings before confirming.",
+    "This final confirmation records your live-session acknowledgement when needed.",
+    "Setup is complete. Enter the workspace or switch paths and repeat setup."
+  ];
+  const setupWarnings = [...blockers, ...autonomyBlockers, ...(signerDisabledReason ? [signerDisabledReason] : [])].slice(0, 4);
+  const methodTone = {
+    browser_wallet: "border-emerald-400/40 bg-emerald-500/10 text-emerald-200",
+    local_hot_wallet: "border-amber-400/40 bg-amber-500/10 text-amber-100",
+    local_signer_daemon: "border-sky-400/40 bg-sky-500/10 text-sky-100"
+  } as const;
+
+  async function handleStepPrimary() {
+    if (stepIndex === 0) {
+      setStepIndex(1);
+      return;
+    }
+    if (stepIndex === 1) {
+      setBusyAction("step");
+      try {
+        let ok = false;
+        if (method === "browser_wallet") ok = connectionReady || await onConnectWallet();
+        if (method === "local_hot_wallet") ok = hotWalletStatus?.unlocked || (hotWalletStatus?.imported ? await onUnlockHotWallet() : await onImportHotWallet());
+        if (method === "local_signer_daemon") ok = connectionReady;
+        if (ok) setStepIndex(2);
+      } finally {
+        setBusyAction("");
+      }
+      return;
+    }
+    if (stepIndex === 2) {
+      setStepIndex(3);
+      return;
+    }
+    if (stepIndex === 3) {
+      setBusyAction("confirm");
+      try {
+        const ok = settings.live_session_acknowledged ? true : await onAcknowledgeLive();
+        if (ok) {
+          setStepIndex(4);
+          setCompletionStamp(Date.now());
+        }
+      } finally {
+        setBusyAction("");
+      }
+      return;
+    }
+    if (stepIndex === 4) {
+      setWorkspaceVisible(true);
+    }
+  }
+
+  async function confirmWorkspaceAction() {
+    if (!pendingWorkspaceAction) return;
+    setBusyAction(pendingWorkspaceAction);
+    try {
+      let ok = false;
+      if (pendingWorkspaceAction === "acknowledge") ok = await onAcknowledgeLive();
+      if (pendingWorkspaceAction === "arm") ok = await onArmBackend();
+      if (pendingWorkspaceAction === "disarm") ok = await onDisarmBackend();
+      if (pendingWorkspaceAction === "reconnect") ok = await onConnectWallet();
+      if (pendingWorkspaceAction === "lock") ok = await onLockHotWallet();
+      if (pendingWorkspaceAction === "clear") ok = await onClearHotWallet();
+      if (ok) setPendingWorkspaceAction(null);
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  const workspaceActionMeta: Record<WorkspaceAction, { title: string; body: string; tone: string }> = {
+    acknowledge: {
+      title: "Confirm live-session acknowledgement",
+      body: "This records that you reviewed the current live warnings and intentionally want to keep operating in the live wallet workspace.",
+      tone: "border-amber-400/20 bg-amber-500/10"
+    },
+    arm: {
+      title: "Arm active backend",
+      body: "This enables the selected backend to execute under the current readiness checks, caps, and autonomy gates.",
+      tone: "border-emerald-500/20 bg-emerald-500/10"
+    },
+    disarm: {
+      title: "Disarm active backend",
+      body: "This halts new autonomous execution for the current backend while leaving review and recovery tools available.",
+      tone: "border-rose-500/20 bg-rose-500/10"
+    },
+    reconnect: {
+      title: "Reconnect browser wallet",
+      body: "This refreshes the assisted browser-wallet context and requests a new wallet connection if needed.",
+      tone: "border-amber-400/20 bg-amber-500/10"
+    },
+    lock: {
+      title: "Lock hot wallet",
+      body: "This removes hot-wallet signing access from memory until you unlock it again.",
+      tone: "border-zinc-500/20 bg-white/5"
+    },
+    clear: {
+      title: "Clear stored hot wallet",
+      body: "This removes the encrypted hot-wallet material from local storage. You will need to import it again before reuse.",
+      tone: "border-rose-500/20 bg-rose-500/10"
+    }
+  };
+
+  function blockerFixDescriptor(blocker: string): { label: string; title: string; body: string; tone: string; run: () => Promise<boolean> | boolean } | null {
+    const lower = blocker.toLowerCase();
+    if (lower.includes("live_trading_enabled is false") || lower.includes("environment flag is disabled")) {
+      return {
+        label: "Enable Live Env",
+        title: "Enable live execution environment",
+        body: "This turns on the local live-trading environment flag and manual live support so the current backend can continue through readiness checks.",
+        tone: "border-amber-400/20 bg-amber-500/10",
+        run: () => onApplyQuickFix("enable_env")
+      };
+    }
+    if (lower.includes("live session acknowledgement")) {
+      return {
+        label: "Acknowledge",
+        title: "Record live-session acknowledgement",
+        body: "This records the session acknowledgement required before live execution can proceed.",
+        tone: "border-amber-400/20 bg-amber-500/10",
+        run: () => onAcknowledgeLive()
+      };
+    }
+    if (lower.includes("must be set")) {
+      return {
+        label: "Apply Caps",
+        title: "Apply recommended live caps",
+        body: "This fills in missing live caps with conservative defaults so the backend can pass basic execution checks without opening the settings screen.",
+        tone: "border-amber-400/20 bg-amber-500/10",
+        run: () => onApplyQuickFix("configure_caps")
+      };
+    }
+    if (lower.includes("kill switch")) {
+      return {
+        label: "Disable Kill Switch",
+        title: "Disable manual kill switch",
+        body: "This turns off the kill switch in dashboard settings so live execution can resume. Use only if you intentionally want the live backend to operate again.",
+        tone: "border-rose-500/20 bg-rose-500/10",
+        run: () => onApplyQuickFix("disable_kill_switch")
+      };
+    }
+    if (lower.includes("wallet public key is required") || lower.includes("no connected signer")) {
+      if (method === "browser_wallet") {
+        return {
+          label: "Connect Wallet",
+          title: "Connect browser wallet",
+          body: "This reconnects the browser wallet so the assisted path has an active public key to work with.",
+          tone: "border-amber-400/20 bg-amber-500/10",
+          run: () => onConnectWallet()
+        };
+      }
+      if (method === "local_hot_wallet") {
+        return {
+          label: hotWalletStatus?.imported ? "Unlock Wallet" : "Finish Setup",
+          title: hotWalletStatus?.imported ? "Unlock encrypted hot wallet" : "Return to wallet setup",
+          body: hotWalletStatus?.imported
+            ? "This unlocks the encrypted hot wallet for the current app session so the unattended path can sign again."
+            : "This sends you back into the guided setup flow so you can import the hot wallet cleanly.",
+          tone: "border-amber-400/20 bg-amber-500/10",
+          run: () => hotWalletStatus?.imported ? onUnlockHotWallet() : (setWorkspaceVisible(false), setStepIndex(1), true)
+        };
+      }
+      return {
+        label: "Edit Setup",
+        title: "Return to signer setup",
+        body: "This returns you to the guided setup steps so you can review the signer path and backend health again.",
+        tone: "border-zinc-500/20 bg-white/5",
+        run: () => {
+          setWorkspaceVisible(false);
+          setStepIndex(1);
+          return true;
+        }
+      };
+    }
+    if (lower.includes("unavailable") || lower.includes("localhost")) {
+      return {
+        label: "Edit Setup",
+        title: "Review backend setup",
+        body: "This takes you back to the setup steps so you can review the selected backend and choose a healthier execution path if needed.",
+        tone: "border-zinc-500/20 bg-white/5",
+        run: () => {
+          setWorkspaceVisible(false);
+          setStepIndex(1);
+          return true;
+        }
+      };
+    }
+    return null;
+  }
+
+  async function confirmBlockerFix() {
+    if (!pendingFixBlocker) return;
+    const descriptor = blockerFixDescriptor(pendingFixBlocker);
+    if (!descriptor) {
+      setPendingFixBlocker(null);
+      return;
+    }
+    setBusyAction(`fix:${pendingFixBlocker}`);
+    try {
+      const ok = await Promise.resolve(descriptor.run());
+      if (ok) setPendingFixBlocker(null);
+    } finally {
+      setBusyAction("");
+    }
+  }
+
+  const primaryWorkspaceButtons = [
+    !settings.live_session_acknowledged ? (
+      <button key="acknowledge" className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20" onClick={() => setPendingWorkspaceAction("acknowledge")}>
+        Confirm Session
+      </button>
+    ) : null,
+    activeBackend?.armed ? (
+      <button key="disarm" className="h-10 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("disarm")}>
+        Disarm
+      </button>
+    ) : (
+      <button key="arm" className="h-10 rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-emerald-100 transition hover:bg-emerald-500/20" onClick={() => setPendingWorkspaceAction("arm")}>
+        Arm Backend
+      </button>
+    ),
+    method === "browser_wallet" ? (
+      <button key="reconnect" className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("reconnect")}>
+        Reconnect
+      </button>
+    ) : null,
+    method === "local_hot_wallet" && hotWalletStatus?.unlocked ? (
+      <button key="lock" className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setPendingWorkspaceAction("lock")}>
+        Lock
+      </button>
+    ) : null,
+    method === "local_hot_wallet" && hotWalletStatus?.imported ? (
+      <button key="clear" className="h-10 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-rose-100 transition hover:bg-rose-500/20" onClick={() => setPendingWorkspaceAction("clear")}>
+        Clear Stored Key
+      </button>
+    ) : null
+  ].filter(Boolean);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
+      <motion.section
+        initial={{ opacity: 0, scale: 0.97, y: 18 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.97, y: 18 }}
+        transition={{ type: "spring", stiffness: 360, damping: 32 }}
+        className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-xl border border-white/10 bg-[#0a0c13]/95 shadow-2xl shadow-black/70"
+      >
+        <div className="sticky top-0 z-10 border-b border-white/10 bg-[#0d0f18]/95 px-5 py-4 backdrop-blur-xl">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <p className="text-[10px] font-black uppercase tracking-[0.28em] text-amber-400">Local live execution</p>
+              <h3 className="mt-1 text-2xl font-black tracking-tight text-white">{workspaceVisible ? "Live Wallet Workspace" : "Connect Wallet"}</h3>
+              <p className="mt-1 max-w-3xl text-xs font-medium text-zinc-400">{workspaceVisible ? "The setup flow is complete. Operate the selected backend from one calmer workspace with clearer readiness, recovery, and execution controls." : setupHelper[stepIndex]}</p>
+            </div>
+            <button className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-zinc-400 transition hover:border-amber-500/40 hover:text-white" onClick={onClose} aria-label="Close live wallet">
+              <X size={18} />
+            </button>
+          </div>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <span className={`rounded-full border px-3 py-1 text-[10px] font-black uppercase tracking-[0.24em] ${methodTone[method]}`}>{methodLabel}</span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[10px] font-black uppercase tracking-[0.24em] text-zinc-300">{workspaceVisible ? "Workspace" : `Step ${stepIndex + 1} of ${setupSteps.length}`}</span>
+            <span className="rounded-full border border-white/10 bg-white/5 px-3 py-1 text-[10px] font-black uppercase tracking-[0.24em] text-zinc-300">{modeLabel}</span>
+          </div>
+          {!workspaceVisible ? (
+            <div className="mt-4 grid gap-2 sm:grid-cols-5">
+              {setupSteps.map((label, index) => {
+                const active = index === stepIndex;
+                const complete = workspaceVisible || index < stepIndex;
+                return (
+                  <div key={label} className={`rounded-xl border px-3 py-3 ${active ? "border-amber-400/40 bg-amber-500/10" : complete ? "border-emerald-400/30 bg-emerald-500/10" : "border-white/10 bg-white/[0.03]"}`}>
+                    <div className="flex items-center gap-2">
+                      <span className={`flex h-6 w-6 items-center justify-center rounded-full border text-[10px] font-black ${active ? "border-amber-400/40 bg-amber-500/10 text-amber-100" : complete ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100" : "border-white/10 bg-black/20 text-zinc-500"}`}>{index + 1}</span>
+                      <span className="text-[10px] font-black uppercase tracking-[0.22em] text-white">{label}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="overflow-y-auto p-5 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+          {!workspaceVisible ? (
+            <div className="space-y-4">
+              {stepIndex === 0 ? (
+                <div className="grid gap-4 lg:grid-cols-3">
+                  {[
+                    ["browser_wallet", "Browser Wallet", "Assisted", "Phantom-first assisted mode. Manual approvals remain required unless the browser environment exposes true unattended signing."],
+                    ["local_hot_wallet", "Local Hot Wallet", hotWalletStatus?.unlocked ? "Unlocked" : hotWalletStatus?.imported ? "Locked" : "Import", "Encrypted-at-rest local signing with password unlock each app start for unattended entries and exits."],
+                    ["local_signer_daemon", "Local Signer Daemon", connectionReady && method === "local_signer_daemon" ? "Healthy" : "Daemon", "Separate localhost signer backend for unattended execution when its own health and auth contract pass."]
+                  ].map(([value, title, badge, body]) => (
+                    <button key={value} className={`rounded-2xl border p-5 text-left transition ${method === value ? value === "browser_wallet" ? "border-emerald-400/50 bg-emerald-500/10 shadow-lg shadow-emerald-500/10" : value === "local_hot_wallet" ? "border-amber-400/50 bg-amber-500/10 shadow-lg shadow-amber-500/10" : "border-sky-400/50 bg-sky-500/10 shadow-lg shadow-sky-500/10" : "border-white/10 bg-white/[0.03] hover:border-white/20"}`} onClick={() => onMethodChange(value as LiveWalletMethod)}>
+                      <div className="flex items-center justify-between gap-3">
+                        <strong className="text-sm font-black uppercase tracking-[0.18em] text-white">{title}</strong>
+                        <span className={`rounded-full border px-2 py-1 text-[10px] font-black uppercase tracking-[0.2em] ${methodTone[value as LiveWalletMethod]}`}>{badge}</span>
+                      </div>
+                      <p className="mt-3 text-xs leading-5 text-zinc-400">{body}</p>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+
+              {stepIndex === 1 ? (
+                <div className="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
+                  <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Setup</p>
+                        <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">{setupSteps[1]}</h3>
+                        <p className="mt-1 text-xs text-zinc-400">{setupHelper[1]}</p>
+                      </div>
+                      <Wallet size={18} className="text-amber-400" />
+                    </div>
+                    {method === "browser_wallet" ? (
+                      <div className="rounded-2xl border border-white/5 bg-black/20 p-4">
+                        <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Browser wallet connection</p>
+                        <p className="mt-2 text-xs text-zinc-400">Connect the browser wallet now. The next step will review the public key, assisted mode, and current readiness state.</p>
+                        <button className="mt-4 h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20" onClick={handleStepPrimary} disabled={busyAction === "step"}>
+                          {busyAction === "step" ? "Connecting" : walletPublicKey ? "Continue with Connected Wallet" : "Connect Browser Wallet"}
+                        </button>
+                      </div>
+                    ) : null}
+                    {method === "local_hot_wallet" ? (
+                      <div className="space-y-3 rounded-2xl border border-white/5 bg-black/20 p-4">
+                        <input className="h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletLabel} onChange={(event) => onHotWalletLabelChange(event.target.value)} placeholder="Wallet label (optional)" />
+                        {!hotWalletStatus?.imported ? <textarea className="min-h-[88px] w-full rounded-xl border border-white/10 bg-black/40 px-3 py-2 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletPrivateKey} onChange={(event) => onHotWalletPrivateKeyChange(event.target.value)} placeholder="Base58 private key or byte array" /> : null}
+                        <input className="h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" type="password" value={hotWalletPassword} onChange={(event) => onHotWalletPasswordChange(event.target.value)} placeholder={hotWalletStatus?.imported ? "Unlock password" : "Encryption password"} />
+                        <button className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={busyAction === "step" || (!hotWalletStatus?.imported && (!hotWalletPrivateKey.trim() || !hotWalletPassword.trim())) || (hotWalletStatus?.imported && !hotWalletStatus?.unlocked && !hotWalletPassword.trim())}>
+                          {busyAction === "step" ? (hotWalletStatus?.imported ? "Unlocking" : "Importing") : hotWalletStatus?.unlocked ? "Continue with Unlocked Wallet" : hotWalletStatus?.imported ? "Unlock Hot Wallet" : "Import & Encrypt"}
+                        </button>
+                      </div>
+                    ) : null}
+                    {method === "local_signer_daemon" ? (
+                      <div className="rounded-2xl border border-white/5 bg-black/20 p-4">
+                        <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Signer daemon health</p>
+                        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                          <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                            <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Endpoint</p>
+                            <p className="mt-1 break-all text-xs font-bold text-white">{liveStatus?.signer?.endpoint || "not reported"}</p>
+                          </div>
+                          <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                            <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Health</p>
+                            <p className="mt-1 text-xs font-bold text-white">{connectionReady ? "healthy" : "not ready"}</p>
+                          </div>
+                        </div>
+                        <button className="mt-4 h-10 rounded-xl border border-sky-400/30 bg-sky-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-sky-100 transition hover:bg-sky-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={!connectionReady}>
+                          Continue with Daemon
+                        </button>
+                      </div>
+                    ) : null}
+                  </section>
+                  <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Current state</p>
+                        <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Readiness Snapshot</h3>
+                        <p className="mt-1 text-xs text-zinc-400">A compact summary before you move into review.</p>
+                      </div>
+                      <Shield size={18} className="text-amber-400" />
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {[
+                        ["Wallet", shortAddress(walletDisplay || "")],
+                        ["SOL balance", walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`],
+                        ["Backend health", backendHealth],
+                        ["Readiness", `${readinessScore}% / ${readinessState}`],
+                        ["Live env", envEnabled ? "enabled" : "disabled"],
+                        ["Caps", capsSet ? "set" : "required"],
+                        ["Acknowledgement", settings.live_session_acknowledged ? "done" : "needed"],
+                        ["Armed backend", activeBackend?.armed ? `${activeBackend.mode.replace(/_/g, " ")} / ${shortAddress(activeBackend.wallet_public_key)}` : "not armed"]
+                      ].map(([label, value]) => (
+                        <div key={label} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">{label}</p>
+                          <p className="mt-1 truncate text-xs font-bold text-white">{value}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-4 space-y-2">
+                      {setupWarnings.length ? setupWarnings.map((warning) => <p key={warning} className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">{warning}</p>) : <p className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-100">The selected backend is ready to move into review.</p>}
+                    </div>
+                  </section>
+                </div>
+              ) : null}
+
+              {stepIndex === 2 ? (
+                <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+                  <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Review</p>
+                        <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Confirmation Card</h3>
+                        <p className="mt-1 text-xs text-zinc-400">Review the backend path, wallet context, readiness, and exact action before you confirm.</p>
+                      </div>
+                      <Shield size={18} className="text-amber-400" />
+                    </div>
+                    <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 p-4">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <div>
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Backend path</p>
+                          <p className="mt-1 text-sm font-black uppercase tracking-[0.16em] text-white">{methodLabel}</p>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Current mode</p>
+                          <p className="mt-1 text-sm font-black uppercase tracking-[0.16em] text-white">{modeLabel}</p>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Wallet / public key</p>
+                          <p className="mt-1 break-all text-xs font-bold text-white">{walletDisplay || hotWalletLabel || "Will be confirmed by backend on connect"}</p>
+                        </div>
+                        <div>
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Action being confirmed</p>
+                          <p className="mt-1 text-xs font-bold text-white">{method === "browser_wallet" ? "Enter assisted live review flow with the connected browser wallet" : method === "local_hot_wallet" ? "Use encrypted local signing for this live wallet session" : "Use signer daemon as the active live signing path"}</p>
+                        </div>
+                      </div>
+                      <div className="mt-4 grid gap-2 sm:grid-cols-3">
+                        <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Readiness</p>
+                          <p className="mt-1 text-xs font-bold text-white">{readinessScore}% / {readinessState}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Caps</p>
+                          <p className="mt-1 text-xs font-bold text-white">{capsSet ? "Configured" : "Needs attention"}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Session acknowledgement</p>
+                          <p className="mt-1 text-xs font-bold text-white">{settings.live_session_acknowledged ? "Already recorded" : "Will confirm next"}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                  <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Warnings</p>
+                        <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">What to watch</h3>
+                        <p className="mt-1 text-xs text-zinc-400">These warnings stay visible through confirmation so the operator never loses the safety context.</p>
+                      </div>
+                      <Activity size={18} className="text-amber-400" />
+                    </div>
+                    <div className="space-y-2">
+                      {setupWarnings.length ? setupWarnings.map((warning) => <p key={warning} className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">{warning}</p>) : <p className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-100">No blocking warnings are currently reported for the selected backend.</p>}
+                    </div>
+                  </section>
+                </div>
+              ) : null}
+
+              {stepIndex === 3 ? (
+                <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                  <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
+                    <div className="rounded-2xl border border-amber-400/20 bg-amber-500/10 p-5">
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Final confirmation</p>
+                      <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Enter Live Wallet Setup</h3>
+                      <p className="mt-2 text-xs leading-5 text-zinc-300">{settings.live_session_acknowledged ? "Your live-session acknowledgement is already recorded. Confirm to move into the ready state." : "Confirm this live-session acknowledgement so the workspace can open with the current backend path and safety notes attached."}</p>
+                    </div>
+                    <div className="rounded-2xl border border-white/5 bg-black/20 p-5">
+                      <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Confirmation summary</p>
+                      <div className="mt-3 space-y-2 text-xs text-zinc-300">
+                        <p>Backend: <span className="font-bold text-white">{methodLabel}</span></p>
+                        <p>Wallet: <span className="font-bold text-white">{shortAddress(walletDisplay || "")}</span></p>
+                        <p>Mode: <span className="font-bold text-white">{modeLabel}</span></p>
+                        <p>Live gates: <span className="font-bold text-white">{liveStatus?.live_execution_available ? "open" : "blocked"}</span></p>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
+
+              {stepIndex === 4 ? (
+                <section className="rounded-2xl border border-emerald-500/20 bg-emerald-500/10 p-5">
+                  <div className="grid gap-4 xl:grid-cols-[1fr_0.9fr]">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-emerald-100">Ready</p>
+                      <h3 className="mt-1 text-lg font-black tracking-tight text-white">Wallet setup completed</h3>
+                      <p className="mt-2 text-sm text-emerald-50/90">The selected path is staged. Enter the workspace to review readiness, arm the backend, and manage quote and recovery operations from one place.</p>
+                      {completionStamp ? <p className="mt-3 text-[11px] uppercase tracking-[0.2em] text-emerald-100/80">Confirmed {new Date(completionStamp).toLocaleTimeString()}</p> : null}
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                        <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Backend</p>
+                        <p className="mt-1 text-xs font-bold text-white">{methodLabel}</p>
+                      </div>
+                      <div className="rounded-xl border border-white/10 bg-black/20 p-3">
+                        <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Wallet</p>
+                        <p className="mt-1 text-xs font-bold text-white">{shortAddress(walletDisplay || "")}</p>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
+                <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+                  <div>
+                    <div className="mb-4 flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Operator console</p>
+                        <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Connected Backend Summary</h3>
+                        <p className="mt-1 text-xs text-zinc-400">Keep the critical state at the top: backend path, readiness, blockers, wallet balance, and the next action.</p>
+                      </div>
+                      <Wallet size={18} className="text-amber-400" />
+                    </div>
+                    <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+                      {[
+                        ["Backend", methodLabel],
+                        ["Wallet", shortAddress(walletDisplay || "")],
+                        ["Balance", walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`],
+                        ["Armed state", activeBackend?.armed ? "armed" : "disarmed"],
+                        ["Readiness", `${readinessScore}% / ${readinessState}`],
+                        ["Live gates", liveStatus?.live_execution_available ? "open" : "blocked"],
+                        ["Auto entries", liveStatus?.entry_autonomy_available ? "enabled" : "blocked"],
+                        ["Protective exits", liveStatus?.exit_autonomy_available ? "enabled" : "blocked"]
+                      ].map(([label, value]) => (
+                        <div key={label} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">{label}</p>
+                          <p className="mt-1 truncate text-xs font-bold text-white">{value}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {primaryWorkspaceButtons}
+                      <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
+                        Switch Path
+                      </button>
+                      <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(1); }}>
+                        Edit Setup
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-3">
+                    {pendingWorkspaceAction ? (
+                      <article className={`rounded-2xl border p-4 ${workspaceActionMeta[pendingWorkspaceAction].tone}`}>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Confirm action</p>
+                        <h4 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">{workspaceActionMeta[pendingWorkspaceAction].title}</h4>
+                        <p className="mt-2 text-xs leading-5 text-zinc-300">{workspaceActionMeta[pendingWorkspaceAction].body}</p>
+                        <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                          <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+                            <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Backend path</p>
+                            <p className="mt-1 text-xs font-bold text-white">{methodLabel}</p>
+                          </div>
+                          <div className="rounded-xl border border-white/5 bg-black/20 p-3">
+                            <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Wallet</p>
+                            <p className="mt-1 text-xs font-bold text-white">{shortAddress(walletDisplay || "")}</p>
+                          </div>
+                        </div>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <button className="h-10 rounded-xl border border-white/10 bg-white/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmWorkspaceAction} disabled={busyAction === pendingWorkspaceAction}>
+                            {busyAction === pendingWorkspaceAction ? "Working" : "Confirm"}
+                          </button>
+                          <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/10" onClick={() => setPendingWorkspaceAction(null)}>
+                            Cancel
+                          </button>
+                        </div>
+                      </article>
+                    ) : pendingFixBlocker ? (
+                      <article className={`rounded-2xl border p-4 ${blockerFixDescriptor(pendingFixBlocker)?.tone || "border-amber-400/20 bg-amber-500/10"}`}>
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Fix blocker</p>
+                        <h4 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">{blockerFixDescriptor(pendingFixBlocker)?.title || "Review blocker"}</h4>
+                        <p className="mt-2 text-xs leading-5 text-zinc-300">{blockerFixDescriptor(pendingFixBlocker)?.body || pendingFixBlocker}</p>
+                        <div className="mt-4 rounded-xl border border-white/5 bg-black/20 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Current blocker</p>
+                          <p className="mt-1 text-xs font-bold text-white">{pendingFixBlocker}</p>
+                        </div>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <button className="h-10 rounded-xl border border-white/10 bg-white/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/15 disabled:cursor-not-allowed disabled:opacity-50" onClick={confirmBlockerFix} disabled={busyAction === `fix:${pendingFixBlocker}`}>
+                            {busyAction === `fix:${pendingFixBlocker}` ? "Applying" : blockerFixDescriptor(pendingFixBlocker)?.label || "Apply"}
+                          </button>
+                          <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:bg-white/10" onClick={() => setPendingFixBlocker(null)}>
+                            Cancel
+                          </button>
+                        </div>
+                      </article>
+                    ) : (
+                      <article className="rounded-2xl border border-white/5 bg-black/20 p-4">
+                        <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Blockers & readiness</p>
+                        <div className="mt-3 space-y-2">
+                          {setupWarnings.length ? setupWarnings.map((warning) => {
+                            const fix = blockerFixDescriptor(warning);
+                            return (
+                              <div key={warning} className="rounded-xl border border-amber-400/20 bg-amber-500/10 p-3">
+                                <p className="text-xs font-bold text-amber-100">{warning}</p>
+                                {fix ? (
+                                  <button className="mt-3 h-8 rounded-lg border border-white/10 bg-white/10 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white transition hover:bg-white/15" onClick={() => setPendingFixBlocker(warning)}>
+                                    {fix.label}
+                                  </button>
+                                ) : null}
+                              </div>
+                            );
+                          }) : <p className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-100">No current blockers are reported for this backend.</p>}
+                        </div>
+                      </article>
+                    )}
+                    <article className="rounded-2xl border border-white/5 bg-black/20 p-4">
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Capability summary</p>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Backend health</p>
+                          <p className="mt-1 text-xs font-bold text-white">{backendHealth}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Supports auto-buy</p>
+                          <p className="mt-1 text-xs font-bold text-white">{signerSupportsAutoBuy ? "yes" : "no"}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Supports auto-sell</p>
+                          <p className="mt-1 text-xs font-bold text-white">{signerSupportsAutoSell ? "yes" : "no"}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Transport</p>
+                          <p className="mt-1 text-xs font-bold text-white">{String(liveStatus?.signer?.transport || "localhost_http")}</p>
+                        </div>
+                      </div>
+                    </article>
+                  </div>
+                </div>
+              </section>
+
+              <div className="grid gap-4 xl:grid-cols-[0.95fr_1.05fr]">
+                <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-4">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Intent desk</p>
+                      <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Queue & Intent Review</h3>
+                      <p className="mt-1 text-xs text-zinc-400">Build manual candidates, generate strategy intents, then quote or cancel from one place.</p>
+                    </div>
+                    <Bot size={18} className="text-amber-400" />
+                  </div>
+                  <div className="mb-4 flex flex-wrap gap-2">
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10" onClick={onCreateManualIntent}>Create Manual Intent</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10" onClick={onGenerateIntents}>Generate Strategy Intents</button>
+                  </div>
+                  <div className="max-h-[26rem] space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                    {liveIntents.slice(0, 10).map((intent) => (
+                      <article key={intent.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <strong className="block truncate text-xs font-black uppercase tracking-[0.18em] text-white">{intent.action} / {intent.symbol || intent.mint.slice(0, 8)} / {intent.status}</strong>
+                            <span className="mt-1 block truncate text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500">{intent.source} / rank {intent.priority.toFixed(0)} / expires {intent.expires_at ? new Date(intent.expires_at).toLocaleTimeString() : "-"}</span>
+                          </div>
+                          {intent.generated_from_position ? <span className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.2em] text-amber-100">Protective exit</span> : null}
+                        </div>
+                        <p className="mt-2 text-xs text-zinc-400">{intent.reason || "Live intent candidate"}</p>
+                        {intent.autonomy_blocked ? <div className="mt-2 flex flex-wrap gap-2">{intent.autonomy_blockers.map((blocker) => <span key={blocker} className="rounded-full border border-amber-400/20 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-[0.2em] text-amber-100">{blocker}</span>)}</div> : null}
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white disabled:cursor-not-allowed disabled:opacity-50" onClick={() => onQuoteIntent(intent.id)} disabled={quoteBlocked || intent.status === "cancelled"}>Quote</button>
+                          <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white" onClick={() => onCancelIntent(intent.id)}>Cancel</button>
+                        </div>
+                      </article>
+                    ))}
+                    {!liveIntents.length ? <p className="rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No active live intents yet.</p> : null}
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-4">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Execution</p>
+                      <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Quote Preview & Submission</h3>
+                      <p className="mt-1 text-xs text-zinc-400">Keep quote, simulation, and sign/send actions together with the active audit state and stale-quote warnings.</p>
+                    </div>
+                    <Target size={18} className="text-amber-400" />
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Action<select className="dashboard-select mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" value={liveAction} onChange={(event) => onLiveActionChange(event.target.value as "buy" | "sell")}><option value="buy">buy</option><option value="sell">sell</option></select></label>
+                    <label className="md:col-span-2 text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Mint<input className="mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white placeholder-zinc-600" value={liveMint} onChange={(event) => onLiveMintChange(event.target.value)} placeholder="Pump.fun mint address" /></label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Amount<input className="mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white placeholder-zinc-600" value={liveAmount} onChange={(event) => onLiveAmountChange(event.target.value)} placeholder={liveAction === "sell" ? "100%" : "0.001"} /></label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Slippage %<input className="mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white" type="number" min="0.001" step="0.1" value={liveSlippage} onChange={(event) => onLiveSlippageChange(Number(event.target.value))} /></label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Priority fee SOL<input className="mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold text-white" type="number" min="0.00001" step="0.00001" value={livePriorityFee} onChange={(event) => onLivePriorityFeeChange(Number(event.target.value))} /></label>
+                    <label className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Pool<select className="dashboard-select mt-1 h-10 w-full rounded-xl border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" value={livePool} onChange={(event) => onLivePoolChange(event.target.value)}>{["pump", "auto", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk"].map((pool) => <option key={pool} value={pool}>{pool}</option>)}</select></label>
+                  </div>
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
+                    <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
+                    <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                  </div>
+                  {!envEnabled ? <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Live env is disabled, so quotes and signing are blocked. Wallet checks and setup still work.</p> : null}
+                  {activeLiveAudit ? (
+                    <article className="mt-3 rounded-xl border border-white/5 bg-black/25 p-3">
+                      <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
+                      <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
+                      <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
+                      <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                      {activeQuoteStale ? <p className="mt-2 text-xs font-bold text-amber-100">This quote is stale. Refresh the preview before signing.</p> : null}
+                    </article>
+                  ) : <p className="mt-3 rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No active quote preview yet.</p>}
+                </section>
+              </div>
+
+              <section className="rounded-2xl border border-amber-400/20 bg-amber-500/[0.045] p-4">
+                <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Recovery</p>
+                    <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Recovery & Review</h3>
+                    <p className="mt-1 text-xs text-zinc-400">Backend-assisted confirmation only checks recorded signatures and wallet/RPC reconciliation. It never signs, sends, or resubmits.</p>
+                  </div>
+                  <button className="h-9 rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-[0.22em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onRecoverAllLiveAudits} disabled={!reviewAudits.length}>Recover Unresolved</button>
+                </div>
+                <div className="mb-3 grid gap-2 sm:grid-cols-4">
+                  <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Unresolved <strong className="block pt-1 text-xs text-white">{liveStatus?.unresolved_audit_count ?? reviewAudits.length}</strong></span>
+                  <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Recoverable <strong className="block pt-1 text-xs text-white">{liveStatus?.recoverable_audit_count ?? reviewAudits.filter((audit) => audit.transaction_signature).length}</strong></span>
+                  <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Poller <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.poller_status ?? "unknown"}</strong></span>
+                  <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Last check <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.last_live_poll_at ? new Date(liveStatus.last_live_poll_at).toLocaleTimeString() : "not run"}</strong></span>
+                </div>
+                <p className="mb-3 rounded-xl border border-white/5 bg-black/20 p-3 text-xs text-zinc-400">Recovery summary: checked {Number(recoverySummary?.checked ?? 0)}, updated {Number(recoverySummary?.updated ?? 0)}{recoverySummary?.reason ? ` / ${recoverySummary.reason}` : ""}</p>
+                <div className="grid max-h-72 gap-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent lg:grid-cols-2">
+                  {reviewAudits.slice(0, 8).map((audit) => (
+                    <article key={audit.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <strong className="block truncate text-xs font-black uppercase tracking-[0.18em] text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
+                          <span className="mt-1 block truncate text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-500">{audit.transaction_signature || "missing signature"}</span>
+                        </div>
+                        <button className="h-8 shrink-0 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-[0.2em] text-white transition hover:bg-white/10" onClick={() => onRecoverLiveAudit(audit.id)}>Retry</button>
+                      </div>
+                      <div className="mt-2 grid gap-2 text-[11px] text-zinc-400 sm:grid-cols-3">
+                        <span>RPC: {audit.confirmation_status || String(audit.confirmation?.confirmation_status ?? "unknown")}</span>
+                        <span>Attempts: {audit.recovery_attempts ?? 0}</span>
+                        <span>Checked: {audit.confirmation_checked_at ? new Date(audit.confirmation_checked_at).toLocaleTimeString() : "not run"}</span>
+                      </div>
+                      {audit.last_recovery_error ? <p className="mt-2 text-xs text-amber-100">{audit.last_recovery_error}</p> : null}
+                      <p className="mt-2 text-xs text-zinc-500">{audit.recommended_action || "Review the audit row before taking any wallet action."}</p>
+                    </article>
+                  ))}
+                  {!reviewAudits.length ? <p className="rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No unresolved live audits need recovery.</p> : null}
+                </div>
+              </section>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-4">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Positions</p>
+                      <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Wallet Positions</h3>
+                      <p className="mt-1 text-xs text-zinc-400">RPC token balances for mints touched by live audit records.</p>
+                    </div>
+                    <Database size={18} className="text-amber-400" />
+                  </div>
+                  <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                    {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
+                      <article key={position.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                        <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
+                        <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
+                        <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
+                      </article>
+                    ))}
+                    {livePositions.slice(0, 6).map((position) => (
+                      <article key={position.mint} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                        <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
+                        <span className="mt-1 block truncate text-xs text-zinc-500">{position.mint}</span>
+                        {position.warning ? <p className="mt-2 text-xs text-amber-100">{position.warning}</p> : null}
+                      </article>
+                    ))}
+                    {!livePositions.length && !(liveLedger?.positions.length) ? <p className="rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No live wallet positions loaded.</p> : null}
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-4">
+                  <div className="mb-4 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.28em] text-zinc-500">Audit</p>
+                      <h3 className="mt-1 text-sm font-black uppercase tracking-[0.18em] text-white">Latest Audit</h3>
+                      <p className="mt-1 text-xs text-zinc-400">Recent quote, simulation, submission, and reconciliation records.</p>
+                    </div>
+                    <Activity size={18} className="text-amber-400" />
+                  </div>
+                  <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                    {liveAudit.slice(0, 6).map((audit) => (
+                      <article key={audit.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                        <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{audit.action} / {audit.status} / {audit.reconciliation_status ?? "pending"}</strong>
+                        <span className="mt-1 block truncate text-xs text-zinc-400">{audit.transaction_signature ? `Signature ${audit.transaction_signature}` : audit.wallet_public_key || "No wallet recorded"}</span>
+                        <p className="mt-2 text-xs text-zinc-500">{[...audit.warnings, ...audit.errors].join(" / ") || audit.final_status}</p>
+                      </article>
+                    ))}
+                    {!liveAudit.length ? <p className="rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No live audit records yet.</p> : null}
+                  </div>
+                </section>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {!workspaceVisible ? (
+          <div className="border-t border-white/10 bg-[#0d0f18]/95 px-5 py-4 backdrop-blur-xl">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={stepIndex === 0 ? onClose : () => setStepIndex((current) => Math.max(0, current - 1))}>{stepIndex === 0 ? "Cancel" : "Back"}</button>
+              <div className="flex flex-wrap gap-2">
+                {stepIndex === 4 ? <button className="h-10 rounded-xl border border-white/10 bg-white/5 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => setStepIndex(0)}>Switch Path</button> : null}
+                <button className="h-10 rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 text-[10px] font-black uppercase tracking-[0.24em] text-amber-100 transition hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={handleStepPrimary} disabled={(stepIndex === 1 && method === "local_signer_daemon" && !connectionReady) || busyAction === "step" || busyAction === "confirm"}>
+                  {stepIndex === 0 ? "Continue" : stepIndex === 1 ? method === "browser_wallet" ? busyAction === "step" ? "Connecting" : walletPublicKey ? "Continue" : "Connect" : method === "local_hot_wallet" ? busyAction === "step" ? hotWalletStatus?.imported ? "Unlocking" : "Importing" : hotWalletStatus?.unlocked ? "Continue" : hotWalletStatus?.imported ? "Unlock" : "Import" : "Continue" : stepIndex === 2 ? "Continue" : stepIndex === 3 ? busyAction === "confirm" ? "Confirming" : "Confirm" : "Enter Workspace"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </motion.section>
+    </div>
+  );
+}
+
+function LegacyLiveWalletModal({
+  method,
+  onMethodChange,
+  walletPublicKey,
+  walletBalanceSol,
+  settings,
+  liveStatus,
+  liveAudit,
+  livePositions,
+  liveIntents,
+  liveLedger,
+  liveAction,
+  liveMint,
+  liveAmount,
+  liveSlippage,
+  livePriorityFee,
+  livePool,
+  activeLiveAudit,
+  activeLiveIntentId,
+  onClose,
+  onConnectWallet,
+  onAcknowledgeLive,
+  onArmBackend,
+  onDisarmBackend,
+  hotWalletStatus,
+  hotWalletPrivateKey,
+  hotWalletPassword,
+  hotWalletLabel,
+  onHotWalletPrivateKeyChange,
+  onHotWalletPasswordChange,
+  onHotWalletLabelChange,
+  onImportHotWallet,
+  onUnlockHotWallet,
+  onLockHotWallet,
+  onClearHotWallet,
   onLiveActionChange,
   onLiveMintChange,
   onLiveAmountChange,
@@ -1738,6 +2986,19 @@ function LiveWalletModal({
   onClose: () => void;
   onConnectWallet: () => Promise<void>;
   onAcknowledgeLive: () => Promise<void>;
+  onArmBackend: () => Promise<void>;
+  onDisarmBackend: () => Promise<void>;
+  hotWalletStatus: HotWalletStatus | null;
+  hotWalletPrivateKey: string;
+  hotWalletPassword: string;
+  hotWalletLabel: string;
+  onHotWalletPrivateKeyChange: (value: string) => void;
+  onHotWalletPasswordChange: (value: string) => void;
+  onHotWalletLabelChange: (value: string) => void;
+  onImportHotWallet: () => Promise<void>;
+  onUnlockHotWallet: () => Promise<void>;
+  onLockHotWallet: () => Promise<void>;
+  onClearHotWallet: () => Promise<void>;
   onLiveActionChange: (action: "buy" | "sell") => void;
   onLiveMintChange: (mint: string) => void;
   onLiveAmountChange: (amount: string) => void;
@@ -1756,7 +3017,8 @@ function LiveWalletModal({
 }) {
   const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
-  const quoteBlocked = !envEnabled || method !== "browser_wallet";
+  const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
+  const quoteBlocked = !envEnabled;
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
   const activeQuoteStale = activeLiveAudit?.status === "stale" || Boolean(activeLiveAudit?.quote?.stale);
   const recoverableAuditStatuses = new Set(["submitted", "failed", "needs_review", "stale"]);
@@ -1768,6 +3030,7 @@ function LiveWalletModal({
   const signerDisabledReason = liveStatus?.signer?.disabled_reason || liveStatus?.wallet_adapter?.disabled_reason || "";
   const signerSupportsAutoSell = Boolean(liveStatus?.signer?.supports_auto_sell);
   const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
+  const activeBackend = liveStatus?.active_backend;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
@@ -1784,7 +3047,7 @@ function LiveWalletModal({
               <p className="text-[10px] font-black uppercase tracking-[0.28em] text-amber-400">Local live execution</p>
               <h3 className="mt-1 text-2xl font-black tracking-tight text-white">Live Wallet</h3>
               <p className="mt-1 max-w-3xl text-xs font-medium text-zinc-400">
-                Manual browser-wallet buy and sell flow with quote previews, wallet approval, and audit records.
+                Unified control plane for assisted browser-wallet execution, encrypted local hot wallet signing, and localhost signer-daemon autonomy.
               </p>
             </div>
             <button
@@ -1798,7 +3061,7 @@ function LiveWalletModal({
         </div>
 
         <div className="overflow-y-auto p-5 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-          <div className="grid gap-4 lg:grid-cols-2">
+          <div className="grid gap-4 lg:grid-cols-3">
             <button
               className={`rounded-xl border p-4 text-left transition ${
                 method === "browser_wallet"
@@ -1809,20 +3072,41 @@ function LiveWalletModal({
             >
               <div className="flex items-center justify-between gap-3">
                 <strong className="text-sm font-black uppercase tracking-widest text-white">Browser wallet</strong>
-                <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-emerald-300">Active</span>
+                <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-emerald-300">Assisted</span>
               </div>
-              <span className="mt-2 block text-xs leading-5 text-zinc-400">Manual approval through Phantom, Solflare, or a compatible Solana wallet.</span>
+              <span className="mt-2 block text-xs leading-5 text-zinc-400">Phantom-first assisted mode. Manual approvals remain required unless the browser environment exposes true unattended capabilities.</span>
             </button>
             <button
-              className="cursor-not-allowed rounded-xl border border-white/10 bg-white/[0.02] p-4 text-left opacity-60"
-              disabled
+              className={`rounded-xl border p-4 text-left transition ${
+                method === "local_hot_wallet"
+                  ? "border-amber-400/50 bg-amber-500/10 shadow-lg shadow-amber-500/10"
+                  : "border-white/10 bg-white/[0.03] hover:border-white/20"
+              }`}
+              onClick={() => onMethodChange("local_hot_wallet")}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <strong className="text-sm font-black uppercase tracking-widest text-white">Local hot wallet</strong>
+                <span className="rounded-full border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-amber-200">
+                  {hotWalletStatus?.unlocked ? "Unlocked" : hotWalletStatus?.imported ? "Locked" : "Import"}
+                </span>
+              </div>
+              <span className="mt-2 block text-xs leading-5 text-zinc-400">Encrypted-at-rest local key import with password unlock per app start for unattended entries and exits.</span>
+            </button>
+            <button
+              className={`rounded-xl border p-4 text-left transition ${
+                method === "local_signer_daemon"
+                  ? "border-sky-400/50 bg-sky-500/10 shadow-lg shadow-sky-500/10"
+                  : "border-white/10 bg-white/[0.03] hover:border-white/20"
+              }`}
               onClick={() => onMethodChange("local_signer_daemon")}
             >
               <div className="flex items-center justify-between gap-3">
                 <strong className="text-sm font-black uppercase tracking-widest text-white">Local signer daemon</strong>
-                <span className="rounded-full border border-white/10 bg-white/5 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-zinc-400">Coming later</span>
+                <span className="rounded-full border border-sky-400/30 bg-sky-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-widest text-sky-200">
+                  {liveStatus?.backend_capabilities?.local_signer_daemon?.healthy ? "Healthy" : "Daemon"}
+                </span>
               </div>
-              <span className="mt-2 block text-xs leading-5 text-zinc-500">Required for any future unattended signing capability.</span>
+              <span className="mt-2 block text-xs leading-5 text-zinc-400">Separate localhost signer backend for unattended execution when its own health/auth contract is satisfied.</span>
             </button>
           </div>
 
@@ -1831,8 +3115,8 @@ function LiveWalletModal({
               <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
                 <div className="mb-4 flex items-start justify-between gap-3">
                   <div>
-                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Connect Wallet</h3>
-                    <p className="mt-1 text-xs text-zinc-400">CryptoARC stores the public key for status checks only. Reconnect and signing still require wallet approval.</p>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Backend Access</h3>
+                    <p className="mt-1 text-xs text-zinc-400">Use the wallet path that matches how you want execution to happen: assisted browser approval, encrypted local signing, or a separate localhost signer daemon.</p>
                   </div>
                   <Wallet size={18} className="text-amber-400" />
                 </div>
@@ -1843,16 +3127,31 @@ function LiveWalletModal({
                 >
                   {walletPublicKey ? "Reconnect Browser Wallet" : "Connect Browser Wallet"}
                 </button>
+                {method === "local_hot_wallet" ? (
+                  <div className="mb-4 space-y-3 rounded-xl border border-white/5 bg-black/20 p-3">
+                    <input className="h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletLabel} onChange={(event) => onHotWalletLabelChange(event.target.value)} placeholder="Wallet label (optional)" />
+                    {!hotWalletStatus?.imported ? (
+                      <textarea className="min-h-[88px] w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-xs font-bold text-white placeholder-zinc-600" value={hotWalletPrivateKey} onChange={(event) => onHotWalletPrivateKeyChange(event.target.value)} placeholder="Base58 private key or byte array" />
+                    ) : null}
+                    <input className="h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold text-white placeholder-zinc-600" type="password" value={hotWalletPassword} onChange={(event) => onHotWalletPasswordChange(event.target.value)} placeholder={hotWalletStatus?.imported ? "Unlock password" : "Encryption password"} />
+                    <div className="flex flex-wrap gap-2">
+                      {!hotWalletStatus?.imported ? <button className="h-9 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onImportHotWallet}>Import & Encrypt</button> : null}
+                      {hotWalletStatus?.imported && !hotWalletStatus?.unlocked ? <button className="h-9 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-amber-200" onClick={onUnlockHotWallet}>Unlock</button> : null}
+                      {hotWalletStatus?.unlocked ? <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white" onClick={onLockHotWallet}>Lock</button> : null}
+                      {hotWalletStatus?.imported ? <button className="h-9 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200" onClick={onClearHotWallet}>Clear Stored Key</button> : null}
+                    </div>
+                  </div>
+                ) : null}
                 <div className="grid gap-2 sm:grid-cols-2">
                   {[
-                    ["Wallet", shortAddress(walletPublicKey)],
+                    ["Wallet", shortAddress(walletDisplay || "")],
                     ["SOL balance", walletBalanceSol === null ? "-" : `${walletBalanceSol.toFixed(4)} SOL`],
                     ["Live env", envEnabled ? "enabled" : "disabled"],
                     ["Caps", capsSet ? "set" : "required"],
                     ["Acknowledgement", settings.live_session_acknowledged ? "done" : "needed"],
                     ["Live gates", liveStatus?.live_execution_available ? "open" : "blocked"],
-                    ["Auto-sell", liveStatus?.auto_sell_available ? "available" : "future gated"],
-                    ["Auto-buy", liveStatus?.auto_buy_available ? "available" : "future gated"]
+                    ["Auto-sell", liveStatus?.auto_sell_available ? "available" : "blocked"],
+                    ["Auto-buy", liveStatus?.auto_buy_available ? "available" : "blocked"]
                   ].map(([label, value]) => (
                     <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
                       <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
@@ -1877,37 +3176,54 @@ function LiveWalletModal({
                     </article>
                   )) : (
                     <article className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-200">
-                      Manual live prerequisites are passing.
+                      Live execution prerequisites are passing for the selected backend.
                     </article>
                   )}
                 </div>
-                <button
-                  className="mt-4 h-10 rounded-lg border border-white/10 bg-white/5 px-4 text-xs font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
-                  onClick={onAcknowledgeLive}
-                >
-                  Acknowledge Risk
-                </button>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    className="h-10 rounded-lg border border-white/10 bg-white/5 px-4 text-xs font-black uppercase tracking-widest text-white transition hover:border-white/20 hover:bg-white/10"
+                    onClick={onAcknowledgeLive}
+                  >
+                    Acknowledge Risk
+                  </button>
+                  <button
+                    className="h-10 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-4 text-xs font-black uppercase tracking-widest text-emerald-200 transition hover:bg-emerald-500/20"
+                    onClick={onArmBackend}
+                  >
+                    Arm Backend
+                  </button>
+                  <button
+                    className="h-10 rounded-lg border border-rose-500/30 bg-rose-500/10 px-4 text-xs font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20"
+                    onClick={onDisarmBackend}
+                  >
+                    Disarm
+                  </button>
+                </div>
               </section>
 
               <section className="rounded-xl border border-white/10 bg-white/[0.035] p-4">
                 <div className="mb-4 flex items-start justify-between gap-3">
                   <div>
-                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Future Autonomy Boundary</h3>
-                    <p className="mt-1 text-xs text-zinc-400">This phase only scaffolds future auto-sell capability. Browser-wallet execution remains fully manual.</p>
+                    <h3 className="text-sm font-black uppercase tracking-widest text-white">Autonomy Control Plane</h3>
+                    <p className="mt-1 text-xs text-zinc-400">One backend can be armed at a time. New entries stop when gates fail; protective exits can still flow if the active backend can execute them.</p>
                   </div>
                   <Bot size={18} className="text-amber-400" />
                 </div>
                 <div className="grid gap-2 sm:grid-cols-2">
                   {[
                     ["Manual signing", liveStatus?.signer?.can_sign ? "available" : "not connected"],
-                    ["Daemon health", liveStatus?.signer?.healthy ? "healthy" : "disconnected"],
+                    ["Backend health", liveStatus?.signer?.healthy ? "healthy" : "degraded"],
                     ["Unattended signing", liveStatus?.signer?.can_unattended_sign ? "available" : "disabled"],
                     ["Supports auto-sell", signerSupportsAutoSell ? "yes" : "no"],
                     ["Supports auto-buy", signerSupportsAutoBuy ? "yes" : "no"],
                     ["Readiness", `${readinessScore}% / ${readinessState}`],
-                    ["Signer mode", method === "browser_wallet" ? "browser wallet" : "local signer later"],
+                    ["Signer mode", method.replace(/_/g, " ")],
                     ["Daemon transport", String(liveStatus?.signer?.transport || "localhost_http")],
-                    ["Daemon auth", liveStatus?.signer?.auth_configured ? "configured" : "not set"]
+                    ["Daemon auth", liveStatus?.signer?.auth_configured ? "configured" : "not set"],
+                    ["Armed backend", activeBackend?.armed ? `${activeBackend.mode.replace(/_/g, " ")} / ${shortAddress(activeBackend.wallet_public_key)}` : "not armed"],
+                    ["Auto entries", liveStatus?.entry_autonomy_available ? "enabled" : "blocked"],
+                    ["Protective exits", liveStatus?.exit_autonomy_available ? "enabled" : "blocked"]
                   ].map(([label, value]) => (
                     <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
                       <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
@@ -1931,7 +3247,7 @@ function LiveWalletModal({
                   ))}
                   {!autonomyBlockers.length ? (
                     <article className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-3 text-xs font-bold text-emerald-200">
-                      Future autonomy blockers are currently clear, but unattended execution is still not enabled in this phase.
+                      Autonomous execution gates are currently clear for the selected backend.
                     </article>
                   ) : null}
                 </div>
@@ -1993,7 +3309,7 @@ function LiveWalletModal({
                 <div className="mb-4 flex items-start justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-black uppercase tracking-widest text-white">Quote Preview</h3>
-                    <p className="mt-1 text-xs text-zinc-400">Quotes use PumpPortal local transactions and stay manual. Simulation warnings are recorded for review.</p>
+                    <p className="mt-1 text-xs text-zinc-400">Quotes use PumpPortal local transactions. Browser wallet stays assisted/manual; hot wallet and daemon paths can sign, submit, and reconcile through the backend.</p>
                   </div>
                   <Target size={18} className="text-amber-400" />
                 </div>
@@ -2033,8 +3349,8 @@ function LiveWalletModal({
                   <button className="h-9 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-black uppercase tracking-widest text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
                   <button className="h-9 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-black uppercase tracking-widest text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
-                {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and status checks still work.</p> : null}
-                {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness is warning-only for manual flows in this phase. It soft-blocks future autonomy, not manual browser-wallet quote/sign actions.</p> : null}
+                {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and backend status checks still work.</p> : null}
+                {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness warnings now hard-block autonomous entries only when the backend gates require it. Manual/assisted flows can still be reviewed here.</p> : null}
                 {activeLiveAudit ? (
                   <article className="mt-3 rounded-lg border border-white/5 bg-black/25 p-3">
                     <strong className="block text-xs font-black uppercase tracking-widest text-white">{activeLiveAudit.action} / {activeLiveAudit.amount} / {activeLiveAudit.status}</strong>
