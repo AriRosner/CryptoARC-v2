@@ -12,8 +12,9 @@ import { PageHeader } from "../components/PageHeader";
 import { Card } from "../components/Card";
 import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
+import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeLabel, TradeRecord, TradeReviewDetail, TuningSuggestion } from "../types";
+import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
 
 interface ReviewPageProps {
   trades: TradeRecord[];
@@ -25,6 +26,8 @@ interface ReviewPageProps {
   timeline: Array<{ at: string; type: string; title: string; detail: string }>;
   detail: TradeReviewDetail | null;
   labels: TradeLabel[];
+  reviewQueue: TradeReviewQueue | null;
+  loading: boolean;
   onLabelTrade: (tokenId: string, label: string) => Promise<void>;
   onSelectTrade: (tokenId: string) => void;
   onApplySuggestion: (suggestion: TuningSuggestion) => Promise<void>;
@@ -35,6 +38,7 @@ const reviewLabels = [
   "bad_entry",
   "bad_exit",
   "bad_price_data",
+  "rug_behavior",
   "exited_too_early",
   "held_too_long",
   "ignore_from_tuning"
@@ -53,6 +57,82 @@ const ReviewMetric: React.FC<{ label: string; value: string; tone?: "neutral" | 
       )}
     >
       {value}
+    </div>
+  </div>
+);
+
+const ReviewQueueSkeleton: React.FC = () => (
+  <Card className="p-4" hover={false}>
+    <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+      <div className="space-y-2">
+        <Skeleton className="h-3 w-28" />
+        <Skeleton className="h-3 w-80 max-w-full" />
+      </div>
+      <Skeleton className="h-7 w-24 rounded-lg" />
+    </div>
+    <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+      {Array.from({ length: 6 }).map((_, index) => (
+        <div key={index} className="rounded-xl border border-white/5 bg-white/[0.015] p-3">
+          <div className="flex items-center justify-between gap-2">
+            <Skeleton className="h-3 w-20" />
+            <Skeleton className="h-4 w-8" />
+          </div>
+          <Skeleton className="mt-3 h-8 w-full" />
+        </div>
+      ))}
+    </div>
+  </Card>
+);
+
+const ReviewTradeListSkeleton: React.FC = () => (
+  <div className="divide-y divide-white/5">
+    {Array.from({ length: 9 }).map((_, index) => (
+      <div key={index} className="px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0 flex-1 space-y-2">
+            <Skeleton className="h-4 w-28" />
+            <Skeleton className="h-3 w-44" />
+          </div>
+          <Skeleton className="h-4 w-20" />
+        </div>
+        <div className="mt-3 flex items-center justify-between gap-3">
+          <Skeleton className="h-3 w-36" />
+          <Skeleton className="h-3 w-12" />
+        </div>
+      </div>
+    ))}
+  </div>
+);
+
+const ReviewDetailSkeleton: React.FC = () => (
+  <div className="space-y-6">
+    <Card className="p-6" hover={false}>
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div className="space-y-3">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-7 w-56" />
+          <Skeleton className="h-3 w-72 max-w-full" />
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {Array.from({ length: 5 }).map((_, index) => <Skeleton key={index} className="h-7 w-24 rounded-lg" />)}
+        </div>
+      </div>
+      <div className="mt-5 grid grid-cols-2 gap-3 xl:grid-cols-5">
+        {Array.from({ length: 5 }).map((_, index) => <Skeleton key={index} className="h-16 rounded-xl" />)}
+      </div>
+      <div className="mt-5 grid grid-cols-1 gap-4 xl:grid-cols-2">
+        <Skeleton className="h-40 rounded-xl" />
+        <Skeleton className="h-40 rounded-xl" />
+      </div>
+      <Skeleton className="mt-5 h-24 rounded-xl" />
+    </Card>
+    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1.35fr)_360px]">
+      <Skeleton className="h-[640px] rounded-xl" />
+      <div className="space-y-6">
+        <Skeleton className="h-56 rounded-xl" />
+        <Skeleton className="h-56 rounded-xl" />
+        <Skeleton className="h-56 rounded-xl" />
+      </div>
     </div>
   </div>
 );
@@ -79,21 +159,37 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   timeline,
   detail,
   labels,
+  reviewQueue,
+  loading,
   onLabelTrade,
   onSelectTrade,
   onApplySuggestion
 }) => {
   const [search, setSearch] = React.useState("");
+  const [activeQueueId, setActiveQueueId] = React.useState("unlabeled");
   const tokenById = React.useMemo(() => new Map(tokens.map((token) => [token.id, token])), [tokens]);
+  const labelByTokenId = React.useMemo(() => new Map(labels.map((label) => [label.token_id, label.label])), [labels]);
   const selectedTrade = detail?.trade ?? trades.find((trade) => trade.token_id === selectedTradeId) ?? null;
   const selectedToken = detail?.token ?? null;
   const selectedTimeline = detail?.timeline?.length ? detail.timeline : timeline;
   const selectedDecision = detail?.decisions?.[0] ?? null;
   const selectedSettingsVersion = versions.find((version) => version.id === selectedTrade?.settings_version_id);
-  const selectedLabel = labels.find((label) => label.token_id === selectedTradeId)?.label;
+  const workflow = detail?.review_workflow;
+  const selectedLabel = workflow?.selected_label || (selectedTradeId ? labelByTokenId.get(selectedTradeId) : undefined);
   const query = search.trim().toLowerCase();
+  const tradeMatchesQueue = React.useCallback((trade: TradeRecord) => {
+    const label = labelByTokenId.get(trade.token_id);
+    if (activeQueueId === "unlabeled") return !label;
+    if (activeQueueId === "losses") return (trade.pnl_sol ?? 0) < 0;
+    if (activeQueueId === "long_holds") return (trade.hold_duration_seconds ?? 0) >= 180;
+    if (activeQueueId === "missing_decision") return false;
+    if (activeQueueId === "bad_price_data") return label === "bad_price_data";
+    if (activeQueueId === "ignored_from_tuning") return label === "ignore_from_tuning";
+    return true;
+  }, [activeQueueId, labelByTokenId]);
   const filteredTrades = trades.filter((trade) => {
     const token = tokenById.get(trade.token_id);
+    if (!tradeMatchesQueue(trade)) return false;
     if (!query) return true;
     const haystack = [
       trade.token_id,
@@ -112,6 +208,13 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   });
   const acceptedObservations = detail?.observations?.filter((observation) => observation.accepted) ?? [];
   const rejectedObservations = detail?.observations?.filter((observation) => !observation.accepted) ?? [];
+  const activeQueue = reviewQueue?.queues.find((queue) => queue.id === activeQueueId);
+
+  React.useEffect(() => {
+    if (!reviewQueue?.queues.some((queue) => queue.id === activeQueueId)) {
+      setActiveQueueId(reviewQueue?.next_queue_id || "unlabeled");
+    }
+  }, [activeQueueId, reviewQueue]);
 
   return (
     <div className="space-y-6">
@@ -120,22 +223,69 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
         description="Inspect paper executions, decision evidence, and tuning opportunities trade by trade."
       />
 
+      {loading && !reviewQueue ? (
+        <ReviewQueueSkeleton />
+      ) : reviewQueue ? (
+        <Card className="p-4" hover={false}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">Review Queues</h3>
+              <p className="mt-1 text-xs text-zinc-500">{reviewQueue.operator_action}</p>
+            </div>
+            <Badge variant={reviewQueue.unlabeled ? "warning" : "success"}>
+              {reviewQueue.labeled}/{reviewQueue.total_closed} labeled
+            </Badge>
+            {reviewQueue.next_token_id ? (
+              <Button variant="secondary" size="sm" onClick={() => onSelectTrade(reviewQueue.next_token_id)}>
+                Next Review
+              </Button>
+            ) : null}
+          </div>
+          <div className="grid gap-2 md:grid-cols-3 xl:grid-cols-6">
+            {reviewQueue.queues.map((queue) => (
+              <button
+                key={queue.id}
+                className={cn(
+                  "rounded-xl border p-3 text-left transition hover:bg-white/[0.04]",
+                  queue.count ? "border-white/10 bg-white/[0.03]" : "border-white/5 bg-white/[0.015] opacity-70",
+                  activeQueueId === queue.id && "border-amber-400/40 bg-amber-500/10"
+                )}
+                onClick={() => {
+                  setActiveQueueId(queue.id);
+                  if (queue.sample_token_ids[0]) onSelectTrade(queue.sample_token_ids[0]);
+                }}
+                disabled={!queue.count}
+                title={queue.reason}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-[10px] font-black uppercase tracking-widest text-zinc-500">{queue.label}</span>
+                  <span className={cn("text-sm font-black", queue.count ? "text-white" : "text-zinc-600")}>{queue.count}</span>
+                </div>
+                <p className="mt-2 line-clamp-2 min-h-8 text-[10px] leading-4 text-zinc-500">{queue.reason}</p>
+              </button>
+            ))}
+          </div>
+        </Card>
+      ) : null}
+
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[340px_minmax(0,1fr)]">
         <div className="space-y-6">
           <Card className="flex h-[760px] flex-col" hover={false}>
             <div className="border-b border-white/5 p-4">
               <div className="flex items-center justify-between gap-3">
-                <h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">Closed Trades</h3>
+                <h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">{activeQueue?.label ?? "Closed Trades"}</h3>
                 <Badge variant="info">{filteredTrades.length}</Badge>
               </div>
+              {activeQueue ? <p className="mt-1 line-clamp-2 text-[11px] text-zinc-500">{activeQueue.reason}</p> : null}
               <div className="relative mt-3">
                 <div className="pointer-events-none absolute inset-y-0 left-0 flex w-11 items-center justify-center text-zinc-600">
                   <Search className="h-4 w-4" />
                 </div>
                 <input
+                  aria-label="Search closed trades"
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
-                  placeholder="Search token, profile, reason"
+                  placeholder="Search token, profile, reason…"
                   className="text-xs text-white placeholder:text-zinc-600"
                   style={{
                     height: "40px",
@@ -147,6 +297,9 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
               </div>
             </div>
             <div className="crypto-scrollbar flex-1 overflow-auto">
+              {loading && !trades.length ? (
+                <ReviewTradeListSkeleton />
+              ) : (
               <div className="divide-y divide-white/5">
                 {filteredTrades.map((trade) => {
                   const token = tokenById.get(trade.token_id);
@@ -186,13 +339,16 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                   );
                 })}
               </div>
-              {!filteredTrades.length ? <div className="p-6 text-center text-xs text-zinc-500">No trades match that filter.</div> : null}
+              )}
+              {!loading && !filteredTrades.length ? <div className="p-6 text-center text-xs text-zinc-500">No trades match that filter.</div> : null}
             </div>
           </Card>
         </div>
 
         <div className="space-y-6">
-          {selectedTrade ? (
+          {loading && !selectedTrade ? (
+            <ReviewDetailSkeleton />
+          ) : selectedTrade ? (
             <>
               <Card className="p-6" hover={false}>
                 <div className="flex flex-wrap items-start justify-between gap-4">
@@ -213,6 +369,16 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
+                    {workflow?.previous_token_id ? (
+                      <Button variant="secondary" size="sm" onClick={() => onSelectTrade(workflow.previous_token_id)}>
+                        Previous
+                      </Button>
+                    ) : null}
+                    {workflow?.next_token_id ? (
+                      <Button variant="secondary" size="sm" onClick={() => onSelectTrade(workflow.next_token_id)}>
+                        Next
+                      </Button>
+                    ) : null}
                     {reviewLabels.map((label) => (
                       <button
                         key={label}
@@ -229,6 +395,23 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                     ))}
                   </div>
                 </div>
+                {workflow ? (
+                  <div className="mt-4 flex flex-wrap items-center gap-2 rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-400">
+                    <span className="font-black uppercase tracking-widest text-zinc-500">
+                      Review {workflow.current_index >= 0 ? workflow.current_index + 1 : "-"} / {workflow.total_closed}
+                    </span>
+                    {workflow.suggested_labels.map((label) => (
+                      <button
+                        key={label}
+                        onClick={() => selectedTradeId && onLabelTrade(selectedTradeId, label)}
+                        className="rounded-md border border-amber-400/30 bg-amber-500/10 px-2 py-1 text-[10px] font-black uppercase tracking-wider text-amber-200 hover:bg-amber-500/20"
+                      >
+                        {label.replace(/_/g, " ")}
+                      </button>
+                    ))}
+                    <span className="min-w-0 flex-1 text-right text-zinc-500">{workflow.operator_action}</span>
+                  </div>
+                ) : null}
 
                 <div className="mt-5 grid grid-cols-2 gap-3 xl:grid-cols-5">
                   <ReviewMetric label="P&L" value={`${selectedTrade.pnl_sol?.toFixed(4) ?? "0.0000"} SOL`} tone={(selectedTrade.pnl_sol ?? 0) >= 0 ? "good" : "bad"} />
@@ -376,6 +559,26 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                           </Button>
                         </div>
                       ))}
+                    </div>
+                  </Card>
+
+                  <Card className="p-4" hover={false}>
+                    <h3 className="mb-4 flex items-center gap-2 text-xs font-black uppercase tracking-widest text-zinc-500">
+                      <Clock size={14} />
+                      Evidence Checklist
+                    </h3>
+                    <div className="space-y-2">
+                      {(workflow?.checklist ?? []).map((item) => (
+                        <div key={item.id} className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                          <div className="flex items-center justify-between gap-3">
+                            <span className="text-[11px] font-black uppercase tracking-wider text-white">{item.label}</span>
+                            <Badge variant={item.status === "pass" ? "success" : item.status === "warn" ? "warning" : "danger"}>{item.count}</Badge>
+                          </div>
+                          <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">{item.operator_action}</p>
+                          {item.ids.length ? <p className="mt-2 truncate font-mono text-[10px] text-zinc-600">{item.ids.join(", ")}</p> : null}
+                        </div>
+                      ))}
+                      {!workflow?.checklist?.length ? <div className="text-xs text-zinc-500">No review checklist is available for this trade.</div> : null}
                     </div>
                   </Card>
 

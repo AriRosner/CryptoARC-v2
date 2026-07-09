@@ -1,5 +1,5 @@
 import React from "react";
-import { motion, AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import { X } from "lucide-react";
 import { Button } from "./Button";
 import { cn } from "./utils";
@@ -21,6 +21,10 @@ export const Modal: React.FC<ModalProps> = ({
   children,
   className
 }) => {
+  const shouldReduceMotion = useReducedMotion();
+  const panelInitial = shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.95, y: 20 };
+  const panelExit = shouldReduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.95, y: 20 };
+
   return (
     <AnimatePresence>
       {isOpen && (
@@ -29,15 +33,24 @@ export const Modal: React.FC<ModalProps> = ({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
+            transition={{ duration: shouldReduceMotion ? 0.01 : 0.18 }}
             onClick={onClose}
             className="fixed inset-0 z-50 bg-black/60 backdrop-blur-md"
+            aria-hidden="true"
           />
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
+          <div
+            className="fixed bottom-0 right-0 top-0 z-50 flex items-center justify-center p-4 pointer-events-none"
+            style={{ left: "var(--cryptoarc-sidebar-width, 0px)" }}
+          >
             <motion.div
-              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              initial={panelInitial}
               animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              transition={{ duration: 0.3, ease: [0.2, 0.8, 0.2, 1] }}
+              exit={panelExit}
+              transition={{ type: "spring", stiffness: 420, damping: 34, duration: shouldReduceMotion ? 0.01 : undefined }}
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="modal-title"
+              aria-describedby={description ? "modal-description" : undefined}
               className={cn(
                 "pointer-events-auto w-full max-w-2xl overflow-hidden rounded-2xl border border-white/10 bg-[#10121c] shadow-2xl shadow-black/60",
                 className
@@ -46,9 +59,9 @@ export const Modal: React.FC<ModalProps> = ({
               <div className="relative border-b border-white/5 p-6">
                 <div className="flex items-center justify-between">
                   <div>
-                    <h3 className="text-xl font-bold text-white">{title}</h3>
+                    <h3 id="modal-title" className="text-xl font-bold text-white">{title}</h3>
                     {description && (
-                      <p className="mt-1 text-sm text-zinc-400">{description}</p>
+                      <p id="modal-description" className="mt-1 text-sm text-zinc-400">{description}</p>
                     )}
                   </div>
                   <Button
@@ -56,6 +69,7 @@ export const Modal: React.FC<ModalProps> = ({
                     size="icon"
                     onClick={onClose}
                     className="h-8 w-8 rounded-full"
+                    aria-label={`Close ${title}`}
                   >
                     <X size={18} />
                   </Button>

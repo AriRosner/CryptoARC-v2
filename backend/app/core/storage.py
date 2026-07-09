@@ -14,7 +14,7 @@ from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, Li
 
 
 class Storage:
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 9
     BACKUP_FORMAT_VERSION = 1
     BACKUP_TABLES = (
         "settings",
@@ -36,6 +36,9 @@ class Storage:
         "live_intents",
         "live_ledger_positions",
         "backup_restore_history",
+        "source_soak_history",
+        "mobile_pairing_requests",
+        "mobile_devices",
     )
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
@@ -150,6 +153,8 @@ class Storage:
             (5, "005_indexes", "timestamp and lookup indexes", self._migration_005_indexes),
             (6, "006_backup_restore_history", "backup and restore history tracking", self._migration_006_backup_restore_history),
             (7, "007_foundation_indexes", "foundation release supporting indexes", self._migration_007_foundation_indexes),
+            (8, "008_source_soak_history", "durable hybrid source soak snapshots", self._migration_008_source_soak_history),
+            (9, "009_mobile_companion", "mobile companion pairing and devices", self._migration_009_mobile_companion),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -306,6 +311,61 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_backup_restore_history_created_at ON backup_restore_history(created_at DESC)"
         )
 
+    def _migration_008_source_soak_history(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_soak_history (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                ready INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_soak_history_created_at ON source_soak_history(created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_soak_history_status ON source_soak_history(status, created_at DESC)"
+        )
+
+    def _migration_009_mobile_companion(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_pairing_requests (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                claimed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_devices (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                revoked_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_pairing_requests_expires_at ON mobile_pairing_requests(expires_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_pairing_requests_claimed_at ON mobile_pairing_requests(claimed_at, created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_devices_last_seen_at ON mobile_devices(last_seen_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mobile_devices_revoked_at ON mobile_devices(revoked_at, created_at DESC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -392,6 +452,16 @@ class Storage:
             raise ValueError("Restore artifact was created by a newer schema version")
         metadata_summary = artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}
         actual_summary = inspection.get("table_counts", {})
+        current_summary = self._summary_counts()
+        table_deltas = {
+            key: {
+                "current": int(current_summary.get(key, 0) or 0),
+                "artifact": int(actual_summary.get(key, 0) or 0),
+                "delta": int(actual_summary.get(key, 0) or 0) - int(current_summary.get(key, 0) or 0),
+            }
+            for key in sorted(set(current_summary) | set(actual_summary))
+        }
+        changed_tables = [key for key, value in table_deltas.items() if int(value["delta"]) != 0]
         if str(artifact.get("database_name") or "") != self.path.name:
             warnings.append("Artifact database name differs from the current local database path.")
         if artifact_version < self.SCHEMA_VERSION:
@@ -401,6 +471,11 @@ class Storage:
         if metadata_summary and metadata_summary != actual_summary:
             warnings.append("Artifact metadata summary differs from the embedded database counts.")
         warnings.append("Restore replaces the local SQLite state. A safety backup copy will be created first.")
+        risk_level = "low"
+        if str(inspection.get("integrity_check") or "").lower() != "ok":
+            risk_level = "blocked"
+        elif artifact_version < self.SCHEMA_VERSION or changed_tables:
+            risk_level = "review"
         return {
             "compatible": True,
             "artifact_type": artifact["artifact_type"],
@@ -410,6 +485,15 @@ class Storage:
             "schema_version": artifact_version,
             "current_schema_version": self.SCHEMA_VERSION,
             "summary": actual_summary,
+            "current_summary": current_summary,
+            "table_deltas": table_deltas,
+            "changed_tables": changed_tables,
+            "risk_level": risk_level,
+            "recommended_actions": [
+                "Download a fresh backup artifact before confirming restore.",
+                "Review changed table counts and restore warnings.",
+                "After restore, verify readiness, source health, wallet state, and unresolved live audits before trading.",
+            ],
             "warnings": warnings,
             "payload_bytes": len(decoded),
             "integrity_check": str(inspection.get("integrity_check") or "unknown"),
@@ -476,6 +560,101 @@ class Storage:
                 """,
                 (item_id, json.dumps(payload), created_at),
             )
+
+    def load_source_soak_history(self, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM source_soak_history ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_source_soak_snapshot(self, payload: dict[str, Any]) -> None:
+        created_at = str(payload.get("created_at") or payload.get("generated_at") or datetime.now(timezone.utc).isoformat())
+        item_id = str(payload.get("id") or f"source_soak_{created_at}")
+        status = str(payload.get("status") or "unknown")
+        ready = 1 if bool(payload.get("ready")) else 0
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO source_soak_history (id, payload, created_at, status, ready)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (item_id, json.dumps(payload), created_at, status, ready),
+            )
+
+    def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
+        item_id = str(payload["id"])
+        created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+        expires_at = str(payload.get("expires_at") or created_at)
+        claimed_at = str(payload.get("claimed_at") or "")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO mobile_pairing_requests (id, payload, created_at, expires_at, claimed_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (item_id, json.dumps(payload), created_at, expires_at, claimed_at),
+            )
+
+    def load_mobile_pairing_request(self, pairing_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM mobile_pairing_requests WHERE id = ?",
+                (pairing_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_mobile_pairing_requests(self, include_claimed: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(500, int(limit or 50)))
+        where_clause = "" if include_claimed else "WHERE claimed_at IS NULL OR claimed_at = ''"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM mobile_pairing_requests {where_clause} ORDER BY created_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_mobile_device(self, payload: dict[str, Any]) -> None:
+        item_id = str(payload["id"])
+        created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+        last_seen_at = str(payload.get("last_seen_at") or "")
+        revoked_at = str(payload.get("revoked_at") or "")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO mobile_devices (id, payload, created_at, last_seen_at, revoked_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (item_id, json.dumps(payload), created_at, last_seen_at, revoked_at),
+            )
+
+    def load_mobile_device(self, device_id: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM mobile_devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_mobile_devices(self, include_revoked: bool = False, limit: int = 50) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit or 50)))
+        where_clause = "" if include_revoked else "WHERE revoked_at IS NULL OR revoked_at = ''"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM mobile_devices {where_clause} ORDER BY COALESCE(last_seen_at, created_at) DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def load_mobile_device_by_token_hash(self, token_hash: str) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT payload FROM mobile_devices").fetchall()
+        for row in rows:
+            payload = json.loads(row["payload"])
+            if str(payload.get("token_hash") or "") == token_hash:
+                return payload
+        return None
 
     def backup_restore_status(self) -> dict[str, Any]:
         history = self.load_backup_restore_history(10)
@@ -569,7 +748,11 @@ class Storage:
             "live_execution_audits": self.count_live_execution_audits(),
             "live_intents": self.count_live_intents(),
             "live_ledger_positions": self.count_live_ledger_positions(),
+            "source_soak_history": self.count_source_soak_history(),
+            "mobile_pairing_requests": self.count_mobile_pairing_requests(),
+            "mobile_devices": self.count_mobile_devices(),
         }
+
     def load_settings(self) -> BotSettings:
         with self._connect() as connection:
             row = connection.execute("SELECT payload FROM settings WHERE id = 1").fetchone()
@@ -636,6 +819,15 @@ class Storage:
 
     def count_backup_restore_history(self) -> int:
         return self._count_table("backup_restore_history")
+
+    def count_source_soak_history(self) -> int:
+        return self._count_table("source_soak_history")
+
+    def count_mobile_pairing_requests(self) -> int:
+        return self._count_table("mobile_pairing_requests")
+
+    def count_mobile_devices(self) -> int:
+        return self._count_table("mobile_devices")
 
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
@@ -1003,6 +1195,10 @@ class Storage:
         with self._connect() as connection:
             connection.execute("DELETE FROM backup_restore_history")
 
+    def clear_source_soak_history(self) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM source_soak_history")
+
     def _token_from_payload(self, payload: dict[str, Any]) -> TokenSignal:
         payload["detected_at"] = datetime.fromisoformat(payload["detected_at"])
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -1014,15 +1210,18 @@ class Storage:
 
     def _event_from_payload(self, payload: dict[str, Any]) -> TradeEvent:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
-        return TradeEvent(**payload)
+        allowed = set(TradeEvent.__dataclass_fields__.keys())
+        return TradeEvent(**{key: value for key, value in payload.items() if key in allowed})
 
     def _source_event_from_payload(self, payload: dict[str, Any]) -> SourceEvent:
         payload["received_at"] = datetime.fromisoformat(payload["received_at"])
-        return SourceEvent(**payload)
+        allowed = set(SourceEvent.__dataclass_fields__.keys())
+        return SourceEvent(**{key: value for key, value in payload.items() if key in allowed})
 
     def _backtest_from_payload(self, payload: dict[str, Any]) -> BacktestRun:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
-        return BacktestRun(**payload)
+        allowed = set(BacktestRun.__dataclass_fields__.keys())
+        return BacktestRun(**{key: value for key, value in payload.items() if key in allowed})
 
     def _trade_from_payload(self, payload: dict[str, Any]) -> TradeRecord:
         payload["opened_at"] = datetime.fromisoformat(payload["opened_at"]) if payload.get("opened_at") else None
@@ -1084,6 +1283,8 @@ class Storage:
     def _live_ledger_position_from_payload(self, payload: dict[str, Any]) -> LiveLedgerPosition:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["updated_at"] = datetime.fromisoformat(payload.get("updated_at") or payload["created_at"])
+        payload["mark_price_at"] = datetime.fromisoformat(payload["mark_price_at"]) if payload.get("mark_price_at") else None
+        payload["balance_verified_at"] = datetime.fromisoformat(payload["balance_verified_at"]) if payload.get("balance_verified_at") else None
         allowed = set(LiveLedgerPosition.__dataclass_fields__.keys())
         return LiveLedgerPosition(**{key: value for key, value in payload.items() if key in allowed})
 

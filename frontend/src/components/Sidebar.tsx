@@ -1,5 +1,5 @@
 import React from "react";
-import { motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import {
   Activity,
   BarChart3,
@@ -19,12 +19,16 @@ import { Card } from "./Card";
 import { Button } from "./Button";
 import { Badge } from "./Badge";
 import { cn } from "./utils";
+import type { LatencyStatus } from "../types";
+
+type DashboardRuntimeStatus = "running" | "stopped" | "starting" | "stopping" | "connecting" | "reconnecting" | "disconnected";
 
 interface SidebarProps {
   activePage: string;
   setActivePage: (page: any) => void;
-  status: "running" | "stopped" | "starting" | "stopping";
+  status: DashboardRuntimeStatus;
   apiState: string;
+  latencyStatus: LatencyStatus | null;
   onStart: () => void;
   onStop: () => void;
   onSettingsOpen: () => void;
@@ -39,6 +43,7 @@ interface SidebarProps {
   walletBalance: number | null;
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  compactViewport?: boolean;
 }
 
 const Tooltip: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => (
@@ -85,6 +90,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   setActivePage,
   status,
   apiState,
+  latencyStatus,
   onStart,
   onStop,
   onSettingsOpen,
@@ -98,13 +104,33 @@ export const Sidebar: React.FC<SidebarProps> = ({
   walletPublicKey,
   walletBalance,
   collapsed,
-  onToggleCollapsed
+  onToggleCollapsed,
+  compactViewport = false
 }) => {
+  const shouldReduceMotion = useReducedMotion();
   const statusPending = status === "starting" || status === "stopping";
-  const statusTone = status === "running" || status === "starting" ? "bg-emerald-500 animate-pulse" : status === "stopping" ? "bg-amber-500 animate-pulse" : "bg-rose-500";
-  const actionLabel = status === "running" ? "Stop" : status === "stopping" ? "Stopping..." : status === "starting" ? "Starting..." : "Start";
+  const botIsActive = status === "running" || status === "connecting" || status === "reconnecting" || status === "disconnected";
+  const statusTone = status === "running"
+    ? "bg-emerald-500 animate-pulse"
+    : status === "starting" || status === "connecting" || status === "reconnecting" || status === "stopping"
+      ? "bg-amber-500 animate-pulse"
+      : "bg-rose-500";
+  const actionLabel = botIsActive ? "Stop" : status === "stopping" ? "Stopping..." : status === "starting" ? "Starting..." : "Start";
   const compactApiLabel = apiState === "connected" ? "Linked" : apiState === "offline" ? "Offline" : apiState;
-  const compactStatusLabel = status === "running" ? "Running" : status === "stopped" ? "Stopped" : status === "starting" ? "Starting" : "Stopping";
+  const compactStatusLabel = status === "running" ? "Running" : status === "stopped" ? "Stopped" : status === "starting" ? "Starting" : status === "stopping" ? "Stopping" : status === "connecting" ? "Connecting" : status === "reconnecting" ? "Reconnecting" : "Disconnected";
+  const formatMs = (value: number | null | undefined) => (typeof value === "number" && Number.isFinite(value) ? `${Math.round(value)}ms` : "--");
+  const serverLatencyMs = latencyStatus?.dashboard_rtt_ms ?? latencyStatus?.api_loop_ms;
+  const sourceLatencyMs = latencyStatus?.source_connection?.startup_ms ?? latencyStatus?.source_connection?.first_event_ms;
+  const sourceLatencyText = typeof sourceLatencyMs === "number" && Number.isFinite(sourceLatencyMs)
+    ? formatMs(sourceLatencyMs)
+    : latencyStatus?.source_connection?.state || "--";
+  const latencyLabel = [
+    `Server ${formatMs(serverLatencyMs)}`,
+    `PumpPortal ${formatMs(latencyStatus?.pumpportal_public_ms)}`,
+    `Source ${sourceLatencyText}`,
+    latencyStatus?.latency_stale ? `Last poll failed: ${latencyStatus.latency_error || "unknown error"}` : ""
+  ].join(" / ");
+  const latencyState = latencyStatus?.latency_stale ? "stale" : latencyStatus?.pumpportal_state || "unknown";
   const navItems = [
     { id: "monitor", label: "Monitor", icon: Activity },
     { id: "analysis", label: "Analysis", icon: BarChart3 },
@@ -115,11 +141,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <motion.aside
-      animate={{ width: collapsed ? 92 : 310 }}
-      transition={{ type: "spring", stiffness: 400, damping: 32 }}
+      animate={{ width: collapsed ? (compactViewport ? 76 : 92) : 310 }}
+      transition={shouldReduceMotion ? { duration: 0.01 } : { type: "spring", stiffness: 400, damping: 32 }}
       className="fixed inset-y-0 left-0 z-[70] overflow-visible border-r border-white/5 bg-[#08090f]/80 backdrop-blur-2xl"
     >
-      <div className={cn("flex h-full flex-col overflow-visible", collapsed ? "items-center p-3" : "p-6")}>
+      <div className={cn("flex h-full flex-col overflow-visible", collapsed ? (compactViewport ? "items-center p-2" : "items-center p-3") : "p-6")}>
         <div className={cn("mb-8 flex items-center", collapsed ? "w-full flex-col gap-3" : "gap-3")}>
           <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-amber-400 to-amber-600 shadow-xl shadow-amber-500/20">
             <Bot size={28} className="text-[#160f08]" strokeWidth={2.5} />
@@ -130,26 +156,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">Sniper Bot v2.0</p>
             </div>
           ) : null}
-          {collapsed ? (
+          {collapsed && !compactViewport ? (
             <Tooltip label="Expand Sidebar">
               <button
                 type="button"
                 onClick={onToggleCollapsed}
+                aria-label="Expand Sidebar"
                 className="inline-flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 transition-colors hover:border-amber-500/30 hover:text-amber-300"
               >
                 <ChevronRight size={16} />
               </button>
             </Tooltip>
-          ) : (
+          ) : !collapsed ? (
             <button
               type="button"
               onClick={onToggleCollapsed}
               title="Collapse sidebar"
+              aria-label="Collapse Sidebar"
               className="ml-auto inline-flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 transition-colors hover:border-amber-500/30 hover:text-amber-300"
             >
               <ChevronLeft size={16} />
             </button>
-          )}
+          ) : null}
         </div>
 
         <div className={cn("mb-8", collapsed ? "w-full space-y-1" : "space-y-1")}>
@@ -178,7 +206,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
 
         <div className={cn("mt-auto", collapsed ? "w-full space-y-3" : "space-y-4")}>
-          <Card className={cn("border-amber-500/20 bg-amber-500/[0.03]", collapsed ? "mx-auto w-[64px] px-2 py-3" : "p-4")} hover={false}>
+          <Card className={cn("border-amber-500/20 bg-amber-500/[0.03]", collapsed ? (compactViewport ? "mx-auto w-[52px] px-1.5 py-2" : "mx-auto w-[64px] px-2 py-3") : "p-4")} hover={false}>
             {!collapsed ? (
               <>
                 <div className="mb-3 flex items-center justify-between">
@@ -190,14 +218,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="mb-4">
                   <div className="flex items-center gap-2">
                     <div className={cn("h-2 w-2 rounded-full", statusTone)} />
-                    <span className="text-sm font-bold text-white capitalize">{status}</span>
+                    <span className="text-sm font-bold text-white capitalize">{compactStatusLabel}</span>
+                  </div>
+                </div>
+                <div className="mb-4 rounded-lg border border-white/10 bg-black/20 p-2">
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="text-[9px] font-black uppercase tracking-widest text-zinc-500">Latency</span>
+                    <span className={cn(
+                      "text-[9px] font-black uppercase tracking-widest",
+                      latencyStatus?.latency_stale ? "text-amber-300" : latencyStatus?.pumpportal_state === "connected" ? "text-emerald-300" : latencyStatus?.pumpportal_state === "error" ? "text-rose-300" : "text-zinc-500"
+                    )}>
+                      {latencyState}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2 text-[10px]">
+                    <div className="min-w-0">
+                      <div className="truncate text-zinc-500">Server</div>
+                      <div className="truncate font-black text-white">{formatMs(serverLatencyMs)}</div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-zinc-500">PumpPortal</div>
+                      <div className="truncate font-black text-white">{formatMs(latencyStatus?.pumpportal_public_ms)}</div>
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-zinc-500">Source</div>
+                      <div className="truncate font-black text-white">{sourceLatencyText}</div>
+                    </div>
                   </div>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Button
                     size="sm"
-                    variant={status === "running" || status === "stopping" ? "danger" : "primary"}
-                    onClick={status === "running" ? onStop : onStart}
+                    variant={botIsActive || status === "stopping" ? "danger" : "primary"}
+                    onClick={botIsActive ? onStop : onStart}
                     className="w-full"
                     disabled={statusPending}
                   >
@@ -228,23 +281,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     {apiState === "connected" ? "API" : "OFF"}
                   </div>
                 </Tooltip>
+                <Tooltip label={latencyLabel}>
+                  <div className={cn(
+                    "flex h-6 w-10 items-center justify-center rounded-md border px-1 text-[9px] font-bold uppercase tracking-wider",
+                    latencyStatus?.pumpportal_state === "connected" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300" : "border-amber-500/20 bg-amber-500/10 text-amber-300"
+                  )}>
+                    {formatMs(serverLatencyMs).replace("ms", "")}
+                  </div>
+                </Tooltip>
                 <div className="flex flex-col items-center gap-2">
                   <Tooltip label={actionLabel}>
                     <div>
                       <Button
                         size="icon"
-                        variant={status === "running" || status === "stopping" ? "danger" : "primary"}
-                        onClick={status === "running" ? onStop : onStart}
+                        variant={botIsActive || status === "stopping" ? "danger" : "primary"}
+                        onClick={botIsActive ? onStop : onStart}
                         className="h-9 w-9"
                         disabled={statusPending}
+                        aria-label={actionLabel}
                       >
-                        {status === "running" || status === "stopping" ? <Square size={12} /> : <Play size={12} />}
+                        {botIsActive || status === "stopping" ? <Square size={12} /> : <Play size={12} />}
                       </Button>
                     </div>
                   </Tooltip>
                   <Tooltip label="Settings">
                     <div>
-                      <Button size="icon" variant="secondary" onClick={onSettingsOpen} className="h-9 w-9">
+                      <Button size="icon" variant="secondary" onClick={onSettingsOpen} className="h-9 w-9" aria-label="Open Settings">
                         <Shield size={14} />
                       </Button>
                     </div>
@@ -254,7 +316,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             )}
           </Card>
 
-          <Card className={cn(collapsed ? "mx-auto w-[64px] px-2 py-3" : "p-4")} hover={false}>
+          <Card className={cn(collapsed ? (compactViewport ? "mx-auto w-[52px] px-1.5 py-2" : "mx-auto w-[64px] px-2 py-3") : "p-4")} hover={false}>
             {!collapsed ? (
               <>
                 <div className="mb-3 flex items-center justify-between">
@@ -310,6 +372,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <button
                     type="button"
                     onClick={onManageWalletOpen}
+                    aria-label="Manage Wallets"
                     className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-zinc-400 transition-colors hover:border-amber-500/30 hover:text-amber-300"
                   >
                     <Wallet size={16} />
@@ -330,6 +393,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <button
                     type="button"
                     onClick={onAddWalletOpen}
+                    aria-label="Add Wallet"
                     className="flex h-8 w-8 items-center justify-center rounded-xl border border-amber-500/20 bg-amber-500/10 text-amber-200 transition-colors hover:bg-amber-500/20"
                   >
                     <PlusIcon />

@@ -62,6 +62,10 @@ class RiskEngine:
         if token.metadata_score < settings.min_metadata_score:
             return RiskDecision(False, f"metadata score {token.metadata_score:.2f} below minimum {settings.min_metadata_score:.2f}")
 
+        entry_confirmation = self.entry_confirmation_reason(token, settings)
+        if entry_confirmation:
+            return RiskDecision(False, entry_confirmation)
+
         if token.age_seconds > settings.max_token_age_seconds:
             return RiskDecision(False, f"token age {token.age_seconds}s above maximum {settings.max_token_age_seconds}s")
 
@@ -76,6 +80,39 @@ class RiskEngine:
             return RiskDecision(False, f"score {token.score} below entry threshold {threshold}")
 
         return RiskDecision(True, "risk checks passed")
+
+    def entry_confirmation_reason(self, token: TokenSignal, settings: BotSettings) -> str:
+        if not settings.entry_confirmation_enabled:
+            return ""
+
+        observed_required = max(0, int(settings.entry_confirmation_min_observed_trades))
+        observed_ok = token.observed_price_updates >= observed_required
+        price_ok = token.price_confidence >= settings.entry_confirmation_min_price_confidence
+        observed_confirmation = observed_ok and price_ok
+
+        launch_confirmation = (
+            token.buy_velocity >= settings.entry_confirmation_min_buy_velocity
+            and token.sell_pressure <= settings.entry_confirmation_max_sell_pressure
+            and token.metadata_score >= settings.entry_confirmation_min_metadata_score
+        )
+        seeded_launch_confirmation = launch_confirmation and (
+            token.initial_buy_sol >= settings.entry_confirmation_min_initial_buy_sol
+            or price_ok
+            or token.buy_velocity >= min(1.0, settings.entry_confirmation_min_buy_velocity + 0.15)
+        )
+
+        if observed_confirmation or seeded_launch_confirmation:
+            return ""
+
+        return (
+            "entry confirmation missing: "
+            f"buy velocity {token.buy_velocity:.2f}/{settings.entry_confirmation_min_buy_velocity:.2f}, "
+            f"sell pressure {token.sell_pressure:.2f}/{settings.entry_confirmation_max_sell_pressure:.2f} max, "
+            f"metadata {token.metadata_score:.2f}/{settings.entry_confirmation_min_metadata_score:.2f}, "
+            f"initial buy {token.initial_buy_sol:.2f}/{settings.entry_confirmation_min_initial_buy_sol:.2f} SOL, "
+            f"price confidence {token.price_confidence:.2f}/{settings.entry_confirmation_min_price_confidence:.2f}, "
+            f"observed trades {token.observed_price_updates}/{observed_required}"
+        )
 
     def effective_score_threshold(self, settings: BotSettings) -> int:
         profile_offset = self.PROFILE_SCORE_OFFSETS.get(settings.strategy_profile, 0)

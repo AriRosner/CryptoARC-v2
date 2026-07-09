@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import re
+import secrets
 import time
 import urllib.error
 import urllib.request
 from collections import Counter, deque
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -42,6 +46,7 @@ from app.core.models import (
     new_id,
     utc_now,
 )
+from app.core.alerts import AlertRouter
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.integrity import DataIntegrityAnalyzer
@@ -52,25 +57,52 @@ from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
 from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
-from app.core.sources import LaunchEvent, normalize_pumpportal_new_token
+from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, normalize_pumpportal_new_token
+
+LAMPORTS_PER_SOL = 1_000_000_000
+SOLANA_SIGNATURE_BASE_FEE_LAMPORTS = 5_000
 from app.core.strategy import DecisionPipeline
 
 
 class BotState:
+    MOBILE_MONITOR_SCOPE = "mobile:monitor"
+    MOBILE_CONTROL_SCOPE = "mobile:control"
+    MOBILE_DEFAULT_SCOPES = (MOBILE_MONITOR_SCOPE, MOBILE_CONTROL_SCOPE)
+    MOBILE_PAIRING_TTL_SECONDS = 300
+    MOBILE_PAIRING_MAX_FAILED_ATTEMPTS = 5
+    MOBILE_TOKEN_TTL_DAYS = 30
+    live_recovery_max_attempts = 3
+    LIVE_CAP_SETTING_KEYS = (
+        "live_max_trade_sol",
+        "live_daily_loss_cap_sol",
+        "live_wallet_exposure_cap_sol",
+        "live_max_open_positions",
+        "live_max_slippage_pct",
+        "live_priority_fee_cap_sol",
+    )
+
     def __init__(
         self,
         database_path: str = "data/cryptoarc.db",
         default_source: str = "pumpportal",
         default_solana_rpc_url: str = "",
+        default_solana_wss_endpoint: str = "",
+        default_solana_logs_mentions_address: str = "",
         default_watch_wallet_address: str = "",
         signer_daemon_url: str = "http://127.0.0.1:8799",
         signer_daemon_auth_token: str = "",
+        alert_router: AlertRouter | None = None,
     ) -> None:
         self.storage = Storage(database_path)
         database_file = self.storage.path
         self.hot_wallet = HotWalletVault(str(database_file.with_suffix(".hotwallet.json")))
+        self.solana_wss_endpoint = default_solana_wss_endpoint.strip()
+        self.solana_logs_mentions_address = default_solana_logs_mentions_address.strip()
+        self.solana_logs_status = SourceStatus(source="solana_logs", status="offline", message="Solana logs verifier is idle")
         self.signer_daemon_url = signer_daemon_url.strip()
         self.signer_daemon_auth_token = signer_daemon_auth_token.strip()
+        self.alerts = alert_router or AlertRouter()
+        self.active_live_session_id = ""
         self._cached_signer_status: dict[str, object] | None = None
         self._cached_signer_status_at: datetime | None = None
         self.status = BotStatus.STOPPED
@@ -79,11 +111,12 @@ class BotState:
         if self.settings.max_position_ticks == 12:
             self.settings.max_position_ticks = 40
             self.storage.save_settings(self.settings)
+        if self.settings.paper_fee_bps == 25.0:
+            self.settings.paper_fee_bps = 50.0
+            self.storage.save_settings(self.settings)
         if self.settings.live_signer_mode not in {"browser_wallet", "local_hot_wallet", "local_signer_daemon"}:
             self.settings.live_signer_mode = "browser_wallet"
-        self.settings.live_hot_wallet_enabled = self.hot_wallet.status()["imported"]
-        if self.settings.live_hot_wallet_enabled and not self.settings.live_hot_wallet_public_key:
-            self.settings.live_hot_wallet_public_key = self.hot_wallet.wallet_public_key()
+        self._sync_hot_wallet_settings(self.hot_wallet.status())
         if self.settings.launch_source not in {"mock", "pumpportal"}:
             self.settings.launch_source = default_source
         elif not has_saved_settings and self.settings.launch_source == "mock" and default_source != "mock":
@@ -129,6 +162,328 @@ class BotState:
         self.add_event("warning", "Paper trading loop stopped", subsystem="paper")
         return self.snapshot()
 
+    def create_mobile_pairing(
+        self,
+        api_base_url: str = "",
+        scopes: list[str] | None = None,
+        ttl_seconds: int = MOBILE_PAIRING_TTL_SECONDS,
+    ) -> dict[str, object]:
+        now = utc_now()
+        expires_at = now + timedelta(seconds=max(60, min(1800, int(ttl_seconds or self.MOBILE_PAIRING_TTL_SECONDS))))
+        code = str(secrets.randbelow(900000) + 100000)
+        pairing_id = new_id("mpair")
+        requested_scopes = self._normalize_mobile_scopes(scopes)
+        payload: dict[str, object] = {
+            "id": pairing_id,
+            "created_at": now.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "claimed_at": "",
+            "claimed_device_id": "",
+            "api_base_url": api_base_url.strip(),
+            "scopes": requested_scopes,
+            "code_hash": self._hash_mobile_secret(code),
+            "failed_attempts": 0,
+            "max_failed_attempts": self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS,
+        }
+        self.storage.save_mobile_pairing_request(payload)
+        self.add_event(
+            "info",
+            "Mobile pairing code created",
+            subsystem="security",
+            operator_action="Pair only over the private tunnel and revoke unknown devices immediately.",
+        )
+        return {
+            "id": pairing_id,
+            "code": code,
+            "manual_code": code,
+            "api_base_url": payload["api_base_url"],
+            "expires_at": payload["expires_at"],
+            "scopes": requested_scopes,
+            "qr_payload": {
+                "artifact_type": "cryptoarc_mobile_pairing",
+                "format_version": 1,
+                "pairing_id": pairing_id,
+                "code": code,
+                "api_base_url": payload["api_base_url"],
+                "expires_at": payload["expires_at"],
+                "scopes": requested_scopes,
+            },
+        }
+
+    def claim_mobile_pairing(self, pairing_id: str, code: str, device_name: str, platform: str = "android") -> dict[str, object]:
+        pairing = self.storage.load_mobile_pairing_request(pairing_id.strip())
+        now = utc_now()
+        if not pairing:
+            raise ValueError("Invalid or expired mobile pairing code")
+        if str(pairing.get("claimed_at") or ""):
+            raise ValueError("Mobile pairing code has already been claimed")
+        if self._parse_mobile_time(pairing.get("expires_at")) <= now:
+            raise ValueError("Mobile pairing code has expired")
+        failed_attempts = int(pairing.get("failed_attempts") or 0)
+        max_failed_attempts = int(pairing.get("max_failed_attempts") or self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS)
+        if failed_attempts >= max_failed_attempts:
+            raise ValueError("Mobile pairing code has too many failed attempts")
+        if not secrets.compare_digest(self._hash_mobile_secret(code.strip()), str(pairing.get("code_hash") or "")):
+            pairing["failed_attempts"] = failed_attempts + 1
+            self.storage.save_mobile_pairing_request(pairing)
+            raise ValueError("Invalid or expired mobile pairing code")
+
+        token = secrets.token_urlsafe(32)
+        device_id = new_id("mdev")
+        token_expires_at = now + timedelta(days=self.MOBILE_TOKEN_TTL_DAYS)
+        scopes = self._normalize_mobile_scopes(list(pairing.get("scopes") or []))
+        device: dict[str, object] = {
+            "id": device_id,
+            "name": self._clean_mobile_label(device_name, "Mobile device", 80),
+            "platform": self._clean_mobile_label(platform, "unknown", 40).lower(),
+            "scopes": scopes,
+            "created_at": now.isoformat(),
+            "last_seen_at": now.isoformat(),
+            "expires_at": token_expires_at.isoformat(),
+            "revoked_at": "",
+            "token_hash": self._hash_mobile_secret(token),
+            "paired_from_pairing_id": pairing["id"],
+        }
+        pairing["claimed_at"] = now.isoformat()
+        pairing["claimed_device_id"] = device_id
+        self.storage.save_mobile_device(device)
+        self.storage.save_mobile_pairing_request(pairing)
+        self.add_event(
+            "warning",
+            f"Mobile device paired: {device['name']}",
+            subsystem="security",
+            operator_action="Confirm the device is expected and revoke it from Settings if not.",
+        )
+        return {"token": token, "device": self._public_mobile_device(device), "scopes": scopes, "expires_at": device["expires_at"]}
+
+    def validate_mobile_token(self, token: str, required_scope: str = MOBILE_MONITOR_SCOPE) -> dict[str, object] | None:
+        if not token.strip():
+            return None
+        device = self.storage.load_mobile_device_by_token_hash(self._hash_mobile_secret(token.strip()))
+        now = utc_now()
+        if not device:
+            return None
+        if str(device.get("revoked_at") or ""):
+            return None
+        if self._parse_mobile_time(device.get("expires_at")) <= now:
+            return None
+        scopes = [str(scope) for scope in device.get("scopes") or []]
+        if required_scope and required_scope not in scopes:
+            return None
+        device["last_seen_at"] = now.isoformat()
+        self.storage.save_mobile_device(device)
+        return self._public_mobile_device(device)
+
+    def revoke_mobile_device(self, device_id: str) -> dict[str, object]:
+        device = self.storage.load_mobile_device(device_id.strip())
+        if not device:
+            raise ValueError("Mobile device was not found")
+        if not str(device.get("revoked_at") or ""):
+            device["revoked_at"] = utc_now().isoformat()
+            self.storage.save_mobile_device(device)
+            self.add_event(
+                "warning",
+                f"Mobile device revoked: {device.get('name') or device_id}",
+                subsystem="security",
+                operator_action="Reconnect trusted devices with a fresh private-tunnel pairing code.",
+            )
+        return self._public_mobile_device(device)
+
+    def mobile_devices(self, include_revoked: bool = False) -> list[dict[str, object]]:
+        return [self._public_mobile_device(device) for device in self.storage.load_mobile_devices(include_revoked=include_revoked, limit=200)]
+
+    def mobile_feed(self, level: str = "", subsystem: str = "", limit: int = 100) -> dict[str, object]:
+        report = self.operator_logs_report(timeframe="7d", level=level, subsystem=subsystem, limit=limit)
+        return {
+            "artifact_type": "cryptoarc_mobile_feed",
+            "format_version": 1,
+            "generated_at": report.get("generated_at"),
+            "filters": report.get("filters", {}),
+            "summary": report.get("summary", {}),
+            "events": report.get("events", []),
+            "action_items": report.get("action_items", []),
+        }
+
+    def mobile_cockpit(
+        self,
+        live_trading_enabled: bool = False,
+        local_auth_enabled: bool = False,
+        device: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        snapshot = self.snapshot()
+        source = self.source_health()
+        readiness = self.readiness_status()
+        live = self.live_status(live_trading_enabled, local_auth_enabled=local_auth_enabled)
+        events = self.storage.load_all_events(80)
+        latest_alerts = [
+            event.to_dict()
+            for event in events
+            if event.level in {"warning", "danger", "error"} or event.operator_action
+        ][:12]
+        live_pnl = live.get("live_pnl") if isinstance(live.get("live_pnl"), dict) else {}
+        readiness_actions = readiness.get("recommended_actions", []) if isinstance(readiness.get("recommended_actions"), list) else []
+        live_blockers = live.get("blockers", []) if isinstance(live.get("blockers"), list) else []
+        source_action = str(source.get("operator_action") or "")
+        next_operator_action = (
+            str(readiness_actions[0])
+            if readiness_actions
+            else source_action
+            if source_action
+            else f"Resolve live blocker: {live_blockers[0]}"
+            if live_blockers
+            else "Monitor the paper run and keep the private tunnel connected."
+        )
+        mode = self.settings.mode.value if hasattr(self.settings.mode, "value") else str(self.settings.mode)
+        start_allowed = snapshot.status == BotStatus.STOPPED and mode != "live_locked" and not self.settings.live_trading_enabled
+        stop_allowed = snapshot.status == BotStatus.RUNNING
+        return {
+            "artifact_type": "cryptoarc_mobile_cockpit",
+            "format_version": 1,
+            "server_time": utc_now().isoformat(),
+            "device": device or {},
+            "connection": {
+                "state": "connected",
+                "api": "ok",
+                "websocket": "available",
+                "private_tunnel_required": True,
+            },
+            "bot": {
+                "status": snapshot.status.value,
+                "mode": mode,
+                "launch_source": self.settings.launch_source,
+                "detected_tokens": len(snapshot.tokens),
+                "auto_refresh": self.settings.auto_refresh,
+            },
+            "source": {
+                "status": source.get("status"),
+                "status_message": source.get("status_message"),
+                "health_score": source.get("health_score"),
+                "trust_state": source.get("trust_state"),
+                "events_per_minute": source.get("events_per_minute"),
+                "last_event_age_seconds": source.get("last_event_age_seconds"),
+                "live_entry_blocked": source.get("live_entry_blocked"),
+                "operator_action": source_action,
+            },
+            "readiness": {
+                "status": readiness.get("status"),
+                "score": readiness.get("score"),
+                "entries_allowed": readiness.get("entries_allowed"),
+                "blockers": [
+                    gate
+                    for gate in readiness.get("gates", [])
+                    if isinstance(gate, dict) and gate.get("status") == "fail"
+                ],
+                "warnings": readiness_actions,
+                "sample_size": readiness.get("sample_size", {}),
+                "paper_only": readiness.get("paper_only", True),
+            },
+            "live": {
+                "kill_switch_enabled": self.settings.kill_switch_enabled,
+                "blockers": live_blockers,
+                "autonomy_blockers": live.get("autonomy_blockers", []),
+                "mode_visibility": live.get("mode_visibility", {}),
+                "full_sniper_gate": live.get("full_sniper_gate", {}),
+                "active_intent_count": live.get("active_intent_count", 0),
+                "unresolved_audit_count": live.get("unresolved_audit_count", 0),
+                "recoverable_audit_count": live.get("recoverable_audit_count", 0),
+                "paper_default": live.get("paper_default", True),
+            },
+            "open_risk": {
+                "paper_open_positions": self.stats.open_positions,
+                "live_open_positions": int(live_pnl.get("open_positions", 0) or 0),
+                "active_live_intents": live.get("active_intent_count", 0),
+                "unresolved_live_audits": live.get("unresolved_audit_count", 0),
+                "risk_blockers": live_blockers[:8],
+            },
+            "pnl": {
+                "paper": {
+                    "total_pnl_sol": self.stats.total_pnl_sol,
+                    "win_rate_pct": self.stats.win_rate_pct,
+                    "closed_trades": self.stats.closed_trades,
+                    "open_positions": self.stats.open_positions,
+                    "max_drawdown_sol": self.stats.max_drawdown_sol,
+                },
+                "live": {
+                    "realized_pnl_sol": float(live_pnl.get("realized_pnl_sol", 0.0) or 0.0),
+                    "unrealized_pnl_sol": float(live_pnl.get("unrealized_pnl_sol", 0.0) or 0.0),
+                    "cost_basis_sol": float(live_pnl.get("cost_basis_sol", 0.0) or 0.0),
+                    "open_positions": int(live_pnl.get("open_positions", 0) or 0),
+                    "approximate": bool(live_pnl.get("approximate", True)),
+                },
+            },
+            "alerts": {
+                "telegram": self.alerts.status(),
+                "latest": latest_alerts,
+            },
+            "allowed_actions": {
+                "start": start_allowed,
+                "stop": stop_allowed,
+                "kill_switch": True,
+                "clear_kill_switch": True,
+                "live_backend_arm": False,
+                "live_submit": False,
+                "hot_wallet_import": False,
+            },
+            "next_operator_action": next_operator_action,
+        }
+
+    def mobile_start_bot(self, live_trading_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:
+        self.start()
+        self.add_event("info", "Mobile cockpit started bot", subsystem="mobile")
+        return self.mobile_cockpit(live_trading_enabled=live_trading_enabled, local_auth_enabled=local_auth_enabled)
+
+    def mobile_stop_bot(self, live_trading_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:
+        self.stop()
+        self.add_event("warning", "Mobile cockpit stopped bot", subsystem="mobile")
+        return self.mobile_cockpit(live_trading_enabled=live_trading_enabled, local_auth_enabled=local_auth_enabled)
+
+    def mobile_set_kill_switch(
+        self,
+        enabled: bool,
+        reason: str = "",
+        live_trading_enabled: bool = False,
+        local_auth_enabled: bool = False,
+    ) -> dict[str, object]:
+        self.set_live_kill_switch(enabled, reason)
+        self.add_event(
+            "danger" if enabled else "warning",
+            f"Mobile cockpit {'enabled' if enabled else 'disabled'} kill switch",
+            subsystem="mobile",
+            operator_action=reason.strip(),
+        )
+        return self.mobile_cockpit(live_trading_enabled=live_trading_enabled, local_auth_enabled=local_auth_enabled)
+
+    def _normalize_mobile_scopes(self, scopes: list[str] | None) -> list[str]:
+        requested = scopes or list(self.MOBILE_DEFAULT_SCOPES)
+        allowed = {self.MOBILE_MONITOR_SCOPE, self.MOBILE_CONTROL_SCOPE}
+        clean = [scope for scope in requested if scope in allowed]
+        if self.MOBILE_MONITOR_SCOPE not in clean:
+            clean.insert(0, self.MOBILE_MONITOR_SCOPE)
+        return list(dict.fromkeys(clean))
+
+    def _hash_mobile_secret(self, value: str) -> str:
+        return hashlib.sha256(f"cryptoarc-mobile-v1:{value}".encode("utf-8")).hexdigest()
+
+    def _parse_mobile_time(self, value: object) -> datetime:
+        if not value:
+            return datetime.min.replace(tzinfo=utc_now().tzinfo)
+        text = str(value).replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return datetime.min.replace(tzinfo=utc_now().tzinfo)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=utc_now().tzinfo)
+        return parsed
+
+    def _clean_mobile_label(self, value: str, fallback: str, limit: int) -> str:
+        cleaned = re.sub(r"\s+", " ", str(value or "").strip())
+        cleaned = re.sub(r"[^A-Za-z0-9 .:_()/-]", "", cleaned)
+        return (cleaned or fallback)[:limit]
+
+    def _public_mobile_device(self, device: dict[str, object]) -> dict[str, object]:
+        return {key: value for key, value in device.items() if key != "token_hash"}
+
     def _hydrate_active_tokens(self) -> list[TokenSignal]:
         recent = self.storage.load_tokens()
         open_statuses = {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}
@@ -138,6 +493,39 @@ class BotState:
         keep_recent = max(0, 80 - len(open_by_id))
         tokens = [*recent_without_open[:keep_recent], *open_by_id.values()]
         return sorted(tokens, key=lambda token: token.detected_at, reverse=True)
+
+    def _load_open_storage_tokens(self) -> list[TokenSignal]:
+        open_statuses = {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}
+        return [
+            token
+            for token in self.storage.load_all_tokens(5000)
+            if token.status in open_statuses or (token.opened_at is not None and token.closed_at is None and token.amount_sol is not None)
+        ]
+
+    def _ensure_active_tokens_loaded(self) -> None:
+        open_by_id = {token.id: token for token in self._load_open_storage_tokens()}
+        if not open_by_id:
+            return
+
+        current_by_id = {token.id: token for token in self.tokens}
+        merged_by_id = dict(current_by_id)
+        for token_id, token in open_by_id.items():
+            if token_id not in merged_by_id:
+                merged_by_id[token_id] = token
+
+        active_tokens = sorted(
+            [merged_by_id[token_id] for token_id in open_by_id if token_id in merged_by_id],
+            key=lambda token: token.detected_at,
+            reverse=True,
+        )
+        active_ids = {token.id for token in active_tokens}
+        remaining_slots = max(0, 80 - len(active_tokens))
+        recent_non_active = [
+            token
+            for token in sorted(merged_by_id.values(), key=lambda token: token.detected_at, reverse=True)
+            if token.id not in active_ids
+        ][:remaining_slots]
+        self.tokens = deque([*active_tokens, *recent_non_active], maxlen=max(80, len(active_tokens)))
 
     def _recover_orphaned_open_tokens(self) -> None:
         recent_ids = {token.id for token in self.storage.load_tokens()}
@@ -187,7 +575,19 @@ class BotState:
         self.storage.save_settings_version(version)
         return version.id
 
+    def _event_context(self, subsystem: str = "app") -> tuple[str, dict[str, object]]:
+        session_id = self.active_live_session_id if subsystem == "live" or self.active_live_session_id else ""
+        context: dict[str, object] = {}
+        if session_id:
+            context["session_id"] = session_id
+        if subsystem == "live" or session_id:
+            context["active_backend"] = self._active_backend_snapshot()
+            context["live_session_acknowledged"] = self.settings.live_session_acknowledged
+            context["kill_switch_enabled"] = self.settings.kill_switch_enabled
+        return session_id, context
+
     def add_event(self, level: str, message: str, token_id: str | None = None, subsystem: str = "app", operator_action: str = "") -> None:
+        session_id, context = self._event_context(subsystem)
         event = TradeEvent(
             id=new_id("evt"),
             created_at=utc_now(),
@@ -196,12 +596,16 @@ class BotState:
             token_id=token_id,
             subsystem=subsystem,
             operator_action=operator_action,
+            session_id=session_id,
+            context=context,
         )
         self.events.appendleft(event)
         self.storage.save_event(event)
+        self.alerts.alert_event(level, subsystem, message, operator_action)
 
     def _reload_from_storage(self) -> None:
         self.settings = self.storage.load_settings()
+        self._sync_hot_wallet_settings(self.hot_wallet.status())
         self.tokens = deque(self._hydrate_active_tokens(), maxlen=80)
         self.events = deque(self.storage.load_events(), maxlen=30)
         self.backtest_runs = deque(self.storage.load_backtest_runs(), maxlen=20)
@@ -213,11 +617,16 @@ class BotState:
     def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> None:
         if token:
             self.last_ingested_launch_at = utc_now()
+        stored_payload = dict(raw_payload)
+        if token and not any(str(stored_payload.get(key) or "").strip() for key in ("mint", "tokenMint", "token", "ca", "normalized_mint")):
+            stored_payload["normalized_mint"] = token.mint
+            stored_payload["normalized_symbol"] = token.symbol
+            stored_payload["normalized_source"] = source
         event = SourceEvent(
             id=new_id("src"),
             source=source,
             received_at=utc_now(),
-            raw_payload=raw_payload,
+            raw_payload=stored_payload,
             normalized_token_id=token.id if token else None,
             status=status or ("normalized" if token else "raw"),
             message=message,
@@ -226,17 +635,74 @@ class BotState:
 
     def ingest_source_event(self, event: LaunchEvent) -> None:
         if event.kind == "trade":
+            if event.source == "pumpportal" and self.source_status.pumpportal_funding_blocked:
+                self.source_status.pumpportal_funding_blocked = False
+                self.source_status.pumpportal_funding_message = ""
+                self.source_status.pumpportal_funding_blocked_at = None
             self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
             self.apply_observed_trade(event)
             return
-        event_status = "status" if event.message and event.token is None else None
+        if event.kind in {"verification", "verification_status"}:
+            token = self._direct_solana_token_from_event(event) if event.kind == "verification" else None
+            self.record_source_event(event.source, event.raw_payload, token, event.message, status="status" if event.kind == "verification_status" else ("normalized" if token else "raw"))
+            if token:
+                self.ingest_launch(token)
+            return
+        self._handle_source_status_message(event)
+        event_status = None
+        if event.token is None:
+            if self._is_pumpportal_ignored_non_launch(event.raw_payload):
+                event_status = "ignored"
+            elif event.message or self._is_pumpportal_funding_message(event.raw_payload, event.message):
+                event_status = "status"
         self.record_source_event(event.source, event.raw_payload, event.token, event.message, status=event_status)
         if event.token:
             self.ingest_launch(event.token)
 
+    def _handle_source_status_message(self, event: LaunchEvent) -> None:
+        if event.source != "pumpportal" or not self._is_pumpportal_funding_message(event.raw_payload, event.message):
+            return
+        already_blocked = self.source_status.pumpportal_funding_blocked
+        message = event.message or str(event.raw_payload.get("message") or "PumpPortal API wallet appears unfunded.")
+        self.source_status.pumpportal_funding_blocked = True
+        self.source_status.pumpportal_funding_message = message[:500]
+        self.source_status.pumpportal_funding_blocked_at = event.received_at
+        if already_blocked:
+            return
+        self.add_event(
+            "warning",
+            "PumpPortal API wallet appears unfunded; paid trade-stream evidence may have stopped.",
+            subsystem="source",
+            operator_action="Refill the PumpPortal API wallet or lower Max Trade Subscriptions before trusting paper/shadow price evidence.",
+        )
+
+    def _is_pumpportal_funding_message(self, payload: dict[str, object], message: str = "") -> bool:
+        text = f"{message} {json.dumps(payload, default=str)}".lower()
+        mentions_trade_stream = (
+            "subscribetokentrade" in text
+            or "subscribeaccounttrade" in text
+            or "trade subscription" in text
+            or "pumpswap websocket data" in text
+            or "websocket data" in text
+        )
+        mentions_funding = (
+            "funded" in text
+            or "0.02" in text
+            or "insufficient" in text
+            or "balance" in text
+            or "wallet" in text
+            or "minimum balance" in text
+        )
+        return mentions_trade_stream and mentions_funding
+
+    def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
+        mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
+        return mint in PUMPPORTAL_NON_LAUNCH_MINTS
+
     def apply_observed_trade(self, event: LaunchEvent) -> None:
         if not self.settings.use_observed_prices or not event.mint:
             return
+        self._ensure_active_tokens_loaded()
         observation = self.price_pipeline.observe(
             event.raw_payload,
             mint=event.mint,
@@ -278,8 +744,7 @@ class BotState:
                     token.rejected_price_streak = 0
                     token.observed_price_updates += 1
                     token.last_observed_trade_at = event.received_at
-                    fee_drag = token.fee_paid_sol + ((token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000))
-                    token.pnl_sol = round(-fee_drag, 6)
+                    self.paper.mark_to_market(token, self.settings)
                     token.unrealized_pct = 0.0
                     token.highest_unrealized_pct = max(token.highest_unrealized_pct, 0.0)
                     token.lowest_unrealized_pct = min(token.lowest_unrealized_pct, 0.0)
@@ -312,15 +777,14 @@ class BotState:
             if token.entry_price:
                 move_pct = ((token.current_price - token.entry_price) / token.entry_price) * 100
                 token.unrealized_pct = round(move_pct, 2)
-                gross_pnl = (token.amount_sol or self.settings.trade_size_sol) * (move_pct / 100)
-                exit_fee = (token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000)
-                token.pnl_sol = round(gross_pnl - token.fee_paid_sol - exit_fee, 6)
+                self.paper.mark_to_market(token, self.settings)
             token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {observed_price:.8f} ({observation.price_source}, {observation.confidence:.2f})")
             self.storage.save_token(token)
             self.storage.save_price_observation(observation)
             break
 
     def tick(self) -> BotSnapshot:
+        self._ensure_active_tokens_loaded()
         self.last_bot_tick_at = utc_now()
         self.last_tick_error = ""
         self.bot_loop_iterations += 1
@@ -350,6 +814,62 @@ class BotState:
 
         self.recalculate_stats()
         return self.snapshot()
+
+    def recover_open_paper_positions(self, note: str = "") -> dict[str, object]:
+        clean_note = (note or "operator recovery").strip()[:160] or "operator recovery"
+        exit_reason = f"paper recovery: {clean_note}"
+        open_statuses = {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}
+        tokens_by_id = {token.id: token for token in self.storage.load_all_tokens(5000)}
+        for token in self.tokens:
+            tokens_by_id[token.id] = token
+
+        open_tokens = [
+            token
+            for token in tokens_by_id.values()
+            if token.status in open_statuses or (token.opened_at is not None and token.closed_at is None and token.amount_sol is not None)
+        ]
+        closed_tokens: list[TokenSignal] = []
+        total_pnl = 0.0
+        closed_at = utc_now()
+
+        for token in open_tokens:
+            if token.entry_price and token.current_price and token.pnl_sol is None:
+                self.paper.mark_to_market(token, self.settings)
+            token.status = TokenStatus.PAPER_SOLD
+            token.exit_price = token.current_price or token.entry_price
+            token.closed_at = closed_at
+            token.exit_reason = exit_reason
+            if token.opened_at:
+                token.hold_duration_seconds = max(0, int((closed_at - token.opened_at).total_seconds()))
+            token.realized_pnl_sol = token.pnl_sol or 0.0
+            token.remaining_fraction = 0.0
+            token.decision_log.append(f"Paper position recovered closed: {clean_note}; final P&L {token.pnl_sol or 0.0:+.6f} SOL")
+            self.storage.save_token(token)
+            self.storage.save_trade(self.trade_from_token(token))
+            self.storage.save_trade_session(self.session_from_token(token, "closed"))
+            total_pnl = round(total_pnl + (token.pnl_sol or 0.0), 6)
+            closed_tokens.append(token)
+
+        if closed_tokens:
+            self.tokens = deque(sorted(tokens_by_id.values(), key=lambda item: item.detected_at, reverse=True), maxlen=80)
+            self.add_event(
+                "warning",
+                f"Recovered {len(closed_tokens)} open paper position{'s' if len(closed_tokens) != 1 else ''} ({clean_note})",
+                subsystem="paper",
+                operator_action="Review recovered paper positions before using this run for promotion evidence.",
+            )
+        else:
+            self.add_event("info", "No open paper positions to recover", subsystem="paper")
+
+        self.recalculate_stats()
+        return {
+            "closed_positions": len(closed_tokens),
+            "total_recovered_pnl_sol": total_pnl,
+            "exit_reason": exit_reason,
+            "token_ids": [token.id for token in closed_tokens],
+            "status": "recovered" if closed_tokens else "clear",
+            "operator_action": "Review recovered paper positions before the next paper run." if closed_tokens else "No recovery action was needed.",
+        }
 
     def ingest_launch(self, token: TokenSignal) -> None:
         if self.status != BotStatus.RUNNING or not self.settings.detect_new_tokens:
@@ -403,7 +923,7 @@ class BotState:
     def enrich_token_intelligence(self, token: TokenSignal) -> None:
         previous_launches = self.creator_history[token.creator]
         token.creator_launch_count = previous_launches + 1
-        tags: list[str] = []
+        tags: list[str] = list(token.intelligence_tags)
 
         duplicate_symbols = sum(1 for existing in self.tokens if existing.symbol.upper() == token.symbol.upper())
 
@@ -473,7 +993,15 @@ class BotState:
             decision_log=token.decision_log,
             lifecycle_status="closed" if token.closed_at else "open",
             entry_fee_sol=token.fee_paid_sol,
-            exit_fee_sol=(token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000) if token.closed_at else 0.0,
+            exit_fee_sol=token.exit_fee_sol if token.closed_at and token.exit_fee_sol else ((token.amount_sol or self.settings.trade_size_sol) * (self.settings.paper_fee_bps / 10000) if token.closed_at else 0.0),
+            entry_provider_fee_sol=token.entry_provider_fee_sol,
+            exit_provider_fee_sol=token.exit_provider_fee_sol if token.closed_at else 0.0,
+            entry_network_fee_sol=token.entry_network_fee_sol,
+            exit_network_fee_sol=token.exit_network_fee_sol if token.closed_at else 0.0,
+            entry_priority_fee_sol=token.entry_priority_fee_sol,
+            exit_priority_fee_sol=token.exit_priority_fee_sol if token.closed_at else 0.0,
+            entry_slippage_cost_sol=token.entry_slippage_cost_sol,
+            entry_price_impact_cost_sol=token.entry_price_impact_cost_sol,
             price_impact_pct=token.price_impact_pct,
             slippage_paid_pct=token.slippage_paid_pct,
             source_price_confidence=token.price_confidence,
@@ -530,6 +1058,7 @@ class BotState:
             losses = [trade for trade in closed_trades if trade.closed_at and (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001)]
             if losses and (now - losses[0].closed_at).total_seconds() < self.settings.cooldown_after_loss_seconds:
                 return "cooldown after loss active"
+        self._ensure_active_tokens_loaded()
         same_creator_buys = sum(1 for existing in self.tokens if existing.creator == token.creator and existing.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING, TokenStatus.PAPER_SOLD})
         if self.settings.max_same_creator_buys_enabled and same_creator_buys >= self.settings.max_same_creator_buys:
             return f"same creator buy cap reached ({self.settings.max_same_creator_buys})"
@@ -570,10 +1099,11 @@ class BotState:
         trough = 0.0
         trades: list[dict[str, object]] = []
         for token in candidates:
-            decision = self.risk.evaluate(token, settings, replay_stats, open_positions=0)
+            replay_token = self._replay_launch_candidate(token)
+            decision = self.risk.evaluate(replay_token, settings, replay_stats, open_positions=0)
             if decision.allowed:
                 buys += 1
-                pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings)
+                pnl = replay_token.pnl_sol if replay_token.pnl_sol is not None else self._observed_replay_pnl(replay_token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
                 trough = min(trough, simulated_pnl)
@@ -593,8 +1123,8 @@ class BotState:
                         "token_id": token.id,
                         "symbol": token.symbol,
                         "decision": "buy",
-                        "reason": token.reason,
-                        "score": token.score,
+                        "reason": replay_token.reason,
+                        "score": replay_token.score,
                         "pnl_sol": round(pnl, 6),
                     }
                 )
@@ -635,6 +1165,7 @@ class BotState:
             trades=trades[:80],
             comparison=[{"date_from": date_from or "any", "date_to": date_to or "any", "replay_speed": replay_speed}],
         )
+        run.determinism_fingerprint = self._backtest_run_fingerprint(run, candidates, settings)
         self.backtest_runs.appendleft(run)
         self.storage.save_backtest_run(run)
         return run
@@ -676,8 +1207,650 @@ class BotState:
                 candidates.append(token)
         run = self._run_backtest(candidates[:limit], replay_source="raw_source_events", settings=self._settings_for_profile(profile))
         run.comparison = [{"raw_events": len(source_events), "normalized": len(candidates), "normalization_failures": failures, "date_from": date_from or "any", "date_to": date_to or "any", "replay_speed": replay_speed}]
+        run.determinism_fingerprint = self._backtest_run_fingerprint(run, candidates[:limit], self._settings_for_profile(profile))
         self.storage.save_backtest_run(run)
         return run
+
+    def source_parser_replay_report(
+        self,
+        limit: int | None = None,
+        profile: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> dict[str, object]:
+        limit = max(1, min(5000, int(limit or self.settings.raw_replay_limit)))
+        events = self._filter_source_events_by_date(self.storage.load_source_events(limit), date_from, date_to)
+        candidates: list[TokenSignal] = []
+        rows: list[dict[str, object]] = []
+        counts: Counter[str] = Counter()
+
+        for event in events:
+            event_payload = event.to_dict()
+            event_kind = str(event_payload.get("event_kind") or "unknown")
+            parser_result = str(event_payload.get("parser_result") or "unknown")
+            mint = self._source_event_mint(event)
+            counts[f"status:{event.status}"] += 1
+            counts[f"kind:{event_kind}"] += 1
+            counts[f"parser:{parser_result}"] += 1
+            token: TokenSignal | None = None
+            replay_result = parser_result
+            failure_reason = ""
+            replay_action = "inspect"
+
+            if event.status == "trade" or event_kind in {"buy", "sell", "trade"}:
+                replay_result = "trade_event"
+                replay_action = "use_for_price_context"
+                counts["trade_events"] += 1
+            elif not mint:
+                replay_result = "missing_mint"
+                failure_reason = "raw event does not expose a mint/token address"
+                replay_action = "inspect_raw_payload"
+                counts["normalization_failures"] += 1
+            elif event.source == "pumpportal":
+                token = normalize_pumpportal_new_token(event.raw_payload, event.received_at)
+                if token:
+                    replay_result = "normalized"
+                    replay_action = "eligible_for_replay"
+                    candidates.append(token)
+                    counts["normalized"] += 1
+                else:
+                    replay_result = "unsupported_shape"
+                    failure_reason = "PumpPortal event did not match supported create/new-token shape"
+                    replay_action = "inspect_parser_shape"
+                    counts["normalization_failures"] += 1
+            else:
+                token = TokenSignal(
+                    id=new_id("replay"),
+                    symbol=str(event.raw_payload.get("symbol") or "MOCK")[:12].upper(),
+                    name=str(event.raw_payload.get("symbol") or "Mock Replay"),
+                    mint=mint,
+                    creator=str(event.raw_payload.get("creator") or "unknown"),
+                    detected_at=event.received_at,
+                    current_price=0.00003,
+                    metadata_score=0.65,
+                    buy_velocity=0.45,
+                    sell_pressure=0.2,
+                )
+                replay_result = "normalized"
+                replay_action = "eligible_for_replay"
+                candidates.append(token)
+                counts["normalized"] += 1
+
+            rows.append(
+                {
+                    "event_id": event.id,
+                    "received_at": event.received_at.isoformat(),
+                    "source": event.source,
+                    "status": event.status,
+                    "event_kind": event_kind,
+                    "parser_result": replay_result,
+                    "mint": mint,
+                    "normalized_token_id": token.id if token else event.normalized_token_id,
+                    "symbol": token.symbol if token else "",
+                    "failure_reason": failure_reason,
+                    "replay_action": replay_action,
+                    "message": event.message,
+                }
+            )
+
+        launch_candidates = counts["normalized"] + counts["normalization_failures"]
+        normalization_rate = round(counts["normalized"] / max(1, launch_candidates), 3)
+        dry_backtest = self._run_backtest(
+            candidates[:limit],
+            replay_source="source_parser_replay_report",
+            settings=self._settings_for_profile(profile),
+            persist=False,
+        )
+        failures = [row for row in rows if row["parser_result"] in {"missing_mint", "unsupported_shape"}]
+        return {
+            "artifact_type": "cryptoarc_source_parser_replay",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "limit": limit,
+            "profile": profile or self.settings.strategy_profile,
+            "date_from": date_from or "any",
+            "date_to": date_to or "any",
+            "summary": {
+                "raw_events": len(events),
+                "launch_candidates": launch_candidates,
+                "normalized": counts["normalized"],
+                "normalization_failures": counts["normalization_failures"],
+                "trade_events": counts["trade_events"],
+                "normalization_rate": normalization_rate,
+                "parser_counts": {key.replace("parser:", ""): value for key, value in counts.items() if key.startswith("parser:")},
+                "event_kind_counts": {key.replace("kind:", ""): value for key, value in counts.items() if key.startswith("kind:")},
+            },
+            "dry_backtest": {
+                "tokens_replayed": dry_backtest.tokens_replayed,
+                "paper_buys": dry_backtest.paper_buys,
+                "skips": dry_backtest.skips,
+                "estimated_pnl_sol": dry_backtest.estimated_pnl_sol,
+                "win_rate_pct": dry_backtest.win_rate_pct,
+                "profit_factor": dry_backtest.profit_factor,
+                "replay_source": dry_backtest.replay_source,
+            },
+            "failures": failures[:50],
+            "events": rows[:200],
+            "operator_action": "Review parser failures and malformed source events before trusting source replay or strategy promotion.",
+            "privacy_note": "Report contains raw source metadata and parser evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def solana_logs_verification_report(self, limit: int | None = None) -> dict[str, object]:
+        limit = max(1, min(5000, int(limit or 500)))
+        events = self.storage.load_source_events(limit)
+        direct_events = [event for event in events if event.source in {"solana_logs", "solana_logs_subscribe", "solana"}]
+        portal_events = [event for event in events if event.source == "pumpportal"]
+        direct_rows = [self._solana_log_evidence(event) for event in direct_events]
+        portal_rows = [self._portal_source_evidence(event) for event in portal_events]
+        portal_by_mint: dict[str, list[dict[str, object]]] = {}
+        portal_by_signature: dict[str, list[dict[str, object]]] = {}
+        for row in portal_rows:
+            for mint in row["mints"]:
+                portal_by_mint.setdefault(str(mint), []).append(row)
+            signature = str(row.get("signature") or "")
+            if signature:
+                portal_by_signature.setdefault(signature, []).append(row)
+
+        matches: list[dict[str, object]] = []
+        conflicts: list[dict[str, object]] = []
+        unmatched_direct: list[dict[str, object]] = []
+        for row in direct_rows:
+            signature = str(row.get("signature") or "")
+            mints = [str(mint) for mint in row.get("mints", [])]
+            signature_matches = portal_by_signature.get(signature, []) if signature else []
+            mint_matches = [match for mint in mints for match in portal_by_mint.get(mint, [])]
+            unique_matches = {str(match["event_id"]): match for match in [*signature_matches, *mint_matches]}
+            if unique_matches:
+                earliest_portal = min(unique_matches.values(), key=lambda item: str(item["received_at"]))
+                lag_ms = self._iso_lag_ms(str(row["received_at"]), str(earliest_portal["received_at"]))
+                matches.append(
+                    {
+                        "direct_event_id": row["event_id"],
+                        "portal_event_ids": list(unique_matches.keys())[:10],
+                        "signature": signature,
+                        "mints": mints,
+                        "slot": row["slot"],
+                        "direct_received_at": row["received_at"],
+                        "first_portal_received_at": earliest_portal["received_at"],
+                        "direct_minus_portal_ms": lag_ms,
+                        "match_type": "signature" if signature_matches else "mint",
+                    }
+                )
+            elif row.get("create_hint") or mints or signature:
+                unmatched_direct.append(row)
+            if row.get("err"):
+                conflicts.append(
+                    {
+                        "event_id": row["event_id"],
+                        "signature": signature,
+                        "slot": row["slot"],
+                        "reason": "logsSubscribe notification includes a transaction error",
+                        "error": row["err"],
+                    }
+                )
+
+        unmatched_portal = [
+            row
+            for row in portal_rows
+            if row["mints"] and not any(str(mint) in {candidate for direct in direct_rows for candidate in direct.get("mints", [])} for mint in row["mints"])
+        ][:50]
+        status = "unknown"
+        if not self.solana_wss_endpoint:
+            status = "not_configured"
+        elif not self.solana_logs_mentions_address:
+            status = "missing_mentions_address"
+        elif not direct_rows:
+            status = "configured_no_events"
+        elif conflicts:
+            status = "review"
+        elif matches and unmatched_direct:
+            status = "partial"
+        elif matches:
+            status = "matching"
+        else:
+            status = "no_matches"
+
+        direct_create_hints = [row for row in direct_rows if row.get("create_hint")]
+        decoded_create_rows = [row for row in direct_rows if row.get("create_evidence", {}).get("field_count", 0)]
+        action_items: list[str] = []
+        if not self.solana_wss_endpoint:
+            action_items.append("Set SOLANA_WSS_ENDPOINT before collecting direct-chain verification evidence.")
+        if self.solana_wss_endpoint and not self.solana_logs_mentions_address:
+            action_items.append("Set SOLANA_LOGS_MENTIONS_ADDRESS to the Pump.fun program or related address before opening logsSubscribe.")
+        if self.solana_wss_endpoint and not direct_rows:
+            action_items.append("Archive solana_logs source events from logsSubscribe before comparing sources.")
+        if unmatched_direct:
+            action_items.append("Inspect direct Solana log events that do not match PumpPortal mints or signatures.")
+        if unmatched_portal:
+            action_items.append("Inspect PumpPortal launches that do not yet have direct Solana log evidence.")
+        if conflicts:
+            action_items.append("Review direct-chain error notifications before trusting those launches.")
+        if matches:
+            action_items.append("Use matched direct/PumpPortal timing as source-soak evidence, not as live execution permission by itself.")
+        if direct_create_hints and not decoded_create_rows:
+            action_items.append("Collect or decode Program data fields for direct create events before treating them as rich launch evidence.")
+
+        return {
+            "artifact_type": "cryptoarc_solana_logs_verification",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "limit": limit,
+            "status": status,
+            "configured": bool(self.solana_wss_endpoint and self.solana_logs_mentions_address),
+            "wss_configured": bool(self.solana_wss_endpoint),
+            "mentions_address_configured": bool(self.solana_logs_mentions_address),
+            "summary": {
+                "direct_events": len(direct_rows),
+                "pumpportal_events": len(portal_rows),
+                "direct_create_hints": len(direct_create_hints),
+                "decoded_create_events": len(decoded_create_rows),
+                "matches": len(matches),
+                "unmatched_direct": len(unmatched_direct),
+                "unmatched_pumpportal": len(unmatched_portal),
+                "conflicts": len(conflicts),
+            },
+            "matches": matches[:50],
+            "unmatched_direct": unmatched_direct[:50],
+            "unmatched_pumpportal": unmatched_portal,
+            "conflicts": conflicts[:50],
+            "direct_events": direct_rows[:100],
+            "source_soak": self._source_soak_from_verification(
+                len(direct_rows),
+                len(portal_rows),
+                len(direct_create_hints),
+                len(decoded_create_rows),
+                len(matches),
+                len(unmatched_direct),
+                len(unmatched_portal),
+                len(conflicts),
+            ),
+            "operator_action": "Collect direct logsSubscribe evidence and compare it with PumpPortal before using source verification for live promotion.",
+            "action_items": list(dict.fromkeys(action_items)),
+            "docs": {
+                "solana_logs_subscribe": "https://solana.com/docs/rpc/websocket/logssubscribe",
+                "subscription_limit": "one address in mentions per subscription",
+            },
+            "privacy_note": "Report contains public Solana signatures, slots, logs, mints, and local source timing evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def source_soak_acceptance_report(self, limit: int | None = None, include_history: bool = True) -> dict[str, object]:
+        verification = self.solana_logs_verification_report(limit=limit or 500)
+        source = self.source_health()
+        source_events = self.storage.count_source_events()
+        soak = verification.get("source_soak", {}) if isinstance(verification.get("source_soak"), dict) else {}
+        gates = [
+            self._promotion_gate(
+                "source_events",
+                "Raw source events",
+                source_events,
+                ">= 100",
+                source_events >= 100,
+                "Collect enough raw source evidence for parser replay and soak review.",
+            ),
+            self._promotion_gate(
+                "source_trust",
+                "Source trust",
+                source.get("trust_state", "unknown"),
+                "trusted",
+                source.get("trust_state") == "trusted",
+                "Primary source trust must be trusted before source promotion.",
+            ),
+            self._promotion_gate(
+                "direct_config",
+                "Direct verifier config",
+                "configured" if verification.get("configured") else verification.get("status", "not_configured"),
+                "configured",
+                bool(verification.get("configured")),
+                "Configure SOLANA_WSS_ENDPOINT and SOLANA_LOGS_MENTIONS_ADDRESS for hybrid source verification.",
+            ),
+            self._promotion_gate(
+                "direct_samples",
+                "Direct log samples",
+                verification.get("summary", {}).get("direct_events", 0),
+                ">= 20",
+                int(verification.get("summary", {}).get("direct_events", 0) or 0) >= 20,
+                "Collect enough direct Solana log notifications for source-soak confidence.",
+            ),
+            self._promotion_gate(
+                "direct_matches",
+                "Direct/PumpPortal matches",
+                f"{soak.get('matches', 0)} / {soak.get('match_rate', 0)}",
+                ">= 10 and >= 60%",
+                int(soak.get("matches", 0) or 0) >= 10 and float(soak.get("match_rate", 0.0) or 0.0) >= 0.6,
+                "Direct Solana logs should match enough PumpPortal events by signature or mint.",
+            ),
+            self._promotion_gate(
+                "decoded_coverage",
+                "Decoded create coverage",
+                soak.get("decoded_create_rate", 0.0),
+                ">= 50%",
+                float(soak.get("decoded_create_rate", 0.0) or 0.0) >= 0.5,
+                "At least half of direct create hints should expose rich decoded create evidence.",
+            ),
+            self._promotion_gate(
+                "direct_conflicts",
+                "Direct conflicts",
+                verification.get("summary", {}).get("conflicts", 0),
+                "0",
+                int(verification.get("summary", {}).get("conflicts", 0) or 0) == 0,
+                "Direct-chain error notifications or conflicts must be reviewed before source promotion.",
+            ),
+        ]
+        hard_required = bool(verification.get("configured")) or int(verification.get("summary", {}).get("direct_events", 0) or 0) > 0
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail" and (hard_required or gate["id"] in {"source_events", "source_trust"})]
+        status = "ready" if not blockers and all(gate["status"] == "pass" for gate in gates) else ("blocked" if blockers else "not_configured")
+        report: dict[str, object] = {
+            "artifact_type": "cryptoarc_source_soak_acceptance",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "status": status,
+            "ready": status == "ready",
+            "hard_required": hard_required,
+            "gates": gates,
+            "blockers": list(dict.fromkeys(blockers)),
+            "summary": soak,
+            "verification_status": verification.get("status", "unknown"),
+            "operator_action": "Source-soak gate is clear for hybrid source promotion." if status == "ready" else "Collect matched direct/PumpPortal evidence before relying on hybrid source verification.",
+            "privacy_note": "Source-soak acceptance contains public source timing, signature, mint, and local quality evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+        if include_history:
+            history = self.storage.load_source_soak_history(20)
+            report["history"] = history
+            report["history_summary"] = self._source_soak_history_summary(history)
+        return report
+
+    def record_source_soak_snapshot(self, limit: int | None = None) -> dict[str, object]:
+        report = self.source_soak_acceptance_report(limit=limit or 500, include_history=False)
+        created_at = str(report.get("generated_at") or utc_now().isoformat())
+        snapshot = {
+            **report,
+            "id": f"source_soak_{created_at.replace(':', '').replace('.', '').replace('+', 'Z')}",
+            "created_at": created_at,
+            "operator_action": "Source-soak snapshot saved. Use the history trend to prove sustained direct/PumpPortal agreement before promotion.",
+        }
+        self.storage.save_source_soak_snapshot(snapshot)
+        history = self.storage.load_source_soak_history(20)
+        snapshot["history"] = history
+        snapshot["history_summary"] = self._source_soak_history_summary(history)
+        self.add_event("info", f"Source-soak snapshot recorded: {snapshot.get('status', 'unknown')}")
+        return snapshot
+
+    def _source_soak_history_summary(self, history: list[dict[str, object]]) -> dict[str, object]:
+        recent_ready_window_hours = 24.0
+        ready_sessions = [item for item in history if bool(item.get("ready"))]
+        blocked_sessions = [item for item in history if str(item.get("status", "")) == "blocked"]
+        match_rates: list[float] = []
+        decoded_rates: list[float] = []
+        direct_events = 0
+        for item in history:
+            summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+            try:
+                match_rates.append(float(summary.get("match_rate", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                match_rates.append(0.0)
+            try:
+                decoded_rates.append(float(summary.get("decoded_create_rate", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                decoded_rates.append(0.0)
+            try:
+                direct_events += int(summary.get("direct_events", 0) or 0)
+            except (TypeError, ValueError):
+                direct_events += 0
+        latest = history[0] if history else None
+        latest_ready = ready_sessions[0] if ready_sessions else None
+        latest_ready_created_at = str(latest_ready.get("created_at") or latest_ready.get("generated_at") or "") if latest_ready else ""
+        latest_ready_at = self._parse_iso_datetime(latest_ready_created_at) if latest_ready_created_at else None
+        latest_ready_age_hours = round(max(0.0, (utc_now() - latest_ready_at).total_seconds() / 3600), 2) if latest_ready_at else None
+        latest_ready_recent = latest_ready_age_hours is not None and latest_ready_age_hours <= recent_ready_window_hours
+        return {
+            "snapshots": len(history),
+            "ready_snapshots": len(ready_sessions),
+            "blocked_snapshots": len(blocked_sessions),
+            "latest_status": latest.get("status") if latest else "none",
+            "latest_ready": bool(latest.get("ready")) if latest else False,
+            "latest_created_at": latest.get("created_at") if latest else None,
+            "latest_ready_created_at": latest_ready_created_at or None,
+            "latest_ready_age_hours": latest_ready_age_hours,
+            "latest_ready_recent": latest_ready_recent,
+            "recent_ready_window_hours": recent_ready_window_hours,
+            "average_match_rate": round(sum(match_rates) / max(1, len(match_rates)), 3) if match_rates else 0.0,
+            "average_decoded_create_rate": round(sum(decoded_rates) / max(1, len(decoded_rates)), 3) if decoded_rates else 0.0,
+            "direct_events_recorded": direct_events,
+            "operator_action": "Record snapshots after meaningful soak windows so acceptance can be audited across sessions.",
+        }
+
+    def _source_soak_from_verification(
+        self,
+        direct_events: int,
+        pumpportal_events: int,
+        direct_create_hints: int,
+        decoded_create_events: int,
+        matches: int,
+        unmatched_direct: int,
+        unmatched_pumpportal: int,
+        conflicts: int,
+    ) -> dict[str, object]:
+        match_rate = round(matches / max(1, direct_events), 3) if direct_events else 0.0
+        decoded_rate = round(decoded_create_events / max(1, direct_create_hints), 3) if direct_create_hints else 0.0
+        return {
+            "direct_events": direct_events,
+            "pumpportal_events": pumpportal_events,
+            "direct_create_hints": direct_create_hints,
+            "decoded_create_events": decoded_create_events,
+            "matches": matches,
+            "match_rate": match_rate,
+            "decoded_create_rate": decoded_rate,
+            "unmatched_direct": unmatched_direct,
+            "unmatched_pumpportal": unmatched_pumpportal,
+            "conflicts": conflicts,
+            "target": {
+                "direct_events": ">= 20",
+                "matches": ">= 10",
+                "match_rate": ">= 0.60",
+                "decoded_create_rate": ">= 0.50",
+                "conflicts": 0,
+            },
+        }
+
+    def _solana_log_evidence(self, event: SourceEvent) -> dict[str, object]:
+        payload = event.raw_payload or {}
+        params = payload.get("params")
+        result = params.get("result", {}) if isinstance(params, dict) else payload.get("result", {})
+        if not isinstance(result, dict):
+            result = payload
+        payload_context = payload.get("context", {})
+        context = result.get("context", {}) if isinstance(result.get("context"), dict) else payload_context
+        value = result.get("value", {}) if isinstance(result.get("value"), dict) else payload.get("value", {})
+        if not isinstance(value, dict):
+            value = payload
+        logs = value.get("logs") or payload.get("logs") or []
+        if not isinstance(logs, list):
+            logs = [str(logs)]
+        log_rows = [str(log) for log in logs]
+        signature = str(value.get("signature") or payload.get("signature") or payload.get("transaction_signature") or "").strip()
+        slot = context.get("slot") if isinstance(context, dict) else payload.get("slot")
+        err = value.get("err") if "err" in value else payload.get("err")
+        mints = list(dict.fromkeys([*self._candidate_mints_from_payload(payload), *self._candidate_mints_from_text("\n".join(log_rows))]))
+        create_hint = self._logs_have_create_hint(log_rows)
+        create_evidence = self._solana_create_evidence(payload, log_rows, mints)
+        return {
+            "event_id": event.id,
+            "received_at": event.received_at.isoformat(),
+            "signature": signature,
+            "slot": slot or "",
+            "err": err,
+            "mints": mints,
+            "create_hint": create_hint,
+            "create_evidence": create_evidence,
+            "logs_count": len(log_rows),
+            "logs_excerpt": log_rows[:8],
+            "parser_result": "create_hint" if create_hint else ("signature_only" if signature else "unclassified"),
+            "message": event.message,
+        }
+
+    def _portal_source_evidence(self, event: SourceEvent) -> dict[str, object]:
+        payload = event.raw_payload or {}
+        signature = str(payload.get("signature") or payload.get("txSignature") or payload.get("tx") or payload.get("transaction_signature") or "").strip()
+        return {
+            "event_id": event.id,
+            "received_at": event.received_at.isoformat(),
+            "signature": signature,
+            "mints": self._candidate_mints_from_payload(payload),
+            "status": event.status,
+            "event_kind": event.to_dict().get("event_kind", "unknown"),
+        }
+
+    def _candidate_mints_from_payload(self, payload: dict[str, object]) -> list[str]:
+        mints: list[str] = []
+        for key in ("mint", "tokenMint", "token", "ca", "normalized_mint"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                mints.append(value.strip())
+        text_parts: list[str] = []
+        for key in ("logs", "message", "log", "instruction"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                text_parts.extend(str(item) for item in value)
+            elif value:
+                text_parts.append(str(value))
+        text = "\n".join(text_parts)
+        for match in re.finditer(r"(?i)(?:mint|tokenMint|token|ca)\s*[:= ]\s*([1-9A-HJ-NP-Za-km-z]{8,64})", text):
+            mints.append(match.group(1))
+        return list(dict.fromkeys(mints))
+
+    def _candidate_mints_from_text(self, text: str) -> list[str]:
+        return list(
+            dict.fromkeys(
+                match.group(1)
+                for match in re.finditer(r"(?i)(?:mint|tokenMint|token|ca)\s*[:= ]\s*([1-9A-HJ-NP-Za-km-z]{8,64})", text)
+            )
+        )
+
+    def _solana_create_evidence(self, payload: dict[str, object], logs: list[str], mints: list[str]) -> dict[str, object]:
+        text = "\n".join(logs)
+        decoded_program_data = self._decoded_program_data_strings(logs)
+        combined = "\n".join([text, *decoded_program_data])
+        fields: dict[str, str] = {}
+        patterns = {
+            "name": r"(?i)(?:name|tokenName)\s*[:=]\s*([^\n\r,|]{2,80}?)(?=\s+(?:symbol|ticker|uri|metadataUri|metadata_uri|creator|user|owner|traderPublicKey|bondingCurveKey|bondingCurve|bonding_curve|mint|tokenMint)\s*[:=]|\s*$)",
+            "symbol": r"(?i)(?:symbol|ticker)\s*[:=]\s*([A-Za-z0-9_$.-]{1,16})",
+            "metadata_uri": r"(?i)(?:uri|metadataUri|metadata_uri)\s*[:=]\s*(https?://[^\s,|]+|ipfs://[^\s,|]+)",
+            "creator": r"(?i)(?:creator|user|owner|traderPublicKey)\s*[:= ]\s*([1-9A-HJ-NP-Za-km-z]{8,64})",
+            "bonding_curve": r"(?i)(?:bondingCurveKey|bondingCurve|bonding_curve)\s*[:= ]\s*([1-9A-HJ-NP-Za-km-z]{8,64})",
+            "mint": r"(?i)(?:mint|tokenMint|token|ca)\s*[:= ]\s*([1-9A-HJ-NP-Za-km-z]{8,64})",
+        }
+        for field, pattern in patterns.items():
+            match = re.search(pattern, combined)
+            if match:
+                fields[field] = match.group(1).strip().strip('"').strip("'")
+        if mints and "mint" not in fields:
+            fields["mint"] = mints[0]
+        field_count = len(fields)
+        confidence = round(min(1.0, 0.2 + field_count * 0.16 + (0.12 if decoded_program_data else 0.0)), 2) if field_count else 0.0
+        missing = [field for field in ("mint", "name", "symbol", "metadata_uri", "creator", "bonding_curve") if field not in fields]
+        return {
+            "fields": fields,
+            "field_count": field_count,
+            "missing_fields": missing,
+            "confidence": confidence,
+            "program_data_decoded": bool(decoded_program_data),
+            "program_data_text": decoded_program_data[:3],
+            "operator_action": "Direct create metadata is rich enough for comparison." if confidence >= 0.65 else "Keep direct create evidence as a timing/log hint until more fields decode.",
+        }
+
+    def _decoded_program_data_strings(self, logs: list[str]) -> list[str]:
+        decoded: list[str] = []
+        for log in logs:
+            match = re.search(r"(?i)Program data:\s*([A-Za-z0-9+/=_-]{12,})", log)
+            if not match:
+                continue
+            encoded = match.group(1).strip()
+            variants = [encoded]
+            if "-" in encoded or "_" in encoded:
+                variants.append(encoded.replace("-", "+").replace("_", "/"))
+            for variant in variants:
+                padded = variant + ("=" * ((4 - len(variant) % 4) % 4))
+                try:
+                    raw = base64.b64decode(padded, validate=False)
+                except Exception:
+                    continue
+                text = raw.decode("utf-8", errors="ignore")
+                cleaned = "".join(char if char.isprintable() or char in "\n\r\t" else " " for char in text)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if cleaned:
+                    decoded.append(cleaned[:500])
+                    break
+        return decoded
+
+    def _logs_have_create_hint(self, logs: list[str]) -> bool:
+        text = "\n".join(logs).lower()
+        return any(marker in text for marker in ("initialize mint", "create", "mintto", "createpool", "create pool", "instruction: create"))
+
+    def _direct_solana_token_from_event(self, event: LaunchEvent) -> TokenSignal | None:
+        if event.source not in {"solana_logs", "solana_logs_subscribe", "solana"}:
+            return None
+        if not self.settings.direct_solana_paper_enabled:
+            return None
+        synthetic = SourceEvent(
+            id="src_direct_candidate",
+            source=event.source,
+            received_at=event.received_at,
+            raw_payload=event.raw_payload,
+            status="raw",
+            message=event.message,
+        )
+        evidence = self._solana_log_evidence(synthetic)
+        if evidence.get("err"):
+            return None
+        if not evidence.get("create_hint"):
+            return None
+        create_evidence = evidence.get("create_evidence") if isinstance(evidence.get("create_evidence"), dict) else {}
+        fields = create_evidence.get("fields") if isinstance(create_evidence.get("fields"), dict) else {}
+        confidence = float(create_evidence.get("confidence", 0.0) or 0.0)
+        if confidence < self.settings.direct_solana_min_confidence:
+            return None
+        mint = str(fields.get("mint") or next(iter(evidence.get("mints", []) or []), "")).strip()
+        if not mint:
+            return None
+        if any(existing.mint == mint for existing in self.storage.load_all_tokens(5000)):
+            return None
+        symbol = str(fields.get("symbol") or mint[:5]).strip().upper()[:12]
+        name = str(fields.get("name") or symbol).strip()[:80]
+        creator = str(fields.get("creator") or "unknown").strip()[:80]
+        metadata_uri = str(fields.get("metadata_uri") or "").strip()
+        bonding_curve = str(fields.get("bonding_curve") or "").strip()
+        metadata_score = round(min(1.0, max(0.35, confidence)), 2)
+        token = TokenSignal(
+            id=new_id("tok"),
+            symbol=symbol or mint[:5].upper(),
+            name=name or symbol or mint[:5].upper(),
+            mint=mint,
+            creator=creator or "unknown",
+            detected_at=event.received_at,
+            status=TokenStatus.DETECTED,
+            age_seconds=0,
+            buy_velocity=0.25,
+            sell_pressure=0.08,
+            metadata_score=metadata_score,
+            current_price=0.00003,
+        )
+        token.bonding_curve = bonding_curve
+        token.metadata_uri = metadata_uri
+        token.price_source = "direct_solana_derived"
+        token.price_confidence = round(min(0.7, confidence), 2)
+        token.intelligence_tags.extend(["direct solana create", "paper-only source"])
+        token.decision_log.append(
+            f"Normalized from direct Solana logsSubscribe create evidence at confidence {confidence:.2f}; paper-only until source-soak gates pass."
+        )
+        return token
+
+    def _iso_lag_ms(self, later_iso: str, earlier_iso: str) -> int | None:
+        try:
+            later = datetime.fromisoformat(later_iso)
+            earlier = datetime.fromisoformat(earlier_iso)
+        except ValueError:
+            return None
+        return int((later - earlier).total_seconds() * 1000)
 
     def compare_strategies(self, limit: int = 80) -> BacktestRun:
         candidates = [
@@ -725,10 +1898,11 @@ class BotState:
                 "estimated_pnl_sol": round(pnl, 6),
             })
         run.comparison = comparison
+        run.determinism_fingerprint = self._backtest_run_fingerprint(run, candidates, settings)
         self.storage.save_backtest_run(run)
         return run
 
-    def _run_backtest(self, candidates: list[TokenSignal], replay_source: str, settings: BotSettings | None = None) -> BacktestRun:
+    def _run_backtest(self, candidates: list[TokenSignal], replay_source: str, settings: BotSettings | None = None, persist: bool = True) -> BacktestRun:
         settings = settings or self.settings
         replay_stats = BotStats()
         buys = 0
@@ -744,16 +1918,17 @@ class BotState:
         trough = 0.0
         trades: list[dict[str, object]] = []
         for token in candidates:
-            if not token.score:
-                self.enrich_token_intelligence(token)
-                score = self.scoring.score(token, settings)
-                token.score = score.score
-                token.reason = score.reason
-                token.score_breakdown = score.breakdown
-            decision = self.risk.evaluate(token, settings, replay_stats, open_positions=0)
+            replay_token = self._replay_launch_candidate(token)
+            if not replay_token.score:
+                self.enrich_token_intelligence(replay_token)
+                score = self.scoring.score(replay_token, settings)
+                replay_token.score = score.score
+                replay_token.reason = score.reason
+                replay_token.score_breakdown = score.breakdown
+            decision = self.risk.evaluate(replay_token, settings, replay_stats, open_positions=0)
             if decision.allowed:
                 buys += 1
-                pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings)
+                pnl = replay_token.pnl_sol if replay_token.pnl_sol is not None else self._observed_replay_pnl(replay_token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
                 trough = min(trough, simulated_pnl)
@@ -768,10 +1943,10 @@ class BotState:
                     gross_loss += abs(pnl)
                 else:
                     scratches += 1
-                trades.append({"token_id": token.id, "symbol": token.symbol, "decision": "buy", "reason": token.reason, "score": token.score, "pnl_sol": round(pnl, 6)})
+                trades.append({"token_id": token.id, "symbol": token.symbol, "decision": "buy", "reason": replay_token.reason, "score": replay_token.score, "pnl_sol": round(pnl, 6)})
             else:
                 skips += 1
-                trades.append({"token_id": token.id, "symbol": token.symbol, "decision": "skip", "reason": decision.reason, "score": token.score, "pnl_sol": 0})
+                trades.append({"token_id": token.id, "symbol": token.symbol, "decision": "skip", "reason": decision.reason, "score": replay_token.score, "pnl_sol": 0})
         run = BacktestRun(
             id=new_id("bt"),
             created_at=utc_now(),
@@ -796,15 +1971,104 @@ class BotState:
             trades=trades[:120],
             replay_source=replay_source,
         )
-        self.backtest_runs.appendleft(run)
-        self.storage.save_backtest_run(run)
+        run.determinism_fingerprint = self._backtest_run_fingerprint(run, candidates, settings)
+        if persist:
+            self.backtest_runs.appendleft(run)
+            self.storage.save_backtest_run(run)
         return run
+
+    def _replay_launch_candidate(self, token: TokenSignal) -> TokenSignal:
+        return replace(token, age_seconds=0)
+
+    def _backtest_run_fingerprint(self, run: BacktestRun, candidates: list[TokenSignal], settings: BotSettings) -> str:
+        candidate_rows = [
+            {
+                "mint": token.mint,
+                "symbol": token.symbol,
+                "creator": token.creator,
+                "detected_at": token.detected_at.isoformat(),
+                "status": str(token.status),
+                "score": token.score,
+                "reason": token.reason,
+                "pnl_sol": round(float(token.pnl_sol or 0.0), 9) if token.pnl_sol is not None else None,
+                "current_price": round(float(token.current_price or 0.0), 12),
+                "metadata_score": round(float(token.metadata_score or 0.0), 6),
+                "buy_velocity": round(float(token.buy_velocity or 0.0), 6),
+                "sell_pressure": round(float(token.sell_pressure or 0.0), 6),
+                "hold_duration_seconds": token.hold_duration_seconds,
+            }
+            for token in candidates
+        ]
+        trade_rows = [
+            {
+                "symbol": item.get("symbol"),
+                "decision": item.get("decision"),
+                "reason": item.get("reason"),
+                "score": item.get("score"),
+                "pnl_sol": item.get("pnl_sol"),
+            }
+            for item in run.trades
+        ]
+        payload = {
+            "engine": "cryptoarc-backtest-v1",
+            "profile": run.profile,
+            "risk_tolerance": run.risk_tolerance,
+            "replay_source": run.replay_source,
+            "settings": {
+                "strategy_profile": settings.strategy_profile,
+                "risk_tolerance": settings.risk_tolerance,
+                "score_threshold": settings.score_threshold,
+                "take_profit_pct": settings.take_profit_pct,
+                "stop_loss_pct": settings.stop_loss_pct,
+                "max_hold_time_seconds": settings.max_hold_time_seconds,
+                "minimum_hold_time_seconds": settings.minimum_hold_time_seconds,
+                "paper_fee_bps": settings.paper_fee_bps,
+                "paper_price_impact_pct": settings.paper_price_impact_pct,
+                "paper_failed_fill_pct": settings.paper_failed_fill_pct,
+                "trailing_stop_enabled": settings.trailing_stop_enabled,
+                "trailing_stop_pct": settings.trailing_stop_pct,
+            },
+            "metrics": {
+                "tokens_replayed": run.tokens_replayed,
+                "paper_buys": run.paper_buys,
+                "skips": run.skips,
+                "wins": run.wins,
+                "losses": run.losses,
+                "scratches": run.scratches,
+                "estimated_pnl_sol": run.estimated_pnl_sol,
+                "max_drawdown_sol": run.max_drawdown_sol,
+                "profit_factor": run.profit_factor,
+                "pnl_curve": run.pnl_curve,
+            },
+            "comparison": run.comparison,
+            "candidates": candidate_rows,
+            "trades": trade_rows,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
 
     def backtests(self) -> list[dict[str, object]]:
         return [run.to_dict() for run in self.backtest_runs]
 
-    def source_events(self, limit: int = 80) -> list[dict[str, object]]:
-        return [event.to_dict() for event in self.storage.load_source_events(limit)]
+    def source_events(self, limit: int = 80, status: str = "", mint: str = "", source: str = "", event_kind: str = "", parser_result: str = "") -> list[dict[str, object]]:
+        events = self.storage.load_source_events(max(1, min(1000, limit)))
+        normalized_status = status.strip().lower()
+        normalized_mint = mint.strip().lower()
+        normalized_source = source.strip().lower()
+        normalized_kind = event_kind.strip().lower()
+        normalized_parser = parser_result.strip().lower()
+        if normalized_status:
+            events = [event for event in events if event.status.lower() == normalized_status]
+        if normalized_source:
+            events = [event for event in events if event.source.lower() == normalized_source]
+        if normalized_mint:
+            events = [event for event in events if normalized_mint in (self._source_event_mint(event).lower())]
+        rows = [event.to_dict() for event in events]
+        if normalized_kind:
+            rows = [event for event in rows if str(event.get("event_kind", "")).lower() == normalized_kind]
+        if normalized_parser:
+            rows = [event for event in rows if str(event.get("parser_result", "")).lower() == normalized_parser]
+        return rows
 
     def trades(self, limit: int = 300) -> list[dict[str, object]]:
         return [trade.to_dict() for trade in self.storage.load_trades(limit)]
@@ -887,48 +2151,82 @@ class BotState:
         normalized = [event for event in events if event.status == "normalized"]
         failures = len([event for event in events if event.status == "raw"])
         quality_events = len(normalized) + failures
+        now = utc_now()
         last_age = None
         if self.source_status.last_event_at:
-            last_age = max(0, int((utc_now() - self.source_status.last_event_at).total_seconds()))
-        if self.source_status.raw_events_seen > 0:
-            raw = max(1, self.source_status.raw_events_seen)
-            ratio = self.source_status.normalized_events / raw
-        else:
-            ratio = len(normalized) / max(1, quality_events)
+            last_age = max(0, int((now - self.source_status.last_event_at).total_seconds()))
+        requested_at = self.source_status.connection_requested_at
+        connected_at = self.source_status.connected_at
+        first_event_at = self.source_status.first_event_at
+        if requested_at and first_event_at and first_event_at < requested_at:
+            first_event_at = None
+        startup_ms = None
+        if requested_at and connected_at:
+            startup_ms = max(0, int((connected_at - requested_at).total_seconds() * 1000))
+        elif requested_at and self.source_status.status in {"connecting", "reconnecting"}:
+            startup_ms = max(0, int((now - requested_at).total_seconds() * 1000))
+        first_event_ms = None
+        if requested_at and first_event_at:
+            first_event_ms = max(0, int((first_event_at - requested_at).total_seconds() * 1000))
+        ratio = len(normalized) / max(1, quality_events)
         expects_live_source = self.status.value == "running" and self.settings.detect_new_tokens
         source_is_idle = (
             self.source_status.status == "offline"
             and self.source_status.message == "Source is idle"
+            and not expects_live_source
+        )
+        recent_source_fresh = (
+            expects_live_source
+            and last_age is not None
+            and last_age <= self.settings.source_stale_seconds
+        )
+        source_is_starting = (
+            expects_live_source
+            and self.source_status.status in {"connecting", "reconnecting"}
             and self.source_status.last_event_at is None
-            and self.source_status.raw_events_seen == 0
-            and self.source_status.normalized_events == 0
+            and self.source_status.reconnect_attempts <= self.settings.source_max_reconnects
         )
         health = 100
         if self.source_status.status != "connected" and not source_is_idle:
-            health -= 35
+            health -= 15 if recent_source_fresh or source_is_starting else 35
         if expects_live_source and last_age is not None and last_age > self.settings.source_stale_seconds:
             health -= 25
         if quality_events and ratio < 0.35:
             health -= 20
-        health -= min(20, max(0, self.source_status.reconnect_attempts - self.settings.source_max_reconnects) * 4)
+        reconnect_attempts_for_score = self.source_status.reconnect_attempts if self.source_status.status != "connected" and not recent_source_fresh else 0
+        health -= min(20, max(0, reconnect_attempts_for_score - self.settings.source_max_reconnects) * 4)
         if source_is_idle and not expects_live_source:
             health = 100
         newest_normalized = normalized[0] if normalized else None
         cutoff = utc_now() - timedelta(minutes=1)
         recent_events = [event for event in events if event.received_at >= cutoff]
         recent_normalized = [event for event in recent_events if event.status == "normalized"]
+        recent_raw = [event for event in recent_events if event.status == "raw" and not self._source_event_is_operational_status(event)]
         status_message = "healthy"
         if source_is_idle:
             status_message = "idle"
         if health < 50:
             status_message = "degraded"
-        if self.source_status.status != "connected" and not source_is_idle:
+        if self.source_status.status != "connected" and not source_is_idle and source_is_starting:
+            status_message = "connecting"
+        elif self.source_status.status != "connected" and not source_is_idle and recent_source_fresh:
+            status_message = "reconnecting"
+        elif self.source_status.status != "connected" and not source_is_idle:
             status_message = "offline"
+        trust = self._source_trust_snapshot(
+            events=events,
+            health_score=max(0, min(100, health)),
+            normalized_ratio=ratio,
+            last_age=last_age,
+            source_is_idle=source_is_idle,
+            expects_live_source=expects_live_source,
+            status_message=status_message,
+        )
         return {
             "status": self.source_status.status,
             "events_per_minute": round(len(recent_events), 2),
             "normalized_ratio": round(ratio, 3),
-            "recent_normalized_ratio": round(len(recent_normalized) / max(1, len(recent_events)), 3),
+            "recent_normalized_ratio": round(len(recent_normalized) / max(1, len(recent_normalized) + len(recent_raw)), 3),
             "normalization_failures": failures,
             "last_event_age_seconds": last_age,
             "reconnect_attempts": self.source_status.reconnect_attempts,
@@ -941,11 +2239,258 @@ class BotState:
             "status_events": self.source_status.status_events_seen,
             "active_trade_subscriptions": self.source_status.active_trade_subscriptions,
             "dropped_trade_subscriptions": self.source_status.dropped_trade_subscriptions,
+            "connection": {
+                "state": self.source_status.status,
+                "requested_at": requested_at.isoformat() if requested_at else None,
+                "connected_at": connected_at.isoformat() if connected_at else None,
+                "first_event_at": first_event_at.isoformat() if first_event_at else None,
+                "startup_ms": startup_ms,
+                "first_event_ms": first_event_ms,
+                "message": self.source_status.message,
+            },
             "price_observations": self.storage.count_price_observations(),
             "strategy_decisions": self.storage.count_strategy_decisions(),
             "trade_sessions": self.storage.count_trade_sessions(),
             "reliability_note": "PumpPortal trade subscriptions rotate toward the newest launches.",
+            **trust,
         }
+
+    def source_health_report(self, limit: int = 300) -> dict[str, object]:
+        limit = max(1, min(5000, int(limit or 300)))
+        health = self.source_health()
+        events = self.storage.load_source_events(limit)
+        history = list(health.get("quality_history", [])) if isinstance(health.get("quality_history"), list) else []
+        populated = [bucket for bucket in history if int(bucket.get("events", 0) or 0) > 0]
+        degraded = [bucket for bucket in populated if str(bucket.get("trust_state", "")) in {"degraded", "conflicting"}]
+        status_counts = Counter(event.status for event in events)
+        source_counts = Counter(event.source for event in events)
+        parser_counts = Counter(str(event.to_dict().get("parser_result") or "unknown") for event in events)
+        first_event = min((event.received_at for event in events), default=None)
+        last_event = max((event.received_at for event in events), default=None)
+        source_events = [event for event in self.storage.load_events(200) if event.subsystem == "source" or "source" in event.message.lower()]
+        recent_rows = []
+        for event in events[:50]:
+            row = event.to_dict()
+            row["mint"] = self._source_event_mint(event)
+            recent_rows.append(row)
+        status = str(health.get("trust_state") or "unknown")
+        return {
+            "artifact_type": "cryptoarc_source_health_history",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "limit": limit,
+            "status": status,
+            "ready": status == "trusted" and not health.get("live_entry_blocked"),
+            "current": health,
+            "history_summary": {
+                "buckets": len(history),
+                "active_buckets": len(populated),
+                "trusted_buckets": len([bucket for bucket in populated if bucket.get("trust_state") == "trusted"]),
+                "degraded_buckets": len(degraded),
+                "empty_buckets": len([bucket for bucket in history if bucket.get("trust_state") == "empty"]),
+                "average_normalized_ratio": round(sum(float(bucket.get("normalized_ratio", 0.0) or 0.0) for bucket in populated) / max(1, len(populated)), 3),
+                "total_events": sum(int(bucket.get("events", 0) or 0) for bucket in history),
+                "malformed_events": sum(int(bucket.get("malformed", 0) or 0) for bucket in history),
+            },
+            "event_window": {
+                "first_event_at": first_event.isoformat() if first_event else None,
+                "last_event_at": last_event.isoformat() if last_event else None,
+                "source_event_count": len(events),
+                "status_counts": dict(status_counts),
+                "source_counts": dict(source_counts),
+                "parser_counts": dict(parser_counts),
+            },
+            "recent_source_events": recent_rows,
+            "recent_operator_events": [event.to_dict() for event in source_events[:30]],
+            "operator_action": str(health.get("operator_action") or "Inspect source history before promotion."),
+            "privacy_note": "Source health history contains raw source metadata, public mint/source evidence, and local operator events only. It must not contain seed phrases, private keys, Telegram tokens, or auth secrets.",
+        }
+
+    def _source_quality_history(self, events: list[SourceEvent], bucket_minutes: int = 15, buckets: int = 12) -> list[dict[str, object]]:
+        if bucket_minutes <= 0 or buckets <= 0:
+            return []
+        now = utc_now()
+        span = timedelta(minutes=bucket_minutes)
+        start = now - span * buckets
+        rows: list[dict[str, object]] = []
+        for index in range(buckets):
+            bucket_start = start + span * index
+            bucket_end = bucket_start + span
+            bucket_events = [event for event in events if bucket_start <= event.received_at < bucket_end]
+            normalized = [event for event in bucket_events if event.status == "normalized"]
+            raw = [event for event in bucket_events if event.status == "raw" and not self._source_event_is_operational_status(event)]
+            trade = [event for event in bucket_events if event.status == "trade"]
+            malformed = len(
+                [
+                    event
+                    for event in bucket_events
+                    if event.status in {"raw", "normalized", "trade"}
+                    and not self._source_event_is_operational_status(event)
+                    and not self._source_event_mint(event)
+                ]
+            )
+            unique_mints = len(
+                {
+                    self._source_event_mint(event)
+                    for event in bucket_events
+                    if self._source_event_mint(event) and self._source_event_mint(event) not in PUMPPORTAL_NON_LAUNCH_MINTS
+                }
+            )
+            quality_events = len(normalized) + len(raw)
+            ratio = round(len(normalized) / max(1, quality_events), 3)
+            if not bucket_events:
+                trust_state = "empty"
+            elif quality_events >= 10 and ratio < 0.35:
+                trust_state = "conflicting"
+            elif malformed:
+                trust_state = "degraded"
+            else:
+                trust_state = "trusted"
+            rows.append(
+                {
+                    "bucket_start": bucket_start.isoformat(),
+                    "bucket_end": bucket_end.isoformat(),
+                    "events": len(bucket_events),
+                    "normalized": len(normalized),
+                    "raw": len(raw),
+                    "trade": len(trade),
+                    "malformed": malformed,
+                    "unique_mints": unique_mints,
+                    "normalized_ratio": ratio,
+                    "trust_state": trust_state,
+                }
+            )
+        return rows
+
+    def _source_trust_snapshot(
+        self,
+        events: list[SourceEvent],
+        health_score: int,
+        normalized_ratio: float,
+        last_age: int | None,
+        source_is_idle: bool,
+        expects_live_source: bool,
+        status_message: str,
+    ) -> dict[str, object]:
+        status_counts: dict[str, int] = {}
+        source_counts: dict[str, int] = {}
+        mint_counts: dict[str, int] = {}
+        malformed = 0
+        for event in events:
+            status_counts[event.status] = status_counts.get(event.status, 0) + 1
+            source_counts[event.source] = source_counts.get(event.source, 0) + 1
+            if event.status == "trade":
+                continue
+            mint = self._source_event_mint(event)
+            if mint in PUMPPORTAL_NON_LAUNCH_MINTS:
+                continue
+            if mint:
+                mint_counts[mint] = mint_counts.get(mint, 0) + 1
+            elif event.status in {"raw", "normalized", "trade"} and not self._source_event_is_operational_status(event):
+                malformed += 1
+
+        duplicate_mints = sorted([mint for mint, count in mint_counts.items() if count > 1])[:10]
+        blockers: list[str] = []
+        warnings: list[str] = []
+        trust_state = "trusted"
+
+        if source_is_idle and not events:
+            trust_state = "unknown"
+            warnings.append("source has not collected events yet")
+        recent_source_fresh = (
+            expects_live_source
+            and last_age is not None
+            and last_age <= self.settings.source_stale_seconds
+        )
+        source_is_starting = (
+            expects_live_source
+            and self.source_status.status in {"connecting", "reconnecting"}
+            and self.source_status.last_event_at is None
+            and self.source_status.reconnect_attempts <= self.settings.source_max_reconnects
+        )
+        if self.source_status.status != "connected" and not source_is_idle and source_is_starting:
+            warnings.append("source is still in startup connection grace")
+        elif self.source_status.status != "connected" and not source_is_idle and recent_source_fresh:
+            warnings.append("source is reconnecting but recent events are fresh")
+        elif self.source_status.status != "connected" and not source_is_idle:
+            trust_state = "degraded"
+            blockers.append("source is not connected")
+        if expects_live_source and last_age is not None and last_age > self.settings.source_stale_seconds:
+            trust_state = "stale"
+            blockers.append(f"last source event is older than {self.settings.source_stale_seconds}s")
+        if normalized_ratio < 0.35 and (status_counts.get("normalized", 0) + status_counts.get("raw", 0)) >= 10:
+            trust_state = "conflicting" if trust_state == "trusted" else trust_state
+            blockers.append("normalization ratio is below 35%")
+        if health_score < 50 and trust_state == "trusted":
+            trust_state = "degraded"
+            blockers.append("source health score is below 50")
+        if self.source_status.status != "connected" and self.source_status.reconnect_attempts > self.settings.source_max_reconnects:
+            warnings.append("source reconnect attempts exceed configured tolerance")
+        if malformed:
+            warnings.append(f"{malformed} recent source events are missing a mint")
+        if duplicate_mints:
+            warnings.append("recent duplicate mint events detected")
+        trade_subscription_funding_message = self.source_status.pumpportal_funding_blocked or any(
+            self._is_pumpportal_funding_message(event.raw_payload, event.message)
+            for event in events
+        )
+        if trade_subscription_funding_message:
+            if self.source_status.pumpportal_funding_blocked:
+                trust_state = "degraded"
+                blockers.append("PumpPortal API wallet appears unfunded")
+            warnings.append("PumpPortal trade subscriptions require a funded API key before shadow price observations can evaluate.")
+        if trust_state == "trusted" and health_score < 70:
+            trust_state = "degraded"
+            warnings.append("source health score is below preferred trust threshold")
+        if status_message == "idle" and events:
+            warnings.append("source is idle; trust is based on historical event quality")
+
+        live_entry_blocked = trust_state in {"degraded", "stale", "conflicting", "unknown"} and not source_is_idle
+        paper_collection_allowed = trust_state in {"trusted", "degraded", "stale", "conflicting", "unknown"}
+        if trust_state == "trusted":
+            operator_action = "source is usable for paper collection and readiness evidence"
+        elif trust_state == "unknown":
+            operator_action = "collect source events before trusting strategy or live readiness"
+        elif trust_state == "stale":
+            operator_action = "restart or recover the source feed before live entries"
+        elif trust_state == "conflicting":
+            operator_action = "inspect raw source events and parser failures before promotion"
+        else:
+            operator_action = "stabilize source health before promotion"
+
+        return {
+            "trust_state": trust_state,
+            "trust_blockers": blockers,
+            "trust_warnings": warnings,
+            "pumpportal_funding_blocked": trade_subscription_funding_message,
+            "pumpportal_funding_message": self.source_status.pumpportal_funding_message,
+            "pumpportal_funding_blocked_at": self.source_status.pumpportal_funding_blocked_at.isoformat() if self.source_status.pumpportal_funding_blocked_at else None,
+            "shadow_price_observations_blocked": trade_subscription_funding_message,
+            "live_entry_blocked": live_entry_blocked,
+            "paper_collection_allowed": paper_collection_allowed,
+            "operator_action": operator_action,
+            "raw_event_inspection": {
+                "recent_events": len(events),
+                "status_counts": status_counts,
+                "source_counts": source_counts,
+                "unique_mints": len(mint_counts),
+                "duplicate_mints": duplicate_mints,
+                "malformed_events": malformed,
+                "filterable_fields": ["limit", "status", "mint", "source", "event_kind", "parser_result"],
+            },
+            "quality_history": self._source_quality_history(events),
+        }
+
+    def _source_event_mint(self, event: SourceEvent) -> str:
+        payload = event.raw_payload or {}
+        for key in ("mint", "tokenMint", "token", "ca"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _source_event_is_operational_status(self, event: SourceEvent) -> bool:
+        return event.status in {"raw", "status"} and event.source == "pumpportal" and self._is_pumpportal_funding_message(event.raw_payload, event.message)
 
     def settings_versions(self) -> list[dict[str, object]]:
         return [version.to_dict() for version in self.storage.load_settings_versions(50)]
@@ -953,8 +2498,13 @@ class BotState:
     def performance_analytics(self) -> dict[str, object]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
         tokens_by_id = {token.id: token for token in self.storage.load_all_tokens(5000)}
+        paper_summary = self._performance_group("all trades", trades)
+        wallet_analytics = self._wallet_performance_analytics()
+        execution = self._execution_readiness_status(source=self.source_health(), strategy_promotion=None)
+        execution_metrics = execution.get("metrics", {}) if isinstance(execution.get("metrics"), dict) else {}
+        latest_replay = next(iter(self.storage.load_backtest_runs(1)), None)
         return {
-            "summary": self._performance_group("all trades", trades),
+            "summary": paper_summary,
             "by_exit_reason": self._group_performance(trades, lambda trade: trade.exit_reason or "unknown"),
             "by_strategy": self._group_performance(trades, lambda trade: trade.strategy_profile or "unknown"),
             "by_settings_version": self._group_performance(trades, lambda trade: trade.settings_version_id or "legacy"),
@@ -965,6 +2515,113 @@ class BotState:
             "by_price_confidence": self._group_performance(trades, lambda trade: self._confidence_bucket(trade.source_price_confidence)),
             "recent_curve": self._pnl_curve(trades),
             "strategy_modules": self.strategy.describe_modules(self.settings),
+            "wallets": wallet_analytics["wallets"],
+            "wallet_summary": wallet_analytics["summary"],
+            "mode_comparison": {
+                "paper": {
+                    "mode": "paper",
+                    "pnl_sol": paper_summary["pnl_sol"],
+                    "samples": paper_summary["count"],
+                    "confidence": "paper",
+                    "source": "closed paper trades",
+                },
+                "replay": {
+                    "mode": "replay",
+                    "pnl_sol": round(float(latest_replay.estimated_pnl_sol if latest_replay else 0.0), 6),
+                    "samples": int(latest_replay.tokens_replayed if latest_replay else 0),
+                    "confidence": "fingerprinted" if latest_replay and latest_replay.determinism_fingerprint else "missing",
+                    "source": latest_replay.replay_source if latest_replay else "no replay runs",
+                },
+                "shadow": {
+                    "mode": "shadow",
+                    "pnl_sol": round(float(execution_metrics.get("shadow_estimated_pnl_sol", 0.0) or 0.0), 6),
+                    "samples": int(execution_metrics.get("shadow_evaluated", 0) or 0),
+                    "confidence": "shadow" if int(execution_metrics.get("shadow_evaluated", 0) or 0) else "missing",
+                    "source": "dry-run live quote comparisons",
+                },
+                "live": {
+                    "mode": "live",
+                    "pnl_sol": wallet_analytics["summary"]["total_pnl_sol"],
+                    "samples": wallet_analytics["summary"]["positions"],
+                    "confidence": wallet_analytics["summary"]["pnl_confidence"],
+                    "source": "wallet-scoped live ledger",
+                },
+            },
+        }
+
+    def _wallet_performance_analytics(self) -> dict[str, object]:
+        positions = self._live_ledger_positions("")
+        grouped: dict[str, list[LiveLedgerPosition]] = {}
+        for position in positions:
+            wallet = position.wallet_public_key or "unknown"
+            grouped.setdefault(wallet, []).append(position)
+
+        def summarize_wallet(wallet: str, items: list[LiveLedgerPosition]) -> dict[str, object]:
+            scratch = self.stats.scratch_threshold_sol or 0.001
+            realized = round(sum(position.realized_pnl_sol for position in items), 9)
+            unrealized = round(sum(position.unrealized_pnl_sol for position in items), 9)
+            total = round(realized + unrealized, 9)
+            closed = [position for position in items if position.status == "closed"]
+            open_positions = [position for position in items if position.status == "open"]
+            pnl_samples = [position.realized_pnl_sol + position.unrealized_pnl_sol for position in items]
+            wins = [pnl for pnl in pnl_samples if pnl > scratch]
+            losses = [pnl for pnl in pnl_samples if pnl < -scratch]
+            decisive = len(wins) + len(losses)
+            needs_review = len([position for position in items if position.reconciliation_status == "needs_review"])
+            stale_balance = len([position for position in items if position.status == "open" and position.balance_age_seconds is None])
+            confidence_counts: dict[str, int] = {}
+            for position in items:
+                label = position.unrealized_pnl_confidence if position.status == "open" else position.realized_pnl_confidence
+                confidence_counts[label or "unknown"] = confidence_counts.get(label or "unknown", 0) + 1
+            if needs_review or stale_balance:
+                confidence = "needs_review"
+            elif any(label in {"estimated", "unknown"} for label in confidence_counts):
+                confidence = "estimated"
+            else:
+                confidence = "audited"
+            return {
+                "wallet_public_key": wallet,
+                "label": wallet[-6:] if wallet != "unknown" else wallet,
+                "positions": len(items),
+                "open_positions": len(open_positions),
+                "closed_positions": len(closed),
+                "wins": len(wins),
+                "losses": len(losses),
+                "win_rate_pct": int((len(wins) / decisive) * 100) if decisive else 0,
+                "cost_basis_sol": round(sum(position.cost_basis_sol for position in items), 9),
+                "realized_pnl_sol": realized,
+                "unrealized_pnl_sol": unrealized,
+                "total_pnl_sol": total,
+                "fees_sol": round(sum(position.total_fees_sol for position in items), 9),
+                "priority_fees_sol": round(sum(position.total_priority_fees_sol for position in items), 9),
+                "needs_review_positions": needs_review,
+                "stale_balance_positions": stale_balance,
+                "pnl_confidence": confidence,
+                "confidence_counts": confidence_counts,
+                "operator_action": "Review reconciliation and balance evidence before using this wallet for unattended entries." if confidence == "needs_review" else "Wallet performance is usable for live comparison.",
+            }
+
+        wallets = [summarize_wallet(wallet, items) for wallet, items in grouped.items()]
+        wallets.sort(key=lambda item: abs(float(item["total_pnl_sol"])), reverse=True)
+        total_realized = round(sum(float(item["realized_pnl_sol"]) for item in wallets), 9)
+        total_unrealized = round(sum(float(item["unrealized_pnl_sol"]) for item in wallets), 9)
+        total_needs_review = sum(int(item["needs_review_positions"]) for item in wallets)
+        total_stale = sum(int(item["stale_balance_positions"]) for item in wallets)
+        summary_confidence = "needs_review" if total_needs_review or total_stale else "estimated" if wallets else "missing"
+        return {
+            "wallets": wallets,
+            "summary": {
+                "wallets": len(wallets),
+                "positions": sum(int(item["positions"]) for item in wallets),
+                "open_positions": sum(int(item["open_positions"]) for item in wallets),
+                "closed_positions": sum(int(item["closed_positions"]) for item in wallets),
+                "realized_pnl_sol": total_realized,
+                "unrealized_pnl_sol": total_unrealized,
+                "total_pnl_sol": round(total_realized + total_unrealized, 9),
+                "needs_review_positions": total_needs_review,
+                "stale_balance_positions": total_stale,
+                "pnl_confidence": summary_confidence,
+            },
         }
 
     def tuning_suggestions(self) -> list[dict[str, object]]:
@@ -974,24 +2631,72 @@ class BotState:
         trades = [trade for trade in trades if trade.token_id not in ignored_tokens]
         suggestions: list[dict[str, object]] = []
         if len(trades) < 8:
-            return [{"title": "Collect more samples", "reason": "Auto-tuning needs at least 8 closed trades before the suggestions are meaningful.", "setting": "backtest_replay_limit", "confidence": 0.35}]
+            return [
+                self._tuning_suggestion(
+                    "Collect more samples",
+                    "Auto-tuning needs at least 8 closed trades before the suggestions are meaningful.",
+                    "backtest_replay_limit",
+                    None,
+                    0.35,
+                    trades,
+                    evidence_trades=trades,
+                    expected_benefit="Avoids overfitting settings to a tiny paper sample.",
+                    overfit_risk="high",
+                )
+            ]
 
         summary = self._performance_group("all trades", trades)
         by_exit = {item["label"]: item for item in self._group_performance(trades, lambda trade: trade.exit_reason or "unknown")}
         if summary["win_rate_pct"] < 35 and not self.settings.cooldown_after_loss_enabled:
-            suggestions.append({"title": "Enable loss cooldown", "reason": "Recent decisive win rate is low; pausing briefly after losses can reduce clustered bad entries.", "setting": "cooldown_after_loss_enabled", "suggested_value": True, "confidence": 0.72})
+            losses = [trade for trade in trades if (trade.pnl_sol or 0) < 0]
+            suggestions.append(self._tuning_suggestion("Enable loss cooldown", "Recent decisive win rate is low; pausing briefly after losses can reduce clustered bad entries.", "cooldown_after_loss_enabled", True, 0.72, trades, evidence_trades=losses, expected_benefit=f"Targets {len(losses)} recent loss samples and may reduce clustered re-entry losses.", overfit_risk="medium"))
         max_tick = by_exit.get("max position ticks")
         if max_tick and max_tick["pnl_sol"] < 0 and not self.settings.stalled_trade_exit_enabled:
-            suggestions.append({"title": "Try stalled-trade exit", "reason": "Max-tick exits are losing money; stalled exits can close flat trades earlier.", "setting": "stalled_trade_exit_enabled", "suggested_value": True, "confidence": 0.68})
+            evidence = [trade for trade in trades if (trade.exit_reason or "unknown") == "max position ticks"]
+            suggestions.append(self._tuning_suggestion("Try stalled-trade exit", "Max-tick exits are losing money; stalled exits can close flat trades earlier.", "stalled_trade_exit_enabled", True, 0.68, trades, evidence_trades=evidence, expected_benefit=f"Targets {max_tick['count']} max-tick exits with {float(max_tick['pnl_sol']):.6f} SOL paper PnL.", overfit_risk="medium"))
         stop_loss = by_exit.get("stop loss")
         if stop_loss and stop_loss["count"] >= 3 and self.settings.stop_loss_pct > 20:
-            suggestions.append({"title": "Tighten stop loss", "reason": "Several trades are reaching the stop; a tighter stop may lower average loss size in paper testing.", "setting": "stop_loss_pct", "suggested_value": max(10, round(self.settings.stop_loss_pct * 0.8, 1)), "confidence": 0.61})
+            evidence = [trade for trade in trades if (trade.exit_reason or "unknown") == "stop loss"]
+            suggestions.append(self._tuning_suggestion("Tighten stop loss", "Several trades are reaching the stop; a tighter stop may lower average loss size in paper testing.", "stop_loss_pct", max(10, round(self.settings.stop_loss_pct * 0.8, 1)), 0.61, trades, evidence_trades=evidence, expected_benefit=f"Targets {stop_loss['count']} stop-loss exits; validate lower average loss before live promotion.", overfit_risk="medium"))
         low_conf_losses = [trade for trade in trades if trade.source_price_confidence < self.settings.min_price_confidence and (trade.pnl_sol or 0) < 0]
         if len(low_conf_losses) >= 3:
-            suggestions.append({"title": "Raise price confidence floor", "reason": "Low-confidence price marks are contributing multiple losses.", "setting": "min_price_confidence", "suggested_value": min(0.9, round(self.settings.min_price_confidence + 0.1, 2)), "confidence": 0.64})
+            suggestions.append(self._tuning_suggestion("Raise price confidence floor", "Low-confidence price marks are contributing multiple losses.", "min_price_confidence", min(0.9, round(self.settings.min_price_confidence + 0.1, 2)), 0.64, trades, evidence_trades=low_conf_losses, expected_benefit=f"Filters {len(low_conf_losses)} low-confidence losing price samples from future entries.", overfit_risk="low"))
         if not suggestions:
-            suggestions.append({"title": "Keep current profile", "reason": "No single failure pattern dominates the closed trade set yet.", "setting": "strategy_profile", "suggested_value": self.settings.strategy_profile, "confidence": 0.52})
+            suggestions.append(self._tuning_suggestion("Keep current profile", "No single failure pattern dominates the closed trade set yet.", "strategy_profile", self.settings.strategy_profile, 0.52, trades, evidence_trades=trades, expected_benefit="Preserves the current profile until a clearer paper or shadow edge appears.", overfit_risk="medium"))
         return suggestions
+
+    def _tuning_suggestion(
+        self,
+        title: str,
+        reason: str,
+        setting: str,
+        suggested_value: object,
+        confidence: float,
+        all_trades: list[TradeRecord],
+        *,
+        evidence_trades: list[TradeRecord],
+        expected_benefit: str,
+        overfit_risk: str,
+    ) -> dict[str, object]:
+        sample_size = len(evidence_trades)
+        closed_count = len(all_trades)
+        evidence_pnl = round(sum(float(trade.pnl_sol or 0.0) for trade in evidence_trades), 6)
+        payload: dict[str, object] = {
+            "title": title,
+            "reason": reason,
+            "setting": setting,
+            "confidence": confidence,
+            "expected_benefit": expected_benefit,
+            "supporting_sample_size": sample_size,
+            "supporting_closed_trades": closed_count,
+            "supporting_pnl_sol": evidence_pnl,
+            "overfit_risk": overfit_risk,
+            "requires_operator_review": True,
+            "review_note": "Applying this creates a settings version and updates local settings only; review labels, sample size, and shadow evidence before live promotion.",
+        }
+        if suggested_value is not None:
+            payload["suggested_value"] = suggested_value
+        return payload
 
     def apply_tuning_suggestion(self, setting: str, suggested_value: object) -> dict[str, object]:
         current = asdict(self.settings)
@@ -1029,6 +2734,67 @@ class BotState:
 
     def trade_labels(self) -> list[dict[str, object]]:
         return [label.to_dict() for label in self.storage.load_trade_labels(500)]
+
+    def trade_review_queue(self) -> dict[str, object]:
+        closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        labels = self.storage.load_trade_labels(5000)
+        latest_label_by_token: dict[str, TradeLabel] = {}
+        for label in sorted(labels, key=lambda item: item.created_at):
+            latest_label_by_token[label.token_id] = label
+        decisions = self.storage.load_strategy_decisions(5000)
+        observations = self.storage.load_price_observations(5000)
+        decisions_by_token: dict[str, list[StrategyDecisionRecord]] = {}
+        observations_by_token: dict[str, list[PriceObservation]] = {}
+        for decision in decisions:
+            decisions_by_token.setdefault(decision.token_id, []).append(decision)
+        for observation in observations:
+            if observation.token_id:
+                observations_by_token.setdefault(observation.token_id, []).append(observation)
+
+        def queue_item(queue_id: str, label: str, trades: list[TradeRecord], reason: str) -> dict[str, object]:
+            sorted_trades = sorted(trades, key=lambda trade: trade.closed_at or trade.opened_at or utc_now(), reverse=True)
+            return {
+                "id": queue_id,
+                "label": label,
+                "count": len(sorted_trades),
+                "sample_token_ids": [trade.token_id for trade in sorted_trades[:8]],
+                "sample_trade_ids": [trade.id for trade in sorted_trades[:8]],
+                "reason": reason,
+            }
+
+        unlabeled = [trade for trade in closed if trade.token_id not in latest_label_by_token]
+        losses = [trade for trade in closed if (trade.pnl_sol or 0.0) < 0]
+        bad_price = [
+            trade
+            for trade in closed
+            if trade.source_price_confidence < 0.65
+            or any(not observation.accepted for observation in observations_by_token.get(trade.token_id, []))
+        ]
+        long_holds = [trade for trade in closed if int(trade.hold_duration_seconds or 0) >= max(300, int(self.settings.minimum_hold_time_seconds or 0) * 3)]
+        no_decision = [trade for trade in closed if not decisions_by_token.get(trade.token_id)]
+        excluded = [trade for trade in closed if latest_label_by_token.get(trade.token_id) and latest_label_by_token[trade.token_id].label == "ignore_from_tuning"]
+        label_counts: dict[str, int] = {}
+        for label in latest_label_by_token.values():
+            label_counts[label.label] = label_counts.get(label.label, 0) + 1
+        queues = [
+            queue_item("unlabeled", "Unlabeled", unlabeled, "Closed trades that still need an operator label."),
+            queue_item("losses", "Losses", losses, "Negative-PnL trades should be reviewed before trusting tuning suggestions."),
+            queue_item("bad_price_data", "Price Evidence", bad_price, "Trades with rejected or low-confidence price evidence."),
+            queue_item("long_holds", "Long Holds", long_holds, "Trades whose hold time may indicate exit-rule tuning opportunities."),
+            queue_item("missing_decision", "Missing Decisions", no_decision, "Trades without attached strategy decision records."),
+            queue_item("ignored_from_tuning", "Ignored", excluded, "Trades intentionally excluded from tuning evidence."),
+        ]
+        return {
+            "total_closed": len(closed),
+            "labeled": len([trade for trade in closed if trade.token_id in latest_label_by_token]),
+            "unlabeled": len(unlabeled),
+            "label_counts": label_counts,
+            "queues": queues,
+            "next_queue_id": next((queue["id"] for queue in queues if int(queue["count"]) > 0 and queue["id"] != "ignored_from_tuning"), ""),
+            "next_token_id": next((str(queue["sample_token_ids"][0]) for queue in queues if int(queue["count"]) > 0 and queue["sample_token_ids"] and queue["id"] != "ignored_from_tuning"), ""),
+            "operator_action": "Start with unlabeled losses or bad price evidence, then apply labels before accepting tuning changes.",
+            "generated_at": utc_now().isoformat(),
+        }
 
     def label_trade(self, token_id: str, label: str, note: str = "") -> dict[str, object]:
         trade = next((item for item in self.storage.load_trades(5000) if item.token_id == token_id), None)
@@ -1073,10 +2839,15 @@ class BotState:
         if len(history) > 40:
             history = [0.0, *history[-39:]]
         pnl_sol = round(sum((trade.pnl_sol or 0.0) for trade in filtered), 6)
+        entry_fees = round(sum(float(trade.entry_fee_sol or 0.0) for trade in filtered), 9)
+        exit_fees = round(sum(float(trade.exit_fee_sol or 0.0) for trade in filtered), 9)
         return {
             "timeframe": timeframe,
             "closed_trade_count": len(filtered),
             "pnl_sol": pnl_sol,
+            "entry_fees_sol": entry_fees,
+            "exit_fees_sol": exit_fees,
+            "total_fees_sol": round(entry_fees + exit_fees, 9),
             "history": history if history else [0.0],
         }
 
@@ -1118,7 +2889,7 @@ class BotState:
 
     def data_integrity_report(self) -> dict[str, object]:
         return self.integrity.report(
-            self.storage.load_all_tokens(5000),
+            self.storage.load_all_tokens(10000),
             self.storage.load_trades(5000),
             self.storage.load_price_observations(5000),
             self.storage.load_source_events(5000),
@@ -1144,7 +2915,12 @@ class BotState:
         ]
 
     def pumpfun_report(self) -> dict[str, object]:
-        return self.pumpfun_intelligence.summarize(self.storage.load_all_tokens(5000), self.storage.load_source_events(5000))
+        return self.pumpfun_intelligence.summarize(
+            self.storage.load_all_tokens(5000),
+            self.storage.load_source_events(5000),
+            self.storage.load_trades(5000),
+            self.storage.load_trade_labels(5000),
+        )
 
     def readiness_status(self) -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
@@ -1152,11 +2928,14 @@ class BotState:
         source = self.source_health()
         price = self.price_diagnostics()
         performance = self._performance_group("all trades", closed)
+        source_soak = self.source_soak_acceptance_report()
         closed_count = len(closed)
         source_events = int(integrity.get("source_events", 0))
+        source_trust_blocks_entries = bool(source.get("live_entry_blocked")) or source.get("trust_state") in {"degraded", "stale", "conflicting"}
         gross_win = sum((trade.pnl_sol or 0.0) for trade in closed if (trade.pnl_sol or 0.0) > (self.stats.scratch_threshold_sol or 0.001))
         gross_loss = abs(sum((trade.pnl_sol or 0.0) for trade in closed if (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001)))
         effective_profit_factor = 99.0 if gross_win > 0 and gross_loss == 0 else float(performance.get("profit_factor", 0.0))
+        out_of_sample = self._out_of_sample_strategy_evidence(self.settings.strategy_profile)
 
         gates = [
             self._readiness_gate(
@@ -1201,7 +2980,7 @@ class BotState:
                 int(source.get("health_score", 0)),
                 ">= 70",
                 15,
-                self._threshold_status(float(source.get("health_score", 0)), 70, 50),
+                "fail" if source_trust_blocks_entries else self._threshold_status(float(source.get("health_score", 0)), 70, 50),
                 "Source health tracks connection status, staleness, normalization ratio, and reconnect pressure.",
             ),
             self._readiness_gate(
@@ -1238,7 +3017,7 @@ class BotState:
                 "paper-only",
                 5,
                 "pass",
-                "No signer, wallet connection, transaction builder, or live executor is available.",
+                "Paper readiness does not submit transactions; live execution stays behind separate local live/autonomy gates.",
             ),
         ]
         score = int(round(sum(int(gate["weight"]) if gate["status"] == "pass" else int(gate["weight"]) * 0.5 if gate["status"] == "warn" else 0 for gate in gates)))
@@ -1262,18 +3041,1268 @@ class BotState:
             "entries_allowed": True,
             "gates": gates,
             "recommended_actions": self._readiness_actions(gates, status),
+            "strategy_promotion": self._strategy_promotion_status(
+                closed=closed,
+                source_events=source_events,
+                replay_confidence=int(integrity.get("replay_confidence", {}).get("score", 0)) if isinstance(integrity.get("replay_confidence"), dict) else 0,
+                source=source,
+                price=price,
+                performance=performance,
+                profit_factor=effective_profit_factor,
+                out_of_sample=out_of_sample,
+                source_soak=source_soak,
+            ),
+            "execution_readiness": self._execution_readiness_status(
+                source=source,
+                strategy_promotion=None,
+            ),
             "sample_size": {
                 "closed_trades": closed_count,
                 "source_events": source_events,
                 "price_observations": int(integrity.get("price_observations", 0)),
                 "strategy_decisions": int(integrity.get("strategy_decisions", 0)),
             },
+            "source_soak": source_soak,
             "paper_only": True,
             "halt_on_low_readiness": self.settings.halt_on_low_readiness,
             "min_readiness_score": self.settings.min_readiness_score,
         }
+        result["execution_readiness"] = self._execution_readiness_status(
+            source=source,
+            strategy_promotion=result["strategy_promotion"],
+        )
         result["entries_allowed"] = self.readiness_halt_reason(result) is None
         return result
+
+    def _execution_readiness_status(
+        self,
+        source: dict[str, object] | None = None,
+        strategy_promotion: dict[str, object] | None = None,
+        env_live_enabled: bool | None = None,
+        wallet_public_key: str = "",
+        signer_mode: str | None = None,
+    ) -> dict[str, object]:
+        source = source or self.source_health()
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
+        normalized_audits = self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+        calibration = self._live_landing_calibration(normalized_audits)
+        audits = self._refresh_shadow_comparisons(normalized_audits)
+        pipeline_latency = self._execution_pipeline_latency(audits)
+        latency_summary = self._execution_latency_summary(pipeline_latency, calibration)
+        now = utc_now()
+        quote_audits = [audit for audit in audits if isinstance(audit.quote, dict) and audit.quote.get("id")]
+        shadow_audits = [audit for audit in quote_audits if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison]
+        shadow_evaluated = [audit for audit in shadow_audits if audit.shadow_comparison.get("status") == "evaluated"]
+        recent_shadow_window_hours = 24.0
+        recent_shadow_cutoff = now - timedelta(hours=recent_shadow_window_hours)
+        recent_shadow_evaluated = [audit for audit in shadow_evaluated if audit.created_at >= recent_shadow_cutoff]
+        shadow_winners = [audit for audit in shadow_evaluated if str(audit.shadow_comparison.get("outcome", "")) == "win"]
+        recent_shadow_winners = [audit for audit in recent_shadow_evaluated if str(audit.shadow_comparison.get("outcome", "")) == "win"]
+        shadow_pnls = [float(audit.shadow_comparison.get("estimated_pnl_sol", 0.0) or 0.0) for audit in shadow_evaluated]
+        recent_shadow_pnls = [float(audit.shadow_comparison.get("estimated_pnl_sol", 0.0) or 0.0) for audit in recent_shadow_evaluated]
+        shadow_windows = [
+            window
+            for audit in shadow_audits
+            for window in audit.shadow_comparison.get("landing_windows", [])
+            if isinstance(window, dict)
+        ]
+        shadow_window_evaluated = [window for window in shadow_windows if window.get("status") == "evaluated"]
+        shadow_window_winners = [window for window in shadow_window_evaluated if str(window.get("outcome", "")) == "win"]
+        shadow_window_pnls = [float(window.get("estimated_pnl_sol", 0.0) or 0.0) for window in shadow_window_evaluated]
+        submittable_quote_audits = [audit for audit in quote_audits if not bool(audit.quote.get("shadow_only"))]
+        stale_quotes = [audit for audit in submittable_quote_audits if audit.status == "stale" or bool(audit.quote.get("stale"))]
+        blocked_quotes = [audit for audit in submittable_quote_audits if audit.status == "blocked"]
+        ready_quotes = [audit for audit in submittable_quote_audits if audit.status in {"ready", "simulated", "simulation_warning"}]
+        submitted = [audit for audit in quote_audits if audit.transaction_signature or audit.status in {"submitted", "confirmed", "reconciled", "needs_review", "failed"}]
+        unresolved = [audit for audit in audits if self._is_unresolved_live_audit(audit)]
+        quote_issues = self._quote_issue_taxonomy(quote_audits)
+        failure_stages = self._execution_failure_stage_taxonomy(quote_audits)
+        latest_quote_at = max((audit.created_at for audit in quote_audits), default=None)
+        latest_quote_age_seconds = round((now - latest_quote_at).total_seconds(), 3) if latest_quote_at else None
+        quote_health_sample = submittable_quote_audits or quote_audits
+        stale_rate = round(len(stale_quotes) / len(quote_health_sample), 3) if quote_health_sample else 0.0
+        blocked_rate = round(len(blocked_quotes) / len(quote_health_sample), 3) if quote_health_sample else 0.0
+        policy_blockers = self._execution_policy_blockers()
+        signer = self.signer_status(signer_mode, wallet_public_key)
+        strategy_can_shadow = bool(strategy_promotion.get("can_promote")) if isinstance(strategy_promotion, dict) else False
+        shadow_price_observations_blocked = bool(source.get("shadow_price_observations_blocked"))
+        live_blockers = self._live_execution_blockers(bool(env_live_enabled), "buy", wallet_public_key, signer_mode, autonomous=False) if env_live_enabled is not None else []
+        policy_recommendation = self._execution_policy_recommendation(
+            stale_rate=stale_rate,
+            blocked_rate=blocked_rate,
+            quote_issues=quote_issues,
+            calibration=calibration,
+            shadow_windows=shadow_windows,
+            policy_blockers=policy_blockers,
+        )
+        gates = [
+            self._promotion_gate("dry_run_quote_path", "Dry-run quote path", "available", "quote without submit", True, "PumpPortal local transaction quotes are stored as audits before signing or submit."),
+            self._promotion_gate("quote_audit_sample", "Quote audit sample", len(quote_audits), ">= 5", len(quote_audits) >= 5, "Collect at least five quote attempts before speed tuning."),
+            self._promotion_gate("quote_freshness", "Quote freshness", f"{round(stale_rate * 100, 1)}% stale", "<= 25%", len(quote_audits) > 0 and stale_rate <= 0.25, "Stale quote frequency must be low enough for fast entries."),
+            self._promotion_gate("failed_quote_rate", "Failed quote rate", f"{round(blocked_rate * 100, 1)}% blocked", "<= 25%", len(quote_audits) > 0 and blocked_rate <= 0.25, "Policy and provider blocks should be rare before live shadow runs."),
+            self._promotion_gate("execution_policy_caps", "Execution policy caps", "configured" if not policy_blockers else "incomplete", "caps set", not policy_blockers, "Trade size, slippage, priority fee, loss, exposure, and position caps must be explicit."),
+            self._promotion_gate("source_trust", "Source trust", str(source.get("trust_state", "unknown")), "trusted", not bool(source.get("live_entry_blocked")), "Live entries need trusted or explicitly non-blocking source state."),
+            self._promotion_gate("shadow_price_observations", "Shadow price observations", "blocked" if shadow_price_observations_blocked else "available", "available", not shadow_price_observations_blocked, "PumpPortal trade subscriptions require a funded API key before shadow price observations can evaluate."),
+            self._promotion_gate("strategy_shadow_gate", "Strategy shadow gate", "eligible" if strategy_can_shadow else "blocked", "eligible", strategy_can_shadow, "Strategy promotion gates should pass before comparing fast live-entry shadows."),
+            self._promotion_gate("signer_boundary", "Signer boundary", signer_mode, "local signer known", bool(signer.get("connected")) if wallet_public_key else True, "Execution keeps local signing boundaries visible before any submit path."),
+            self._promotion_gate("recovery_queue", "Recovery queue", len(unresolved), "0 unresolved", len(unresolved) == 0, "Unresolved live audits must be cleared before speed tuning."),
+        ]
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail"]
+        blockers.extend(policy_blockers)
+        if live_blockers:
+            blockers.extend([f"Live blocker: {blocker}" for blocker in live_blockers])
+        can_shadow = not blockers
+        return {
+            "status": "shadow_ready" if can_shadow else "not_enough_quote_data" if not quote_audits else "blocked",
+            "can_shadow": can_shadow,
+            "can_live_submit": bool(env_live_enabled) and can_shadow and bool(signer.get("connected")) and not live_blockers,
+            "mode": "dry_run_to_shadow",
+            "quote_ttl_seconds": 30,
+            "latest_quote_age_seconds": latest_quote_age_seconds,
+            "metrics": {
+                "quote_attempts": len(quote_audits),
+                "ready_quotes": len(ready_quotes),
+                "blocked_quotes": len(blocked_quotes),
+                "stale_quotes": len(stale_quotes),
+                "submitted_audits": len(submitted),
+                "unresolved_audits": len(unresolved),
+                "stale_quote_rate": stale_rate,
+                "blocked_quote_rate": blocked_rate,
+                "shadow_samples": len(shadow_audits),
+                "shadow_evaluated": len(shadow_evaluated),
+                "recent_shadow_evaluated": len(recent_shadow_evaluated),
+                "recent_shadow_window_hours": recent_shadow_window_hours,
+                "shadow_win_rate_pct": int((len(shadow_winners) / len(shadow_evaluated)) * 100) if shadow_evaluated else 0,
+                "shadow_estimated_pnl_sol": round(sum(shadow_pnls), 6),
+                "recent_shadow_win_rate_pct": int((len(recent_shadow_winners) / len(recent_shadow_evaluated)) * 100) if recent_shadow_evaluated else 0,
+                "recent_shadow_estimated_pnl_sol": round(sum(recent_shadow_pnls), 6),
+                "shadow_landing_windows": len(shadow_windows),
+                "shadow_landing_evaluated": len(shadow_window_evaluated),
+                "shadow_landing_win_rate_pct": int((len(shadow_window_winners) / len(shadow_window_evaluated)) * 100) if shadow_window_evaluated else 0,
+                "shadow_landing_best_pnl_sol": round(max(shadow_window_pnls), 6) if shadow_window_pnls else 0.0,
+                "shadow_landing_worst_pnl_sol": round(min(shadow_window_pnls), 6) if shadow_window_pnls else 0.0,
+                "live_landing_samples": int(calibration["samples"]),
+                "live_quote_to_submit_p50_ms": int(calibration["quote_to_submit_p50_ms"]),
+                "live_quote_to_submit_p90_ms": int(calibration["quote_to_submit_p90_ms"]),
+                "live_quote_to_submit_p99_ms": int(calibration["quote_to_submit_p99_ms"]),
+                "live_submit_to_confirm_p50_ms": int(calibration["submit_to_confirm_p50_ms"]),
+                "live_submit_to_confirm_p90_ms": int(calibration["submit_to_confirm_p90_ms"]),
+                "live_submit_to_confirm_p99_ms": int(calibration["submit_to_confirm_p99_ms"]),
+                "pipeline_samples": int(pipeline_latency["samples"]),
+                "signal_to_quote_p50_ms": int(pipeline_latency["totals"]["signal_to_quote_ms"]["p50_ms"]),
+                "signal_to_quote_p90_ms": int(pipeline_latency["totals"]["signal_to_quote_ms"]["p90_ms"]),
+                "intent_to_quote_p50_ms": int(pipeline_latency["totals"]["intent_to_quote_ms"]["p50_ms"]),
+                "intent_to_quote_p90_ms": int(pipeline_latency["totals"]["intent_to_quote_ms"]["p90_ms"]),
+            },
+            "policy": {
+                "max_trade_sol": self.settings.live_max_trade_sol,
+                "max_slippage_pct": self.settings.live_max_slippage_pct,
+                "priority_fee_cap_sol": self.settings.live_priority_fee_cap_sol,
+                "daily_loss_cap_sol": self.settings.live_daily_loss_cap_sol,
+                "wallet_exposure_cap_sol": self.settings.live_wallet_exposure_cap_sol,
+                "max_open_positions": self.settings.live_max_open_positions,
+                "suggested_slippage_pct": policy_recommendation["suggested_slippage_pct"],
+                "suggested_priority_fee_sol": policy_recommendation["suggested_priority_fee_sol"],
+                "recommendation": policy_recommendation,
+                "blockers": policy_blockers,
+            },
+            "latency_summary": latency_summary,
+            "pipeline_latency": pipeline_latency,
+            "quote_issues": quote_issues,
+            "failure_stages": failure_stages,
+            "landing_calibration": calibration,
+            "gates": gates,
+            "shadow_comparisons": [audit.shadow_comparison for audit in shadow_audits[:10]],
+            "blockers": list(dict.fromkeys(blockers)),
+            "operator_action": "Run dry-run quotes until the quote sample, freshness, policy, source, and recovery gates pass.",
+            "generated_at": now.isoformat(),
+        }
+
+    def _execution_latency_summary(self, pipeline_latency: dict[str, object], calibration: dict[str, object]) -> dict[str, object]:
+        totals = pipeline_latency.get("totals", {}) if isinstance(pipeline_latency, dict) else {}
+        signal = totals.get("signal_to_quote_ms", {}) if isinstance(totals, dict) else {}
+        intent = totals.get("intent_to_quote_ms", {}) if isinstance(totals, dict) else {}
+        quote_submit = totals.get("quote_to_submit_ms", {}) if isinstance(totals, dict) else {}
+        quote_to_submit_p50 = int(quote_submit.get("p50_ms", 0) or calibration.get("quote_to_submit_p50_ms", 0) or 0) if isinstance(quote_submit, dict) else int(calibration.get("quote_to_submit_p50_ms", 0) or 0)
+        quote_to_submit_p90 = int(quote_submit.get("p90_ms", 0) or calibration.get("quote_to_submit_p90_ms", 0) or 0) if isinstance(quote_submit, dict) else int(calibration.get("quote_to_submit_p90_ms", 0) or 0)
+        signal_p90 = int(signal.get("p90_ms", 0) or 0) if isinstance(signal, dict) else 0
+        quote_submit_samples = int(quote_submit.get("samples", 0) or calibration.get("samples", 0) or 0) if isinstance(quote_submit, dict) else int(calibration.get("samples", 0) or 0)
+        issues: list[str] = []
+        if int(pipeline_latency.get("samples", 0) or 0) == 0:
+            issues.append("No linked source-to-quote latency samples yet")
+        if quote_submit_samples == 0:
+            issues.append("No quote-to-submit timing samples yet")
+        if signal_p90 and signal_p90 > 1500:
+            issues.append("Signal-to-quote p90 is above 1500ms")
+        if quote_to_submit_p90 and quote_to_submit_p90 > 2500:
+            issues.append("Quote-to-submit p90 is above 2500ms")
+        if issues:
+            status = "needs_samples" if any("No " in issue for issue in issues) else "slow"
+        elif signal_p90 <= 750 and quote_to_submit_p90 <= 1000:
+            status = "fast"
+        else:
+            status = "watch"
+        return {
+            "status": status,
+            "samples": int(pipeline_latency.get("samples", 0) or 0),
+            "signal_to_quote_p50_ms": int(signal.get("p50_ms", 0) or 0) if isinstance(signal, dict) else 0,
+            "signal_to_quote_p90_ms": signal_p90,
+            "intent_to_quote_p50_ms": int(intent.get("p50_ms", 0) or 0) if isinstance(intent, dict) else 0,
+            "intent_to_quote_p90_ms": int(intent.get("p90_ms", 0) or 0) if isinstance(intent, dict) else 0,
+            "quote_to_submit_p50_ms": quote_to_submit_p50,
+            "quote_to_submit_p90_ms": quote_to_submit_p90,
+            "quote_to_submit_samples": quote_submit_samples,
+            "issues": issues,
+            "operator_action": "Collect linked source, decision, intent, quote, and submit evidence until the latency summary is fast or watch.",
+        }
+
+    def _quote_issue_taxonomy(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+        categories: dict[str, dict[str, object]] = {}
+        recent: list[dict[str, object]] = []
+        stale_count = 0
+        blocked_count = 0
+        failed_count = 0
+        for audit in audits:
+            quote = audit.quote if isinstance(audit.quote, dict) else {}
+            status = str(audit.status or quote.get("status") or "")
+            quote_error = str(quote.get("error") or "").strip()
+            reasons = [str(error).strip() for error in audit.errors if str(error).strip()]
+            if quote_error:
+                reasons.append(quote_error)
+            if audit.last_recovery_error:
+                reasons.append(audit.last_recovery_error)
+            reasons = list(dict.fromkeys(reasons))
+            is_stale = status == "stale" or bool(quote.get("stale"))
+            is_blocked = status == "blocked" or str(quote.get("status", "")) == "blocked"
+            is_failed = status in {"failed", "needs_review"} or bool(
+                quote_error
+                and not is_stale
+                and not is_blocked
+                and status not in {"ready", "simulated", "simulation_warning", "submitted", "confirmed", "reconciled"}
+            )
+            if not (is_stale or is_blocked or is_failed):
+                continue
+            if is_stale:
+                stale_count += 1
+            if is_blocked:
+                blocked_count += 1
+            if is_failed:
+                failed_count += 1
+            if not reasons:
+                if is_stale:
+                    reasons = ["quote expired before signing or submit"]
+                elif is_blocked:
+                    reasons = ["quote blocked without a recorded reason"]
+                else:
+                    reasons = ["quote failed without a recorded reason"]
+            category = self._quote_issue_category(reasons[0], audit, is_stale=is_stale, is_blocked=is_blocked, is_failed=is_failed)
+            bucket = categories.setdefault(
+                category,
+                {
+                    "category": category,
+                    "count": 0,
+                    "latest_at": "",
+                    "reasons": [],
+                    "audit_ids": [],
+                },
+            )
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["latest_at"] = max(str(bucket["latest_at"]), audit.created_at.isoformat())
+            bucket["reasons"] = list(dict.fromkeys([*bucket["reasons"], *reasons]))[:5]
+            bucket["audit_ids"] = list(dict.fromkeys([*bucket["audit_ids"], audit.id]))[:10]
+            recent.append(
+                {
+                    "audit_id": audit.id,
+                    "mint": audit.mint,
+                    "status": status or "unknown",
+                    "category": category,
+                    "reason": reasons[0],
+                    "created_at": audit.created_at.isoformat(),
+                }
+            )
+        sorted_categories = sorted(categories.values(), key=lambda item: (-int(item["count"]), str(item["category"])))
+        recent.sort(key=lambda item: str(item["created_at"]), reverse=True)
+        return {
+            "total_issues": len(recent),
+            "stale_count": stale_count,
+            "blocked_count": blocked_count,
+            "failed_count": failed_count,
+            "categories": sorted_categories,
+            "recent": recent[:10],
+            "operator_action": "Review the top quote issue category before raising caps, slippage, priority fees, or signer automation.",
+        }
+
+    def _execution_failure_stage_taxonomy(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+        stage_order = ["quote", "simulation", "submit", "confirmation", "reconciliation"]
+        stages: dict[str, dict[str, object]] = {
+            stage: {"stage": stage, "count": 0, "latest_at": "", "categories": {}, "audit_ids": [], "reasons": []}
+            for stage in stage_order
+        }
+        recent: list[dict[str, object]] = []
+        for audit in audits:
+            stage, reason = self._execution_failure_stage(audit)
+            if not stage:
+                continue
+            category = self._execution_stage_failure_category(stage, reason, audit)
+            bucket = stages[stage]
+            bucket["count"] = int(bucket["count"]) + 1
+            bucket["latest_at"] = max(str(bucket["latest_at"]), audit.created_at.isoformat())
+            bucket["audit_ids"] = list(dict.fromkeys([*bucket["audit_ids"], audit.id]))[:10]
+            bucket["reasons"] = list(dict.fromkeys([*bucket["reasons"], reason]))[:5]
+            categories = bucket["categories"] if isinstance(bucket["categories"], dict) else {}
+            categories[category] = int(categories.get(category, 0)) + 1
+            bucket["categories"] = categories
+            recent.append(
+                {
+                    "audit_id": audit.id,
+                    "mint": audit.mint,
+                    "action": audit.action,
+                    "stage": stage,
+                    "category": category,
+                    "reason": reason,
+                    "status": audit.final_status or audit.status,
+                    "created_at": audit.created_at.isoformat(),
+                }
+            )
+
+        rows: list[dict[str, object]] = []
+        for stage in stage_order:
+            row = stages[stage]
+            categories = row["categories"] if isinstance(row["categories"], dict) else {}
+            rows.append(
+                {
+                    **row,
+                    "categories": [
+                        {"category": category, "count": count}
+                        for category, count in sorted(categories.items(), key=lambda item: (-int(item[1]), item[0]))
+                    ],
+                }
+            )
+        total = sum(int(row["count"]) for row in rows)
+        recent.sort(key=lambda item: str(item["created_at"]), reverse=True)
+        top_stage = next((row for row in rows if int(row["count"]) > 0), None)
+        return {
+            "total_failures": total,
+            "stages": rows,
+            "recent": recent[:10],
+            "operator_action": (
+                f"Start with the {str(top_stage['stage']).replace('_', ' ')} stage before changing execution policy."
+                if top_stage
+                else "No stage-level execution failures are recorded in recent audits."
+            ),
+        }
+
+    def _execution_failure_stage(self, audit: LiveExecutionAudit) -> tuple[str, str]:
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        simulation = audit.simulation if isinstance(audit.simulation, dict) else {}
+        timing = self._audit_execution_timing(audit)
+        reasons = [str(error).strip() for error in audit.errors if str(error).strip()]
+        quote_error = str(quote.get("error") or "").strip()
+        if quote_error:
+            reasons.append(quote_error)
+        if audit.last_recovery_error:
+            reasons.append(audit.last_recovery_error)
+        reason = next((item for item in reasons if item), "")
+        status = str(audit.final_status or audit.status or quote.get("status") or "").lower()
+        quote_status = str(quote.get("status") or "").lower()
+        simulation_status = str(simulation.get("status") or "").lower()
+        simulation_error = str(simulation.get("error") or simulation.get("warning") or "").strip()
+
+        if status == "stale" or bool(quote.get("stale")):
+            return "quote", reason or "quote expired before signing or submit"
+        if status == "blocked" or quote_status == "blocked":
+            return "quote", reason or "quote blocked before transaction preparation"
+        if quote_error and status not in {"ready", "simulated", "simulation_warning", "submitted", "confirmed", "reconciled"}:
+            return "quote", quote_error
+        if simulation and (simulation_status in {"warning", "error"} or simulation_error):
+            return "simulation", simulation_error or reason or "simulation returned warning or error"
+        if status == "failed" and not audit.transaction_signature:
+            return "submit", reason or "transaction submit failed before signature was recorded"
+        if status in {"failed", "needs_review"} and audit.transaction_signature and not timing.get("confirmed_at"):
+            return "confirmation", reason or "submitted transaction could not be confirmed"
+        if audit.reconciliation_status == "needs_review" or (status in {"failed", "needs_review"} and timing.get("confirmed_at")):
+            return "reconciliation", reason or "confirmed transaction needs ledger reconciliation review"
+        return "", ""
+
+    def _execution_stage_failure_category(self, stage: str, reason: str, audit: LiveExecutionAudit) -> str:
+        text = " ".join([stage, reason, audit.status, audit.final_status, audit.reconciliation_status]).lower()
+        if "stale" in text or "expired" in text:
+            return "stale_or_expired"
+        if "slippage" in text:
+            return "slippage"
+        if "priority fee" in text or "priority_fee" in text:
+            return "priority_fee"
+        if any(term in text for term in ("cap", "daily loss", "wallet exposure", "open position", "max trade", "amount exceeds")):
+            return "cap_or_policy"
+        if any(term in text for term in ("signer", "wallet", "session acknowledgement", "backend", "unattended")):
+            return "signer_or_wallet"
+        if "source" in text:
+            return "source_trust"
+        if any(term in text for term in ("rpc", "provider", "pumpportal", "http", "timeout")):
+            return "provider_or_rpc"
+        if stage == "simulation":
+            return "simulation_warning"
+        if stage == "confirmation":
+            return "confirmation_unknown"
+        if stage == "reconciliation":
+            return "ledger_reconciliation"
+        return "unknown"
+
+    def _quote_issue_category(self, reason: str, audit: LiveExecutionAudit, *, is_stale: bool, is_blocked: bool, is_failed: bool) -> str:
+        text = " ".join(
+            [
+                reason,
+                audit.status,
+                str(audit.quote.get("status", "")) if isinstance(audit.quote, dict) else "",
+            ]
+        ).lower()
+        if is_stale or "stale" in text or "expired" in text:
+            return "stale_quote"
+        if "slippage" in text:
+            return "slippage_policy"
+        if "priority fee" in text or "priority_fee" in text:
+            return "priority_fee_policy"
+        if any(term in text for term in ("amount exceeds", "cap", "daily loss", "wallet exposure", "open position", "max trade")):
+            return "cap_policy"
+        if any(term in text for term in ("signer", "wallet", "session acknowledgement", "live_trading_enabled", "live trading enabled", "unattended", "backend")):
+            return "signer_or_live_gate"
+        if "source trust" in text or "source health" in text:
+            return "source_trust"
+        if any(term in text for term in ("pumpportal", "provider", "rpc", "http", "transaction")):
+            return "provider_or_rpc"
+        if "simulation" in text:
+            return "simulation"
+        if is_blocked:
+            return "blocked_quote"
+        if is_failed:
+            return "failed_quote"
+        return "unknown"
+
+    def _execution_pipeline_latency(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+        tokens = self.storage.load_all_tokens(5000)
+        tokens_by_mint: dict[str, list[TokenSignal]] = {}
+        tokens_by_id = {token.id: token for token in tokens}
+        for token in tokens:
+            tokens_by_mint.setdefault(token.mint, []).append(token)
+        source_events = self.storage.load_source_events(5000)
+        source_by_mint: dict[str, list[SourceEvent]] = {}
+        for event in source_events:
+            mint = self._source_event_mint(event)
+            if mint:
+                source_by_mint.setdefault(mint, []).append(event)
+            if event.normalized_token_id and event.normalized_token_id in tokens_by_id:
+                source_by_mint.setdefault(tokens_by_id[event.normalized_token_id].mint, []).append(event)
+        decisions_by_mint: dict[str, list[StrategyDecisionRecord]] = {}
+        for decision in self.storage.load_strategy_decisions(5000):
+            decisions_by_mint.setdefault(decision.mint, []).append(decision)
+        intents_by_id = {intent.id: intent for intent in self.storage.load_live_intents(5000)}
+
+        stages: dict[str, list[int]] = {
+            "source_to_token_ms": [],
+            "token_to_decision_ms": [],
+            "decision_to_intent_ms": [],
+            "intent_to_quote_ms": [],
+            "quote_to_submit_ms": [],
+            "submit_to_confirm_ms": [],
+            "confirm_to_reconcile_ms": [],
+            "signal_to_quote_ms": [],
+            "signal_to_confirm_ms": [],
+        }
+        samples: list[dict[str, object]] = []
+        for audit in audits:
+            quote_at = self._parse_iso_datetime(str(audit.quote.get("created_at") or "")) if isinstance(audit.quote, dict) else None
+            quote_at = quote_at or audit.created_at
+            intent = intents_by_id.get(audit.intent_id)
+            intent_at = intent.created_at if intent else self._parse_iso_datetime(str((audit.request or {}).get("created_at") or "")) if isinstance(audit.request, dict) else None
+            token = self._nearest_token_for_audit(audit, tokens_by_mint.get(audit.mint, []), quote_at)
+            source_event = self._nearest_source_event_for_audit(source_by_mint.get(audit.mint, []), token, quote_at)
+            decision = self._nearest_decision_for_audit(decisions_by_mint.get(audit.mint, []), quote_at)
+            timing = self._audit_execution_timing(audit)
+            submitted_at = self._parse_iso_datetime(str(timing.get("submitted_at") or ""))
+            confirmed_at = self._parse_iso_datetime(str(timing.get("confirmed_at") or ""))
+            reconciled_at = audit.updated_at if audit.reconciliation_status == "matched" else None
+            stage_values = {
+                "source_to_token_ms": self._stage_ms(source_event.received_at if source_event else None, token.detected_at if token else None),
+                "token_to_decision_ms": self._stage_ms(token.detected_at if token else None, decision.created_at if decision else None),
+                "decision_to_intent_ms": self._stage_ms(decision.created_at if decision else None, intent_at),
+                "intent_to_quote_ms": self._stage_ms(intent_at, quote_at),
+                "quote_to_submit_ms": self._stage_ms(quote_at, submitted_at),
+                "submit_to_confirm_ms": self._stage_ms(submitted_at, confirmed_at),
+                "confirm_to_reconcile_ms": self._stage_ms(confirmed_at, reconciled_at),
+                "signal_to_quote_ms": self._stage_ms(source_event.received_at if source_event else token.detected_at if token else None, quote_at),
+                "signal_to_confirm_ms": self._stage_ms(source_event.received_at if source_event else token.detected_at if token else None, confirmed_at),
+            }
+            for stage, value in stage_values.items():
+                if isinstance(value, int):
+                    stages[stage].append(value)
+            if any(isinstance(value, int) for value in stage_values.values()):
+                samples.append(
+                    {
+                        "audit_id": audit.id,
+                        "mint": audit.mint,
+                        "action": audit.action,
+                        "status": audit.final_status or audit.status,
+                        "quoted_at": quote_at.isoformat(),
+                        "source_event_id": source_event.id if source_event else "",
+                        "token_id": token.id if token else "",
+                        "decision_id": decision.id if decision else "",
+                        "intent_id": audit.intent_id,
+                        "stages": stage_values,
+                    }
+                )
+        return {
+            "samples": len(samples),
+            "totals": {stage: self._latency_stage_summary(values) for stage, values in stages.items()},
+            "recent_samples": samples[:10],
+            "missing_evidence": {
+                "source_events": len([sample for sample in samples if not sample.get("source_event_id")]),
+                "tokens": len([sample for sample in samples if not sample.get("token_id")]),
+                "decisions": len([sample for sample in samples if not sample.get("decision_id")]),
+                "intents": len([sample for sample in samples if not sample.get("intent_id")]),
+            },
+        }
+
+    def _nearest_token_for_audit(self, audit: LiveExecutionAudit, candidates: list[TokenSignal], at: datetime) -> TokenSignal | None:
+        prior = [token for token in candidates if token.detected_at <= at]
+        if prior:
+            return max(prior, key=lambda token: token.detected_at)
+        return min(candidates, key=lambda token: abs((token.detected_at - at).total_seconds()), default=None)
+
+    def _nearest_source_event_for_audit(self, candidates: list[SourceEvent], token: TokenSignal | None, at: datetime) -> SourceEvent | None:
+        if token:
+            direct = [event for event in candidates if event.normalized_token_id == token.id]
+            if direct:
+                candidates = direct
+        prior = [event for event in candidates if event.received_at <= at]
+        if prior:
+            return max(prior, key=lambda event: event.received_at)
+        return min(candidates, key=lambda event: abs((event.received_at - at).total_seconds()), default=None)
+
+    def _nearest_decision_for_audit(self, candidates: list[StrategyDecisionRecord], at: datetime) -> StrategyDecisionRecord | None:
+        prior = [decision for decision in candidates if decision.created_at <= at]
+        if prior:
+            return max(prior, key=lambda decision: decision.created_at)
+        return min(candidates, key=lambda decision: abs((decision.created_at - at).total_seconds()), default=None)
+
+    def _stage_ms(self, start: datetime | None, end: datetime | None) -> int | None:
+        if not start or not end:
+            return None
+        return max(0, int((end - start).total_seconds() * 1000))
+
+    def _latency_stage_summary(self, values: list[int]) -> dict[str, object]:
+        return {
+            "samples": len(values),
+            "p50_ms": self._percentile_ms(values, 0.5),
+            "p90_ms": self._percentile_ms(values, 0.9),
+            "p99_ms": self._percentile_ms(values, 0.99),
+            "max_ms": max(values) if values else 0,
+        }
+
+    def _refresh_shadow_comparisons(self, audits: list[LiveExecutionAudit]) -> list[LiveExecutionAudit]:
+        for audit in audits:
+            original = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
+            if not audit.shadow_comparison:
+                audit.shadow_comparison = self._build_shadow_comparison(audit)
+            if audit.shadow_comparison:
+                audit.shadow_comparison = self._evaluate_shadow_comparison(audit)
+            updated = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
+            if updated != original:
+                audit.updated_at = utc_now()
+                self.storage.save_live_execution_audit(audit)
+        return audits
+
+    def _shadow_quote_cost_breakdown(self, audit: LiveExecutionAudit, amount_sol: float) -> dict[str, float]:
+        priority_fee = float(audit.quote.get("priority_fee_sol", 0.0) or 0.0) if isinstance(audit.quote, dict) else 0.0
+        fee_rate = float(self.settings.paper_fee_bps or 0.0) / 10000
+        entry_fee = amount_sol * fee_rate
+        exit_fee = amount_sol * fee_rate
+        impact_drag = amount_sol * (float(self.settings.paper_price_impact_pct or 0.0) / 100)
+        total_fee_drag = entry_fee + exit_fee
+        return {
+            "amount_sol": round(amount_sol, 9),
+            "entry_fee_sol": round(entry_fee, 9),
+            "exit_fee_sol": round(exit_fee, 9),
+            "paper_fee_drag_sol": round(total_fee_drag, 9),
+            "price_impact_drag_sol": round(impact_drag, 9),
+            "priority_fee_sol": round(priority_fee, 9),
+            "slippage_pct": round(float(audit.quote.get("slippage_pct", 0.0) or 0.0), 4) if isinstance(audit.quote, dict) else 0.0,
+            "total_cost_sol": round(total_fee_drag + impact_drag + priority_fee, 9),
+        }
+
+    def _build_shadow_comparison(self, audit: LiveExecutionAudit) -> dict[str, object]:
+        if audit.action != "buy" or audit.status != "ready":
+            return {}
+        amount_sol = self._audit_amount_sol(audit)
+        costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
+        entry_price, entry_source, entry_at = self._shadow_price_at_or_before(audit.mint, audit.created_at)
+        comparison = {
+            "mode": "dry_run_shadow",
+            "status": "waiting_for_price",
+            "evaluation_model": "exit_rules_v1",
+            "audit_id": audit.id,
+            "intent_id": audit.intent_id,
+            "mint": audit.mint,
+            "quoted_at": audit.created_at.isoformat(),
+            "would_submit_at": audit.created_at.isoformat(),
+            "amount_sol": amount_sol,
+            "entry_price": entry_price,
+            "entry_price_source": entry_source,
+            "entry_observed_at": entry_at.isoformat() if entry_at else None,
+            "latest_price": None,
+            "latest_price_source": "",
+            "latest_observed_at": None,
+            "exit_price": None,
+            "exit_price_source": "",
+            "exit_observed_at": None,
+            "exit_reason": "",
+            "hold_duration_seconds": 0,
+            "landing_windows": [],
+            "move_pct": None,
+            "costs": costs,
+            "gross_pnl_sol": 0.0,
+            "cost_adjusted_pnl_sol": 0.0,
+            "estimated_pnl_sol": 0.0,
+            "outcome": "pending",
+            "latency_ms": self._quote_latency_ms(audit),
+            "rules": self._shadow_rule_snapshot(),
+            "reason": "Waiting for accepted price observations after the dry-run quote.",
+        }
+        if not entry_price:
+            comparison["status"] = "missing_entry_price"
+            comparison["reason"] = "No accepted entry price is available for shadow comparison."
+        return comparison
+
+    def _evaluate_shadow_comparison(self, audit: LiveExecutionAudit) -> dict[str, object]:
+        comparison = dict(audit.shadow_comparison or {})
+        if not comparison or comparison.get("mode") != "dry_run_shadow":
+            return comparison
+        entry_price = float(comparison.get("entry_price") or 0.0)
+        if entry_price <= 0:
+            return comparison
+        quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
+        observations = self._shadow_observations_after(audit.mint, quoted_at)
+        latest_price, latest_source, latest_at = self._shadow_price_from_observation(observations[-1]) if observations else (None, "", None)
+        if not latest_price or not latest_at:
+            comparison["status"] = "waiting_for_price"
+            comparison["reason"] = "Waiting for accepted price observations after the dry-run quote."
+            return comparison
+        amount_sol = float(comparison.get("amount_sol") or self._audit_amount_sol(audit))
+        exit_price, exit_source, exit_at, exit_reason, partial_realized = self._shadow_exit_from_observations(entry_price, quoted_at, observations, amount_sol)
+        if not exit_price or not exit_at:
+            exit_price, exit_source, exit_at, exit_reason = latest_price, latest_source, latest_at, "latest observed price"
+        move_pct = ((exit_price - entry_price) / max(entry_price, 0.000000001)) * 100
+        costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
+        gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
+        estimated_pnl = round(gross_pnl - float(costs["total_cost_sol"]), 6)
+        comparison.update(
+            {
+                "status": "evaluated",
+                "latest_price": latest_price,
+                "latest_price_source": latest_source,
+                "latest_observed_at": latest_at.isoformat(),
+                "exit_price": exit_price,
+                "exit_price_source": exit_source,
+                "exit_observed_at": exit_at.isoformat(),
+                "exit_reason": exit_reason,
+                "hold_duration_seconds": max(0, int((exit_at - quoted_at).total_seconds())),
+                "move_pct": round(move_pct, 3),
+                "costs": costs,
+                "gross_pnl_sol": gross_pnl,
+                "cost_adjusted_pnl_sol": estimated_pnl,
+                "estimated_pnl_sol": estimated_pnl,
+                "outcome": self._classify_pnl(estimated_pnl),
+                "landing_windows": self._shadow_landing_windows(audit, entry_price, quoted_at),
+                "reason": "Shadow outcome estimated from accepted price observations and configured exit rules; no transaction was submitted.",
+            }
+        )
+        return comparison
+
+    def _shadow_landing_windows(self, audit: LiveExecutionAudit, immediate_entry_price: float, quoted_at: datetime) -> list[dict[str, object]]:
+        windows = []
+        for delay_ms in self._shadow_delay_windows_ms():
+            landing_at = quoted_at + timedelta(milliseconds=delay_ms)
+            windows.append(self._shadow_landing_window(audit, immediate_entry_price, quoted_at, landing_at, delay_ms))
+        return windows
+
+    def _shadow_delay_windows_ms(self) -> list[int]:
+        calibration = self._live_landing_calibration(self.storage.load_live_execution_audits(200))
+        calibrated = calibration.get("suggested_delay_windows_ms", []) if isinstance(calibration, dict) else []
+        return sorted({0, 250, 500, 1000, 2000, *[int(value) for value in calibrated if int(value) >= 0]})
+
+    def _live_landing_calibration(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+        quote_to_submit: list[int] = []
+        submit_to_confirm: list[int] = []
+        quote_to_confirm: list[int] = []
+        by_signer: dict[str, dict[str, list[int]]] = {}
+        by_pool: dict[str, dict[str, list[int]]] = {}
+        by_quote_source: dict[str, dict[str, list[int]]] = {}
+        for audit in audits:
+            timing = self._audit_execution_timing(audit)
+            buckets = [
+                by_signer.setdefault(str(audit.signer_mode or "unknown"), self._empty_timing_group()),
+                by_pool.setdefault(self._audit_quote_pool(audit), self._empty_timing_group()),
+                by_quote_source.setdefault(self._audit_quote_source(audit), self._empty_timing_group()),
+            ]
+            qts = timing.get("quote_to_submit_ms")
+            stc = timing.get("submit_to_confirm_ms")
+            qtc = timing.get("quote_to_confirm_ms")
+            if isinstance(qts, int) and qts >= 0:
+                quote_to_submit.append(qts)
+                for bucket in buckets:
+                    bucket["quote_to_submit"].append(qts)
+            if isinstance(stc, int) and stc >= 0:
+                submit_to_confirm.append(stc)
+                for bucket in buckets:
+                    bucket["submit_to_confirm"].append(stc)
+            if isinstance(qtc, int) and qtc >= 0:
+                quote_to_confirm.append(qtc)
+                for bucket in buckets:
+                    bucket["quote_to_confirm"].append(qtc)
+        p50_submit = self._percentile_ms(quote_to_submit, 0.5)
+        p90_submit = self._percentile_ms(quote_to_submit, 0.9)
+        p99_submit = self._percentile_ms(quote_to_submit, 0.99)
+        p50_confirm = self._percentile_ms(submit_to_confirm, 0.5)
+        p90_confirm = self._percentile_ms(submit_to_confirm, 0.9)
+        p99_confirm = self._percentile_ms(submit_to_confirm, 0.99)
+        suggested = sorted({0, 250, 500, 1000, 2000, *[value for value in (p50_submit, p90_submit) if value > 0]})
+        return {
+            "samples": len(quote_to_submit),
+            "quote_to_submit_p50_ms": p50_submit,
+            "quote_to_submit_p90_ms": p90_submit,
+            "quote_to_submit_p99_ms": p99_submit,
+            "submit_to_confirm_p50_ms": p50_confirm,
+            "submit_to_confirm_p90_ms": p90_confirm,
+            "submit_to_confirm_p99_ms": p99_confirm,
+            "quote_to_confirm_p50_ms": self._percentile_ms(quote_to_confirm, 0.5),
+            "quote_to_confirm_p90_ms": self._percentile_ms(quote_to_confirm, 0.9),
+            "quote_to_confirm_p99_ms": self._percentile_ms(quote_to_confirm, 0.99),
+            "by_signer_mode": {
+                signer_mode: self._timing_group_summary(groups)
+                for signer_mode, groups in sorted(by_signer.items())
+                if groups["quote_to_submit"] or groups["submit_to_confirm"] or groups["quote_to_confirm"]
+            },
+            "by_pool": {
+                pool: self._timing_group_summary(groups)
+                for pool, groups in sorted(by_pool.items())
+                if groups["quote_to_submit"] or groups["submit_to_confirm"] or groups["quote_to_confirm"]
+            },
+            "by_quote_source": {
+                source: self._timing_group_summary(groups)
+                for source, groups in sorted(by_quote_source.items())
+                if groups["quote_to_submit"] or groups["submit_to_confirm"] or groups["quote_to_confirm"]
+            },
+            "suggested_delay_windows_ms": suggested,
+            "source": "live_audits" if quote_to_submit else "fixed_defaults",
+        }
+
+    def _empty_timing_group(self) -> dict[str, list[int]]:
+        return {"quote_to_submit": [], "submit_to_confirm": [], "quote_to_confirm": []}
+
+    def _timing_group_summary(self, groups: dict[str, list[int]]) -> dict[str, object]:
+        quote_to_submit = groups.get("quote_to_submit", [])
+        submit_to_confirm = groups.get("submit_to_confirm", [])
+        quote_to_confirm = groups.get("quote_to_confirm", [])
+        return {
+            "samples": len(quote_to_submit),
+            "quote_to_submit_p50_ms": self._percentile_ms(quote_to_submit, 0.5),
+            "quote_to_submit_p90_ms": self._percentile_ms(quote_to_submit, 0.9),
+            "quote_to_submit_p99_ms": self._percentile_ms(quote_to_submit, 0.99),
+            "submit_to_confirm_p50_ms": self._percentile_ms(submit_to_confirm, 0.5),
+            "submit_to_confirm_p90_ms": self._percentile_ms(submit_to_confirm, 0.9),
+            "submit_to_confirm_p99_ms": self._percentile_ms(submit_to_confirm, 0.99),
+            "quote_to_confirm_p50_ms": self._percentile_ms(quote_to_confirm, 0.5),
+            "quote_to_confirm_p90_ms": self._percentile_ms(quote_to_confirm, 0.9),
+            "quote_to_confirm_p99_ms": self._percentile_ms(quote_to_confirm, 0.99),
+        }
+
+    def _audit_quote_pool(self, audit: LiveExecutionAudit) -> str:
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        pool = str(quote.get("pool") or "").strip()
+        return pool or "unknown"
+
+    def _audit_quote_source(self, audit: LiveExecutionAudit) -> str:
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        provider = str(quote.get("provider") or quote.get("source") or "").strip()
+        if provider:
+            return provider
+        provider_request = quote.get("provider_request")
+        if isinstance(provider_request, dict) and provider_request:
+            return "pumpportal_local"
+        return "unknown"
+
+    def _audit_execution_timing(self, audit: LiveExecutionAudit) -> dict[str, object]:
+        timing = dict(audit.execution_timing or {})
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        quote_at = self._parse_iso_datetime(str(quote.get("created_at") or "")) or audit.created_at
+        submitted_at = self._parse_iso_datetime(str(timing.get("submitted_at") or ""))
+        confirmed_at = self._parse_iso_datetime(str(timing.get("confirmed_at") or ""))
+        if not submitted_at and audit.transaction_signature and audit.status in {"submitted", "confirmed", "reconciled", "needs_review", "failed"}:
+            submitted_at = audit.updated_at
+        if not confirmed_at and audit.confirmation_checked_at and audit.confirmation_status in {"confirmed", "finalized"}:
+            confirmed_at = audit.confirmation_checked_at
+        if submitted_at:
+            timing["submitted_at"] = submitted_at.isoformat()
+            if "quote_to_submit_ms" not in timing:
+                timing["quote_to_submit_ms"] = max(0, int((submitted_at - quote_at).total_seconds() * 1000))
+        if confirmed_at:
+            timing["confirmed_at"] = confirmed_at.isoformat()
+            if "quote_to_confirm_ms" not in timing:
+                timing["quote_to_confirm_ms"] = max(0, int((confirmed_at - quote_at).total_seconds() * 1000))
+            if submitted_at and "submit_to_confirm_ms" not in timing:
+                timing["submit_to_confirm_ms"] = max(0, int((confirmed_at - submitted_at).total_seconds() * 1000))
+        return timing
+
+    def _percentile_ms(self, values: list[int], percentile: float) -> int:
+        if not values:
+            return 0
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * percentile))))
+        return int(ordered[index])
+
+    def _shadow_landing_window(
+        self,
+        audit: LiveExecutionAudit,
+        immediate_entry_price: float,
+        quoted_at: datetime,
+        landing_at: datetime,
+        delay_ms: int,
+    ) -> dict[str, object]:
+        quote_expires_at = self._parse_iso_datetime(str(audit.quote.get("expires_at") or "")) if isinstance(audit.quote, dict) else None
+        window = {
+            "delay_ms": delay_ms,
+            "landing_at": landing_at.isoformat(),
+            "status": "waiting_for_fill",
+            "entry_price": None,
+            "entry_price_source": "",
+            "entry_observed_at": None,
+            "exit_price": None,
+            "exit_price_source": "",
+            "exit_observed_at": None,
+            "exit_reason": "",
+            "hold_duration_seconds": 0,
+            "move_pct": None,
+            "costs": self._shadow_quote_cost_breakdown(audit, self._audit_amount_sol(audit)),
+            "gross_pnl_sol": 0.0,
+            "cost_adjusted_pnl_sol": 0.0,
+            "estimated_pnl_sol": 0.0,
+            "outcome": "pending",
+            "fill_status": "pending",
+            "reason": "Waiting for accepted price observations at or after landing delay.",
+        }
+        if quote_expires_at and landing_at >= quote_expires_at:
+            window.update({"status": "stale_quote", "fill_status": "missed", "outcome": "missed", "reason": "Landing delay is beyond quote expiry."})
+            return window
+        observations = self._shadow_observations_after(audit.mint, landing_at - timedelta(microseconds=1))
+        if delay_ms == 0:
+            entry_price = immediate_entry_price
+            entry_source = "immediate_quote_entry"
+            entry_at = quoted_at
+            path = self._shadow_observations_after(audit.mint, quoted_at)
+        elif observations:
+            entry = observations[0]
+            entry_price = float(entry.price or 0.0)
+            entry_source = entry.price_source
+            entry_at = entry.observed_at
+            path = [item for item in observations if item.observed_at > entry_at]
+        else:
+            window.update({"status": "missed_fill", "fill_status": "missed", "outcome": "missed", "reason": "No accepted price observation was available at or after the landing delay."})
+            return window
+        if entry_price <= 0:
+            window.update({"status": "missed_fill", "fill_status": "missed", "outcome": "missed", "reason": "Landing price was unavailable or invalid."})
+            return window
+        amount_sol = self._audit_amount_sol(audit)
+        exit_price, exit_source, exit_at, exit_reason, partial_realized = self._shadow_exit_from_observations(entry_price, entry_at, path, amount_sol)
+        if not exit_price or not exit_at:
+            latest_price, latest_source, latest_at = self._shadow_price_from_observation(path[-1]) if path else (entry_price, entry_source, entry_at)
+            exit_price, exit_source, exit_at, exit_reason = latest_price, latest_source, latest_at, "latest observed price"
+        move_pct = ((float(exit_price) - entry_price) / max(entry_price, 0.000000001)) * 100
+        costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
+        gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
+        estimated_pnl = round(gross_pnl - float(costs["total_cost_sol"]), 6)
+        window.update(
+            {
+                "status": "evaluated",
+                "fill_status": "filled",
+                "entry_price": entry_price,
+                "entry_price_source": entry_source,
+                "entry_observed_at": entry_at.isoformat(),
+                "exit_price": exit_price,
+                "exit_price_source": exit_source,
+                "exit_observed_at": exit_at.isoformat(),
+                "exit_reason": exit_reason,
+                "hold_duration_seconds": max(0, int((exit_at - entry_at).total_seconds())),
+                "move_pct": round(move_pct, 3),
+                "costs": costs,
+                "gross_pnl_sol": gross_pnl,
+                "cost_adjusted_pnl_sol": estimated_pnl,
+                "estimated_pnl_sol": estimated_pnl,
+                "outcome": self._classify_pnl(estimated_pnl),
+                "reason": "Delayed landing window evaluated with configured exit rules.",
+            }
+        )
+        return window
+
+    def _shadow_rule_snapshot(self) -> dict[str, object]:
+        return {
+            "take_profit_pct": self.settings.take_profit_pct,
+            "stop_loss_pct": self.settings.stop_loss_pct,
+            "minimum_hold_time_seconds": self.settings.minimum_hold_time_seconds,
+            "max_hold_time_seconds": self.settings.max_hold_time_seconds,
+            "max_position_ticks": self.settings.max_position_ticks,
+            "trailing_stop_enabled": self.settings.trailing_stop_enabled,
+            "trailing_stop_pct": self.settings.trailing_stop_pct,
+            "break_even_stop_enabled": self.settings.break_even_stop_enabled,
+            "break_even_after_profit_pct": self.settings.break_even_after_profit_pct,
+            "stalled_trade_exit_enabled": self.settings.stalled_trade_exit_enabled,
+            "stalled_trade_seconds": self.settings.stalled_trade_seconds,
+            "stalled_trade_min_move_pct": self.settings.stalled_trade_min_move_pct,
+            "partial_take_profit_enabled": self.settings.partial_take_profit_enabled,
+            "partial_take_profit_pct": self.settings.partial_take_profit_pct,
+            "partial_take_profit_fraction": self.settings.partial_take_profit_fraction,
+        }
+
+    def _shadow_exit_from_observations(
+        self,
+        entry_price: float,
+        quoted_at: datetime,
+        observations: list[PriceObservation],
+        amount_sol: float,
+    ) -> tuple[float | None, str, datetime | None, str, float]:
+        highest_move = 0.0
+        partial_realized = 0.0
+        partial_taken = False
+        ticks = 0
+        latest: PriceObservation | None = None
+        for observation in observations:
+            latest = observation
+            ticks += 1
+            price = float(observation.price or 0.0)
+            if price <= 0:
+                continue
+            move_pct = ((price - entry_price) / max(entry_price, 0.000000001)) * 100
+            highest_move = max(highest_move, move_pct)
+            hold_seconds = max(0, int((observation.observed_at - quoted_at).total_seconds()))
+            if self.settings.partial_take_profit_enabled and not partial_taken and move_pct >= self.settings.partial_take_profit_pct:
+                fraction = max(0.0, min(1.0, self.settings.partial_take_profit_fraction))
+                partial_realized = round(amount_sol * (move_pct / 100) * fraction, 6)
+                partial_taken = True
+            if hold_seconds < self.settings.minimum_hold_time_seconds:
+                continue
+            reason = ""
+            if move_pct >= self.settings.take_profit_pct:
+                reason = "take profit"
+            elif self.settings.trailing_stop_enabled and highest_move >= self.settings.partial_take_profit_pct and move_pct <= highest_move - self.settings.trailing_stop_pct:
+                reason = "trailing stop"
+            elif self.settings.break_even_stop_enabled and highest_move >= self.settings.break_even_after_profit_pct and move_pct <= 0:
+                reason = "break-even stop"
+            elif self.settings.stalled_trade_exit_enabled and hold_seconds >= self.settings.stalled_trade_seconds and abs(move_pct) <= self.settings.stalled_trade_min_move_pct:
+                reason = "stalled trade"
+            elif move_pct <= -abs(self.settings.stop_loss_pct):
+                reason = "stop loss"
+            elif hold_seconds >= self.settings.max_hold_time_seconds:
+                reason = "max hold time"
+            elif ticks >= self.settings.max_position_ticks:
+                reason = "max position ticks"
+            if reason:
+                return price, observation.price_source, observation.observed_at, reason, partial_realized
+        if latest:
+            return float(latest.price or 0.0), latest.price_source, latest.observed_at, "latest observed price", partial_realized
+        return None, "", None, "", partial_realized
+
+    def _audit_amount_sol(self, audit: LiveExecutionAudit) -> float:
+        try:
+            if audit.action == "buy" and not str(audit.amount).endswith("%"):
+                return max(0.0, float(audit.amount))
+        except ValueError:
+            return 0.0
+        return 0.0
+
+    def _quote_latency_ms(self, audit: LiveExecutionAudit) -> int:
+        request = audit.request if isinstance(audit.request, dict) else {}
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        requested_at = self._parse_iso_datetime(str(request.get("created_at") or ""))
+        quoted_at = self._parse_iso_datetime(str(quote.get("created_at") or "")) or audit.created_at
+        if not requested_at:
+            return 0
+        return max(0, int((quoted_at - requested_at).total_seconds() * 1000))
+
+    def _shadow_price_at_or_before(self, mint: str, at: datetime) -> tuple[float | None, str, datetime | None]:
+        observations = [item for item in self.storage.load_price_observations(1000, mint=mint) if item.accepted and item.price and item.observed_at <= at]
+        if observations:
+            latest = observations[-1]
+            return float(latest.price or 0.0), latest.price_source, latest.observed_at
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
+        if token and token.current_price:
+            return float(token.current_price), "token_current_price", token.detected_at
+        return None, "", None
+
+    def _shadow_price_after(self, mint: str, at: datetime) -> tuple[float | None, str, datetime | None]:
+        observations = self._shadow_observations_after(mint, at)
+        if not observations:
+            return None, "", None
+        return self._shadow_price_from_observation(observations[-1])
+
+    def _shadow_observations_after(self, mint: str, at: datetime) -> list[PriceObservation]:
+        return [item for item in self.storage.load_price_observations(1000, mint=mint) if item.accepted and item.price and item.observed_at > at]
+
+    def _shadow_price_from_observation(self, observation: PriceObservation) -> tuple[float | None, str, datetime | None]:
+        return float(observation.price or 0.0), observation.price_source, observation.observed_at
+
+    def _parse_iso_datetime(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=utc_now().tzinfo)
+
+    def _execution_policy_blockers(self) -> list[str]:
+        blockers: list[str] = []
+        if float(self.settings.live_max_trade_sol or 0) <= 0:
+            blockers.append("live max trade cap must be set")
+        if float(self.settings.live_daily_loss_cap_sol or 0) <= 0:
+            blockers.append("live daily loss cap must be set")
+        if float(self.settings.live_wallet_exposure_cap_sol or 0) <= 0:
+            blockers.append("live wallet exposure cap must be set")
+        if int(self.settings.live_max_open_positions or 0) <= 0:
+            blockers.append("live max open positions must be set")
+        if float(self.settings.live_max_slippage_pct or 0) <= 0:
+            blockers.append("live max slippage cap must be set")
+        if float(self.settings.live_max_slippage_pct or 0) > 10:
+            blockers.append("live max slippage cap should be 10% or lower for the pilot")
+        if float(self.settings.live_priority_fee_cap_sol or 0) <= 0:
+            blockers.append("live priority fee cap must be set")
+        if float(self.settings.live_priority_fee_cap_sol or 0) > 0.001:
+            blockers.append("live priority fee cap should be 0.001 SOL or lower for the pilot")
+        if not blockers:
+            cap_intent = self._live_cap_operator_intent_status()
+            if not cap_intent["visible"]:
+                blockers.append(str(cap_intent["blocker"]))
+        return blockers
+
+    def _live_cap_operator_intent_status(self) -> dict[str, object]:
+        current_settings = asdict(self.settings)
+        cap_snapshot = {key: current_settings.get(key) for key in self.LIVE_CAP_SETTING_KEYS}
+        for version in self.storage.load_settings_versions(100):
+            cap_changed_keys = sorted(set(version.changed_keys).intersection(self.LIVE_CAP_SETTING_KEYS))
+            if not cap_changed_keys:
+                continue
+            if all(version.settings.get(key) == value for key, value in cap_snapshot.items()):
+                return {
+                    "visible": True,
+                    "settings_version_id": version.id,
+                    "recorded_at": version.created_at.isoformat(),
+                    "changed_keys": cap_changed_keys,
+                    "blocker": "",
+                    "operator_action": "Live cap settings have visible settings-version evidence.",
+                }
+        return {
+            "visible": False,
+            "settings_version_id": "",
+            "recorded_at": None,
+            "changed_keys": [],
+            "blocker": "live cap changes require visible operator intent via settings version evidence",
+            "operator_action": "Save live cap settings through the operator settings flow before a real-money pilot.",
+        }
+
+    def _execution_policy_recommendation(
+        self,
+        *,
+        stale_rate: float,
+        blocked_rate: float,
+        quote_issues: dict[str, object],
+        calibration: dict[str, object],
+        shadow_windows: list[dict[str, object]],
+        policy_blockers: list[str],
+    ) -> dict[str, object]:
+        slippage_cap = float(self.settings.live_max_slippage_pct or 0.0)
+        fee_cap = float(self.settings.live_priority_fee_cap_sol or 0.0)
+        base_slippage = min(max(slippage_cap if slippage_cap > 0 else 1.0, 0.5), 10.0)
+        base_fee = min(max(fee_cap if fee_cap > 0 else 0.00001, 0.00001), 0.001)
+        categories = {str(item.get("category")): item for item in quote_issues.get("categories", []) if isinstance(item, dict)}
+        stale_pressure = stale_rate > 0.25 or "stale_quote" in categories
+        slippage_pressure = "slippage_policy" in categories
+        provider_pressure = "provider_or_rpc" in categories
+        cap_pressure = "cap_policy" in categories
+        missed_windows = [window for window in shadow_windows if str(window.get("fill_status", "")) == "missed" or str(window.get("status", "")) in {"missed_fill", "stale_quote"}]
+        evaluated_windows = [window for window in shadow_windows if str(window.get("status", "")) == "evaluated"]
+        missed_rate = round(len(missed_windows) / max(1, len(shadow_windows)), 3) if shadow_windows else 0.0
+        quote_to_submit_p90 = int(calibration.get("quote_to_submit_p90_ms", 0) or 0)
+
+        slippage_delta = 0.0
+        if slippage_pressure:
+            slippage_delta += 0.5
+        if stale_pressure or missed_rate > 0.25:
+            slippage_delta += 0.25
+        if blocked_rate > 0.25 and not cap_pressure:
+            slippage_delta += 0.25
+        suggested_slippage = base_slippage + slippage_delta
+        if slippage_cap > 0:
+            suggested_slippage = min(suggested_slippage, slippage_cap)
+        suggested_slippage = round(min(max(suggested_slippage, 0.5), 10.0), 2)
+
+        fee_multiplier = 0.35
+        if stale_pressure:
+            fee_multiplier += 0.25
+        if provider_pressure:
+            fee_multiplier += 0.15
+        if quote_to_submit_p90 > 1500:
+            fee_multiplier += 0.15
+        if missed_rate > 0.25:
+            fee_multiplier += 0.1
+        suggested_fee = round(min(max(base_fee * fee_multiplier, 0.00001), fee_cap if fee_cap > 0 else base_fee), 9)
+
+        reasons: list[str] = []
+        if stale_pressure:
+            reasons.append("stale quote pressure suggests paying for faster landing before increasing size")
+        if slippage_pressure:
+            reasons.append("recent quotes hit slippage policy")
+        if provider_pressure:
+            reasons.append("provider/RPC quote issues are present; do not solve these with caps alone")
+        if cap_pressure:
+            reasons.append("cap-policy blocks mean the requested order exceeds configured safety limits")
+        if missed_rate > 0.25:
+            reasons.append("shadow landing windows show delayed fills missing or going stale")
+        if quote_to_submit_p90 > 1500:
+            reasons.append("quote-to-submit p90 is slow enough to justify a cautious priority-fee bump")
+        if policy_blockers:
+            reasons.append("configure live policy caps before applying dynamic suggestions")
+        status = "blocked" if policy_blockers else ("raise_priority_fee" if stale_pressure or quote_to_submit_p90 > 1500 else ("review_slippage" if slippage_pressure or missed_rate > 0.25 else "stable"))
+        return {
+            "status": status,
+            "suggested_slippage_pct": suggested_slippage,
+            "suggested_priority_fee_sol": suggested_fee,
+            "cap_room": {
+                "slippage_pct": round(max(0.0, slippage_cap - suggested_slippage), 4) if slippage_cap > 0 else 0.0,
+                "priority_fee_sol": round(max(0.0, fee_cap - suggested_fee), 9) if fee_cap > 0 else 0.0,
+            },
+            "inputs": {
+                "stale_quote_rate": stale_rate,
+                "blocked_quote_rate": blocked_rate,
+                "missed_landing_rate": missed_rate,
+                "landing_windows": len(shadow_windows),
+                "evaluated_landing_windows": len(evaluated_windows),
+                "quote_to_submit_p90_ms": quote_to_submit_p90,
+                "issue_categories": list(categories.keys()),
+            },
+            "reasons": reasons or ["recent quote policy evidence is stable"],
+            "operator_action": "Apply only within caps after reviewing quote issues and shadow landing evidence.",
+        }
+
+    def _strategy_promotion_status(
+        self,
+        closed: list[TradeRecord],
+        source_events: int,
+        replay_confidence: int,
+        source: dict[str, object],
+        price: dict[str, object],
+        performance: dict[str, object],
+        profit_factor: float,
+        out_of_sample: dict[str, object] | None = None,
+        source_soak: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        closed_count = len(closed)
+        pnl_sol = float(performance.get("pnl_sol", 0.0))
+        max_drawdown = self._max_drawdown_sol(closed)
+        out_of_sample = out_of_sample or self._out_of_sample_strategy_evidence(self.settings.strategy_profile)
+        source_soak = source_soak or self.source_soak_acceptance_report()
+        source_soak_required = bool(source_soak.get("hard_required"))
+        source_soak_ready = bool(source_soak.get("ready"))
+        validate = out_of_sample.get("validate", {}) if isinstance(out_of_sample.get("validate"), dict) else {}
+        validate_tokens = int(validate.get("tokens_replayed", 0) or 0)
+        validate_pnl = float(validate.get("estimated_pnl_sol", 0.0) or 0.0)
+        validate_profit_factor = float(validate.get("profit_factor", 0.0) or 0.0)
+        collapse = bool(out_of_sample.get("collapse_warning"))
+        gates = [
+            self._promotion_gate("closed_trades", "Closed paper trades", closed_count, ">= 30", closed_count >= 30, "Collect enough closed paper trades to reduce sample noise."),
+            self._promotion_gate("source_events", "Source event sample", source_events, ">= 100", source_events >= 100, "Collect enough source events for replay and parser confidence."),
+            self._promotion_gate("replay_confidence", "Replay confidence", replay_confidence, ">= 70", replay_confidence >= 70, "Replay confidence needs accepted price and normalized event coverage."),
+            self._promotion_gate("source_trust", "Source trust", str(source.get("trust_state", "unknown")), "trusted", source.get("trust_state") == "trusted", "Source trust must be trusted before strategy promotion."),
+            self._promotion_gate("source_soak", "Hybrid source soak", source_soak.get("status", "unknown"), "ready when direct verifier is configured", (not source_soak_required) or source_soak_ready, "Direct/PumpPortal soak must pass once the direct verifier is configured or direct events are collected."),
+            self._promotion_gate("price_acceptance", "Price acceptance", round(float(price.get("acceptance_rate", 0.0)), 3), ">= 0.70", float(price.get("acceptance_rate", 0.0)) >= 0.70, "Accepted prices should dominate rejected marks."),
+            self._promotion_gate("paper_profitability", "Paper profitability", f"{round(pnl_sol, 6)} SOL / PF {round(profit_factor, 2)}", "PnL > 0 and PF > 1.1", pnl_sol > 0 and profit_factor > 1.1, "Paper performance must be positive with profit factor above 1.1."),
+            self._promotion_gate("drawdown", "Max drawdown", round(max_drawdown, 6), "<= 0.05 SOL", max_drawdown <= 0.05, "Drawdown must fit the tiny-pilot risk envelope."),
+            self._promotion_gate("out_of_sample", "Out-of-sample replay", f"{round(validate_pnl, 6)} SOL / PF {round(validate_profit_factor, 2)} / {validate_tokens} tokens", "validate PnL > 0, PF > 1.0, >= 10 tokens", validate_tokens >= 10 and validate_pnl > 0 and validate_profit_factor > 1.0, "Validation replay must stay profitable on held-out tokens."),
+            self._promotion_gate("strategy_drift", "Strategy drift", "collapse" if collapse else "stable", "stable", not collapse, "Validation performance must not collapse versus training performance."),
+            self._promotion_gate("safety_boundary", "Safety boundary", "paper-first", "paper-first", True, "Strategy promotion cannot bypass paper-first and live-control-plane boundaries."),
+        ]
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail"]
+        can_promote = not blockers
+        return {
+            "can_promote": can_promote,
+            "status": "eligible" if can_promote else "blocked" if closed_count >= 10 or source_events >= 25 else "not_enough_data",
+            "mode": "paper_to_shadow",
+            "gates": gates,
+            "blockers": blockers,
+            "summary": "Strategy can be promoted to shadow comparison." if can_promote else "Strategy needs more evidence before promotion.",
+            "requires_operator_review": True,
+            "out_of_sample": out_of_sample,
+            "source_soak": source_soak,
+            "generated_at": utc_now().isoformat(),
+        }
+
+    def _out_of_sample_strategy_evidence(self, profile: str | None = None, limit: int | None = None) -> dict[str, object]:
+        selected_profile = profile or self.settings.strategy_profile
+        candidates = [
+            token
+            for token in self.storage.load_all_tokens(limit or self.settings.backtest_replay_limit)
+            if token.status in {TokenStatus.SKIPPED, TokenStatus.PAPER_SOLD, TokenStatus.DETECTED, TokenStatus.ANALYZING}
+        ]
+        midpoint = max(1, len(candidates) // 2)
+        settings = self._settings_for_profile(selected_profile)
+        train = self._run_backtest(candidates[:midpoint], replay_source="promotion_train", settings=settings, persist=False)
+        validate = self._run_backtest(candidates[midpoint:], replay_source="promotion_validate", settings=settings, persist=False)
+        train_profit_factor = self._effective_backtest_profit_factor(train)
+        validate_profit_factor = self._effective_backtest_profit_factor(validate)
+        collapse_warning = (
+            validate.tokens_replayed >= 10
+            and train.paper_buys > 0
+            and validate.paper_buys > 0
+            and (
+                validate.estimated_pnl_sol <= 0
+                or train.win_rate_pct - validate.win_rate_pct > 25
+                or (train_profit_factor > 1.5 and validate_profit_factor <= 1.0)
+            )
+        )
+        return {
+            "engine_version": "promotion-walk-forward-v1",
+            "profile": settings.strategy_profile,
+            "sample_size": len(candidates),
+            "split": {"train_tokens": train.tokens_replayed, "validate_tokens": validate.tokens_replayed},
+            "train": {**train.to_dict(), "profit_factor": train_profit_factor},
+            "validate": {**validate.to_dict(), "profit_factor": validate_profit_factor},
+            "collapse_warning": collapse_warning,
+            "determinism_fingerprint": self.data_integrity_report()["determinism_fingerprint"],
+        }
+
+    def _effective_backtest_profit_factor(self, run: BacktestRun) -> float:
+        if run.profit_factor > 0:
+            return float(run.profit_factor)
+        if run.wins > 0 and run.losses == 0:
+            return 99.0
+        return 0.0
+
+    def _promotion_gate(self, gate_id: str, label: str, value: object, target: object, passed: bool, reason: str) -> dict[str, object]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "status": "pass" if passed else "fail",
+            "value": value,
+            "target": target,
+            "reason": reason,
+        }
+
+    def _max_drawdown_sol(self, trades: list[TradeRecord]) -> float:
+        running = 0.0
+        peak = 0.0
+        drawdown = 0.0
+        for trade in sorted(trades, key=lambda item: item.closed_at or item.opened_at or utc_now()):
+            running = round(running + (trade.pnl_sol or 0.0), 6)
+            peak = max(peak, running)
+            drawdown = max(drawdown, peak - running)
+        return round(drawdown, 6)
 
     def readiness_halt_reason(self, readiness: dict[str, object] | None = None) -> str | None:
         if not self.settings.halt_on_low_readiness:
@@ -1505,7 +4534,7 @@ class BotState:
             transport="localhost_http",
             auth_configured=auth_configured,
         )
-        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost"}:
+        if not self._local_signer_daemon_endpoint_allowed(endpoint):
             base.disabled_reason = "Signer daemon endpoint must stay localhost-only"
             base.message = "Local signer daemon endpoint is invalid for this safety boundary."
             result = base.to_dict()
@@ -1539,14 +4568,39 @@ class BotState:
         self._cached_signer_status_at = now
         return result
 
+    def _local_signer_daemon_endpoint_allowed(self, endpoint: str) -> bool:
+        parsed = urlparse(endpoint or "http://127.0.0.1:8799")
+        return parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost"}
+
     def hot_wallet_status(self) -> dict[str, object]:
         status = self.hot_wallet.status()
-        self.settings.live_hot_wallet_enabled = bool(status["imported"])
-        self.settings.live_hot_wallet_public_key = str(status["wallet_public_key"] or "")
-        if status.get("label"):
-            self.settings.live_hot_wallet_label = str(status["label"] or "")
-        self.storage.save_settings(self.settings)
+        self._sync_hot_wallet_settings(status)
         return status
+
+    def _sync_hot_wallet_settings(self, status: dict[str, object], save: bool = True) -> None:
+        previous = (
+            self.settings.live_hot_wallet_enabled,
+            self.settings.live_hot_wallet_public_key,
+            self.settings.live_hot_wallet_label,
+            self.settings.live_active_backend_armed,
+            self.settings.live_active_wallet_public_key,
+        )
+        imported = bool(status.get("imported"))
+        self.settings.live_hot_wallet_enabled = imported
+        self.settings.live_hot_wallet_public_key = str(status.get("wallet_public_key") or "") if imported else ""
+        self.settings.live_hot_wallet_label = str(status.get("label") or "") if imported else ""
+        if not imported and self.settings.live_signer_mode == "local_hot_wallet":
+            self.settings.live_active_backend_armed = False
+            self.settings.live_active_wallet_public_key = ""
+        current = (
+            self.settings.live_hot_wallet_enabled,
+            self.settings.live_hot_wallet_public_key,
+            self.settings.live_hot_wallet_label,
+            self.settings.live_active_backend_armed,
+            self.settings.live_active_wallet_public_key,
+        )
+        if save and current != previous:
+            self.storage.save_settings(self.settings)
 
     def import_hot_wallet(self, private_key: str, password: str, label: str = "") -> dict[str, object]:
         status = self.hot_wallet.import_private_key(private_key, password, label)
@@ -1610,6 +4664,7 @@ class BotState:
             acknowledged_at=utc_now() if self.settings.live_session_acknowledged else None,
         )
         self.storage.save_live_session(session)
+        self.active_live_session_id = session.id
         self.add_event("warning", f"Live backend armed: {signer_mode} / {wallet}", subsystem="live", operator_action="Use the kill switch or disarm control to halt new autonomous entries.")
         return {"armed": True, "wallet_public_key": wallet, "signer_mode": signer_mode, "live_status": self.live_status(env_live_enabled, wallet, signer_mode)}
 
@@ -1620,6 +4675,7 @@ class BotState:
         self.settings.live_active_wallet_public_key = ""
         self.storage.save_settings(self.settings)
         self.add_event("warning", f"Live backend disarmed: {mode} / {wallet or 'no wallet'}", subsystem="live", operator_action="Protective exits can still be handled manually if needed.")
+        self.active_live_session_id = ""
         return {"armed": False, "wallet_public_key": wallet, "signer_mode": mode}
 
     def live_caps_snapshot(self) -> dict[str, object]:
@@ -1630,6 +4686,7 @@ class BotState:
             "max_open_positions": self.settings.live_max_open_positions,
             "max_slippage_pct": self.settings.live_max_slippage_pct,
             "priority_fee_cap_sol": self.settings.live_priority_fee_cap_sol,
+            "operator_intent": self._live_cap_operator_intent_status(),
         }
 
     def _resolve_backend_wallet(self, signer_mode: str, wallet_public_key: str = "") -> str:
@@ -1654,6 +4711,59 @@ class BotState:
             "open_positions": float(open_positions),
         }
 
+    def _pre_run_backup_status(self, max_age_hours: int = 24) -> dict[str, object]:
+        status = self.storage.backup_restore_status()
+        latest_backup = status.get("latest_backup") if isinstance(status, dict) else None
+        latest_restore = status.get("latest_restore") if isinstance(status, dict) else None
+        now = utc_now()
+
+        def parse_created_at(item: object) -> datetime | None:
+            if not isinstance(item, dict):
+                return None
+            value = item.get("created_at")
+            if not isinstance(value, str) or not value:
+                return None
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+
+        backup_at = parse_created_at(latest_backup)
+        restore_at = parse_created_at(latest_restore)
+        max_age_seconds = max(1, int(max_age_hours) * 3600)
+        age_seconds = int((now - backup_at).total_seconds()) if backup_at else None
+        backup_after_restore = bool(backup_at and (not restore_at or backup_at >= restore_at))
+        fresh = bool(backup_at and age_seconds is not None and age_seconds <= max_age_seconds and backup_after_restore)
+        if not backup_at:
+            state = "missing"
+            blocker = "pre-run backup artifact is required before live entries"
+            operator_action = "Create a backup artifact from the Data workspace before starting a real-money session."
+        elif not backup_after_restore:
+            state = "superseded_by_restore"
+            blocker = "pre-run backup is older than the latest restore"
+            operator_action = "Create a new backup artifact after the latest restore before live entries."
+        elif age_seconds is not None and age_seconds > max_age_seconds:
+            state = "stale"
+            blocker = f"pre-run backup is older than {max_age_hours}h"
+            operator_action = "Create a fresh backup artifact before starting this real-money session."
+        else:
+            state = "fresh"
+            blocker = ""
+            operator_action = "Pre-run backup is fresh enough for a live session."
+        return {
+            "required": True,
+            "state": state,
+            "fresh": fresh,
+            "max_age_hours": max_age_hours,
+            "age_seconds": age_seconds,
+            "latest_backup": latest_backup,
+            "latest_restore": latest_restore,
+            "backup_after_restore": backup_after_restore,
+            "blocks_live_entries": not fresh,
+            "blocker": blocker,
+            "operator_action": operator_action,
+        }
+
     def _live_execution_blockers(
         self,
         env_live_enabled: bool,
@@ -1674,6 +4784,8 @@ class BotState:
         if not self.settings.live_session_acknowledged:
             blockers.append("live session acknowledgement is required")
         for key, value in caps.items():
+            if key == "operator_intent":
+                continue
             if float(value or 0) <= 0:
                 blockers.append(f"{key} must be set")
         if not self.settings.solana_rpc_url:
@@ -1683,6 +4795,16 @@ class BotState:
 
         wallet_metrics = self._wallet_live_metrics(wallet_public_key)
         if action == "buy":
+            unresolved = [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(200)) if self._is_unresolved_live_audit(audit)]
+            if unresolved:
+                blockers.append("unresolved live audit recovery debt blocks new entries")
+            source_health = self.source_health()
+            source_blocker = self._source_live_entry_blocker(source_health)
+            if source_blocker:
+                blockers.append(source_blocker)
+            replay_halt = self.replay_confidence_halt_reason()
+            if replay_halt:
+                blockers.append(replay_halt)
             if self.settings.kill_switch_enabled:
                 blockers.append("manual kill switch enabled")
             if not signer.get("healthy"):
@@ -1698,6 +4820,13 @@ class BotState:
                 blockers.append(f"{signer_mode.replace('_', ' ')} cannot execute protective exits")
 
         if autonomous:
+            if action == "buy":
+                backup = self._pre_run_backup_status()
+                if backup.get("blocks_live_entries"):
+                    blockers.append(str(backup.get("blocker") or "pre-run backup is required before live entries"))
+            stale_balance_positions = self._stale_balance_positions(wallet_public_key)
+            if stale_balance_positions:
+                blockers.append(f"stale token-balance verification blocks autonomy for {len(stale_balance_positions)} position{'s' if len(stale_balance_positions) != 1 else ''}")
             if not self.settings.autonomous_live_enabled:
                 blockers.append("autonomous live is disabled in settings")
             if not self.settings.live_active_backend_armed:
@@ -1718,6 +4847,38 @@ class BotState:
 
         return list(dict.fromkeys(blockers))
 
+    def _source_live_entry_blocker(self, source_health: dict[str, object] | None = None) -> str:
+        source = source_health or self.source_health()
+        status = str(source.get("status") or "unknown")
+        trust_state = str(source.get("trust_state") or "unknown")
+        last_age = source.get("last_event_age_seconds")
+        if status != "connected":
+            return "source trust requires PumpPortal source connected before live entries"
+        if not isinstance(last_age, (int, float)):
+            return "source trust requires a recent PumpPortal source event before live entries"
+        if float(last_age) > float(self.settings.source_stale_seconds):
+            return f"source trust blocks live entries because the latest source event is older than {self.settings.source_stale_seconds}s"
+        if source.get("live_entry_blocked"):
+            return f"source trust {trust_state} blocks live entries"
+        return ""
+
+    def _source_archive_blocker(self, source_health: dict[str, object] | None = None) -> str:
+        source = source_health or self.source_health()
+        inspection = source.get("raw_event_inspection", {}) if isinstance(source, dict) else {}
+        source_counts = inspection.get("source_counts", {}) if isinstance(inspection, dict) else {}
+        pumpportal_events = int(source_counts.get("pumpportal", 0) or 0) if isinstance(source_counts, dict) else 0
+        if pumpportal_events <= 0:
+            return "archived PumpPortal source events are required before live entries"
+        return ""
+
+    def replay_confidence_halt_reason(self) -> str | None:
+        if not self.settings.halt_on_low_replay_confidence:
+            return None
+        replay_confidence = int(self.data_integrity_report().get("replay_confidence", {}).get("score", 0))
+        if replay_confidence < int(self.settings.min_replay_confidence):
+            return f"low replay confidence halt active ({replay_confidence} below {self.settings.min_replay_confidence})"
+        return None
+
     def _active_backend_snapshot(self) -> dict[str, object]:
         return {
             "armed": self.settings.live_active_backend_armed,
@@ -1725,15 +4886,227 @@ class BotState:
             "wallet_public_key": self.settings.live_active_wallet_public_key,
         }
 
-    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None) -> dict[str, object]:
+    def _autonomy_gate_state(
+        self,
+        action: str,
+        blockers: list[str],
+        active_backend_matches: bool,
+        unresolved_count: int,
+    ) -> dict[str, object]:
+        action_label = "entry" if action == "buy" else "protective_exit"
+        stage = "stage_4_tiny_real_money_pilot" if action == "buy" else "stage_3_protective_exit_automation"
+        return {
+            "action": action,
+            "label": action_label,
+            "stage": stage,
+            "available": not blockers,
+            "blockers": blockers,
+            "active_backend_matches": active_backend_matches,
+            "recovery_debt_blocks_entries": action == "buy" and unresolved_count > 0,
+            "operator_action": "Autonomy can run on the armed backend." if not blockers else "Resolve blockers before unattended execution.",
+        }
+
+    def _autonomy_override_status(self, local_auth_enabled: bool = False) -> dict[str, object]:
+        return {
+            "available": bool(local_auth_enabled),
+            "local_auth_enabled": bool(local_auth_enabled),
+            "local_only": True,
+            "bypass_enabled": False,
+            "supported_targets": ["entry_autonomy", "exit_autonomy", "source_trust", "recovery_debt", "signer_boundary"],
+            "operator_action": "Override requests are audit-only; they do not bypass live blockers.",
+            "disabled_reason": "" if local_auth_enabled else "dashboard password/local auth is not configured",
+        }
+
+    def _source_degraded_mode(
+        self,
+        source: dict[str, object],
+        *,
+        env_live_enabled: bool,
+        sell_blockers: list[str],
+    ) -> dict[str, object]:
+        trust_state = str(source.get("trust_state") or "unknown")
+        live_entry_blocked = bool(source.get("live_entry_blocked"))
+        paper_collection_allowed = bool(source.get("paper_collection_allowed", True))
+        protective_exits_available = bool(env_live_enabled and not sell_blockers)
+        if live_entry_blocked and protective_exits_available:
+            mode = "exit_only"
+            state = "degraded"
+            operator_action = "Source trust blocks new live entries; protective exits can still be prepared through the selected backend."
+        elif live_entry_blocked:
+            mode = "paper_only"
+            state = "degraded"
+            operator_action = "Source trust blocks live entries; keep collecting paper evidence and resolve source blockers."
+        else:
+            mode = "normal"
+            state = "ready" if trust_state == "trusted" else "review"
+            operator_action = "Source trust does not currently force paper-only or exit-only operation."
+        return {
+            "mode": mode,
+            "state": state,
+            "trust_state": trust_state,
+            "live_entries_allowed": not live_entry_blocked,
+            "paper_collection_allowed": paper_collection_allowed,
+            "protective_exits_available": protective_exits_available,
+            "entry_blockers": list(source.get("trust_blockers", [])) if isinstance(source.get("trust_blockers"), list) else [],
+            "exit_blockers": sell_blockers,
+            "operator_action": operator_action,
+        }
+
+    def _full_sniper_gate(
+        self,
+        *,
+        autonomy: dict[str, object],
+        source_mode: dict[str, object],
+        pre_run_backup: dict[str, object],
+        manual_live_verification: dict[str, object],
+    ) -> dict[str, object]:
+        entry = autonomy.get("entry", {}) if isinstance(autonomy, dict) else {}
+        exit_gate = autonomy.get("exit", {}) if isinstance(autonomy, dict) else {}
+        active_backend_matches = bool(autonomy.get("active_backend_matches")) if isinstance(autonomy, dict) else False
+        entry_available = bool(entry.get("available")) if isinstance(entry, dict) else False
+        exit_available = bool(exit_gate.get("available")) if isinstance(exit_gate, dict) else False
+        source_normal = source_mode.get("mode") == "normal" if isinstance(source_mode, dict) else False
+        backup_fresh = bool(pre_run_backup.get("fresh")) if isinstance(pre_run_backup, dict) else False
+        manual_live_verified = bool(manual_live_verification.get("verified")) if isinstance(manual_live_verification, dict) else False
+        override = autonomy.get("override", {}) if isinstance(autonomy, dict) else {}
+        blockers: list[str] = []
+        if not active_backend_matches:
+            blockers.append("active backend does not match selected wallet")
+        if not entry_available:
+            blockers.extend(str(item) for item in entry.get("blockers", [])[:5] if isinstance(entry, dict))
+        if not exit_available:
+            blockers.extend(str(item) for item in exit_gate.get("blockers", [])[:5] if isinstance(exit_gate, dict))
+        if not source_normal:
+            blockers.append(f"source mode is {source_mode.get('mode', 'unknown') if isinstance(source_mode, dict) else 'unknown'}")
+        if not backup_fresh:
+            blockers.append(str(pre_run_backup.get("blocker") or "fresh pre-run backup is required"))
+        if not manual_live_verified:
+            blockers.append(str(manual_live_verification.get("blocker") or "recent manual live verification is required before full sniper automation"))
+        blockers = list(dict.fromkeys([blocker for blocker in blockers if blocker]))
+        ready = not blockers
+        return {
+            "mode": "full_sniper",
+            "ready": ready,
+            "state": "ready" if ready else "blocked",
+            "entry_ready": entry_available,
+            "exit_ready": exit_available,
+            "active_backend_matches": active_backend_matches,
+            "source_mode": str(source_mode.get("mode", "unknown") if isinstance(source_mode, dict) else "unknown"),
+            "pre_run_backup_fresh": backup_fresh,
+            "manual_live_verified": manual_live_verified,
+            "manual_live_audit_id": str(manual_live_verification.get("audit_id") or "") if isinstance(manual_live_verification, dict) else "",
+            "manual_live_verified_at": manual_live_verification.get("verified_at") if isinstance(manual_live_verification, dict) else None,
+            "manual_live_window_hours": manual_live_verification.get("window_hours") if isinstance(manual_live_verification, dict) else None,
+            "audited_override_active": False,
+            "override_effect": str(override.get("operator_action") or "Override records are audit-only and do not bypass full-sniper blockers.") if isinstance(override, dict) else "Override records are audit-only and do not bypass full-sniper blockers.",
+            "blockers": blockers,
+            "operator_action": "Full sniper automation can run on the armed local backend." if ready else "Resolve every full-sniper blocker before unattended buys and sells.",
+        }
+
+    def _manual_live_verification_status(self, wallet_public_key: str = "", signer_mode: str = "browser_wallet") -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        required_signer_mode = signer_mode or "browser_wallet"
+        window_hours = 24.0
+        cutoff = utc_now() - timedelta(hours=window_hours)
+        audits = [
+            audit
+            for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+            if audit.signer_mode == required_signer_mode
+            and audit.created_at >= cutoff
+            and (not wallet or audit.wallet_public_key == wallet)
+            and (audit.final_status == "reconciled" or audit.status == "reconciled")
+            and audit.transaction_signature
+            and audit.reconciliation_status == "matched"
+            and not audit.errors
+        ]
+        latest = max(audits, key=lambda audit: audit.created_at, default=None)
+        if latest:
+            return {
+                "verified": True,
+                "audit_id": latest.id,
+                "verified_at": latest.created_at.isoformat(),
+                "window_hours": window_hours,
+                "wallet_public_key": latest.wallet_public_key,
+                "signer_mode": required_signer_mode,
+                "blocker": "",
+                "operator_action": f"Recent confirmed and reconciled {required_signer_mode} manual live execution is verified for full-sniper promotion.",
+            }
+        return {
+            "verified": False,
+            "audit_id": "",
+            "verified_at": None,
+            "window_hours": window_hours,
+            "wallet_public_key": wallet,
+            "signer_mode": required_signer_mode,
+            "blocker": f"recent confirmed and reconciled {required_signer_mode} manual live proof is required before full sniper automation",
+            "operator_action": f"Complete and reconcile a {required_signer_mode} manual live buy or sell within 24 hours before unattended full-sniper mode.",
+        }
+
+    def record_expert_override(
+        self,
+        local_auth_enabled: bool,
+        target_gate: str,
+        action: str,
+        reason: str,
+        wallet_public_key: str = "",
+        signer_mode: str | None = None,
+    ) -> dict[str, object]:
+        override = self._autonomy_override_status(local_auth_enabled)
+        if not override["available"]:
+            raise ValueError(str(override["disabled_reason"]))
+        target_gate = target_gate.strip()
+        action = action.strip() or "buy"
+        if target_gate not in override["supported_targets"]:
+            raise ValueError("unsupported override target")
+        if action not in {"buy", "sell"}:
+            raise ValueError("override action must be buy or sell")
+        reason = reason.strip()
+        if len(reason) < 12:
+            raise ValueError("override reason must be at least 12 characters")
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        wallet = self._resolve_backend_wallet(signer_mode, wallet_public_key)
+        blockers = self._live_execution_blockers(True, action, wallet, signer_mode, autonomous=True)
+        event = {
+            "target_gate": target_gate,
+            "action": action,
+            "wallet_public_key": wallet,
+            "signer_mode": signer_mode,
+            "reason": reason,
+            "risk_state": {
+                "blockers": blockers,
+                "active_backend": self._active_backend_snapshot(),
+                "kill_switch_enabled": self.settings.kill_switch_enabled,
+                "caps": self.live_caps_snapshot(),
+            },
+            "recorded_at": utc_now().isoformat(),
+            "effect": "audit_only_no_gate_bypass",
+        }
+        self.add_event(
+            "warning",
+            f"Expert override recorded for {target_gate} / {action}",
+            subsystem="live",
+            operator_action=json.dumps(event, sort_keys=True),
+        )
+        return event
+
+    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None, local_auth_enabled: bool = False) -> dict[str, object]:
         signer_mode = signer_mode or self.settings.live_signer_mode
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         signer = self.signer_status(signer_mode, wallet_public_key)
         caps = self.live_caps_snapshot()
         blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=False)
+        sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=False)
         autonomy_buy_blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=True)
         autonomy_sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=True)
         readiness = self.readiness_status()
+        source_health = self.source_health()
+        execution_readiness = self._execution_readiness_status(
+            source=source_health,
+            strategy_promotion=readiness.get("strategy_promotion") if isinstance(readiness, dict) else None,
+            env_live_enabled=env_live_enabled,
+            wallet_public_key=wallet_public_key,
+            signer_mode=signer_mode,
+        )
         intents = self._decorate_live_intents(self._mark_stale_live_intents(self.storage.load_live_intents(200)), readiness)
         ledger = self._live_ledger_positions(wallet_public_key)
         audit_rows = self._normalize_live_audits(self.storage.load_live_execution_audits(200))
@@ -1742,13 +5115,53 @@ class BotState:
         stale_quotes = sum(1 for intent in intents if intent.stale and intent.quote_id)
         latest_reconciliation = next((position.reconciliation_status for position in ledger), "pending")
         autonomy_blockers = list(dict.fromkeys([*autonomy_buy_blockers, *autonomy_sell_blockers]))
+        active_backend = self._active_backend_snapshot()
+        active_backend_matches = (
+            bool(active_backend["armed"])
+            and active_backend["mode"] == signer_mode
+            and active_backend["wallet_public_key"] == wallet_public_key
+        )
+        autonomy = {
+            "entry": self._autonomy_gate_state("buy", autonomy_buy_blockers, active_backend_matches, len(unresolved)),
+            "exit": self._autonomy_gate_state("sell", autonomy_sell_blockers, active_backend_matches, len(unresolved)),
+            "active_backend_matches": active_backend_matches,
+            "recovery_debt": {
+                "unresolved_audits": len(unresolved),
+                "recoverable_audits": len(recoverable),
+                "blocks_new_entries": len(unresolved) > 0,
+            },
+            "override": self._autonomy_override_status(local_auth_enabled),
+        }
+        mode_visibility = self._live_mode_visibility(
+            env_live_enabled=env_live_enabled,
+            blockers=blockers,
+            execution_readiness=execution_readiness,
+            signer=signer,
+            autonomy=autonomy,
+            active_backend=active_backend,
+        )
         live_metrics = self._wallet_live_metrics(wallet_public_key)
         live_pnl = {**live_metrics, "open_positions": int(live_metrics["open_positions"]), "approximate": True}
+        pre_run_backup = self._pre_run_backup_status()
+        source_degraded_mode = self._source_degraded_mode(source_health, env_live_enabled=env_live_enabled, sell_blockers=sell_blockers)
+        manual_live_verification = self._manual_live_verification_status(wallet_public_key, signer_mode)
+        full_sniper_gate = self._full_sniper_gate(
+            autonomy=autonomy,
+            source_mode=source_degraded_mode,
+            pre_run_backup=pre_run_backup,
+            manual_live_verification=manual_live_verification,
+        )
         backend_capabilities = {
             "browser_wallet": self.signer_status("browser_wallet", wallet_public_key if signer_mode == "browser_wallet" else ""),
             "local_hot_wallet": self.signer_status("local_hot_wallet", self.hot_wallet.wallet_public_key()),
             "local_signer_daemon": self.signer_status("local_signer_daemon", ""),
         }
+        execution_backend = self._execution_backend_status(
+            signer_mode=signer_mode,
+            signer=signer,
+            env_live_enabled=env_live_enabled,
+            active_backend_matches=active_backend_matches,
+        )
         return {
             "mode": "autonomous_live_v1",
             "paper_default": False,
@@ -1760,11 +5173,18 @@ class BotState:
             "caps": caps,
             "session_acknowledged": self.settings.live_session_acknowledged,
             "readiness": readiness,
+            "execution_readiness": execution_readiness,
             "local_desktop_only": True,
             "autonomous_live_available": not autonomy_buy_blockers or not autonomy_sell_blockers,
             "auto_sell_available": not autonomy_sell_blockers,
             "auto_buy_available": not autonomy_buy_blockers,
             "autonomy_blockers": autonomy_blockers,
+            "autonomy": autonomy,
+            "mode_visibility": mode_visibility,
+            "source_degraded_mode": source_degraded_mode,
+            "full_sniper_gate": full_sniper_gate,
+            "manual_live_verification": manual_live_verification,
+            "pre_run_backup": pre_run_backup,
             "active_intent_count": len([intent for intent in intents if intent.status not in {"cancelled", "executed", "expired"}]),
             "stale_quote_count": stale_quotes,
             "unresolved_audit_count": len(unresolved),
@@ -1782,6 +5202,7 @@ class BotState:
                 "supports_auto_buy": bool(signer.get("supports_auto_buy")),
                 "disabled_reason": str(signer.get("disabled_reason") or ""),
             },
+            "execution_backend": execution_backend,
             "signer_readiness": {
                 "mode": signer_mode,
                 "healthy": bool(signer.get("healthy")),
@@ -1792,11 +5213,123 @@ class BotState:
             "live_pnl": live_pnl,
             "readiness_warnings": readiness.get("recommended_actions", []) if readiness.get("status") != "ready" else [],
             "hot_wallet": self.hot_wallet.status(),
-            "active_backend": self._active_backend_snapshot(),
+            "active_backend": active_backend,
             "backend_capabilities": backend_capabilities,
             "entry_autonomy_available": not autonomy_buy_blockers,
             "exit_autonomy_available": not autonomy_sell_blockers,
         }
+
+    def _execution_backend_status(self, signer_mode: str, signer: dict[str, object], env_live_enabled: bool, active_backend_matches: bool) -> dict[str, object]:
+        if signer_mode == "browser_wallet":
+            submit_path = "browser_wallet_manual_signature"
+            implemented = True
+            local_only = True
+            manual_approval_required = True
+            unattended_submit = False
+            operator_action = "Use browser wallet approval for each manual live submit."
+        elif signer_mode == "local_hot_wallet":
+            submit_path = "encrypted_local_hot_wallet"
+            implemented = True
+            local_only = True
+            manual_approval_required = False
+            unattended_submit = bool(signer.get("can_unattended_sign"))
+            operator_action = "Keep the encrypted hot wallet unlocked only for the local session and use tiny caps."
+        elif signer_mode == "local_signer_daemon":
+            submit_path = "localhost_signer_daemon"
+            implemented = bool(signer.get("can_sign"))
+            local_only = str(signer.get("transport") or "") == "localhost_http"
+            manual_approval_required = False
+            unattended_submit = bool(signer.get("can_unattended_sign"))
+            operator_action = "Run a localhost-only signer daemon with auth before selecting this backend."
+        else:
+            submit_path = "unsupported"
+            implemented = False
+            local_only = False
+            manual_approval_required = True
+            unattended_submit = False
+            operator_action = "Select browser_wallet or local_hot_wallet before live execution."
+
+        blockers: list[str] = []
+        if not env_live_enabled:
+            blockers.append("LIVE_TRADING_ENABLED is false")
+        if not implemented:
+            blockers.append(f"{signer_mode} submit path is not implemented or not connected")
+        if not bool(signer.get("can_sign")):
+            blockers.append(str(signer.get("disabled_reason") or f"{signer_mode.replace('_', ' ')} cannot sign transactions"))
+        if not local_only:
+            blockers.append("execution backend must stay localhost/local-file only")
+        if signer_mode != "browser_wallet" and not active_backend_matches:
+            blockers.append("backend must be armed for this wallet before unattended submit")
+        return {
+            "mode": signer_mode,
+            "submit_path": submit_path,
+            "implemented": implemented,
+            "local_only": local_only,
+            "manual_approval_required": manual_approval_required,
+            "unattended_submit_available": unattended_submit and implemented and not blockers,
+            "can_submit_now": implemented and bool(signer.get("can_sign")) and env_live_enabled and local_only and (signer_mode == "browser_wallet" or active_backend_matches),
+            "blockers": list(dict.fromkeys(blockers)),
+            "operator_action": operator_action,
+        }
+
+    def _live_mode_visibility(
+        self,
+        *,
+        env_live_enabled: bool,
+        blockers: list[str],
+        execution_readiness: dict[str, object],
+        signer: dict[str, object],
+        autonomy: dict[str, object],
+        active_backend: dict[str, object],
+    ) -> list[dict[str, object]]:
+        paper_mode = self.settings.mode.value if hasattr(self.settings.mode, "value") else str(self.settings.mode)
+        shadow_ready = bool(execution_readiness.get("can_shadow")) if isinstance(execution_readiness, dict) else False
+        manual_available = env_live_enabled and not blockers and bool(signer.get("can_sign"))
+        active_backend_matches = bool(autonomy.get("active_backend_matches")) if isinstance(autonomy, dict) else False
+        entry = autonomy.get("entry", {}) if isinstance(autonomy, dict) else {}
+        exit_gate = autonomy.get("exit", {}) if isinstance(autonomy, dict) else {}
+        auto_buy = bool(entry.get("available")) if isinstance(entry, dict) else False
+        auto_sell = bool(exit_gate.get("available")) if isinstance(exit_gate, dict) else False
+        armed = bool(active_backend.get("armed")) if isinstance(active_backend, dict) else False
+        return [
+            {
+                "id": "paper",
+                "label": "Paper",
+                "state": "active" if paper_mode == "paper" else "available",
+                "tone": "emerald",
+                "summary": "Default simulated trading and evidence collection.",
+                "blockers": [],
+            },
+            {
+                "id": "shadow",
+                "label": "Shadow",
+                "state": "ready" if shadow_ready else "blocked",
+                "tone": "sky",
+                "summary": "Would-have-traded comparison without submitting transactions.",
+                "blockers": [] if shadow_ready else list(execution_readiness.get("blockers", []))[:3] if isinstance(execution_readiness, dict) else [],
+            },
+            {
+                "id": "manual_live",
+                "label": "Manual Live",
+                "state": "ready" if manual_available else "blocked",
+                "tone": "amber",
+                "summary": "Quote, simulate, and submit only with local operator approval.",
+                "blockers": blockers[:3],
+            },
+            {
+                "id": "autonomous_live",
+                "label": "Autonomous Live",
+                "state": "ready" if armed and active_backend_matches and (auto_buy or auto_sell) else "blocked",
+                "tone": "rose",
+                "summary": "Unattended entry or exit execution through the armed local backend.",
+                "blockers": list(dict.fromkeys([
+                    *(["backend is not armed"] if not armed else []),
+                    *(["active backend does not match selected wallet"] if armed and not active_backend_matches else []),
+                    *(entry.get("blockers", []) if isinstance(entry, dict) else []),
+                    *(exit_gate.get("blockers", []) if isinstance(exit_gate, dict) else []),
+                ]))[:3],
+            },
+        ]
 
     def start_live_session(self, env_live_enabled: bool, wallet_public_key: str, signer_mode: str = "browser_wallet") -> dict[str, object]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
@@ -1811,6 +5344,7 @@ class BotState:
             acknowledged_at=utc_now() if self.settings.live_session_acknowledged else None,
         )
         self.storage.save_live_session(session)
+        self.active_live_session_id = session.id
         self.add_event(
             "warning",
             f"Live session {session.status}: {', '.join(status['blockers']) or f'{signer_mode} ready'}",
@@ -1822,8 +5356,58 @@ class BotState:
     def acknowledge_live_session(self) -> dict[str, object]:
         self.settings.live_session_acknowledged = True
         self.storage.save_settings(self.settings)
-        self.add_event("warning", "Live session acknowledgement recorded", subsystem="live")
-        return {"acknowledged": True, "acknowledged_at": utc_now().isoformat()}
+        acknowledged_at = utc_now().isoformat()
+        self.add_event(
+            "warning",
+            "Live session acknowledgement recorded",
+            subsystem="live",
+            operator_action=json.dumps(
+                {
+                    "acknowledged_at": acknowledged_at,
+                    "caps": self.live_caps_snapshot(),
+                    "active_backend": self._active_backend_snapshot(),
+                    "kill_switch_enabled": self.settings.kill_switch_enabled,
+                    "effect": "session_risk_acknowledged",
+                },
+                sort_keys=True,
+            ),
+        )
+        return {"acknowledged": True, "acknowledged_at": acknowledged_at, "risk_state": self.live_risk_state()}
+
+    def set_live_kill_switch(self, enabled: bool, reason: str = "") -> dict[str, object]:
+        previous = self.settings.kill_switch_enabled
+        self.settings.kill_switch_enabled = bool(enabled)
+        self.storage.save_settings(self.settings)
+        changed_at = utc_now().isoformat()
+        risk_state = self.live_risk_state()
+        self.add_event(
+            "danger" if enabled else "warning",
+            f"Live kill switch {'enabled' if enabled else 'disabled'}",
+            subsystem="live",
+            operator_action=json.dumps(
+                {
+                    "previous": previous,
+                    "enabled": bool(enabled),
+                    "changed_at": changed_at,
+                    "reason": reason.strip(),
+                    "risk_state": risk_state,
+                    "effect": "blocks_new_entries" if enabled else "allows_entries_when_other_gates_pass",
+                },
+                sort_keys=True,
+            ),
+        )
+        return {"kill_switch_enabled": self.settings.kill_switch_enabled, "changed_at": changed_at, "previous": previous, "risk_state": risk_state}
+
+    def live_risk_state(self) -> dict[str, object]:
+        return {
+            "session_acknowledged": self.settings.live_session_acknowledged,
+            "kill_switch_enabled": self.settings.kill_switch_enabled,
+            "autonomous_live_enabled": self.settings.autonomous_live_enabled,
+            "active_backend": self._active_backend_snapshot(),
+            "caps": self.live_caps_snapshot(),
+            "source_trust": self.source_health().get("trust_state", "unknown"),
+            "unresolved_audit_count": len([audit for audit in self.storage.load_live_execution_audits(200) if self._is_unresolved_live_audit(audit)]),
+        }
 
     def live_positions(self, wallet_public_key: str = "") -> list[dict[str, object]]:
         if not wallet_public_key.strip():
@@ -1851,7 +5435,13 @@ class BotState:
         return positions
 
     def live_audit(self) -> list[dict[str, object]]:
-        return [audit.to_dict() for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(100))]
+        return [audit.to_dict() for audit in self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(100)))]
+
+    def profit_sweep_history(self, limit: int = 100) -> list[dict[str, object]]:
+        normalized = self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(500)))
+        audits = [audit for audit in normalized if audit.action == "profit_sweep"]
+        audits.sort(key=lambda audit: audit.created_at, reverse=True)
+        return [audit.to_dict() for audit in audits[: max(1, int(limit or 100))]]
 
     def _normalize_live_audits(self, audits: list[LiveExecutionAudit]) -> list[LiveExecutionAudit]:
         now = utc_now()
@@ -1877,6 +5467,10 @@ class BotState:
         return audits
 
     def _is_unresolved_live_audit(self, audit: LiveExecutionAudit) -> bool:
+        if isinstance(audit.quote, dict) and audit.quote.get("shadow_only"):
+            return False
+        if audit.status == "stale" and not audit.transaction_signature:
+            return False
         if audit.status in {"submitted", "needs_review", "failed", "stale"}:
             return True
         if audit.transaction_signature and audit.status not in {"reconciled"} and audit.reconciliation_status != "matched":
@@ -1889,17 +5483,71 @@ class BotState:
 
     def live_ledger(self, wallet_public_key: str = "") -> dict[str, object]:
         positions = self._live_ledger_positions(wallet_public_key)
+        confidence_counts: dict[str, int] = {}
+        stale_marks = 0
+        needs_review = 0
+        for position in positions:
+            confidence_counts[position.unrealized_pnl_confidence] = confidence_counts.get(position.unrealized_pnl_confidence, 0) + 1
+            if position.mark_price_age_seconds is not None and position.mark_price_age_seconds > self.settings.source_stale_seconds:
+                stale_marks += 1
+            if position.reconciliation_status == "needs_review":
+                needs_review += 1
+        stale_balance_positions = self._stale_balance_positions(wallet_public_key)
+        realized_pnl = round(sum(position.realized_pnl_sol for position in positions), 6)
+        unrealized_pnl = round(sum(position.unrealized_pnl_sol for position in positions), 6)
+        total_pnl = round(realized_pnl + unrealized_pnl, 6)
+        recent_fills = self._recent_live_fills(positions)
         return {
             "positions": [position.to_dict() for position in positions],
+            "recent_fills": recent_fills,
             "summary": {
-                "realized_pnl_sol": round(sum(position.realized_pnl_sol for position in positions), 6),
-                "unrealized_pnl_sol": round(sum(position.unrealized_pnl_sol for position in positions), 6),
+                "realized_pnl_sol": realized_pnl,
+                "unrealized_pnl_sol": unrealized_pnl,
+                "net_pnl_sol": total_pnl,
+                "total_pnl_sol": total_pnl,
                 "cost_basis_sol": round(sum(position.cost_basis_sol for position in positions), 6),
+                "total_fees_sol": round(sum(position.total_fees_sol for position in positions), 9),
+                "total_priority_fees_sol": round(sum(position.total_priority_fees_sol for position in positions), 9),
                 "open_positions": len([position for position in positions if position.status == "open"]),
                 "approximate": True,
+                "pnl_confidence": "needs_review" if needs_review else "stale" if stale_marks else "estimated" if positions else "none",
+                "confidence_counts": confidence_counts,
+                "stale_mark_positions": stale_marks,
+                "stale_balance_positions": len(stale_balance_positions),
+                "needs_review_positions": needs_review,
+                "pnl_note": "Live PnL is approximate until wallet balances, fills, and mark prices are reconciled.",
                 "wallet_public_key": wallet_public_key,
             },
         }
+
+    def _recent_live_fills(self, positions: list[LiveLedgerPosition], limit: int = 12) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for position in positions:
+            for fill in position.fills:
+                accounting = fill.get("accounting") if isinstance(fill.get("accounting"), dict) else {}
+                rows.append(
+                    {
+                        "id": fill.get("id", ""),
+                        "created_at": fill.get("created_at", ""),
+                        "position_id": position.id,
+                        "wallet_public_key": position.wallet_public_key,
+                        "mint": position.mint,
+                        "symbol": position.symbol,
+                        "action": fill.get("action", ""),
+                        "amount": fill.get("amount", ""),
+                        "signature": fill.get("signature", ""),
+                        "fee_sol": round(float(fill.get("fee_sol", 0.0) or 0.0), 9),
+                        "priority_fee_sol": round(float(fill.get("priority_fee_sol", 0.0) or 0.0), 9),
+                        "wallet_sol_delta_sol": round(float(accounting.get("wallet_sol_delta_sol", 0.0) or 0.0), 9),
+                        "wallet_sol_received_sol": round(float(accounting.get("wallet_sol_received_sol", 0.0) or 0.0), 9),
+                        "wallet_sol_spent_sol": round(float(accounting.get("wallet_sol_spent_sol", 0.0) or 0.0), 9),
+                        "token_delta": round(float(accounting.get("token_delta", 0.0) or 0.0), 9),
+                        "realized_pnl_delta_sol": round(float(accounting.get("realized_pnl_delta_sol", 0.0) or 0.0), 9),
+                        "provenance": accounting.get("provenance", "estimated"),
+                        "reconciliation_status": position.reconciliation_status,
+                    }
+                )
+        return sorted(rows, key=lambda row: str(row.get("created_at") or ""), reverse=True)[:limit]
 
     def create_live_intent(
         self,
@@ -2028,10 +5676,29 @@ class BotState:
                         operator_recommendation="Review the triggered risk condition, then use manual quote/sign if you want to exit now.",
                     )
                 )
+        updated_candidates: list[LiveExecutionIntent] = []
         for intent in candidates:
             self._decorate_live_intent(intent, readiness)
             self.storage.save_live_intent(intent)
-        ranked = self._rank_live_intents(self._decorate_live_intents(existing + candidates, readiness))[:10]
+            if intent.source == "paper_promoted":
+                try:
+                    self.quote_live_intent(
+                        False,
+                        intent.id,
+                        self.settings.live_max_slippage_pct,
+                        self.settings.live_priority_fee_cap_sol,
+                        "pump",
+                        shadow_only=True,
+                    )
+                    updated_candidates.append(self.storage.load_live_intent(intent.id) or intent)
+                except Exception as exc:
+                    intent.warnings.append(f"Automatic shadow quote failed: {exc}")
+                    intent.updated_at = utc_now()
+                    self.storage.save_live_intent(intent)
+                    updated_candidates.append(intent)
+            else:
+                updated_candidates.append(intent)
+        ranked = self._rank_live_intents(self._decorate_live_intents(existing + updated_candidates, readiness))[:10]
         return [intent.to_dict() for intent in ranked]
 
     def cancel_live_intent(self, intent_id: str) -> dict[str, object]:
@@ -2053,17 +5720,34 @@ class BotState:
         pool: str,
         wallet_public_key: str,
         signer_mode: str = "browser_wallet",
+        shadow_only: bool = False,
     ) -> dict[str, object]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
-        blockers = self._live_execution_blockers(env_live_enabled, action, wallet_public_key, signer_mode, autonomous=False)
-        validation_error = self._validate_live_order(action, amount, denominated_in_sol, slippage_pct, priority_fee_sol, wallet_public_key, signer_mode)
+        quote_env_enabled = bool(env_live_enabled) or bool(shadow_only)
+        blockers = [] if shadow_only else self._live_execution_blockers(quote_env_enabled, action, wallet_public_key, signer_mode, autonomous=False)
+        validation_error = self._validate_live_order(action, amount, denominated_in_sol, slippage_pct, priority_fee_sol, wallet_public_key, signer_mode, shadow_only=shadow_only)
         if validation_error:
             blockers.append(validation_error)
+        preflight_checks = self._live_order_preflight_checks(
+            env_live_enabled=quote_env_enabled,
+            action=action,
+            mint=mint,
+            amount=amount,
+            denominated_in_sol=denominated_in_sol,
+            slippage_pct=slippage_pct,
+            priority_fee_sol=priority_fee_sol,
+            pool=pool,
+            wallet_public_key=wallet_public_key,
+            signer_mode=signer_mode,
+            blockers=blockers,
+            shadow_only=shadow_only,
+        )
         if action == "sell":
             balance = self._wallet_token_balance(wallet_public_key, mint)
             if balance["error"]:
                 blockers.append(f"wallet token balance check failed: {balance['error']}")
+                preflight_checks.append(self._preflight_check("wallet_token_balance", "Wallet Token Balance", "fail", "checked", "available for sell", str(balance["error"])))
         else:
             balance = {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": ""}
 
@@ -2125,24 +5809,28 @@ class BotState:
             signer_mode=signer_mode,
             wallet_public_key=wallet_public_key.strip(),
             request=intent.to_dict(),
+            preflight_checks=preflight_checks,
             quote={**quote.to_dict(), "provider_request": quote_payload},
             caps_snapshot=self.live_caps_snapshot(),
             balance_snapshot=balance,
             errors=blockers,
-            warnings=["Simulation warnings do not absolutely block manual signing"] if not blockers else [],
+            warnings=["Shadow-only quote is evidence-only and cannot be submitted"] if shadow_only and not env_live_enabled else ["Simulation warnings do not absolutely block manual signing"] if not blockers else [],
             final_status=quote.status,
             intent_id=intent.id,
         )
+        audit.quote["shadow_only"] = bool(shadow_only)
+        audit.quote["live_env_enabled_at_quote"] = bool(env_live_enabled)
+        audit.shadow_comparison = self._build_shadow_comparison(audit)
         intent.quote_id = quote.id
         intent.audit_id = audit.id
         intent.status = "blocked" if blockers else "quoted"
         intent.reason = "; ".join(blockers) if blockers else "Quote preview ready"
         self.storage.save_live_intent(intent)
         self.storage.save_live_execution_audit(audit)
-        self.add_event("warning", f"Live {action} quote {quote.status} for {mint[:8] or 'unknown'}")
+        self.add_event("warning", f"Live {action} quote {quote.status} for {mint[:8] or 'unknown'}", subsystem="live")
         return audit.to_dict()
 
-    def quote_live_intent(self, env_live_enabled: bool, intent_id: str, slippage_pct: float, priority_fee_sol: float, pool: str) -> dict[str, object]:
+    def quote_live_intent(self, env_live_enabled: bool, intent_id: str, slippage_pct: float, priority_fee_sol: float, pool: str, shadow_only: bool = False) -> dict[str, object]:
         intent = self._require_live_intent(intent_id)
         if intent.status == "cancelled":
             raise ValueError("cannot quote a cancelled intent")
@@ -2157,6 +5845,7 @@ class BotState:
             pool=pool,
             wallet_public_key=intent.wallet_public_key,
             signer_mode=intent.signer_mode,
+            shadow_only=shadow_only,
         )
         stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
         if stored_audit:
@@ -2181,8 +5870,43 @@ class BotState:
         intent.expires_at = utc_now() + timedelta(seconds=30)
         intent.stale = False
         self.storage.save_live_intent(intent)
+        if shadow_only and intent.source == "paper_promoted":
+            stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
+            if stored_audit:
+                self._apply_shadow_quote_costs_to_token(intent.mint, stored_audit)
         audit["intent"] = intent.to_dict()
         return audit
+
+    def _apply_shadow_quote_costs_to_token(self, mint: str, audit: LiveExecutionAudit) -> None:
+        comparison = audit.shadow_comparison or self._build_shadow_comparison(audit)
+        costs = comparison.get("costs", {}) if isinstance(comparison, dict) else {}
+        if not isinstance(costs, dict):
+            return
+        updated = False
+        for token in self.tokens:
+            if token.mint != mint:
+                continue
+            token.quote_shadow_fee_sol = float(costs.get("paper_fee_drag_sol", 0.0) or 0.0)
+            token.quote_shadow_priority_fee_sol = float(costs.get("priority_fee_sol", 0.0) or 0.0)
+            token.quote_shadow_impact_sol = float(costs.get("price_impact_drag_sol", 0.0) or 0.0)
+            token.quote_shadow_total_cost_sol = float(costs.get("total_cost_sol", 0.0) or 0.0)
+            token.quote_shadow_slippage_pct = float(costs.get("slippage_pct", 0.0) or 0.0)
+            token.quote_shadow_status = str(audit.status or audit.final_status or "")
+            token.decision_log.append(
+                f"Shadow quote cost model: fees {token.quote_shadow_fee_sol:.9f} SOL; priority {token.quote_shadow_priority_fee_sol:.9f} SOL; impact {token.quote_shadow_impact_sol:.9f} SOL"
+            )
+            self.storage.save_token(token)
+            updated = True
+        if not updated:
+            stored_tokens = [token for token in self.storage.load_tokens(300) if token.mint == mint]
+            for token in stored_tokens:
+                token.quote_shadow_fee_sol = float(costs.get("paper_fee_drag_sol", 0.0) or 0.0)
+                token.quote_shadow_priority_fee_sol = float(costs.get("priority_fee_sol", 0.0) or 0.0)
+                token.quote_shadow_impact_sol = float(costs.get("price_impact_drag_sol", 0.0) or 0.0)
+                token.quote_shadow_total_cost_sol = float(costs.get("total_cost_sol", 0.0) or 0.0)
+                token.quote_shadow_slippage_pct = float(costs.get("slippage_pct", 0.0) or 0.0)
+                token.quote_shadow_status = str(audit.status or audit.final_status or "")
+                self.storage.save_token(token)
 
     def live_simulate(self, audit_id: str, ok: bool, warning: str = "", error: str = "", result: dict[str, Any] | None = None) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
@@ -2215,8 +5939,28 @@ class BotState:
 
     def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
+        if audit.quote.get("shadow_only"):
+            raise ValueError("shadow-only quote cannot be submitted")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
+        preflight_blockers = self._live_audit_preflight_blockers(audit)
+        if preflight_blockers:
+            raise ValueError(f"cannot submit live audit with failed preflight checks: {'; '.join(preflight_blockers[:4])}")
+        if audit.action == "buy":
+            if self.settings.kill_switch_enabled:
+                raise ValueError("manual kill switch enabled")
+            submit_blockers = self._live_execution_blockers(
+                bool(audit.quote.get("live_env_enabled_at_quote")),
+                audit.action,
+                audit.wallet_public_key,
+                audit.signer_mode,
+                autonomous=False,
+            )
+            if submit_blockers:
+                raise ValueError(f"cannot submit live buy after entry policy changed: {'; '.join(submit_blockers[:4])}")
+            backup = self._pre_run_backup_status()
+            if backup.get("blocks_live_entries"):
+                raise ValueError(str(backup.get("blocker") or "pre-run backup is required before live entries"))
         expires_at = audit.quote.get("expires_at")
         if expires_at and datetime.fromisoformat(str(expires_at)) < utc_now():
             raise ValueError("cannot submit a stale live quote")
@@ -2241,9 +5985,15 @@ class BotState:
                     self._append_unique(audit.warnings, str(simulation.get("warning")))
                 if simulation.get("error"):
                     self._append_unique(audit.errors, str(simulation.get("error")))
+        submitted_at = utc_now()
+        timing = self._audit_execution_timing(audit)
+        quote_created_at = self._parse_iso_datetime(str(audit.quote.get("created_at") or "")) if isinstance(audit.quote, dict) else None
+        timing["submitted_at"] = submitted_at.isoformat()
+        timing["quote_to_submit_ms"] = max(0, int((submitted_at - (quote_created_at or audit.created_at)).total_seconds() * 1000))
+        audit.execution_timing = timing
         audit.status = "submitted"
         audit.final_status = "submitted"
-        audit.updated_at = utc_now()
+        audit.updated_at = submitted_at
         self.storage.save_live_execution_audit(audit)
         if audit.intent_id:
             intent = self.storage.load_live_intent(audit.intent_id)
@@ -2258,12 +6008,21 @@ class BotState:
 
     def live_confirm(self, audit_id: str, confirmation_status: str, error: str = "") -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
+        confirmed_at = utc_now()
         audit.confirmation_status = confirmation_status.strip()
         audit.confirmation = {"source": "frontend", "confirmation_status": audit.confirmation_status, "error": error.strip()}
-        audit.confirmation_checked_at = utc_now()
+        audit.confirmation_checked_at = confirmed_at
+        timing = self._audit_execution_timing(audit)
+        submitted_at = self._parse_iso_datetime(str(timing.get("submitted_at") or ""))
+        quote_created_at = self._parse_iso_datetime(str(audit.quote.get("created_at") or "")) if isinstance(audit.quote, dict) else None
+        timing["confirmed_at"] = confirmed_at.isoformat()
+        timing["quote_to_confirm_ms"] = max(0, int((confirmed_at - (quote_created_at or audit.created_at)).total_seconds() * 1000))
+        if submitted_at:
+            timing["submit_to_confirm_ms"] = max(0, int((confirmed_at - submitted_at).total_seconds() * 1000))
+        audit.execution_timing = timing
         audit.status = "confirmed" if confirmation_status in {"confirmed", "finalized"} and not error else "failed"
         audit.final_status = audit.status
-        audit.updated_at = utc_now()
+        audit.updated_at = confirmed_at
         if error:
             self._append_unique(audit.errors, error)
         self.storage.save_live_execution_audit(audit)
@@ -2285,6 +6044,7 @@ class BotState:
                 audit.recommended_action = "Review wallet/RPC balance reconciliation."
             audit.updated_at = utc_now()
             self.storage.save_live_execution_audit(audit)
+            self._maybe_run_profit_sweep_after_ledger_update()
         return audit.to_dict()
 
     def _execute_backend_audit(self, audit: LiveExecutionAudit) -> dict[str, object]:
@@ -2292,7 +6052,10 @@ class BotState:
         if audit.signer_mode == "local_hot_wallet":
             return self.hot_wallet.simulate_and_submit(unsigned_transaction_base64, self.settings.solana_rpc_url)
         if audit.signer_mode == "local_signer_daemon":
-            endpoint = (self.signer_daemon_url or "http://127.0.0.1:8799").rstrip("/") + "/execute"
+            base_endpoint = self.signer_daemon_url or "http://127.0.0.1:8799"
+            if not self._local_signer_daemon_endpoint_allowed(base_endpoint):
+                raise ValueError("Signer daemon endpoint must stay localhost-only")
+            endpoint = base_endpoint.rstrip("/") + "/execute"
             payload = json.dumps(
                 {
                     "unsigned_transaction_base64": unsigned_transaction_base64,
@@ -2332,30 +6095,39 @@ class BotState:
             except Exception as exc:
                 checked += 1
                 errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
-        summary = {"checked": checked, "updated": updated, "errors": errors, "skipped": checked == 0, "reason": "no unresolved audits" if checked == 0 else ""}
+        summary = {
+            "checked": checked,
+            "updated": updated,
+            "needs_review": len([audit for audit in recovered if str(audit.get("status", "")) == "needs_review"]),
+            "max_recovery_attempts": self.live_recovery_max_attempts,
+            "errors": errors,
+            "skipped": checked == 0,
+            "reason": "no unresolved audits" if checked == 0 else "",
+        }
         self.live_last_poll_at = utc_now()
         self.live_last_poll_summary = summary
         return {"summary": summary, "audits": recovered}
 
     def poll_live_audits(self, env_live_enabled: bool, limit: int = 25) -> dict[str, object]:
         if not env_live_enabled:
-            summary = {"checked": 0, "updated": 0, "errors": [], "skipped": True, "reason": "LIVE_TRADING_ENABLED is false"}
+            summary = {"checked": 0, "updated": 0, "needs_review": 0, "max_recovery_attempts": self.live_recovery_max_attempts, "errors": [], "skipped": True, "reason": "LIVE_TRADING_ENABLED is false"}
             self.live_last_poll_at = utc_now()
             self.live_last_poll_summary = summary
             return summary
         unresolved = [
             audit
             for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500))
-            if audit.transaction_signature and audit.status in {"submitted", "needs_review", "failed"}
+            if audit.transaction_signature and audit.status in {"submitted", "needs_review", "failed"} and not self._recovery_retry_limit_reached(audit)
         ]
         if not unresolved:
-            summary = {"checked": 0, "updated": 0, "errors": [], "skipped": True, "reason": "no unresolved submitted audits"}
+            summary = {"checked": 0, "updated": 0, "needs_review": 0, "max_recovery_attempts": self.live_recovery_max_attempts, "errors": [], "skipped": True, "reason": "no unresolved submitted audits"}
             self.live_last_poll_at = utc_now()
             self.live_last_poll_summary = summary
             return summary
         checked = 0
         updated = 0
         errors: list[str] = []
+        needs_review = 0
         for audit in unresolved[: max(1, int(limit or 25))]:
             try:
                 before = (audit.status, audit.reconciliation_status, audit.recovery_attempts)
@@ -2364,13 +6136,18 @@ class BotState:
                 after = (str(result.get("status", "")), str(result.get("reconciliation_status", "")), int(result.get("recovery_attempts", 0)))
                 if after != before:
                     updated += 1
+                if str(result.get("status", "")) == "needs_review":
+                    needs_review += 1
             except Exception as exc:
                 checked += 1
                 errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
-        summary = {"checked": checked, "updated": updated, "errors": errors, "skipped": checked == 0, "reason": ""}
+        summary = {"checked": checked, "updated": updated, "needs_review": needs_review, "max_recovery_attempts": self.live_recovery_max_attempts, "errors": errors, "skipped": checked == 0, "reason": ""}
         self.live_last_poll_at = utc_now()
         self.live_last_poll_summary = summary
         return summary
+
+    def _recovery_retry_limit_reached(self, audit: LiveExecutionAudit) -> bool:
+        return audit.status == "needs_review" and audit.recovery_attempts >= self.live_recovery_max_attempts
 
     def run_live_autonomy(self, env_live_enabled: bool) -> dict[str, object]:
         if not env_live_enabled:
@@ -2395,9 +6172,31 @@ class BotState:
                 intent.autonomy_blockers = blockers
                 intent.updated_at = utc_now()
                 self.storage.save_live_intent(intent)
+                self.add_event(
+                    "warning",
+                    f"Autonomous {intent.action} blocked for {intent.symbol or intent.mint[:8]}: {'; '.join(blockers[:3])}",
+                    subsystem="live",
+                    operator_action="Review autonomy blockers before trying unattended execution.",
+                )
                 continue
             try:
                 audit = self.quote_live_intent(env_live_enabled, intent.id, self.settings.live_max_slippage_pct, self.settings.live_priority_fee_cap_sol, "pump")
+                stored_audit = self.storage.load_live_execution_audit(str(audit.get("id") or ""))
+                preflight_blockers = self._live_audit_preflight_blockers(stored_audit) if stored_audit else ["missing live audit preflight evidence"]
+                if preflight_blockers:
+                    intent.autonomy_blocked = True
+                    intent.autonomy_blockers = preflight_blockers
+                    intent.status = "blocked"
+                    intent.reason = "Autonomous preflight failed: " + "; ".join(preflight_blockers[:4])
+                    intent.updated_at = utc_now()
+                    self.storage.save_live_intent(intent)
+                    self.add_event(
+                        "warning",
+                        f"Autonomous {intent.action} preflight blocked for {intent.symbol or intent.mint[:8]}: {'; '.join(preflight_blockers[:3])}",
+                        subsystem="live",
+                        operator_action="Review live audit preflight evidence before unattended execution.",
+                    )
+                    continue
                 result = self.live_submit(str(audit["id"]), "")
                 executed.append({"intent_id": intent.id, "audit_id": str(result.get("id") or audit["id"]), "status": str(result.get("status") or "")})
                 if intent.action == "buy":
@@ -2408,9 +6207,14 @@ class BotState:
 
     def recover_live_audit(self, audit_id: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
+        if self._recovery_retry_limit_reached(audit):
+            audit.recommended_action = "Recovery retry limit reached. Review the signature manually before taking further action."
+            self.storage.save_live_execution_audit(audit)
+            return audit.to_dict()
+        checked_at = utc_now()
         audit.recovery_attempts += 1
-        audit.confirmation_checked_at = utc_now()
-        audit.updated_at = utc_now()
+        audit.confirmation_checked_at = checked_at
+        audit.updated_at = checked_at
         if not audit.transaction_signature:
             if audit.status in {"ready", "simulated", "simulation_warning", "stale"}:
                 audit.status = "stale"
@@ -2438,10 +6242,19 @@ class BotState:
             return audit.to_dict()
 
         if not status.get("found", False):
-            audit.status = "submitted"
-            audit.final_status = "submitted"
-            audit.last_recovery_error = ""
-            audit.recommended_action = "Signature is not visible to RPC yet. Wait, then retry confirmation."
+            if audit.recovery_attempts >= self.live_recovery_max_attempts:
+                error = f"signature not found after {audit.recovery_attempts} recovery attempts"
+                audit.status = "needs_review"
+                audit.final_status = "needs_review"
+                audit.last_recovery_error = error
+                audit.recommended_action = "Recovery retry limit reached. Inspect the signature manually before continuing."
+                self._append_unique(audit.warnings, error)
+                self._mark_live_intent_review(audit)
+            else:
+                audit.status = "submitted"
+                audit.final_status = "submitted"
+                audit.last_recovery_error = ""
+                audit.recommended_action = "Signature is not visible to RPC yet. Wait, then retry confirmation."
             self.storage.save_live_execution_audit(audit)
             return audit.to_dict()
 
@@ -2457,6 +6270,14 @@ class BotState:
             return audit.to_dict()
 
         if audit.confirmation_status in {"confirmed", "finalized"}:
+            timing = self._audit_execution_timing(audit)
+            submitted_at = self._parse_iso_datetime(str(timing.get("submitted_at") or ""))
+            quote_created_at = self._parse_iso_datetime(str(audit.quote.get("created_at") or "")) if isinstance(audit.quote, dict) else None
+            timing["confirmed_at"] = checked_at.isoformat()
+            timing["quote_to_confirm_ms"] = max(0, int((checked_at - (quote_created_at or audit.created_at)).total_seconds() * 1000))
+            if submitted_at:
+                timing["submit_to_confirm_ms"] = max(0, int((checked_at - submitted_at).total_seconds() * 1000))
+            audit.execution_timing = timing
             audit.status = "confirmed"
             audit.final_status = "confirmed"
             audit.last_recovery_error = ""
@@ -2467,6 +6288,11 @@ class BotState:
                 audit.status = "reconciled"
                 audit.final_status = "reconciled"
                 audit.recommended_action = "No action needed."
+                self.add_event(
+                    "info",
+                    f"Live recovery complete and reconciled for {audit.mint[:8] or 'unknown'}",
+                    subsystem="live",
+                )
                 if audit.intent_id:
                     intent = self.storage.load_live_intent(audit.intent_id)
                     if intent:
@@ -2480,6 +6306,7 @@ class BotState:
                 self._mark_live_intent_review(audit)
             audit.updated_at = utc_now()
             self.storage.save_live_execution_audit(audit)
+            self._maybe_run_profit_sweep_after_ledger_update()
             return audit.to_dict()
 
         audit.status = "submitted"
@@ -2488,6 +6315,199 @@ class BotState:
         audit.recommended_action = "RPC has not confirmed the transaction yet. Retry confirmation later."
         self.storage.save_live_execution_audit(audit)
         return audit.to_dict()
+
+    def _maybe_run_profit_sweep_after_ledger_update(self) -> None:
+        result = self.maybe_run_profit_sweep()
+        if result.get("status") == "failed":
+            self.add_event("warning", f"Profit sweep failed: {result.get('reason')}", subsystem="live")
+
+    def maybe_run_profit_sweep(self) -> dict[str, object]:
+        if not self.settings.profit_sweep_enabled:
+            return {"status": "idle", "reason": "profit sweep disabled"}
+        blockers: list[str] = []
+        if self.settings.kill_switch_enabled:
+            blockers.append("manual kill switch enabled")
+        if self.settings.live_signer_mode != "local_hot_wallet":
+            blockers.append("profit sweep requires local_hot_wallet signer mode")
+        if not self.settings.live_active_backend_armed:
+            blockers.append("local hot-wallet backend is not armed")
+        wallet = self.settings.live_active_wallet_public_key or self.hot_wallet.wallet_public_key()
+        hot_wallet = self.hot_wallet.status()
+        hot_wallet_public_key = str(hot_wallet.get("wallet_public_key") or "")
+        if not hot_wallet.get("imported"):
+            blockers.append("no local hot wallet is imported")
+        if not hot_wallet.get("unlocked"):
+            blockers.append("local hot wallet is locked")
+        if wallet and hot_wallet_public_key and wallet != hot_wallet_public_key:
+            blockers.append("armed wallet does not match imported local hot wallet")
+        destination = self.settings.profit_sweep_destination_wallet.strip()
+        if not destination:
+            blockers.append("profit sweep destination wallet is required")
+        if destination and wallet and destination == wallet:
+            blockers.append("profit sweep destination must differ from the trading wallet")
+        sweep_mode = self.settings.profit_sweep_mode if self.settings.profit_sweep_mode in {"fixed_sol", "percentage"} else "fixed_sol"
+        minimum_profit = float(self.settings.profit_sweep_min_profit_sol or 0.0)
+        legacy_threshold = float(self.settings.profit_sweep_threshold_sol or 0.0)
+        threshold = minimum_profit if minimum_profit > 0 else legacy_threshold
+        fixed_amount = float(self.settings.profit_sweep_amount_sol or 0.0)
+        sweep_percentage = float(self.settings.profit_sweep_percentage or 0.0)
+        amount = fixed_amount
+        reserve = float(self.settings.profit_sweep_min_reserve_sol or 0.0)
+        if threshold <= 0:
+            blockers.append("minimum profit to sweep must be greater than zero")
+        if sweep_mode == "fixed_sol" and fixed_amount <= 0:
+            blockers.append("profit sweep amount must be greater than zero")
+        if sweep_mode == "percentage" and not (0 < sweep_percentage <= 100):
+            blockers.append("profit sweep percentage must be greater than zero and no more than 100")
+        if not wallet:
+            blockers.append("armed live wallet is required")
+        if blockers:
+            reason = "; ".join(blockers)
+            return {"status": "blocked", "reason": reason, "blockers": blockers}
+
+        ledger = self.live_ledger(wallet)
+        summary = ledger.get("summary", {}) if isinstance(ledger, dict) else {}
+        realized_pnl = float(summary.get("realized_pnl_sol", 0.0) or 0.0)
+        if realized_pnl < threshold:
+            return {
+                "status": "idle",
+                "reason": "realized live profit is below minimum profit to sweep",
+                "realized_pnl_sol": round(realized_pnl, 9),
+                "minimum_profit_sol": round(threshold, 9),
+            }
+        if sweep_mode == "percentage":
+            amount = round(realized_pnl * (sweep_percentage / 100.0), 9)
+            if amount <= 0:
+                return {
+                    "status": "blocked",
+                    "reason": "percentage sweep amount resolved to zero",
+                    "realized_pnl_sol": round(realized_pnl, 9),
+                    "sweep_percentage": round(sweep_percentage, 4),
+                }
+
+        now = utc_now()
+        sweeps = [
+            audit
+            for audit in self.storage.load_live_execution_audits(500)
+            if audit.action == "profit_sweep" and audit.wallet_public_key == wallet and audit.final_status in {"submitted", "confirmed", "reconciled"}
+        ]
+        recent_sweeps = [audit for audit in sweeps if (now - audit.created_at).total_seconds() < 86400]
+        max_per_day = int(self.settings.profit_sweep_max_per_day or 0)
+        if max_per_day > 0 and len(recent_sweeps) >= max_per_day:
+            return {"status": "blocked", "reason": "daily sweep cap reached", "sweeps_today": len(recent_sweeps), "max_per_day": max_per_day}
+        cooldown_seconds = int(self.settings.profit_sweep_cooldown_seconds or 0)
+        last_sweep = max(sweeps, key=lambda audit: audit.created_at, default=None)
+        if last_sweep and cooldown_seconds > 0:
+            age_seconds = int((now - last_sweep.created_at).total_seconds())
+            if age_seconds < cooldown_seconds:
+                return {"status": "blocked", "reason": "profit sweep cooldown active", "cooldown_seconds": cooldown_seconds, "age_seconds": age_seconds}
+
+        balance = self._wallet_sol_balance(wallet)
+        balance_sol = float(balance.get("balance_sol", 0.0) or 0.0)
+        if balance.get("error"):
+            return {"status": "blocked", "reason": f"wallet SOL balance check failed: {balance['error']}", "balance_snapshot": balance}
+        if balance_sol - amount < reserve:
+            return {
+                "status": "blocked",
+                "reason": "profit sweep would breach minimum reserve",
+                "balance_sol": round(balance_sol, 9),
+                "amount_sol": round(amount, 9),
+                "min_reserve_sol": round(reserve, 9),
+            }
+
+        audit = LiveExecutionAudit(
+            id=new_id("liveaudit"),
+            created_at=now,
+            updated_at=now,
+            action="profit_sweep",
+            mint="SOL",
+            amount=str(round(amount, 9)),
+            status="ready",
+            signer_mode="local_hot_wallet",
+            wallet_public_key=wallet,
+            quote={
+                "provider": "local_system_transfer",
+                "destination_wallet": destination,
+                "amount_sol": round(amount, 9),
+                "minimum_profit_sol": round(threshold, 9),
+                "threshold_sol": round(threshold, 9),
+                "realized_pnl_sol": round(realized_pnl, 9),
+                "sweep_mode": sweep_mode,
+                "sweep_percentage": round(sweep_percentage, 4) if sweep_mode == "percentage" else 0.0,
+            },
+            request={
+                "source": "profit_sweep",
+                "reason": "realized live profit reached minimum profit to sweep",
+                "destination_wallet": destination,
+                "amount_sol": round(amount, 9),
+                "minimum_profit_sol": round(threshold, 9),
+                "threshold_sol": round(threshold, 9),
+                "sweep_mode": sweep_mode,
+                "sweep_percentage": round(sweep_percentage, 4) if sweep_mode == "percentage" else 0.0,
+            },
+            preflight_checks=[
+                self._preflight_check("minimum_profit", "Minimum Profit", "pass", round(realized_pnl, 9), f">= {round(threshold, 9)} SOL", ""),
+                self._preflight_check("minimum_reserve", "Minimum Reserve", "pass", round(balance_sol - amount, 9), f">= {round(reserve, 9)} SOL", ""),
+                self._preflight_check("local_hot_wallet", "Local Hot Wallet", "pass", "unlocked", "unlocked and armed", ""),
+            ],
+            caps_snapshot={
+                "profit_sweep_max_per_day": max_per_day,
+                "profit_sweep_cooldown_seconds": cooldown_seconds,
+                "profit_sweep_mode": sweep_mode,
+                "profit_sweep_percentage": round(sweep_percentage, 4) if sweep_mode == "percentage" else 0.0,
+                "profit_sweep_min_profit_sol": round(threshold, 9),
+                "sweeps_today": len(recent_sweeps),
+            },
+            balance_snapshot=balance,
+            final_status="ready",
+            recommended_action="Review the sweep audit and vault wallet receipt.",
+        )
+        self.storage.save_live_execution_audit(audit)
+        try:
+            execution = self.hot_wallet.transfer_sol(destination, amount, self.settings.solana_rpc_url)
+            audit.transaction_signature = str(execution.get("signature") or execution.get("transaction_signature") or "")
+            simulation = execution.get("simulation")
+            if isinstance(simulation, dict):
+                audit.simulation = {
+                    "source": "local_hot_wallet",
+                    "status": "ok" if simulation.get("ok") else "warning" if simulation.get("warning") else "error",
+                    "ok": bool(simulation.get("ok")),
+                    "warning": str(simulation.get("warning") or ""),
+                    "error": str(simulation.get("error") or ""),
+                    "result": simulation.get("result") or {},
+                }
+                if simulation.get("warning"):
+                    self._append_unique(audit.warnings, str(simulation.get("warning")))
+                if simulation.get("error"):
+                    self._append_unique(audit.errors, str(simulation.get("error")))
+            audit.status = "submitted"
+            audit.final_status = "submitted"
+            audit.updated_at = utc_now()
+            self.storage.save_live_execution_audit(audit)
+            self.add_event("warning", f"Profit sweep submitted: {amount:.6f} SOL to {destination[:8]}...", subsystem="live")
+            return {
+                "status": "submitted",
+                "audit": audit.to_dict(),
+                "signature": audit.transaction_signature,
+                "amount_sol": round(amount, 9),
+                "destination_wallet": destination,
+                "realized_pnl_sol": round(realized_pnl, 9),
+            }
+        except Exception as exc:
+            audit.status = "failed"
+            audit.final_status = "failed"
+            audit.errors.append(f"{exc.__class__.__name__}: {exc}")
+            audit.recommended_action = "Review the local hot wallet, destination, RPC, and vault sweep settings before retrying."
+            audit.updated_at = utc_now()
+            self.storage.save_live_execution_audit(audit)
+            return {"status": "failed", "reason": f"{exc.__class__.__name__}: {exc}", "audit": audit.to_dict()}
+
+    def _wallet_sol_balance(self, wallet_public_key: str) -> dict[str, object]:
+        try:
+            balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).balance_sol(wallet_public_key)
+            return {"wallet_public_key": wallet_public_key, "balance_sol": float(balance or 0.0), "error": ""}
+        except Exception as exc:
+            return {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": f"{exc.__class__.__name__}: {exc}"}
 
     def reconcile_live_intent(self, intent_id: str) -> dict[str, object]:
         intent = self._require_live_intent(intent_id)
@@ -2501,13 +6521,13 @@ class BotState:
         position = self._reconcile_live_audit(audit)
         return {"intent": intent.to_dict(), "audit": audit.to_dict(), "position": position.to_dict() if position else None}
 
-    def _validate_live_order(self, action: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, wallet_public_key: str, signer_mode: str) -> str:
+    def _validate_live_order(self, action: str, amount: str, denominated_in_sol: bool, slippage_pct: float, priority_fee_sol: float, wallet_public_key: str, signer_mode: str, shadow_only: bool = False) -> str:
         if action not in {"buy", "sell"}:
             return "action must be buy or sell"
         if not wallet_public_key.strip():
             return "wallet public key is required"
         signer = self.signer_status(signer_mode, wallet_public_key)
-        if not signer.get("connected"):
+        if not shadow_only and not signer.get("connected"):
             return str(signer.get("disabled_reason") or "selected live backend is not connected")
         try:
             numeric_amount = float(str(amount).replace("%", ""))
@@ -2528,12 +6548,88 @@ class BotState:
             return f"priority fee exceeds live cap ({self.settings.live_priority_fee_cap_sol:.9f} SOL)"
         return ""
 
+    def _live_order_preflight_checks(
+        self,
+        *,
+        env_live_enabled: bool,
+        action: str,
+        mint: str,
+        amount: str,
+        denominated_in_sol: bool,
+        slippage_pct: float,
+        priority_fee_sol: float,
+        pool: str,
+        wallet_public_key: str,
+        signer_mode: str,
+        blockers: list[str],
+        shadow_only: bool = False,
+    ) -> list[dict[str, object]]:
+        signer = self.signer_status(signer_mode, wallet_public_key)
+        caps = self.live_caps_snapshot()
+        try:
+            numeric_amount = float(str(amount).replace("%", ""))
+        except ValueError:
+            numeric_amount = -1.0
+        mint_ready = bool(mint.strip())
+        wallet_ready = bool(wallet_public_key.strip())
+        cap_trade = float(caps.get("max_trade_sol", 0.0) or 0.0)
+        cap_slippage = float(caps.get("max_slippage_pct", 0.0) or 0.0)
+        cap_priority = float(caps.get("priority_fee_cap_sol", 0.0) or 0.0)
+        amount_ready = numeric_amount > 0 and (action != "buy" or (denominated_in_sol and numeric_amount <= cap_trade))
+        slippage_ready = float(slippage_pct or 0.0) > 0 and float(slippage_pct or 0.0) <= cap_slippage
+        priority_ready = float(priority_fee_sol or 0.0) >= 0 and float(priority_fee_sol or 0.0) <= cap_priority
+        pool_ready = bool(str(pool or "").strip())
+        signer_ready = bool(wallet_public_key.strip()) if shadow_only else (bool(signer.get("connected")) and bool(signer.get("can_sign")))
+        signer_target = "wallet public key for shadow quote" if shadow_only else "connected signer with can_sign"
+        signer_reason = "Shadow-only quotes are not submitted and do not require signer connection." if shadow_only else str(signer.get("disabled_reason") or "Signer must be connected and able to sign.")
+        checks = [
+            self._preflight_check("environment", "Live Environment", "pass" if env_live_enabled else "fail", bool(env_live_enabled), True, "LIVE_TRADING_ENABLED must be enabled for quotes." if not shadow_only else "Shadow-only quote mode allows quote evidence without live trading enabled."),
+            self._preflight_check("mint", "Mint", "pass" if mint_ready else "fail", mint.strip() or "missing", "non-empty mint", "Mint is required before requesting a local transaction."),
+            self._preflight_check("wallet", "Wallet", "pass" if wallet_ready else "fail", wallet_public_key.strip() or "missing", "connected wallet", "Wallet public key is required."),
+            self._preflight_check("signer", "Signer", "pass" if signer_ready else "fail", signer_mode, signer_target, signer_reason),
+            self._preflight_check("amount", "Amount", "pass" if amount_ready else "fail", amount, f"positive{' and <= live max trade cap' if action == 'buy' else ''}", "Amount must be positive and within configured caps."),
+            self._preflight_check("slippage", "Slippage", "pass" if slippage_ready else "fail", round(float(slippage_pct or 0.0), 4), f"<= {cap_slippage:.4f}%", "Slippage must stay within the live cap."),
+            self._preflight_check("priority_fee", "Priority Fee", "pass" if priority_ready else "fail", round(float(priority_fee_sol or 0.0), 9), f"<= {cap_priority:.9f} SOL", "Priority fee must stay within the live cap."),
+            self._preflight_check("pool", "Pool", "pass" if pool_ready else "fail", pool or "missing", "selected pool", "Pool must be selected before quote."),
+            self._preflight_check("caps", "Live Caps", "pass" if all(float(caps.get(key) or 0) > 0 for key in ("max_trade_sol", "daily_loss_cap_sol", "wallet_exposure_cap_sol", "max_open_positions", "max_slippage_pct", "priority_fee_cap_sol")) else "fail", caps, "all numeric caps > 0", "All live caps must be configured."),
+        ]
+        if blockers:
+            checks.append(self._preflight_check("blockers", "Aggregate Blockers", "fail", len(blockers), 0, "; ".join(blockers[:6])))
+        else:
+            checks.append(self._preflight_check("blockers", "Aggregate Blockers", "pass", 0, 0, "No pre-quote blockers detected."))
+        return checks
+
+    def _preflight_check(self, check_id: str, label: str, status: str, value: object, target: object, reason: str) -> dict[str, object]:
+        return {
+            "id": check_id,
+            "label": label,
+            "status": status,
+            "value": value,
+            "target": target,
+            "reason": reason,
+        }
+
+    def _live_audit_preflight_blockers(self, audit: LiveExecutionAudit | None) -> list[str]:
+        if audit is None:
+            return ["missing live audit"]
+        rows = audit.preflight_checks or []
+        if not rows:
+            return []
+        blockers = []
+        for row in rows:
+            if str(row.get("status") or "").lower() != "pass":
+                label = str(row.get("label") or row.get("id") or "preflight")
+                reason = str(row.get("reason") or "failed")
+                blockers.append(f"{label}: {reason}")
+        return blockers
+
     def _wallet_token_balance(self, wallet_public_key: str, mint: str) -> dict[str, object]:
+        checked_at = utc_now().isoformat()
         try:
             balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet_public_key, mint)
-            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": ""}
+            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": "", "checked_at": checked_at}
         except Exception as exc:
-            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}"}
+            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}", "checked_at": checked_at}
 
     def _signature_status(self, signature: str) -> dict[str, object]:
         signature = signature.strip()
@@ -2560,6 +6656,29 @@ class BotState:
             }
         except Exception as exc:
             return {"ok": False, "found": False, "confirmation_status": "", "signature": signature, "error": f"{exc.__class__.__name__}: {exc}"}
+
+    def _transaction_details(self, signature: str) -> dict[str, object]:
+        signature = signature.strip()
+        if not signature:
+            return {"ok": False, "found": False, "signature": "", "error": "missing transaction signature"}
+        try:
+            response = SolanaReadOnlyClient(self.settings.solana_rpc_url).rpc(
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                        "commitment": "confirmed",
+                    },
+                ],
+            )
+            transaction = response.get("result")
+            if not transaction:
+                return {"ok": True, "found": False, "signature": signature, "error": "transaction not found"}
+            return {"ok": True, "found": True, "signature": signature, "transaction": transaction}
+        except Exception as exc:
+            return {"ok": False, "found": False, "signature": signature, "error": f"{exc.__class__.__name__}: {exc}"}
 
     def _append_unique(self, values: list[str], value: str) -> None:
         clean = str(value or "").strip()
@@ -2779,18 +6898,234 @@ class BotState:
         if audit.action == "buy":
             position.cost_basis_sol = round(position.cost_basis_sol + amount_sol + priority_fee, 9)
             position.status = "open"
+            fill["accounting"] = {
+                "type": "buy",
+                "method": position.cost_basis_method,
+                "amount_sol": round(amount_sol, 9),
+                "priority_fee_sol": round(priority_fee, 9),
+                "cost_basis_added_sol": round(amount_sol + priority_fee, 9),
+                "cost_basis_after_sol": position.cost_basis_sol,
+            }
         else:
             sale_fraction = self._live_sale_fraction(position, audit, token_amount, denominated_in_sol)
             realized_basis = position.cost_basis_sol * sale_fraction
             estimated_proceeds = (position.token_balance * mark_price * sale_fraction) if mark_price > 0 and position.token_balance > 0 else 0.0
-            position.realized_pnl_sol = round(position.realized_pnl_sol + estimated_proceeds - realized_basis - priority_fee, 9)
+            realized_delta = round(estimated_proceeds - realized_basis - priority_fee, 9)
+            position.realized_pnl_sol = round(position.realized_pnl_sol + realized_delta, 9)
             position.cost_basis_sol = round(max(0.0, position.cost_basis_sol - realized_basis), 9)
+            accounting_event = {
+                "type": "sell",
+                "audit_id": audit.id,
+                "recorded_at": now.isoformat(),
+                "method": position.cost_basis_method,
+                "sale_fraction": round(sale_fraction, 6),
+                "token_balance_before": position.token_balance,
+                "mark_price_sol": round(mark_price, 12),
+                "mark_price_source": self._latest_live_mark_price_snapshot(audit.mint).get("source", ""),
+                "estimated_proceeds_sol": round(estimated_proceeds, 9),
+                "cost_basis_consumed_sol": round(realized_basis, 9),
+                "priority_fee_sol": round(priority_fee, 9),
+                "realized_pnl_delta_sol": realized_delta,
+                "cost_basis_after_sol": position.cost_basis_sol,
+                "provenance": "estimated from reconciled token balance and latest accepted mark price; confirmed wallet proceeds are not yet available",
+            }
+            fill["accounting"] = accounting_event
+            position.realized_pnl_events.append(accounting_event)
+            position.realized_pnl_events = position.realized_pnl_events[-25:]
             if sale_fraction >= 0.999:
                 position.status = "closed"
+        position.cost_basis_breakdown = self._live_cost_basis_breakdown(position)
         position.updated_at = now
         position.reconciliation_status = "pending"
         self.storage.save_live_ledger_position(position)
         return self._reconcile_live_audit(audit)
+
+    def _account_key_pubkey(self, account_key: object) -> str:
+        if isinstance(account_key, dict):
+            return str(account_key.get("pubkey") or account_key.get("account") or "")
+        return str(account_key or "")
+
+    def _ui_token_amount(self, token_amount: dict[str, object]) -> float:
+        ui_amount = token_amount.get("uiAmount")
+        if ui_amount is not None:
+            return float(ui_amount or 0.0)
+        raw_amount = token_amount.get("amount")
+        decimals = int(token_amount.get("decimals") or 0)
+        if raw_amount is None:
+            return 0.0
+        return float(raw_amount or 0.0) / (10**decimals)
+
+    def _token_balance_total_from_meta(self, balances: object, mint: str, wallet: str) -> float:
+        total = 0.0
+        if not isinstance(balances, list):
+            return total
+        for row in balances:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("mint") or "") != mint:
+                continue
+            owner = str(row.get("owner") or "")
+            if owner and owner != wallet:
+                continue
+            token_amount = row.get("uiTokenAmount")
+            if isinstance(token_amount, dict):
+                total += self._ui_token_amount(token_amount)
+        return round(total, 9)
+
+    def _live_transaction_effects(self, audit: LiveExecutionAudit, transaction_details: dict[str, object]) -> dict[str, object]:
+        transaction = transaction_details.get("transaction")
+        if not isinstance(transaction, dict):
+            return {"ok": False, "error": str(transaction_details.get("error") or "missing transaction metadata")}
+        meta = transaction.get("meta")
+        tx = transaction.get("transaction")
+        if not isinstance(meta, dict) or not isinstance(tx, dict):
+            return {"ok": False, "error": "transaction metadata is incomplete"}
+        message = tx.get("message") if isinstance(tx.get("message"), dict) else {}
+        account_keys = message.get("accountKeys") if isinstance(message, dict) else []
+        wallet_index = None
+        if isinstance(account_keys, list):
+            for index, account_key in enumerate(account_keys):
+                if self._account_key_pubkey(account_key) == audit.wallet_public_key:
+                    wallet_index = index
+                    break
+        pre_balances = meta.get("preBalances") if isinstance(meta.get("preBalances"), list) else []
+        post_balances = meta.get("postBalances") if isinstance(meta.get("postBalances"), list) else []
+        wallet_sol_delta = 0.0
+        if wallet_index is not None and wallet_index < len(pre_balances) and wallet_index < len(post_balances):
+            wallet_sol_delta = round((float(post_balances[wallet_index]) - float(pre_balances[wallet_index])) / LAMPORTS_PER_SOL, 9)
+        pre_tokens = self._token_balance_total_from_meta(meta.get("preTokenBalances"), audit.mint, audit.wallet_public_key)
+        post_tokens = self._token_balance_total_from_meta(meta.get("postTokenBalances"), audit.mint, audit.wallet_public_key)
+        token_delta = round(post_tokens - pre_tokens, 9)
+        signatures = tx.get("signatures") if isinstance(tx.get("signatures"), list) else []
+        signature_count = max(1, len(signatures))
+        network_fee_sol = round(float(meta.get("fee") or 0.0) / LAMPORTS_PER_SOL, 9)
+        base_fee_sol = round((signature_count * SOLANA_SIGNATURE_BASE_FEE_LAMPORTS) / LAMPORTS_PER_SOL, 9)
+        priority_fee_sol = round(max(0.0, network_fee_sol - base_fee_sol), 9)
+        return {
+            "ok": True,
+            "source": "getTransaction",
+            "signature": audit.transaction_signature,
+            "wallet_index": wallet_index,
+            "wallet_sol_delta_sol": wallet_sol_delta,
+            "pre_token_balance": pre_tokens,
+            "post_token_balance": post_tokens,
+            "token_delta": token_delta,
+            "network_fee_sol": network_fee_sol,
+            "base_fee_sol": base_fee_sol,
+            "priority_fee_sol": priority_fee_sol,
+        }
+
+    def _apply_live_transaction_effects(self, audit: LiveExecutionAudit, position: LiveLedgerPosition, effects: dict[str, object]) -> None:
+        if not effects.get("ok"):
+            return
+        fill = next((row for row in position.fills if row.get("audit_id") == audit.id), None)
+        if fill is None:
+            return
+        wallet_sol_delta = float(effects.get("wallet_sol_delta_sol", 0.0) or 0.0)
+        token_delta = float(effects.get("token_delta", 0.0) or 0.0)
+        network_fee_sol = float(effects.get("network_fee_sol", 0.0) or 0.0)
+        base_fee_sol = float(effects.get("base_fee_sol", 0.0) or 0.0)
+        priority_fee_sol = float(effects.get("priority_fee_sol", 0.0) or 0.0)
+        fill["fee_sol"] = round(network_fee_sol, 9)
+        fill["priority_fee_sol"] = round(priority_fee_sol, 9)
+        if audit.action == "buy":
+            wallet_spent = round(max(0.0, -wallet_sol_delta), 9)
+            fill["token_amount"] = round(max(token_delta, 0.0), 9)
+            fill["accounting"] = {
+                "type": "buy",
+                "method": position.cost_basis_method,
+                "provenance": "transaction_meta",
+                "wallet_sol_delta_sol": round(wallet_sol_delta, 9),
+                "wallet_sol_spent_sol": wallet_spent,
+                "token_delta": round(token_delta, 9),
+                "network_fee_sol": round(network_fee_sol, 9),
+                "base_fee_sol": round(base_fee_sol, 9),
+                "priority_fee_sol": round(priority_fee_sol, 9),
+                "cost_basis_added_sol": wallet_spent,
+            }
+        else:
+            wallet_received = round(max(0.0, wallet_sol_delta), 9)
+            fill["token_amount"] = round(abs(min(token_delta, 0.0)), 9)
+            fill["accounting"] = {
+                "type": "sell",
+                "audit_id": audit.id,
+                "recorded_at": utc_now().isoformat(),
+                "method": position.cost_basis_method,
+                "provenance": "transaction_meta",
+                "wallet_sol_delta_sol": round(wallet_sol_delta, 9),
+                "wallet_sol_received_sol": wallet_received,
+                "token_delta": round(token_delta, 9),
+                "network_fee_sol": round(network_fee_sol, 9),
+                "base_fee_sol": round(base_fee_sol, 9),
+                "priority_fee_sol": round(priority_fee_sol, 9),
+            }
+        self._recompute_live_position_accounting(position)
+
+    def _recompute_live_position_accounting(self, position: LiveLedgerPosition) -> None:
+        cost_basis = 0.0
+        realized_pnl = 0.0
+        total_fees = 0.0
+        total_priority = 0.0
+        accounting_token_balance = 0.0
+        realized_events: list[dict[str, object]] = []
+        for fill in position.fills:
+            action = str(fill.get("action") or "").lower()
+            accounting = fill.get("accounting") if isinstance(fill.get("accounting"), dict) else {}
+            exact = accounting.get("provenance") == "transaction_meta"
+            fee_sol = float(accounting.get("network_fee_sol", fill.get("fee_sol", 0.0)) or 0.0)
+            priority_fee_sol = float(accounting.get("priority_fee_sol", fill.get("priority_fee_sol", 0.0)) or 0.0)
+            total_fees += fee_sol
+            total_priority += priority_fee_sol
+            if action == "buy":
+                if exact:
+                    token_delta = max(0.0, float(accounting.get("token_delta", 0.0) or 0.0))
+                    cost_added = float(accounting.get("wallet_sol_spent_sol", 0.0) or 0.0)
+                else:
+                    token_delta = max(0.0, float(fill.get("token_amount", 0.0) or 0.0))
+                    cost_added = float(fill.get("amount_sol", 0.0) or 0.0) + priority_fee_sol
+                accounting_token_balance += token_delta
+                cost_basis += cost_added
+                accounting["cost_basis_added_sol"] = round(cost_added, 9)
+                accounting["cost_basis_after_sol"] = round(cost_basis, 9)
+                fill["accounting"] = accounting
+            elif action == "sell":
+                if exact:
+                    token_delta = float(accounting.get("token_delta", 0.0) or 0.0)
+                    sold_tokens = abs(min(token_delta, 0.0))
+                    token_balance_before = accounting_token_balance if accounting_token_balance > 0 else max(position.token_balance, sold_tokens)
+                    sale_fraction = min(1.0, max(0.0, sold_tokens / token_balance_before)) if token_balance_before > 0 else 1.0
+                    proceeds = float(accounting.get("wallet_sol_received_sol", 0.0) or 0.0)
+                else:
+                    sale_fraction = float(accounting.get("sale_fraction", 0.0) or 0.0)
+                    proceeds = float(accounting.get("estimated_proceeds_sol", 0.0) or 0.0)
+                    token_balance_before = accounting_token_balance if accounting_token_balance > 0 else position.token_balance
+                    sold_tokens = token_balance_before * sale_fraction
+                consumed_basis = min(cost_basis, cost_basis * sale_fraction)
+                realized_delta = proceeds - consumed_basis
+                cost_basis = max(0.0, cost_basis - consumed_basis)
+                accounting_token_balance = max(0.0, accounting_token_balance - sold_tokens)
+                accounting["sale_fraction"] = round(sale_fraction, 6)
+                accounting["token_balance_before"] = round(token_balance_before, 9)
+                accounting["cost_basis_consumed_sol"] = round(consumed_basis, 9)
+                if exact:
+                    accounting["realized_proceeds_sol"] = round(proceeds, 9)
+                else:
+                    accounting["estimated_proceeds_sol"] = round(proceeds, 9)
+                accounting["realized_pnl_delta_sol"] = round(realized_delta, 9)
+                accounting["cost_basis_after_sol"] = round(cost_basis, 9)
+                fill["accounting"] = accounting
+                realized_pnl += realized_delta
+                realized_events.append(accounting)
+        position.cost_basis_sol = round(cost_basis, 9)
+        position.realized_pnl_sol = round(realized_pnl, 9)
+        position.total_fees_sol = round(total_fees, 9)
+        position.total_priority_fees_sol = round(total_priority, 9)
+        position.realized_pnl_events = realized_events[-25:]
+        if position.token_balance <= 0 and any(str(fill.get("action", "")).lower() == "sell" for fill in position.fills):
+            position.status = "closed"
+        elif position.fills:
+            position.status = "open"
+        position.cost_basis_breakdown = self._live_cost_basis_breakdown(position)
 
     def _reconcile_live_audit(self, audit: LiveExecutionAudit) -> LiveLedgerPosition | None:
         wallet = audit.wallet_public_key
@@ -2798,8 +7133,33 @@ class BotState:
         if position is None:
             return None
         balance = self._wallet_token_balance(wallet, audit.mint)
+        if not balance.get("checked_at"):
+            balance["checked_at"] = utc_now().isoformat()
+        transaction_reconciliation: dict[str, object] = {}
+        transaction_effects_applied = False
+        if audit.transaction_signature:
+            transaction_details = self._transaction_details(audit.transaction_signature)
+            transaction_reconciliation = {
+                "ok": bool(transaction_details.get("ok")),
+                "found": bool(transaction_details.get("found")),
+                "signature": audit.transaction_signature,
+                "error": str(transaction_details.get("error") or ""),
+            }
+            if transaction_details.get("ok") and transaction_details.get("found"):
+                effects = self._live_transaction_effects(audit, transaction_details)
+                transaction_reconciliation = {**transaction_reconciliation, **effects}
+                if effects.get("ok"):
+                    self._apply_live_transaction_effects(audit, position, effects)
+                    transaction_effects_applied = True
+            elif transaction_details.get("error"):
+                self._append_unique(audit.warnings, f"Transaction metadata reconciliation skipped: {transaction_details['error']}")
+        if transaction_reconciliation:
+            balance["transaction"] = transaction_reconciliation
         position.reconciliation = balance
         audit.reconciliation = balance
+        checked_at = self._parse_iso_datetime(str(balance.get("checked_at") or ""))
+        position.balance_verified_at = checked_at
+        position.balance_age_seconds = 0 if checked_at else None
         if balance.get("error"):
             position.reconciliation_status = "needs_review"
             audit.reconciliation_status = "needs_review"
@@ -2812,6 +7172,8 @@ class BotState:
             position.reconciliation_status = "matched"
             audit.reconciliation_status = "matched"
             self._normalize_live_position_status(position)
+            if transaction_effects_applied:
+                self._recompute_live_position_accounting(position)
         self._refresh_live_position_estimate(position)
         position.updated_at = utc_now()
         audit.updated_at = utc_now()
@@ -2832,13 +7194,107 @@ class BotState:
         return refreshed
 
     def _refresh_live_position_estimate(self, position: LiveLedgerPosition) -> None:
-        price = self._latest_live_mark_price(position.mint)
+        mark = self._latest_live_mark_price_snapshot(position.mint)
+        price = float(mark.get("price", 0.0) or 0.0)
+        position.mark_price_sol = price
+        position.mark_price_source = str(mark.get("source", ""))
+        position.mark_price_confidence = float(mark.get("confidence", 0.0) or 0.0)
+        position.mark_price_at = mark.get("observed_at") if isinstance(mark.get("observed_at"), datetime) else None
+        position.mark_price_age_seconds = (
+            max(0, int((utc_now() - position.mark_price_at).total_seconds()))
+            if position.mark_price_at
+            else None
+        )
         if price > 0 and position.token_balance > 0:
             estimated_value = position.token_balance * price
             position.unrealized_pnl_sol = round(estimated_value - position.cost_basis_sol, 9)
             position.average_entry_price_sol = round(position.cost_basis_sol / position.token_balance, 12) if position.token_balance else 0.0
         elif position.status == "closed" or position.token_balance <= 0:
             position.unrealized_pnl_sol = 0.0
+        position.cost_basis_breakdown = self._live_cost_basis_breakdown(position)
+        self._annotate_live_position_pnl_confidence(position)
+
+    def _live_cost_basis_breakdown(self, position: LiveLedgerPosition) -> dict[str, object]:
+        buy_fills = [fill for fill in position.fills if str(fill.get("action", "")).lower() == "buy"]
+        sell_fills = [fill for fill in position.fills if str(fill.get("action", "")).lower() == "sell"]
+        gross_buy_sol = round(sum(float(fill.get("amount_sol", 0.0) or 0.0) for fill in buy_fills), 9)
+        priority_fees_sol = round(sum(float(fill.get("priority_fee_sol", 0.0) or 0.0) for fill in position.fills), 9)
+        realized_events = position.realized_pnl_events or [
+            accounting
+            for fill in sell_fills
+            if isinstance((accounting := fill.get("accounting")), dict)
+        ]
+        consumed_basis = round(sum(float(event.get("cost_basis_consumed_sol", 0.0) or 0.0) for event in realized_events), 9)
+        estimated_proceeds = round(sum(float(event.get("estimated_proceeds_sol", 0.0) or 0.0) for event in realized_events), 9)
+        realized_proceeds = round(sum(float(event.get("realized_proceeds_sol", 0.0) or 0.0) for event in realized_events), 9)
+        realized_delta = round(sum(float(event.get("realized_pnl_delta_sol", 0.0) or 0.0) for event in realized_events), 9)
+        uses_transaction_meta = any(isinstance(fill.get("accounting"), dict) and fill["accounting"].get("provenance") == "transaction_meta" for fill in position.fills)
+        return {
+            "method": position.cost_basis_method,
+            "buy_fills": len(buy_fills),
+            "sell_fills": len(sell_fills),
+            "gross_buy_sol": gross_buy_sol,
+            "priority_fees_sol": priority_fees_sol,
+            "consumed_basis_sol": consumed_basis,
+            "remaining_basis_sol": round(position.cost_basis_sol, 9),
+            "estimated_proceeds_sol": estimated_proceeds,
+            "realized_proceeds_sol": realized_proceeds,
+            "realized_pnl_from_events_sol": realized_delta,
+            "average_entry_price_sol": position.average_entry_price_sol,
+            "explanation": "Weighted-average live cost basis from confirmed wallet deltas when transaction metadata is available." if uses_transaction_meta else "Weighted-average live cost basis. Sell proceeds are estimated from latest mark price until wallet/RPC proceeds are available.",
+        }
+
+    def _stale_balance_positions(self, wallet_public_key: str = "") -> list[LiveLedgerPosition]:
+        positions = self._live_ledger_positions(wallet_public_key)
+        stale: list[LiveLedgerPosition] = []
+        for position in positions:
+            if position.status != "open" or position.token_balance <= 0:
+                continue
+            if position.reconciliation_status != "matched":
+                stale.append(position)
+                continue
+            if position.balance_age_seconds is None or position.balance_age_seconds > self.settings.source_stale_seconds:
+                stale.append(position)
+        return stale
+
+    def _annotate_live_position_pnl_confidence(self, position: LiveLedgerPosition) -> None:
+        notes: list[str] = []
+        mark_age = position.mark_price_age_seconds
+        mark_is_stale = mark_age is not None and mark_age > self.settings.source_stale_seconds
+        if position.balance_verified_at:
+            position.balance_age_seconds = max(0, int((utc_now() - position.balance_verified_at).total_seconds()))
+        elif position.reconciliation_status == "matched":
+            position.balance_age_seconds = None
+        if position.reconciliation_status == "needs_review":
+            realized = "needs_review"
+            unrealized = "needs_review"
+            notes.append("wallet/RPC reconciliation needs review")
+        else:
+            realized = "audited" if position.reconciliation_status == "matched" else "estimated"
+            if position.status == "closed" or position.token_balance <= 0:
+                unrealized = "none"
+            elif position.mark_price_sol <= 0:
+                unrealized = "unknown"
+                notes.append("no accepted mark price is available")
+            elif mark_is_stale:
+                unrealized = "stale"
+                notes.append(f"mark price is older than {self.settings.source_stale_seconds}s")
+            elif position.mark_price_confidence >= self.settings.min_price_confidence:
+                unrealized = "estimated"
+            else:
+                unrealized = "low_confidence"
+                notes.append("mark price confidence is below the configured floor")
+        if position.reconciliation_status != "matched":
+            notes.append("token balance has not been fully reconciled")
+        elif position.balance_age_seconds is None:
+            notes.append("token balance verification age is unknown")
+        elif position.balance_age_seconds > self.settings.source_stale_seconds:
+            notes.append(f"token balance verification is older than {self.settings.source_stale_seconds}s")
+        if position.mark_price_source:
+            notes.append(f"mark source: {position.mark_price_source}")
+        position.realized_pnl_confidence = realized
+        position.unrealized_pnl_confidence = unrealized
+        position.pnl_confidence_notes = list(dict.fromkeys(notes))
 
     def _live_sale_fraction(self, position: LiveLedgerPosition, audit: LiveExecutionAudit, token_amount: float, denominated_in_sol: bool) -> float:
         amount_text = str(audit.amount).strip()
@@ -2861,22 +7317,37 @@ class BotState:
             position.status = "open"
 
     def _latest_live_mark_price(self, mint: str) -> float:
+        return float(self._latest_live_mark_price_snapshot(mint).get("price", 0.0) or 0.0)
+
+    def _latest_live_mark_price_snapshot(self, mint: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
-        candidates: list[float] = []
-        if token:
-            candidates.extend([float(value or 0.0) for value in (token.current_price, token.exit_price, token.entry_price)])
         for observation in self.storage.load_price_observations(100, mint=mint):
             if observation.accepted:
-                candidates.extend(
-                    [
-                        float(observation.selected_price or 0.0),
-                        float(observation.price or 0.0),
-                        float(observation.direct_price or 0.0),
-                        float(observation.market_cap_price or 0.0),
-                    ]
-                )
-                break
-        return next((value for value in candidates if value > 0), 0.0)
+                for key, value in (
+                    ("selected_price", observation.selected_price),
+                    ("price", observation.price),
+                    ("direct_price", observation.direct_price),
+                    ("market_cap_price", observation.market_cap_price),
+                ):
+                    price = float(value or 0.0)
+                    if price > 0:
+                        return {
+                            "price": price,
+                            "source": f"{observation.source}:{observation.price_source or key}",
+                            "confidence": float(observation.confidence or 0.0),
+                            "observed_at": observation.observed_at,
+                        }
+        if token:
+            for source, value in (("token_current_price", token.current_price), ("token_exit_price", token.exit_price), ("token_entry_price", token.entry_price)):
+                price = float(value or 0.0)
+                if price > 0:
+                    return {
+                        "price": price,
+                        "source": source,
+                        "confidence": float(token.price_confidence or 0.0),
+                        "observed_at": token.detected_at,
+                    }
+        return {"price": 0.0, "source": "", "confidence": 0.0, "observed_at": None}
 
     def live_requests(self) -> list[dict[str, object]]:
         return [request.to_dict() for request in self.storage.load_live_execution_requests(100)]
@@ -2892,7 +7363,7 @@ class BotState:
             blockers.append(f"amount exceeds manual cap ({self.settings.manual_live_max_sol:.4f} SOL)")
         if self.settings.require_live_confirmation:
             blockers.append("manual confirmation would be required before any future signer")
-        blockers.append("no live transaction executor is implemented")
+        blockers.append("legacy manual live request capture is audit-only; use the live intent quote/submit path for implemented local execution")
         request = LiveExecutionRequest(
             id=new_id("live"),
             created_at=utc_now(),
@@ -2962,6 +7433,1603 @@ class BotState:
             "recent_errors": [event.to_dict() for event in events if event.level in {"danger", "error"}][:20],
             "recent_warnings": [event.to_dict() for event in events if event.level == "warning"][:20],
             "events_by_subsystem": {key: value[:10] for key, value in grouped.items()},
+            "observability": self._observability_summary(events, source, signer, live_recovery),
+        }
+
+    def operator_logs_report(
+        self,
+        timeframe: str = "24h",
+        level: str = "",
+        subsystem: str = "",
+        limit: int = 200,
+    ) -> dict[str, object]:
+        cutoff = self._timeframe_cutoff(timeframe)
+        level_filter = level.strip().lower()
+        subsystem_filter = subsystem.strip().lower()
+        bounded_limit = max(1, min(1000, int(limit or 200)))
+        events = self.storage.load_all_events(5000)
+        filtered: list[TradeEvent] = []
+        for event in events:
+            if cutoff and event.created_at < cutoff:
+                continue
+            if level_filter and event.level.lower() != level_filter:
+                continue
+            if subsystem_filter and (event.subsystem or "app").lower() != subsystem_filter:
+                continue
+            filtered.append(event)
+
+        level_counts: dict[str, int] = {}
+        subsystem_counts: dict[str, int] = {}
+        session_counts: dict[str, int] = {}
+        recovery_keywords = ("recovery", "restore", "backup", "reconcile", "unresolved", "needs_review")
+        source_keywords = ("source", "pumpportal", "solana", "parser", "replay", "soak")
+        live_keywords = ("live", "intent", "quote", "simulation", "sign", "wallet", "kill switch")
+        recovery_events = 0
+        source_events = 0
+        live_events = 0
+        action_items: list[str] = []
+        for event in filtered:
+            level_counts[event.level] = level_counts.get(event.level, 0) + 1
+            subsystem_name = event.subsystem or "app"
+            subsystem_counts[subsystem_name] = subsystem_counts.get(subsystem_name, 0) + 1
+            if event.session_id:
+                session_counts[event.session_id] = session_counts.get(event.session_id, 0) + 1
+            text = f"{event.subsystem} {event.message} {event.operator_action}".lower()
+            if any(keyword in text for keyword in recovery_keywords):
+                recovery_events += 1
+            if any(keyword in text for keyword in source_keywords):
+                source_events += 1
+            if any(keyword in text for keyword in live_keywords):
+                live_events += 1
+            if event.operator_action and event.level in {"warning", "danger", "error"}:
+                action_items.append(event.operator_action)
+
+        recent = filtered[:bounded_limit]
+        errors = level_counts.get("error", 0) + level_counts.get("danger", 0)
+        warnings = level_counts.get("warning", 0)
+        return {
+            "artifact_type": "cryptoarc_operator_logs",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "timeframe": timeframe,
+            "filters": {
+                "level": level_filter,
+                "subsystem": subsystem_filter,
+                "limit": bounded_limit,
+            },
+            "summary": {
+                "total_events": len(filtered),
+                "returned_events": len(recent),
+                "warnings": warnings,
+                "errors": errors,
+                "subsystems": len(subsystem_counts),
+                "sessions": len(session_counts),
+                "recovery_related_events": recovery_events,
+                "source_related_events": source_events,
+                "live_related_events": live_events,
+            },
+            "level_counts": level_counts,
+            "subsystem_counts": [
+                {"subsystem": name, "events": count}
+                for name, count in sorted(subsystem_counts.items(), key=lambda item: (-item[1], item[0]))[:25]
+            ],
+            "session_counts": [
+                {"session_id": session_id, "events": count}
+                for session_id, count in sorted(session_counts.items(), key=lambda item: (-item[1], item[0]))[:25]
+            ],
+            "events": [event.to_dict() for event in recent],
+            "action_items": list(dict.fromkeys(action_items))[:10],
+            "operator_action": (
+                "Review danger/error events and export this artifact before the next live session."
+                if errors
+                else "Review warning-heavy subsystems before increasing autonomy."
+                if warnings
+                else "Structured local logs are clean for the selected window."
+            ),
+            "privacy_note": "Local event logs may include wallet public keys, transaction signatures, mints, and operational context; they never intentionally include seed phrases.",
+        }
+
+    def _observability_summary(
+        self,
+        events: list[TradeEvent],
+        source: dict[str, object],
+        signer: dict[str, object],
+        live_recovery: dict[str, object],
+    ) -> dict[str, object]:
+        level_counts: dict[str, int] = {}
+        subsystem_counts: dict[str, dict[str, object]] = {}
+        readiness_keywords = ("readiness", "promotion", "shadow", "source trust", "live blocker", "blocked", "kill switch")
+        readiness_events: list[TradeEvent] = []
+        session_counts: dict[str, int] = {}
+        for event in events:
+            level_counts[event.level] = level_counts.get(event.level, 0) + 1
+            if event.session_id:
+                session_counts[event.session_id] = session_counts.get(event.session_id, 0) + 1
+            subsystem = event.subsystem or "app"
+            row = subsystem_counts.setdefault(
+                subsystem,
+                {
+                    "subsystem": subsystem,
+                    "events": 0,
+                    "warnings": 0,
+                    "errors": 0,
+                    "latest_at": "",
+                    "latest_message": "",
+                },
+            )
+            row["events"] = int(row["events"]) + 1
+            if event.level == "warning":
+                row["warnings"] = int(row["warnings"]) + 1
+            if event.level in {"danger", "error"}:
+                row["errors"] = int(row["errors"]) + 1
+            if event.created_at.isoformat() > str(row["latest_at"]):
+                row["latest_at"] = event.created_at.isoformat()
+                row["latest_message"] = event.message
+            text = f"{event.message} {event.operator_action}".lower()
+            if any(keyword in text for keyword in readiness_keywords):
+                readiness_events.append(event)
+        high_severity = [event for event in events if event.level in {"danger", "error", "warning"}]
+        source_metrics = {
+            "status": source.get("status"),
+            "trust_state": source.get("trust_state"),
+            "events_per_minute": source.get("events_per_minute"),
+            "health_score": source.get("health_score"),
+            "reconnect_attempts": source.get("reconnect_attempts"),
+            "live_entry_blocked": source.get("live_entry_blocked"),
+        }
+        signer_metrics = {
+            "mode": signer.get("mode"),
+            "connected": signer.get("connected"),
+            "healthy": signer.get("healthy"),
+            "can_sign": signer.get("can_sign"),
+            "can_unattended_sign": signer.get("can_unattended_sign"),
+            "disabled_reason": signer.get("disabled_reason"),
+        }
+        return {
+            "generated_at": utc_now().isoformat(),
+            "event_count": len(events),
+            "level_counts": level_counts,
+            "session_metrics": {
+                "active_session_id": self.active_live_session_id,
+                "session_event_count": sum(session_counts.values()),
+                "sessions_seen": len(session_counts),
+                "top_sessions": [
+                    {"session_id": session_id, "events": count}
+                    for session_id, count in sorted(session_counts.items(), key=lambda item: (-item[1], item[0]))[:10]
+                ],
+            },
+            "subsystems": sorted(subsystem_counts.values(), key=lambda item: (-int(item["errors"]), -int(item["warnings"]), str(item["subsystem"]))),
+            "high_severity": [event.to_dict() for event in high_severity[:20]],
+            "readiness_changes": [event.to_dict() for event in readiness_events[:20]],
+            "source_metrics": source_metrics,
+            "signer_metrics": signer_metrics,
+            "recovery_metrics": live_recovery,
+            "operator_action": "Review high-severity events first, then subsystem rows with warnings/errors before real-money operation.",
+        }
+
+    def operator_session_report(self, timeframe: str = "24h", wallet_public_key: str = "") -> dict[str, object]:
+        events = self.storage.load_all_events(500)
+        live_audits = self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+        unresolved = [audit for audit in live_audits if self._is_unresolved_live_audit(audit)]
+        wallet = wallet_public_key.strip() or self.settings.live_active_wallet_public_key or self.settings.live_hot_wallet_public_key
+        live_ledger = self.live_ledger(wallet) if wallet else self.live_ledger("")
+        open_risk = self._open_risk_report(wallet, live_ledger, unresolved)
+        source = self.source_health()
+        source_quality = self._session_source_quality(source)
+        performance = self.performance_analytics()
+        readiness = self.readiness_status()
+        action_items: list[str] = []
+        action_items.extend(str(item) for item in readiness.get("recommended_actions", [])[:5])
+        action_items.extend(str(item) for item in open_risk.get("action_items", [])[:5])
+        if source.get("live_entry_blocked"):
+            action_items.append(str(source.get("operator_action") or "Review source health before live entries."))
+        if unresolved:
+            action_items.append(f"Review or recover {len(unresolved)} unresolved live audit{'s' if len(unresolved) != 1 else ''}.")
+        if self.settings.kill_switch_enabled:
+            action_items.append("Kill switch is enabled; clear it only after reviewing live blockers.")
+        if not self.storage.backup_restore_status().get("latest_backup"):
+            action_items.append("Create a backup artifact before real-money operation.")
+        return {
+            "artifact_type": "cryptoarc_operator_session_report",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "timeframe": timeframe,
+            "wallet_public_key": wallet,
+            "bot": {"status": self.status.value, "mode": self.settings.mode.value if hasattr(self.settings.mode, "value") else self.settings.mode},
+            "paper_pnl": self.monitor_pnl_summary(timeframe),
+            "mode_comparison": performance.get("mode_comparison", {}),
+            "live_ledger": live_ledger,
+            "open_risk": open_risk,
+            "source": source,
+            "source_quality": source_quality,
+            "readiness": {
+                "status": readiness.get("status"),
+                "score": readiness.get("score"),
+                "entries_allowed": readiness.get("entries_allowed"),
+                "strategy_promotion": readiness.get("strategy_promotion"),
+                "execution_readiness": readiness.get("execution_readiness"),
+            },
+            "live_recovery": {
+                "last_poll_at": self.live_last_poll_at.isoformat() if self.live_last_poll_at else None,
+                "summary": self.live_last_poll_summary,
+                "unresolved_audits": [audit.to_dict() for audit in unresolved[:25]],
+            },
+            "alerts": self.alerts.status(),
+            "backup_restore": self.storage.backup_restore_status(),
+            "recent_events": [event.to_dict() for event in events[:50]],
+            "action_items": list(dict.fromkeys(action_items)),
+        }
+
+    def evidence_mode_separation_report(self) -> dict[str, object]:
+        trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        backtests = self.storage.load_backtest_runs(200)
+        audits = self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(500)))
+        intents_by_id = {intent.id: intent for intent in self.storage.load_live_intents(500)}
+        ledger_summary = self._wallet_performance_analytics()["summary"]
+
+        shadow_audits = [audit for audit in audits if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison]
+        shadow_evaluated = [audit for audit in shadow_audits if audit.shadow_comparison.get("status") == "evaluated"]
+        shadow_pnl = round(sum(float(audit.shadow_comparison.get("estimated_pnl_sol", 0.0) or 0.0) for audit in shadow_evaluated), 6)
+
+        live_audits = [audit for audit in audits if not (isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison)]
+        autonomous_sources = {"paper_promoted", "watchlist", "live_position_rules"}
+        autonomous_audits = [
+            audit
+            for audit in live_audits
+            if (intents_by_id.get(audit.intent_id) and intents_by_id[audit.intent_id].source in autonomous_sources)
+            or str(audit.request.get("source", "")) in autonomous_sources
+        ]
+        autonomous_ids = {audit.id for audit in autonomous_audits}
+        manual_audits = [audit for audit in live_audits if audit.id not in autonomous_ids]
+
+        paper_pnl = round(sum(float(trade.pnl_sol or 0.0) for trade in trades), 6)
+        replay_pnl = round(sum(float(run.estimated_pnl_sol or 0.0) for run in backtests), 6)
+        live_pnl = round(float(ledger_summary.get("total_pnl_sol", 0.0) or 0.0), 6)
+        contamination_warnings: list[str] = []
+        if any(audit.request.get("source") in autonomous_sources and audit.id not in autonomous_ids for audit in live_audits):
+            contamination_warnings.append("some live audits have automated request sources that could not be joined to stored intents")
+        if shadow_audits and any(audit.transaction_signature for audit in shadow_audits):
+            contamination_warnings.append("shadow audits include transaction signatures; verify they were not submitted as real-money trades")
+        if live_audits and any(not audit.wallet_public_key for audit in live_audits):
+            contamination_warnings.append("some live audits are missing wallet public keys")
+        if trades and any(str(getattr(trade, "price_source", "") or "").lower() in {"wallet_rpc", "live"} for trade in trades):
+            contamination_warnings.append("paper trade rows reference live-looking price sources")
+
+        modes = [
+            self._evidence_mode_row(
+                "paper",
+                "Closed paper trades",
+                len(trades),
+                paper_pnl,
+                "paper trades",
+                "closed trade records only",
+                "clear" if trades else "missing",
+                "Use for strategy review; do not treat as live execution evidence.",
+                newest=[trade.closed_at for trade in trades if trade.closed_at],
+            ),
+            self._evidence_mode_row(
+                "replay",
+                "Backtests and parser replay",
+                len(backtests),
+                replay_pnl,
+                "stored backtest runs",
+                "backtest result fingerprints and replay sources",
+                "clear" if backtests else "missing",
+                "Run replay/backtests before promotion if this row is missing.",
+                newest=[run.created_at for run in backtests],
+                extra={"fingerprinted": len([run for run in backtests if getattr(run, "fingerprint", "")])},
+            ),
+            self._evidence_mode_row(
+                "shadow",
+                "Dry-run shadow quotes",
+                len(shadow_audits),
+                shadow_pnl,
+                "live quote audits with shadow_comparison",
+                "non-submitting quote comparison only",
+                "clear" if shadow_evaluated else "missing" if not shadow_audits else "review",
+                "Collect evaluated shadow comparisons before tiny real-money pilot.",
+                newest=[audit.updated_at for audit in shadow_audits],
+                extra={"evaluated": len(shadow_evaluated), "pending": max(0, len(shadow_audits) - len(shadow_evaluated))},
+            ),
+            self._evidence_mode_row(
+                "manual_live",
+                "Manual live",
+                len(manual_audits),
+                live_pnl,
+                "submitted or blocked live audits without automated intent source",
+                "wallet-scoped ledger and audit records",
+                "clear" if manual_audits else "missing",
+                "Manual live evidence must stay separate from paper and shadow evidence.",
+                newest=[audit.updated_at for audit in manual_audits],
+                extra={"submitted": len([audit for audit in manual_audits if audit.transaction_signature])},
+            ),
+            self._evidence_mode_row(
+                "autonomous_live",
+                "Autonomous live",
+                len(autonomous_audits),
+                live_pnl if autonomous_audits else 0.0,
+                "live audits joined to automated intent sources",
+                "paper_promoted, watchlist, or live_position_rules intents",
+                "clear" if autonomous_audits else "missing",
+                "Autonomous live evidence should appear only after every full-sniper gate passes.",
+                newest=[audit.updated_at for audit in autonomous_audits],
+                extra={"sources": sorted({(intents_by_id.get(audit.intent_id).source if intents_by_id.get(audit.intent_id) else str(audit.request.get("source", ""))) or "unknown" for audit in autonomous_audits})},
+            ),
+        ]
+        ready = not contamination_warnings
+        return {
+            "artifact_type": "cryptoarc_evidence_mode_separation",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "status": "clear" if ready else "review",
+            "ready": ready,
+            "modes": modes,
+            "contamination_warnings": contamination_warnings,
+            "operator_action": "Evidence modes are separated for review." if ready else "Review contamination warnings before using evidence for promotion or live decisions.",
+            "privacy_note": "Mode separation evidence contains local paper, replay, shadow, live audit, and public wallet evidence only. It must not contain seed phrases or private keys.",
+        }
+
+    def _evidence_mode_row(
+        self,
+        mode: str,
+        label: str,
+        samples: int,
+        pnl_sol: float,
+        source: str,
+        boundary: str,
+        status: str,
+        operator_action: str,
+        *,
+        newest: list[datetime],
+        extra: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        latest = max(newest).isoformat() if newest else None
+        return {
+            "mode": mode,
+            "label": label,
+            "samples": samples,
+            "pnl_sol": round(float(pnl_sol or 0.0), 6),
+            "source": source,
+            "boundary": boundary,
+            "status": status,
+            "latest_at": latest,
+            "operator_action": operator_action,
+            **(extra or {}),
+        }
+
+    def _session_source_quality(self, source: dict[str, object]) -> dict[str, object]:
+        history = source.get("quality_history", []) if isinstance(source, dict) else []
+        buckets = history if isinstance(history, list) else []
+        populated = [bucket for bucket in buckets if int(bucket.get("events", 0) or 0) > 0]
+        events = sum(int(bucket.get("events", 0) or 0) for bucket in buckets)
+        normalized = sum(int(bucket.get("normalized", 0) or 0) for bucket in buckets)
+        malformed = sum(int(bucket.get("malformed", 0) or 0) for bucket in buckets)
+        trade = sum(int(bucket.get("trade", 0) or 0) for bucket in buckets)
+        degraded = [
+            bucket
+            for bucket in populated
+            if str(bucket.get("trust_state", "")) in {"degraded", "conflicting", "stale"}
+        ]
+        normalized_ratio = round(normalized / max(1, normalized + malformed), 3) if events else 0.0
+        status = "clear"
+        warnings: list[str] = []
+        if not events:
+            status = "unknown"
+            warnings.append("no source-quality buckets contain events yet")
+        elif degraded:
+            status = "review"
+            warnings.append(f"{len(degraded)} source-quality bucket{'s' if len(degraded) != 1 else ''} need review")
+        elif malformed:
+            status = "review"
+            warnings.append("malformed source events were seen in recent buckets")
+        return {
+            "status": status,
+            "trust_state": source.get("trust_state", "unknown") if isinstance(source, dict) else "unknown",
+            "health_score": source.get("health_score", 0) if isinstance(source, dict) else 0,
+            "events": events,
+            "normalized": normalized,
+            "trade_events": trade,
+            "malformed": malformed,
+            "normalized_ratio": normalized_ratio,
+            "degraded_buckets": len(degraded),
+            "bucket_count": len(buckets),
+            "warnings": warnings,
+            "operator_action": "Collect source events before trusting replay." if status == "unknown" else "Review degraded source buckets before promotion." if status == "review" else "Source quality is clean for this session window.",
+        }
+
+    def _open_risk_report(self, wallet_public_key: str, live_ledger: dict[str, object] | None = None, unresolved: list[LiveExecutionAudit] | None = None) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        ledger = live_ledger or self.live_ledger(wallet)
+        summary = ledger.get("summary", {}) if isinstance(ledger, dict) else {}
+        positions = ledger.get("positions", []) if isinstance(ledger, dict) else []
+        open_positions = [position for position in positions if str(position.get("status", "")) == "open"] if isinstance(positions, list) else []
+        active_intents = [
+            intent
+            for intent in self._decorate_live_intents(self._mark_stale_live_intents(self.storage.load_live_intents(200)))
+            if intent.status in {"open", "quoted", "simulation_warning", "simulated"} and (not wallet or intent.wallet_public_key == wallet)
+        ]
+        unresolved = unresolved if unresolved is not None else [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500)) if self._is_unresolved_live_audit(audit)]
+        unresolved_for_wallet = [audit for audit in unresolved if not wallet or audit.wallet_public_key == wallet]
+        cost_basis = float(summary.get("cost_basis_sol", 0.0) or 0.0)
+        unrealized = float(summary.get("unrealized_pnl_sol", 0.0) or 0.0)
+        realized = float(summary.get("realized_pnl_sol", 0.0) or 0.0)
+        exposure_cap = float(self.settings.live_wallet_exposure_cap_sol or 0.0)
+        daily_loss_cap = float(self.settings.live_daily_loss_cap_sol or 0.0)
+        exposure_ratio = round(cost_basis / exposure_cap, 3) if exposure_cap > 0 else None
+        pnl_total = round(realized + unrealized, 9)
+        daily_loss_used = round(abs(min(0.0, pnl_total)) / daily_loss_cap, 3) if daily_loss_cap > 0 else None
+        stale_balance_positions = int(summary.get("stale_balance_positions", 0) or 0)
+        needs_review_positions = int(summary.get("needs_review_positions", 0) or 0)
+        blockers: list[str] = []
+        warnings: list[str] = []
+        action_items: list[str] = []
+        if unresolved_for_wallet:
+            blockers.append("unresolved live audit recovery debt")
+            action_items.append(f"Recover or inspect {len(unresolved_for_wallet)} unresolved live audit{'s' if len(unresolved_for_wallet) != 1 else ''}.")
+        if needs_review_positions:
+            blockers.append("live ledger positions need review")
+            action_items.append("Review live ledger reconciliation before new entries.")
+        if stale_balance_positions:
+            blockers.append("stale live token-balance evidence")
+            action_items.append("Refresh wallet balance reconciliation before unattended execution.")
+        if exposure_cap <= 0:
+            warnings.append("wallet exposure cap is not configured")
+            action_items.append("Set a live wallet exposure cap before pilot mode.")
+        elif exposure_ratio is not None and exposure_ratio >= 0.8:
+            warnings.append("wallet exposure is near the configured cap")
+            action_items.append("Reduce open exposure or raise the cap only after review.")
+        if daily_loss_cap <= 0:
+            warnings.append("daily loss cap is not configured")
+            action_items.append("Set a live daily loss cap before pilot mode.")
+        elif daily_loss_used is not None and daily_loss_used >= 0.8:
+            warnings.append("daily loss usage is near the configured cap")
+            action_items.append("Pause live entries and review loss exposure.")
+        if active_intents:
+            warnings.append("active live intents are still open")
+            action_items.append(f"Resolve {len(active_intents)} active live intent{'s' if len(active_intents) != 1 else ''} before ending the session.")
+        status = "blocked" if blockers else "warning" if warnings else "clear"
+        return {
+            "status": status,
+            "wallet_public_key": wallet,
+            "open_positions": len(open_positions),
+            "active_intents": len(active_intents),
+            "unresolved_audits": len(unresolved_for_wallet),
+            "cost_basis_sol": round(cost_basis, 9),
+            "unrealized_pnl_sol": round(unrealized, 9),
+            "realized_pnl_sol": round(realized, 9),
+            "total_live_pnl_sol": pnl_total,
+            "wallet_exposure_cap_sol": exposure_cap,
+            "exposure_ratio": exposure_ratio,
+            "daily_loss_cap_sol": daily_loss_cap,
+            "daily_loss_used_ratio": daily_loss_used,
+            "stale_balance_positions": stale_balance_positions,
+            "needs_review_positions": needs_review_positions,
+            "pnl_confidence": summary.get("pnl_confidence", "none"),
+            "blockers": blockers,
+            "warnings": warnings,
+            "action_items": list(dict.fromkeys(action_items)),
+            "operator_action": "Resolve open risk blockers before new live entries." if blockers else "Review open risk warnings before ending the session." if warnings else "Open risk is clear for this wallet.",
+        }
+
+    def post_run_review_report(self, timeframe: str = "24h", wallet_public_key: str = "") -> dict[str, object]:
+        wallet = wallet_public_key.strip() or self.settings.live_active_wallet_public_key or self.settings.live_hot_wallet_public_key
+        now = utc_now()
+        hours = 24
+        if timeframe.endswith("h"):
+            try:
+                hours = max(1, min(168, int(timeframe[:-1])))
+            except ValueError:
+                hours = 24
+        cutoff = now - timedelta(hours=hours)
+        audits = [
+            audit
+            for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+            if audit.created_at >= cutoff and (not wallet or audit.wallet_public_key == wallet)
+            and not (isinstance(audit.quote, dict) and audit.quote.get("shadow_only"))
+        ]
+        review_statuses = {"failed", "needs_review", "stale", "blocked"}
+        unresolved = [audit for audit in audits if self._is_unresolved_live_audit(audit)]
+        needs_review = [
+            audit
+            for audit in audits
+            if audit.final_status in review_statuses
+            or audit.status in review_statuses
+            or bool(audit.errors)
+            or audit.reconciliation_status == "needs_review"
+        ]
+        confirmed = [audit for audit in audits if audit.final_status in {"confirmed", "reconciled"} or audit.status in {"confirmed", "reconciled"}]
+        incident_candidates = list({audit.id: audit for audit in [*needs_review, *unresolved]}.values())
+        incident_reviews = self._incident_export_review_evidence(incident_candidates)
+        pending_incident_candidates = [audit for audit in incident_candidates if not incident_reviews.get(audit.id, {}).get("reviewed")]
+        audits_missing_caps_snapshot = len([audit for audit in audits if not isinstance(audit.caps_snapshot, dict) or not audit.caps_snapshot])
+        kill_switch_events = [
+            event.to_dict()
+            for event in self.storage.load_all_events(500)
+            if event.created_at >= cutoff and ("kill switch" in event.message.lower() or "kill_switch" in json.dumps(event.context, default=str).lower())
+        ][:20]
+        cap_and_stop_ready = bool(audits) and audits_missing_caps_snapshot == 0
+        checklist = [
+            {
+                "id": "live_audit_inventory",
+                "label": "Live audit inventory",
+                "status": "pass" if audits else "empty",
+                "value": len(audits),
+                "target": "all recent live audits counted",
+                "reason": "Every post-run review starts from durable live audit records.",
+            },
+            {
+                "id": "unresolved_recovery",
+                "label": "Unresolved recovery",
+                "status": "pass" if not unresolved else "fail",
+                "value": len(unresolved),
+                "target": 0,
+                "reason": "Submitted live audits must be confirmed, reconciled, failed, or explicitly moved to needs_review.",
+            },
+            {
+                "id": "incident_exports",
+                "label": "Incident exports",
+                "status": "pass" if not pending_incident_candidates else "review",
+                "value": len(pending_incident_candidates),
+                "target": "0 pending or exported for review",
+                "reason": "Failed, stale, blocked, or needs-review audits should be exported before ending a pilot session.",
+            },
+            {
+                "id": "ledger_confidence",
+                "label": "Ledger confidence",
+                "status": "pass" if not self.live_ledger(wallet).get("summary", {}).get("needs_review_positions") else "fail",
+                "value": self.live_ledger(wallet).get("summary", {}).get("pnl_confidence", "unknown"),
+                "target": "no needs_review positions",
+                "reason": "Post-run review should not leave wallet-scoped live PnL in an unresolved state.",
+            },
+            {
+                "id": "cap_and_stop_evidence",
+                "label": "Cap and stop evidence",
+                "status": "pass" if cap_and_stop_ready else "empty" if not audits else "fail",
+                "value": {
+                    "audits_missing_caps_snapshot": audits_missing_caps_snapshot,
+                    "kill_switch_enabled": self.settings.kill_switch_enabled,
+                    "kill_switch_events": len(kill_switch_events),
+                },
+                "target": "each live audit has caps snapshot and kill-switch state is visible",
+                "reason": "Post-run review must show cap decisions and kill-switch state for the pilot window.",
+            },
+        ]
+        action_items: list[str] = []
+        if unresolved:
+            action_items.append(f"Recover or inspect {len(unresolved)} unresolved submitted audit{'s' if len(unresolved) != 1 else ''}.")
+        if pending_incident_candidates:
+            action_items.append(f"Export {len(pending_incident_candidates)} live incident bundle{'s' if len(pending_incident_candidates) != 1 else ''} for post-run review.")
+        if not audits:
+            action_items.append("No live audits were found for this timeframe; run review after a live or shadow-live session.")
+        if audits_missing_caps_snapshot:
+            action_items.append(f"Review {audits_missing_caps_snapshot} live audit{'s' if audits_missing_caps_snapshot != 1 else ''} without cap-snapshot evidence.")
+        ledger_summary = self.live_ledger(wallet).get("summary", {})
+        ledger_needs_review = bool(ledger_summary.get("needs_review_positions"))
+        ready = bool(audits) and not unresolved and not pending_incident_candidates and not ledger_needs_review and cap_and_stop_ready
+        return {
+            "artifact_type": "cryptoarc_post_run_review",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "timeframe": timeframe,
+            "wallet_public_key": wallet,
+            "status": "clear" if ready else "missing_evidence" if not audits else "review_required",
+            "ready": ready,
+            "summary": {
+                "audits": len(audits),
+                "confirmed_or_reconciled": len(confirmed),
+                "unresolved": len(unresolved),
+                "needs_review": len(needs_review),
+                "incident_export_candidates": len(incident_candidates),
+                "pending_incident_exports": len(pending_incident_candidates),
+            },
+            "checklist": checklist,
+            "run_controls": {
+                "kill_switch_enabled": self.settings.kill_switch_enabled,
+                "kill_switch_events": kill_switch_events,
+                "caps": self.live_caps_snapshot(),
+                "audits_missing_caps_snapshot": audits_missing_caps_snapshot,
+                "audit_caps_snapshots": [
+                    {
+                        "audit_id": audit.id,
+                        "mint": audit.mint,
+                        "action": audit.action,
+                        "caps_snapshot": audit.caps_snapshot,
+                    }
+                    for audit in audits[:50]
+                ],
+            },
+            "incident_exports": [
+                {
+                    **incident_reviews.get(audit.id, {"reviewed": False, "review_event_id": "", "reviewed_at": None}),
+                    "audit_id": audit.id,
+                    "mint": audit.mint,
+                    "action": audit.action,
+                    "status": audit.status,
+                    "final_status": audit.final_status,
+                    "wallet_public_key": audit.wallet_public_key,
+                    "reason": audit.recommended_action or "; ".join(audit.errors or audit.warnings) or "Review live audit evidence.",
+                    "export_path": f"/api/live/audit/{audit.id}/incident-export",
+                }
+                for audit in incident_candidates[:25]
+            ],
+            "recent_live_audits": [audit.to_dict() for audit in audits[:50]],
+            "action_items": list(dict.fromkeys(action_items)),
+            "operator_action": "Post-run review is clear." if ready else "Complete the post-run review items before the next real-money pilot.",
+            "privacy_note": "Export contains public wallet, live audit, recovery, and ledger-review status only. It must not contain seed phrases or private keys.",
+        }
+
+    def record_incident_export_review(
+        self,
+        audit_id: str,
+        exported: bool,
+        reviewed: bool,
+        note: str = "",
+    ) -> dict[str, object]:
+        audit = next((item for item in self._normalize_live_audits(self.storage.load_live_execution_audits(1000)) if item.id == audit_id), None)
+        if not audit:
+            raise ValueError(f"Live audit not found: {audit_id}")
+        clean_note = note.strip()[:500]
+        recorded_at = utc_now()
+        complete = bool(exported and reviewed)
+        context: dict[str, object] = {
+            "artifact_type": "cryptoarc_incident_export_review",
+            "audit_id": audit.id,
+            "mint": audit.mint,
+            "wallet_public_key": audit.wallet_public_key,
+            "exported": bool(exported),
+            "reviewed": bool(reviewed),
+            "complete": complete,
+        }
+        if clean_note:
+            context["note"] = clean_note
+        event = TradeEvent(
+            id=new_id("evt"),
+            created_at=recorded_at,
+            level="info" if complete else "warning",
+            message=f"Incident export review recorded for {audit.id}",
+            subsystem="live",
+            operator_action=clean_note or "Incident export review recorded.",
+            context=context,
+        )
+        self.events.appendleft(event)
+        self.storage.save_event(event)
+        self.alerts.alert_event(event.level, event.subsystem, event.message, event.operator_action)
+        return {
+            **context,
+            "event_id": event.id,
+            "recorded_at": recorded_at.isoformat(),
+            "status": "reviewed" if complete else "incomplete",
+            "privacy_note": "Incident export review records audit id, public mint/wallet, checklist booleans, and operator notes only. Do not enter seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def _incident_export_review_evidence(self, audits: list[LiveExecutionAudit]) -> dict[str, dict[str, object]]:
+        audit_ids = {audit.id for audit in audits}
+        if not audit_ids:
+            return {}
+        evidence: dict[str, dict[str, object]] = {}
+        for event in self.storage.load_all_events(1000):
+            context = event.context if isinstance(event.context, dict) else {}
+            if context.get("artifact_type") != "cryptoarc_incident_export_review":
+                continue
+            audit_id = str(context.get("audit_id") or "")
+            if audit_id not in audit_ids or audit_id in evidence:
+                continue
+            reviewed = bool(context.get("exported")) and bool(context.get("reviewed"))
+            evidence[audit_id] = {
+                "reviewed": reviewed,
+                "exported": bool(context.get("exported")),
+                "review_event_id": event.id,
+                "reviewed_at": event.created_at.isoformat(),
+                "review_note": str(context.get("note") or event.operator_action or ""),
+            }
+        return evidence
+
+    def outcome_explanations_report(self, timeframe: str = "24h", limit: int = 80) -> dict[str, object]:
+        cutoff = self._timeframe_cutoff(timeframe)
+        limit = max(1, min(250, int(limit or 80)))
+        tokens = self.storage.load_all_tokens(5000)
+        tokens_by_id = {token.id: token for token in tokens}
+        tokens_by_mint = {token.mint: token for token in tokens if token.mint}
+        rows: list[dict[str, object]] = []
+
+        def include(at: datetime | None) -> bool:
+            return at is not None and (cutoff is None or at >= cutoff)
+
+        def token_label(token: TokenSignal | None, mint: str = "") -> str:
+            if token and token.symbol:
+                return token.symbol
+            return (mint or (token.mint if token else ""))[:8] or "unknown"
+
+        for decision in self.storage.load_strategy_decisions(2000):
+            if not include(decision.created_at):
+                continue
+            token = tokens_by_id.get(decision.token_id)
+            outcome_type = "buy" if decision.allowed or "buy" in decision.action.lower() else "skip"
+            reason_parts = [decision.reason]
+            if decision.risk_reason and decision.risk_reason != decision.reason:
+                reason_parts.append(decision.risk_reason)
+            rows.append(
+                {
+                    "id": f"decision:{decision.id}",
+                    "at": decision.created_at.isoformat(),
+                    "outcome_type": outcome_type,
+                    "status": "allowed" if decision.allowed else "blocked",
+                    "subject": token_label(token, decision.mint),
+                    "mint": decision.mint,
+                    "token_id": decision.token_id,
+                    "reason": "; ".join(part for part in reason_parts if part),
+                    "recommended_action": "Paper buy is explainable from the strategy decision." if decision.allowed else "Review the risk reason before changing filters.",
+                    "evidence": {
+                        "decision_id": decision.id,
+                        "engine_version": decision.engine_version,
+                        "profile": decision.profile,
+                        "score": decision.score,
+                        "action": decision.action,
+                        "settings_version_id": decision.settings_version_id,
+                        "score_breakdown": decision.score_breakdown,
+                        "decision_log": decision.decision_log,
+                    },
+                }
+            )
+
+        for token in tokens:
+            status = token.status.value if isinstance(token.status, TokenStatus) else str(token.status)
+            if include(token.opened_at):
+                rows.append(
+                    {
+                        "id": f"token-buy:{token.id}",
+                        "at": token.opened_at.isoformat() if token.opened_at else token.detected_at.isoformat(),
+                        "outcome_type": "buy",
+                        "status": "paper_opened",
+                        "subject": token_label(token),
+                        "mint": token.mint,
+                        "token_id": token.id,
+                        "reason": token.entry_reason or token.reason or "Paper position opened.",
+                        "recommended_action": "Monitor exit evidence and price confidence.",
+                        "evidence": {
+                            "token_id": token.id,
+                            "status": status,
+                            "entry_price": token.entry_price,
+                            "amount_sol": token.amount_sol,
+                            "strategy_profile": token.entry_strategy_profile,
+                            "risk_filters": token.entry_risk_filters,
+                        },
+                    }
+                )
+            if include(token.closed_at):
+                rows.append(
+                    {
+                        "id": f"token-sell:{token.id}",
+                        "at": token.closed_at.isoformat() if token.closed_at else token.detected_at.isoformat(),
+                        "outcome_type": "sell",
+                        "status": "paper_closed",
+                        "subject": token_label(token),
+                        "mint": token.mint,
+                        "token_id": token.id,
+                        "reason": token.exit_reason or "Paper exit completed.",
+                        "recommended_action": "Review PnL and label the trade if it should influence tuning.",
+                        "evidence": {
+                            "token_id": token.id,
+                            "exit_price": token.exit_price,
+                            "pnl_sol": token.pnl_sol,
+                            "realized_pnl_sol": token.realized_pnl_sol,
+                            "hold_duration_seconds": token.hold_duration_seconds,
+                            "highest_unrealized_pct": token.highest_unrealized_pct,
+                            "lowest_unrealized_pct": token.lowest_unrealized_pct,
+                        },
+                    }
+                )
+            if token.status == TokenStatus.SKIPPED and include(token.detected_at):
+                rows.append(
+                    {
+                        "id": f"token-skip:{token.id}",
+                        "at": token.detected_at.isoformat(),
+                        "outcome_type": "skip",
+                        "status": "skipped",
+                        "subject": token_label(token),
+                        "mint": token.mint,
+                        "token_id": token.id,
+                        "reason": token.reason or "Token skipped by filters.",
+                        "recommended_action": "Inspect score breakdown before relaxing filters.",
+                        "evidence": {
+                            "token_id": token.id,
+                            "score": token.score,
+                            "score_breakdown": token.score_breakdown,
+                            "decision_log": token.decision_log,
+                            "creator": token.creator,
+                            "creator_hold_pct": token.creator_hold_pct,
+                        },
+                    }
+                )
+
+        for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(1000)):
+            if not include(audit.created_at):
+                continue
+            token = tokens_by_mint.get(audit.mint)
+            blocked = audit.status == "blocked" or audit.final_status == "blocked" or bool(audit.errors)
+            recovery = audit.recovery_attempts > 0 or audit.reconciliation_status in {"needs_review", "matched"} or bool(audit.last_recovery_error)
+            outcome_type = "block" if blocked else "recovery" if recovery else audit.action
+            reason = "; ".join(audit.errors or audit.warnings) or audit.recommended_action or str(audit.quote.get("error") or "") or f"Live {audit.action} audit recorded."
+            rows.append(
+                {
+                    "id": f"live-audit:{audit.id}",
+                    "at": audit.created_at.isoformat(),
+                    "outcome_type": outcome_type,
+                    "status": audit.final_status or audit.status,
+                    "subject": token_label(token, audit.mint),
+                    "mint": audit.mint,
+                    "token_id": token.id if token else "",
+                    "reason": reason,
+                    "recommended_action": audit.recommended_action or ("Resolve blockers before retrying." if blocked else "Keep audit evidence with the session report."),
+                    "evidence": {
+                        "audit_id": audit.id,
+                        "intent_id": audit.intent_id,
+                        "action": audit.action,
+                        "signer_mode": audit.signer_mode,
+                        "wallet_public_key": audit.wallet_public_key,
+                        "transaction_signature": audit.transaction_signature,
+                        "reconciliation_status": audit.reconciliation_status,
+                        "recovery_attempts": audit.recovery_attempts,
+                        "quote_status": audit.quote.get("status") if isinstance(audit.quote, dict) else "",
+                    },
+                }
+            )
+
+        for request in self.storage.load_live_execution_requests(500):
+            if not include(request.created_at):
+                continue
+            rows.append(
+                {
+                    "id": f"manual-request:{request.id}",
+                    "at": request.created_at.isoformat(),
+                    "outcome_type": "block" if request.status == "blocked" else "override",
+                    "status": request.status,
+                    "subject": request.mint[:8] or "manual",
+                    "mint": request.mint,
+                    "token_id": "",
+                    "reason": request.reason,
+                    "recommended_action": "Manual live request is audit-only until live execution gates are satisfied.",
+                    "evidence": {
+                        "request_id": request.id,
+                        "action": request.action,
+                        "amount_sol": request.amount_sol,
+                        "mode": request.mode,
+                        "reviewed_at": request.reviewed_at.isoformat() if request.reviewed_at else None,
+                    },
+                }
+            )
+
+        for event in self.storage.load_all_events(1000):
+            if not include(event.created_at):
+                continue
+            payload: dict[str, object] = {}
+            if event.operator_action:
+                try:
+                    decoded = json.loads(event.operator_action)
+                    if isinstance(decoded, dict):
+                        payload = decoded
+                except json.JSONDecodeError:
+                    payload = {}
+            is_override = "override" in event.message.lower() or payload.get("effect") == "audit_only_no_gate_bypass"
+            is_recovery = event.subsystem == "live" and "recover" in event.message.lower()
+            if not is_override and not is_recovery:
+                continue
+            rows.append(
+                {
+                    "id": f"event:{event.id}",
+                    "at": event.created_at.isoformat(),
+                    "outcome_type": "override" if is_override else "recovery",
+                    "status": event.level,
+                    "subject": str(payload.get("target_gate") or event.subsystem),
+                    "mint": "",
+                    "token_id": event.token_id or "",
+                    "reason": str(payload.get("reason") or event.message),
+                    "recommended_action": "Override is audit-only and does not bypass blockers." if payload else event.operator_action,
+                    "evidence": {
+                        "event_id": event.id,
+                        "subsystem": event.subsystem,
+                        "session_id": event.session_id,
+                        "payload": payload,
+                    },
+                }
+            )
+
+        deduped = {str(row["id"]): row for row in rows}
+        ordered = sorted(deduped.values(), key=lambda row: str(row["at"]), reverse=True)[:limit]
+        type_counts = Counter(str(row["outcome_type"]) for row in ordered)
+        status_counts = Counter(str(row["status"]) for row in ordered)
+        action_items: list[str] = []
+        if not ordered:
+            action_items.append("No recent explainable outcomes found for this timeframe; collect paper, shadow, or live evidence.")
+        if type_counts.get("block", 0):
+            action_items.append("Review blocked outcomes before changing live or strategy settings.")
+        if type_counts.get("recovery", 0):
+            action_items.append("Export recovery or incident evidence before the next real-money pilot.")
+        return {
+            "artifact_type": "cryptoarc_outcome_explanations",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "timeframe": timeframe,
+            "limit": limit,
+            "summary": {
+                "total": len(ordered),
+                "by_type": dict(type_counts),
+                "by_status": dict(status_counts),
+            },
+            "outcomes": ordered,
+            "action_items": action_items,
+            "operator_action": "Use this report to answer why the bot bought, skipped, sold, blocked, overrode, or recovered before changing settings.",
+            "privacy_note": "Report contains local decision, audit, and public wallet evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def setup_readiness_report(self, env_live_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:
+        source = self.source_health()
+        summary = self.data_summary()
+        schema = self.storage.schema_status()
+        backup = self.storage.backup_restore_status()
+        mode = self.settings.mode.value if hasattr(self.settings.mode, "value") else str(self.settings.mode)
+        source_name = self.settings.launch_source.strip() or "unknown"
+        source_known = source_name in {"pumpportal", "mock"}
+        paper_trade_ready = self.settings.trade_size_sol > 0 and self.settings.max_open_positions > 0
+        gates = [
+            self._setup_gate(
+                "mode",
+                "Paper mode",
+                mode,
+                "paper or preview",
+                "pass" if mode in {"paper", "preview"} else "fail",
+                "Set the bot to paper or preview before first-run monitoring.",
+            ),
+            self._setup_gate(
+                "source_selection",
+                "Launch source",
+                source_name,
+                "pumpportal or mock",
+                "pass" if source_known else "fail",
+                "Choose a supported launch source before starting the source loop.",
+            ),
+            self._setup_gate(
+                "source_detection",
+                "Source detection",
+                bool(self.settings.detect_new_tokens),
+                True,
+                "pass" if self.settings.detect_new_tokens else "fail",
+                "Enable new-token detection to start paper monitoring.",
+            ),
+            self._setup_gate(
+                "schema",
+                "Local database",
+                f"{schema.get('current_version', 0)}/{schema.get('expected_version', 0)}",
+                "current schema",
+                "pass" if schema.get("current_version") == schema.get("expected_version") else "fail",
+                "Run migrations or bootstrap before relying on local state.",
+            ),
+            self._setup_gate(
+                "paper_settings",
+                "Paper settings",
+                f"{self.settings.trade_size_sol} SOL / {self.settings.max_open_positions} max open",
+                "trade size > 0 and max open > 0",
+                "pass" if paper_trade_ready else "fail",
+                "Set a positive paper trade size and at least one max open position.",
+            ),
+            self._setup_gate(
+                "source_health",
+                "Source health",
+                source.get("trust_state", "unknown"),
+                "not conflicting",
+                "fail" if source.get("trust_state") == "conflicting" else ("warn" if source.get("trust_state") in {"unknown", "stale", "degraded"} else "pass"),
+                "Inspect source health if trust is unknown, stale, degraded, or conflicting.",
+            ),
+            self._setup_gate(
+                "auth",
+                "Local auth",
+                bool(local_auth_enabled),
+                True,
+                "pass" if local_auth_enabled else "warn",
+                "Enable local auth before live work; paper monitoring can start without it on a trusted workstation.",
+            ),
+            self._setup_gate(
+                "backup",
+                "Backup artifact",
+                "present" if backup.get("latest_backup") else "missing",
+                "present",
+                "pass" if backup.get("latest_backup") else "warn",
+                "Create a backup artifact before upgrades, restore testing, or any live phase.",
+            ),
+            self._setup_gate(
+                "live_disabled",
+                "Live disabled",
+                not (env_live_enabled or self.settings.live_trading_enabled or self.settings.autonomous_live_enabled),
+                True,
+                "pass" if not (env_live_enabled or self.settings.live_trading_enabled or self.settings.autonomous_live_enabled) else "warn",
+                "Keep live execution disabled during first-run paper setup unless you are intentionally reviewing live gates.",
+            ),
+        ]
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail"]
+        warnings = [str(gate["reason"]) for gate in gates if gate["status"] == "warn"]
+        ready_for_paper = not blockers
+        return {
+            "artifact_type": "cryptoarc_setup_readiness",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "status": "ready" if ready_for_paper and not warnings else ("review" if ready_for_paper else "blocked"),
+            "ready_for_paper": ready_for_paper,
+            "gates": gates,
+            "blockers": list(dict.fromkeys(blockers)),
+            "warnings": list(dict.fromkeys(warnings)),
+            "operator_action": "Start paper monitoring, then collect source and paper evidence." if ready_for_paper else "Resolve setup blockers before starting paper monitoring.",
+            "next_steps": self._setup_next_steps(gates, ready_for_paper),
+            "evidence": {
+                "bot": {"status": self.status.value, "mode": mode},
+                "source": source,
+                "storage": summary,
+                "schema": schema,
+                "backup_restore": backup,
+                "live_requested": bool(self.settings.live_trading_enabled or self.settings.autonomous_live_enabled),
+                "env_live_enabled": bool(env_live_enabled),
+                "local_auth_enabled": bool(local_auth_enabled),
+            },
+            "privacy_note": "Setup readiness contains local status, source, schema, backup, and settings evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def _setup_gate(self, gate_id: str, label: str, value: object, target: object, status: str, reason: str) -> dict[str, object]:
+        return {
+            "id": gate_id,
+            "label": label,
+            "status": status,
+            "value": value,
+            "target": target,
+            "reason": reason,
+        }
+
+    def _setup_next_steps(self, gates: list[dict[str, object]], ready_for_paper: bool) -> list[str]:
+        actions: list[str] = []
+        for gate in gates:
+            if gate["status"] == "pass":
+                continue
+            gate_id = gate["id"]
+            if gate_id == "mode":
+                actions.append("Switch mode to paper or preview.")
+            elif gate_id == "source_selection":
+                actions.append("Select PumpPortal for real launches or mock for local practice.")
+            elif gate_id == "source_detection":
+                actions.append("Enable new-token detection before starting the source.")
+            elif gate_id == "schema":
+                actions.append("Run the bootstrap or verify script to bring migrations current.")
+            elif gate_id == "paper_settings":
+                actions.append("Set a positive paper trade size and max-open-position limit.")
+            elif gate_id == "source_health":
+                actions.append("Start the source and inspect raw events until source trust improves.")
+            elif gate_id == "auth":
+                actions.append("Configure local auth before live trading or shared workstation use.")
+            elif gate_id == "backup":
+                actions.append("Create a backup artifact from the Data workspace.")
+            elif gate_id == "live_disabled":
+                actions.append("Keep live mode disabled while completing first-run paper setup.")
+        if ready_for_paper:
+            actions.append("Start paper monitoring and collect enough source events for readiness scoring.")
+        return list(dict.fromkeys(actions))
+
+    def release_readiness_report(
+        self,
+        app_version: str = "0.1.0",
+        env_live_enabled: bool = False,
+        local_auth_enabled: bool = False,
+    ) -> dict[str, object]:
+        repo_root = Path(__file__).resolve().parents[3]
+        docs_dir = repo_root / "docs"
+        changelog_path = docs_dir / "CHANGELOG.md"
+        checklist_path = docs_dir / "RELEASE_CHECKLIST.md"
+        verify_path = repo_root / "scripts" / "verify.ps1"
+        bootstrap_path = repo_root / "scripts" / "bootstrap.ps1"
+        doctor_path = repo_root / "scripts" / "doctor.ps1"
+        audit_frontend_path = repo_root / "scripts" / "audit-frontend.ps1"
+        package_path = repo_root / "frontend" / "package.json"
+        frontend_version = self._frontend_package_version(package_path)
+        dependency_audit = self._frontend_dependency_audit_policy(repo_root, audit_frontend_path)
+        release_verification = self._release_verification_evidence(app_version)
+        schema = self.storage.schema_status()
+        backup = self.storage.backup_restore_status()
+        source = self.source_health()
+        unresolved = [
+            audit
+            for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+            if self._is_unresolved_live_audit(audit)
+        ]
+        live_requested = bool(env_live_enabled or self.settings.live_trading_enabled or self.settings.autonomous_live_enabled)
+        version_match = bool(frontend_version) and frontend_version == app_version
+        gates = [
+            self._setup_gate("changelog", "Versioned changelog", changelog_path.exists(), True, "pass" if changelog_path.exists() else "fail", "Create docs/CHANGELOG.md before tagging or handing off a release."),
+            self._setup_gate("release_checklist", "Release checklist", checklist_path.exists(), True, "pass" if checklist_path.exists() else "fail", "Keep docs/RELEASE_CHECKLIST.md available for local release and live-safety gates."),
+            self._setup_gate("verify_script", "Verify script", verify_path.exists(), True, "pass" if verify_path.exists() else "fail", "Use scripts/verify.ps1 as the canonical local release check."),
+            self._setup_gate("bootstrap_script", "Bootstrap script", bootstrap_path.exists(), True, "pass" if bootstrap_path.exists() else "fail", "Use scripts/bootstrap.ps1 for reproducible local setup."),
+            self._setup_gate("doctor_script", "Setup diagnostics", doctor_path.exists(), True, "pass" if doctor_path.exists() else "fail", "Use scripts/doctor.ps1 to diagnose Python, Node, dependency, and Solana package readiness."),
+            self._setup_gate("frontend_audit", "Frontend audit policy", dependency_audit["status"], "ready or acknowledged review", "fail" if dependency_audit["status"] == "blocked" else ("warn" if dependency_audit["status"] == "review" else "pass"), str(dependency_audit["operator_action"])),
+            self._setup_gate("schema", "Local database", f"{schema.get('current_version', 0)}/{schema.get('expected_version', 0)}", "current schema", "pass" if schema.get("current_version") == schema.get("expected_version") else "fail", "Run migrations or bootstrap before preparing a release."),
+            self._setup_gate("frontend_version", "Frontend version", frontend_version or "missing", app_version, "pass" if version_match else "warn", "Align frontend/package.json with the API release version before tagging."),
+            self._setup_gate("backup", "Backup artifact", "present" if backup.get("latest_backup") else "missing", "present", "pass" if backup.get("latest_backup") else "warn", "Create a backup artifact before live testing or handoff."),
+            self._setup_gate("source_trust", "Source trust", source.get("trust_state", "unknown"), "not conflicting", "fail" if source.get("trust_state") == "conflicting" else ("warn" if source.get("trust_state") in {"unknown", "stale", "degraded"} else "pass"), "Inspect source health if trust is unknown, stale, degraded, or conflicting."),
+            self._setup_gate("live_disabled", "Live disabled", not live_requested, True, "pass" if not live_requested else "fail", "Keep live execution disabled unless this release is an intentional local live-test build."),
+            self._setup_gate("recovery_debt", "Recovery debt", len(unresolved), 0, "pass" if not unresolved else "fail", "Recover, review, or export unresolved live audits before releasing."),
+            self._setup_gate("local_auth", "Local auth", bool(local_auth_enabled), True, "pass" if local_auth_enabled else "warn", "Enable local auth before live operation or shared-workstation handoff."),
+            self._setup_gate("manual_verification", "Manual verification", release_verification["status"], "recent scripts/verify.ps1 pass + git diff review", "pass" if release_verification["verified"] else "warn", str(release_verification["operator_action"])),
+        ]
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail"]
+        warnings = [str(gate["reason"]) for gate in gates if gate["status"] == "warn"]
+        status = "blocked" if blockers else ("review" if warnings else "ready")
+        return {
+            "artifact_type": "cryptoarc_release_readiness",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "app_version": app_version,
+            "frontend_version": frontend_version,
+            "status": status,
+            "ready": status == "ready",
+            "gates": gates,
+            "blockers": list(dict.fromkeys(blockers)),
+            "warnings": list(dict.fromkeys(warnings)),
+            "next_steps": self._release_next_steps(gates, status),
+            "operator_action": "Release readiness is clear after recording the verifier result." if status == "ready" else "Resolve release blockers and warnings before tagging, live testing, or handoff.",
+            "evidence": {
+                "docs": {
+                    "changelog": str(changelog_path.relative_to(repo_root)),
+                    "release_checklist": str(checklist_path.relative_to(repo_root)),
+                    "changelog_present": changelog_path.exists(),
+                    "release_checklist_present": checklist_path.exists(),
+                },
+                "scripts": {
+                    "bootstrap": str(bootstrap_path.relative_to(repo_root)),
+                    "verify": str(verify_path.relative_to(repo_root)),
+                    "doctor": str(doctor_path.relative_to(repo_root)),
+                    "frontend_audit": str(audit_frontend_path.relative_to(repo_root)),
+                    "bootstrap_present": bootstrap_path.exists(),
+                    "verify_present": verify_path.exists(),
+                    "doctor_present": doctor_path.exists(),
+                    "frontend_audit_present": audit_frontend_path.exists(),
+                },
+                "dependency_audit": dependency_audit,
+                "schema": schema,
+                "backup_restore": backup,
+                "source": source,
+                "live_requested": live_requested,
+                "env_live_enabled": bool(env_live_enabled),
+                "local_auth_enabled": bool(local_auth_enabled),
+                "unresolved_audits": [audit.to_dict() for audit in unresolved[:25]],
+                "release_verification": release_verification,
+            },
+            "privacy_note": "Release readiness contains local docs, script, schema, backup, source, and public live-audit evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def record_release_verification(
+        self,
+        app_version: str,
+        verify_passed: bool,
+        diff_reviewed: bool,
+        docs_reviewed: bool,
+        note: str = "",
+    ) -> dict[str, object]:
+        clean_version = (app_version or "0.1.0").strip()
+        clean_note = note.strip()[:500]
+        verified = bool(verify_passed and diff_reviewed and docs_reviewed)
+        recorded_at = utc_now()
+        context: dict[str, object] = {
+            "artifact_type": "cryptoarc_release_verification",
+            "app_version": clean_version,
+            "verify_passed": bool(verify_passed),
+            "diff_reviewed": bool(diff_reviewed),
+            "docs_reviewed": bool(docs_reviewed),
+            "verified": verified,
+        }
+        if clean_note:
+            context["note"] = clean_note
+        event = TradeEvent(
+            id=new_id("evt"),
+            created_at=recorded_at,
+            level="info" if verified else "warning",
+            message=f"Release verification recorded for {clean_version}",
+            subsystem="release",
+            operator_action=clean_note or "Local verifier attestation recorded.",
+            context=context,
+        )
+        self.events.appendleft(event)
+        self.storage.save_event(event)
+        self.alerts.alert_event(event.level, event.subsystem, event.message, event.operator_action)
+        return {
+            **context,
+            "event_id": event.id,
+            "recorded_at": recorded_at.isoformat(),
+            "status": "verified" if verified else "incomplete",
+            "privacy_note": "Release verification records local checklist booleans and operator notes only. Do not enter seed phrases, private keys, or Telegram tokens.",
+        }
+
+    def _release_verification_evidence(self, app_version: str) -> dict[str, object]:
+        window_hours = 24.0
+        events = [
+            event
+            for event in self.storage.load_all_events(500)
+            if event.subsystem == "release" and isinstance(event.context, dict) and event.context.get("artifact_type") == "cryptoarc_release_verification"
+        ]
+        for event in events:
+            context = event.context
+            age_hours = round(max(0.0, (utc_now() - event.created_at).total_seconds() / 3600), 2)
+            same_version = str(context.get("app_version") or "") == app_version
+            checks_passed = bool(context.get("verify_passed")) and bool(context.get("diff_reviewed")) and bool(context.get("docs_reviewed"))
+            recent = age_hours <= window_hours
+            if same_version and checks_passed and recent:
+                return {
+                    "status": "verified",
+                    "verified": True,
+                    "event_id": event.id,
+                    "recorded_at": event.created_at.isoformat(),
+                    "age_hours": age_hours,
+                    "window_hours": window_hours,
+                    "app_version": app_version,
+                    "verify_passed": True,
+                    "diff_reviewed": True,
+                    "docs_reviewed": True,
+                    "operator_action": "Recent local verification attestation is recorded for this app version.",
+                }
+        latest = events[0] if events else None
+        if latest:
+            context = latest.context
+            latest_age_hours = round(max(0.0, (utc_now() - latest.created_at).total_seconds() / 3600), 2)
+            status = "stale" if latest_age_hours > window_hours else "incomplete"
+            if str(context.get("app_version") or "") != app_version:
+                status = "version_mismatch"
+            return {
+                "status": status,
+                "verified": False,
+                "event_id": latest.id,
+                "recorded_at": latest.created_at.isoformat(),
+                "age_hours": latest_age_hours,
+                "window_hours": window_hours,
+                "app_version": str(context.get("app_version") or ""),
+                "verify_passed": bool(context.get("verify_passed")),
+                "diff_reviewed": bool(context.get("diff_reviewed")),
+                "docs_reviewed": bool(context.get("docs_reviewed")),
+                "operator_action": "Run scripts/verify.ps1, review git diff and release docs, then record a fresh verifier attestation for this app version.",
+            }
+        return {
+            "status": "missing",
+            "verified": False,
+            "event_id": "",
+            "recorded_at": None,
+            "age_hours": None,
+            "window_hours": window_hours,
+            "app_version": app_version,
+            "verify_passed": False,
+            "diff_reviewed": False,
+            "docs_reviewed": False,
+            "operator_action": "Run scripts/verify.ps1, review git diff and release docs, then record a verifier attestation before tagging or handoff.",
+        }
+
+    def _frontend_package_version(self, package_path: Path) -> str:
+        try:
+            payload = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        return str(payload.get("version") or "")
+
+    def _frontend_dependency_audit_policy(self, repo_root: Path, audit_script_path: Path) -> dict[str, object]:
+        package_lock = repo_root / "frontend" / "package-lock.json"
+        solana_version = self._package_lock_dependency_version(package_lock, "node_modules/@solana/web3.js")
+        jayson_version = self._package_lock_dependency_version(package_lock, "node_modules/jayson")
+        uuid_version = self._package_lock_dependency_version(package_lock, "node_modules/uuid")
+        script_present = audit_script_path.exists()
+        known_chain_present = bool(solana_version and jayson_version and uuid_version)
+        status = "ready"
+        blockers: list[str] = []
+        warnings: list[str] = []
+        if not script_present:
+            status = "blocked"
+            blockers.append("scripts/audit-frontend.ps1 is missing.")
+        elif known_chain_present:
+            status = "review"
+            warnings.append("Known moderate @solana/web3.js -> jayson -> uuid advisory remains acknowledged; npm's available fix downgrades @solana/web3.js to 0.0.3.")
+        return {
+            "status": status,
+            "script": str(audit_script_path.relative_to(repo_root)),
+            "script_present": script_present,
+            "package_lock_present": package_lock.exists(),
+            "known_chain_present": known_chain_present,
+            "packages": {
+                "@solana/web3.js": solana_version,
+                "jayson": jayson_version,
+                "uuid": uuid_version,
+            },
+            "acknowledged_exception": "moderate @solana/web3.js -> jayson -> uuid advisory; do not apply npm's breaking @solana/web3.js@0.0.3 audit fix without a compatibility plan" if known_chain_present else "",
+            "blockers": blockers,
+            "warnings": warnings,
+            "operator_action": "Run scripts/audit-frontend.ps1 before release; review the acknowledged Solana advisory and block high/critical advisories." if status == "review" else ("Restore scripts/audit-frontend.ps1 before release." if status == "blocked" else "Frontend audit policy is present; run it before release."),
+        }
+
+    def _package_lock_dependency_version(self, package_lock_path: Path, dependency_path: str) -> str:
+        try:
+            payload = json.loads(package_lock_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ""
+        packages = payload.get("packages", {})
+        if not isinstance(packages, dict):
+            return ""
+        item = packages.get(dependency_path, {})
+        if not isinstance(item, dict):
+            return ""
+        return str(item.get("version") or "")
+
+    def _release_next_steps(self, gates: list[dict[str, object]], status: str) -> list[str]:
+        actions: list[str] = []
+        for gate in gates:
+            if gate["status"] == "pass":
+                continue
+            gate_id = gate["id"]
+            if gate_id == "changelog":
+                actions.append("Add or update docs/CHANGELOG.md with the pending release notes.")
+            elif gate_id == "release_checklist":
+                actions.append("Restore docs/RELEASE_CHECKLIST.md and review every required local gate.")
+            elif gate_id in {"verify_script", "bootstrap_script", "doctor_script"}:
+                actions.append("Restore the local setup and verification scripts before handoff.")
+            elif gate_id == "frontend_audit":
+                actions.append("Run scripts/audit-frontend.ps1 and keep the Solana advisory acknowledged until a compatible fix exists.")
+            elif gate_id == "schema":
+                actions.append("Run bootstrap or startup migrations until schema status is current.")
+            elif gate_id == "frontend_version":
+                actions.append("Align frontend/package.json version with the API release version.")
+            elif gate_id == "backup":
+                actions.append("Create a backup artifact and run the restore smoke test before live work.")
+            elif gate_id == "source_trust":
+                actions.append("Collect source evidence and inspect source health before release promotion.")
+            elif gate_id == "live_disabled":
+                actions.append("Disable live execution for normal release prep or document the intentional live-test scope.")
+            elif gate_id == "recovery_debt":
+                actions.append("Recover or export unresolved live audits before the next tagged release.")
+            elif gate_id == "local_auth":
+                actions.append("Enable local auth before shared workstation use or real-money operation.")
+            elif gate_id == "manual_verification":
+                actions.append("Run scripts/verify.ps1, review git diff, and record the result in release notes.")
+        if status != "blocked":
+            actions.append("Update the changelog date and tag only after local verification passes.")
+        return list(dict.fromkeys(actions))
+
+    def pilot_readiness_report(
+        self,
+        env_live_enabled: bool = False,
+        wallet_public_key: str = "",
+        signer_mode: str | None = None,
+        local_auth_enabled: bool = False,
+    ) -> dict[str, object]:
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        wallet = self._resolve_backend_wallet(signer_mode, wallet_public_key)
+        source = self.source_health()
+        source_soak = self.source_soak_acceptance_report()
+        readiness = self.readiness_status()
+        strategy = readiness.get("strategy_promotion") if isinstance(readiness, dict) else {}
+        execution = readiness.get("execution_readiness") if isinstance(readiness, dict) else {}
+        live = self.live_status(env_live_enabled, wallet, signer_mode, local_auth_enabled)
+        ledger = self.live_ledger(wallet)
+        backup = self.storage.backup_restore_status()
+        pre_run_backup = self._pre_run_backup_status()
+        caps = self.live_caps_snapshot()
+        unresolved_count = int(live.get("unresolved_audit_count", 0) or 0)
+        policy_blockers = self._execution_policy_blockers()
+        source_soak_required = bool(source_soak.get("hard_required"))
+        source_soak_ready = bool(source_soak.get("ready"))
+        source_soak_history = source_soak.get("history_summary", {}) if isinstance(source_soak.get("history_summary"), dict) else {}
+        source_soak_history_ready = (not source_soak_required) or bool(source_soak_history.get("latest_ready_recent"))
+        source_live_blocker = self._source_live_entry_blocker(source)
+        source_archive_blocker = self._source_archive_blocker(source)
+        source_ready_for_live = not bool(source_live_blocker or source_archive_blocker)
+        ledger_summary = ledger.get("summary", {}) if isinstance(ledger.get("summary"), dict) else {}
+        execution_metrics = execution.get("metrics", {}) if isinstance(execution, dict) and isinstance(execution.get("metrics"), dict) else {}
+        recent_shadow_evaluated = int(execution_metrics.get("recent_shadow_evaluated", 0) or 0)
+        recent_shadow_pnl = float(execution_metrics.get("recent_shadow_estimated_pnl_sol", 0.0) or 0.0)
+        execution_blockers = [str(item) for item in execution.get("blockers", []) if item] if isinstance(execution, dict) else []
+        execution_shadow_reason = "Dry-run quote and shadow evidence must be ready."
+        for blocker in execution_blockers:
+            if "PumpPortal trade subscriptions require a funded API key" in blocker:
+                execution_shadow_reason = blocker
+                break
+        manual_live = live.get("manual_live_verification", {}) if isinstance(live.get("manual_live_verification"), dict) else {}
+        gates = [
+            self._promotion_gate("env_live_enabled", "Live env", bool(live.get("env_live_enabled")), True, bool(live.get("env_live_enabled")), "LIVE_TRADING_ENABLED must be explicitly enabled for a real-money pilot."),
+            self._promotion_gate("session_acknowledged", "Session acknowledgement", bool(live.get("session_acknowledged")), True, bool(live.get("session_acknowledged")), "Operator must acknowledge the live session risk state."),
+            self._promotion_gate("source_trust", "Source trust", f"{source.get('status', 'unknown')}/{source.get('trust_state', 'unknown')}", "connected, recent, trusted, archived", source_ready_for_live, source_live_blocker or source_archive_blocker or "PumpPortal source must be connected, recent, trusted, and archived before live entries."),
+            self._promotion_gate("source_soak", "Hybrid source soak", source_soak.get("status", "unknown"), "ready when direct verifier is configured", (not source_soak_required) or source_soak_ready, "Hybrid direct/PumpPortal source-soak gate must pass before a real-money pilot when direct verification is configured or direct events exist."),
+            self._promotion_gate("source_soak_history", "Source-soak history", source_soak_history.get("latest_ready_age_hours"), "<= 24h ready snapshot when direct soak is required", source_soak_history_ready, "Record a ready source-soak snapshot from a meaningful direct/PumpPortal soak window within 24 hours before a real-money pilot."),
+            self._promotion_gate("strategy_promotion", "Strategy promotion", strategy.get("status", "unknown") if isinstance(strategy, dict) else "unknown", "eligible", bool(strategy.get("can_promote")) if isinstance(strategy, dict) else False, "Paper strategy must pass sample, replay, drawdown, and profitability gates."),
+            self._promotion_gate("execution_shadow", "Shadow execution", execution.get("status", "unknown") if isinstance(execution, dict) else "unknown", "shadow_ready", bool(execution.get("can_shadow")) if isinstance(execution, dict) else False, execution_shadow_reason),
+            self._promotion_gate("shadow_samples", "Shadow samples", recent_shadow_evaluated, ">= 5 evaluated in 24h", recent_shadow_evaluated >= 5, "Pilot requires at least five evaluated shadow comparisons from the last 24 hours to avoid guessing from stale evidence."),
+            self._promotion_gate("shadow_pnl", "Shadow PnL", round(recent_shadow_pnl, 6), ">= 0 SOL in 24h", recent_shadow_pnl >= 0 and recent_shadow_evaluated > 0, "Recent shadow evidence from the last 24 hours should not be net negative."),
+            self._promotion_gate("policy_caps", "Policy caps", "configured" if not policy_blockers else "blocked", "tiny capped", not policy_blockers, "Trade, loss, exposure, slippage, priority-fee, and position caps must be configured conservatively."),
+            self._promotion_gate("signer_health", "Signer health", live.get("signer", {}).get("status", "unknown") if isinstance(live.get("signer"), dict) else "unknown", "connected", not bool(live.get("signer", {}).get("disabled_reason")) if isinstance(live.get("signer"), dict) else False, "The selected signer must be connected and healthy."),
+            self._promotion_gate("manual_live_proof", "Manual-live wallet proof", bool(manual_live.get("verified")), True, bool(manual_live.get("verified")), str(manual_live.get("blocker") or "Selected wallet needs a confirmed and reconciled manual-live proof from the last 24 hours.")),
+            self._promotion_gate("autonomy_entry", "Entry autonomy", bool(live.get("auto_buy_available")), True, bool(live.get("auto_buy_available")), "Capped pilot entries require clear autonomy gates on the armed backend."),
+            self._promotion_gate("autonomy_exit", "Exit autonomy", bool(live.get("auto_sell_available")), True, bool(live.get("auto_sell_available")), "Protective exits must be available before automated buys."),
+            self._promotion_gate("recovery_debt", "Recovery debt", unresolved_count, 0, unresolved_count == 0, "Unresolved live audits must be recovered or reviewed before a pilot."),
+            self._promotion_gate("ledger_confidence", "Ledger confidence", ledger_summary.get("pnl_confidence", "unknown"), "no needs_review/stale", not ledger_summary.get("needs_review_positions") and not ledger_summary.get("stale_balance_positions"), "Ledger positions must not have stale balance evidence or needs-review reconciliation."),
+            self._promotion_gate("backup", "Pre-run backup", pre_run_backup.get("state", "missing"), "fresh", bool(pre_run_backup.get("fresh")), str(pre_run_backup.get("operator_action") or "Create a fresh local backup artifact before the first pilot session.")),
+            self._promotion_gate("kill_switch", "Kill switch", bool(self.settings.kill_switch_enabled), False, not self.settings.kill_switch_enabled, "Kill switch must be clear before starting a pilot."),
+        ]
+        blockers = [str(gate["reason"]) for gate in gates if gate["status"] != "pass"]
+        blockers.extend(str(item) for item in live.get("autonomy_blockers", []) if item)
+        blockers.extend(policy_blockers)
+        blockers = list(dict.fromkeys(blockers))
+        runbook_checklist = self._pilot_runbook_checklist(gates, live)
+        return {
+            "artifact_type": "cryptoarc_tiny_pilot_readiness",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "wallet_public_key": wallet,
+            "signer_mode": signer_mode,
+            "status": "ready" if not blockers else "blocked",
+            "ready": not blockers,
+            "stage": "tiny_real_money_pilot",
+            "gates": gates,
+            "blockers": blockers,
+            "runbook_checklist": runbook_checklist,
+            "operator_action": "Pilot gate is clear for tiny capped real-money execution." if not blockers else "Resolve every blocker before starting a real-money pilot.",
+            "evidence": {
+                "source": source,
+                "source_soak": source_soak,
+                "readiness": {
+                    "status": readiness.get("status") if isinstance(readiness, dict) else "unknown",
+                    "score": readiness.get("score") if isinstance(readiness, dict) else 0,
+                    "strategy_promotion": strategy,
+                    "execution_readiness": execution,
+                },
+                "live_status": live,
+                "live_ledger": ledger,
+                "backup_restore": backup,
+                "pre_run_backup": pre_run_backup,
+                "caps": caps,
+            },
+            "privacy_note": "Export contains public wallet, source/readiness, ledger, cap, signer, and backup status evidence only. It must not contain seed phrases or private keys.",
+        }
+
+    def _pilot_runbook_checklist(self, gates: list[dict[str, object]], live: dict[str, object]) -> list[dict[str, object]]:
+        gate_by_id = {str(gate.get("id")): gate for gate in gates}
+
+        def blockers_for(gate_ids: list[str]) -> list[str]:
+            return [
+                str(gate.get("reason") or gate.get("label") or gate_id)
+                for gate_id in gate_ids
+                for gate in [gate_by_id.get(gate_id)]
+                if gate and gate.get("status") != "pass"
+            ]
+
+        def stage(id_: str, label: str, gate_ids: list[str], actions: list[dict[str, str]], ready_action: str) -> dict[str, object]:
+            blockers = blockers_for(gate_ids)
+            return {
+                "id": id_,
+                "label": label,
+                "status": "ready" if not blockers else "blocked",
+                "blockers": blockers,
+                "actions": actions,
+                "operator_action": ready_action if not blockers else "Resolve this stage's blockers before continuing.",
+            }
+
+        full_sniper_gate = live.get("full_sniper_gate", {}) if isinstance(live.get("full_sniper_gate"), dict) else {}
+        run_blockers = blockers_for(["autonomy_entry", "autonomy_exit", "kill_switch"])
+        run_blockers.extend(str(item) for item in full_sniper_gate.get("blockers", []) if item)
+        run_blockers = list(dict.fromkeys(run_blockers))
+        recover_blockers = blockers_for(["recovery_debt", "ledger_confidence", "backup"])
+        return [
+            stage(
+                "launch",
+                "Launch",
+                [
+                    "env_live_enabled",
+                    "session_acknowledged",
+                    "source_trust",
+                    "source_soak",
+                    "source_soak_history",
+                    "strategy_promotion",
+                    "execution_shadow",
+                    "shadow_samples",
+                    "shadow_pnl",
+                    "policy_caps",
+                    "signer_health",
+                    "manual_live_proof",
+                    "backup",
+                ],
+                [
+                    {"label": "Run full local verification.", "command": "scripts\\verify.ps1"},
+                    {"label": "Confirm PumpPortal source health and raw-event archive are acceptable."},
+                    {"label": "Confirm fresh paper/shadow evidence and recent manual-live wallet proof."},
+                    {"label": "Acknowledge live session risk and tiny caps before arming."},
+                ],
+                "Launch prerequisites are clear; arm only the selected local backend.",
+            ),
+            {
+                "id": "run",
+                "label": "Run",
+                "status": "ready" if not run_blockers else "blocked",
+                "blockers": run_blockers,
+                "actions": [
+                    {"label": "Arm the local backend for the selected wallet."},
+                    {"label": "Confirm full_sniper_gate is ready before autonomous buy/sell flow."},
+                    {"label": "Run only under the configured tiny trade, loss, exposure, position, slippage, and fee caps."},
+                ],
+                "operator_action": "Run the tiny autonomous pilot and watch live audit, ledger, and cap evidence." if not run_blockers else "Resolve run blockers before autonomous execution.",
+            },
+            {
+                "id": "stop",
+                "label": "Stop",
+                "status": "ready",
+                "blockers": [],
+                "actions": [
+                    {"label": "Enable the live kill switch to stop new entries immediately."},
+                    {"label": "Disarm the active backend after the run or on any blocker."},
+                    {"label": "Stop the bot if source, ledger, wallet, cap, or audit state becomes unsafe."},
+                ],
+                "operator_action": "Kill switch and disarm controls are the immediate stop path.",
+            },
+            {
+                "id": "recover",
+                "label": "Recover",
+                "status": "ready" if not recover_blockers else "blocked",
+                "blockers": recover_blockers,
+                "actions": [
+                    {"label": "Recover unresolved live audits before the next entry."},
+                    {"label": "Resolve stale or needs-review ledger confidence."},
+                    {"label": "Use the latest pre-run backup and restore preview if local state needs recovery."},
+                ],
+                "operator_action": "Recovery state is clear." if not recover_blockers else "Clear recovery and accounting debt before the next run.",
+            },
+            {
+                "id": "review",
+                "label": "Review",
+                "status": "ready",
+                "blockers": [],
+                "actions": [
+                    {"label": "Open the post-run review report after every pilot."},
+                    {"label": "Export incident bundles for failed, stale, blocked, or needs-review audits."},
+                    {"label": "Confirm every live action has audit, transaction, ledger, cap, kill-switch, and PnL evidence."},
+                ],
+                "operator_action": "Post-run review is mandatory after live or shadow-live operation.",
+            },
+        ]
+
+    def incident_export(self, audit_id: str) -> dict[str, object]:
+        audit = self.storage.load_live_execution_audit(audit_id)
+        if audit is None:
+            raise ValueError(f"Live audit not found: {audit_id}")
+        intent = self.storage.load_live_intent(audit.intent_id) if audit.intent_id else None
+        token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == audit.mint), None)
+        source_events = [
+            event.to_dict()
+            for event in self.storage.load_source_events(5000)
+            if self._source_event_mint(event) == audit.mint or (token and event.normalized_token_id == token.id)
+        ][:100]
+        operator_events = [
+            event.to_dict()
+            for event in self.storage.load_all_events(1000)
+            if event.subsystem in {"live", "source", "backup_restore"} or audit.id in event.message or audit.mint[:8] in event.message
+        ][:100]
+        position = next((item for item in self.storage.load_live_ledger_positions(500) if item.mint == audit.mint and item.wallet_public_key == audit.wallet_public_key), None)
+        return {
+            "artifact_type": "cryptoarc_live_incident_export",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "audit_id": audit.id,
+            "audit": audit.to_dict(),
+            "intent": intent.to_dict() if intent else None,
+            "quote": audit.quote,
+            "simulation": audit.simulation,
+            "signature_status": audit.confirmation,
+            "balance_snapshot": audit.balance_snapshot,
+            "ledger_position": position.to_dict() if position else None,
+            "token": token.to_dict() if token else None,
+            "source_events": source_events,
+            "operator_events": operator_events,
+            "recovery_state": {
+                "status": audit.status,
+                "final_status": audit.final_status,
+                "reconciliation_status": audit.reconciliation_status,
+                "recovery_attempts": audit.recovery_attempts,
+                "last_recovery_error": audit.last_recovery_error,
+                "recommended_action": audit.recommended_action,
+            },
+            "privacy_note": "Export contains public wallet, transaction, token, quote, and local operator evidence only. It must not contain seed phrases or private keys.",
         }
 
     def backup_artifact(self) -> dict[str, object]:
@@ -2996,17 +9064,140 @@ class BotState:
         )
         return result
 
+    def restore_smoke_test(self) -> dict[str, object]:
+        artifact = self.storage.create_backup_artifact()
+        preview = self.storage.preview_restore_artifact(artifact)
+        passed = bool(preview.get("compatible")) and str(preview.get("integrity_check", "")).lower() == "ok"
+        status = "pass" if passed else "review"
+        operator_action = (
+            "Backup artifact can be previewed and passes SQLite integrity checks."
+            if passed
+            else "Review restore smoke test warnings before any real-money session."
+        )
+        result = {
+            "artifact_type": "cryptoarc_restore_smoke_test",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "status": status,
+            "passed": passed,
+            "backup_artifact_created_at": artifact.get("created_at"),
+            "schema_version": preview.get("schema_version"),
+            "current_schema_version": preview.get("current_schema_version"),
+            "database_name": preview.get("database_name"),
+            "payload_bytes": preview.get("payload_bytes"),
+            "integrity_check": preview.get("integrity_check"),
+            "risk_level": preview.get("risk_level"),
+            "changed_tables": preview.get("changed_tables", []),
+            "table_deltas": preview.get("table_deltas", {}),
+            "summary": preview.get("summary", {}),
+            "current_summary": preview.get("current_summary", {}),
+            "warnings": preview.get("warnings", []),
+            "recommended_actions": preview.get("recommended_actions", []),
+            "operator_action": operator_action,
+            "privacy_note": "Smoke test returns restore metadata only. It does not return the embedded database payload, seed phrases, private keys, or Telegram tokens.",
+        }
+        self.add_event(
+            "info" if passed else "warning",
+            "Restore smoke test completed",
+            subsystem="backup_restore",
+            operator_action=operator_action,
+        )
+        return result
+
+    def backup_restore_export(self, entry_id: str = "") -> dict[str, object]:
+        history = self.storage.load_backup_restore_history(100)
+        selected = None
+        if entry_id.strip():
+            selected = next((item for item in history if str(item.get("id", "")) == entry_id.strip()), None)
+            if selected is None:
+                raise ValueError(f"Backup/restore history entry not found: {entry_id}")
+        status = self.storage.backup_restore_status()
+        return {
+            "artifact_type": "cryptoarc_backup_restore_evidence",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "entry_id": entry_id.strip() or None,
+            "selected_entry": selected,
+            "status": status,
+            "schema": self.storage.schema_status(),
+            "data_summary": self.data_summary(),
+            "source": self.source_health(),
+            "readiness": self.readiness_status(),
+            "live_recovery": {
+                "last_poll_at": self.live_last_poll_at.isoformat() if self.live_last_poll_at else None,
+                "summary": self.live_last_poll_summary,
+                "unresolved_audits": [
+                    audit.to_dict()
+                    for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(200))
+                    if self._is_unresolved_live_audit(audit)
+                ][:25],
+            },
+            "operator_events": [
+                event.to_dict()
+                for event in self.storage.load_all_events(500)
+                if event.subsystem in {"backup_restore", "live", "source"} or "restore" in event.message.lower() or "backup" in event.message.lower()
+            ][:100],
+            "privacy_note": "Export contains local database path, schema, restore history, public wallet/audit evidence, and operator events. It must not contain seed phrases or private keys.",
+        }
+
     def source_adapters(self) -> list[dict[str, object]]:
+        source = self.source_health()
+        solana_configured = bool(self.solana_wss_endpoint)
+        solana_mentions_configured = bool(self.solana_logs_mentions_address.strip())
+        solana_ready = solana_configured and solana_mentions_configured
+        solana_status = self.solana_logs_status.status if solana_ready else ("missing_mentions_address" if solana_configured else "not_configured")
         return [
             {"name": "mock", "enabled": True, "status": "available", "capabilities": ["launches", "simulated_prices"], "confidence": 0.7},
-            {"name": "pumpportal", "enabled": True, "status": self.source_status.status if self.source_status.source == "pumpportal" else "available", "capabilities": ["launches", "trades", "raw_events"], "confidence": self.source_health().get("health_score", 0) / 100},
+            {
+                "name": "pumpportal",
+                "enabled": True,
+                "status": self.source_status.status if self.source_status.source == "pumpportal" else "available",
+                "capabilities": ["launches", "trades", "raw_events"],
+                "confidence": source.get("health_score", 0) / 100,
+                "details": {
+                    "role": "fast_path",
+                    "cost_profile": "free_launch_streams_bounded_trade_subscriptions",
+                    "operator_action": "Keep one WebSocket connection and inspect raw event quality before promotion.",
+                },
+            },
+            {
+                "name": "solana_logs",
+                "enabled": solana_ready,
+                "status": solana_status,
+                "capabilities": ["logsSubscribe", "single_address_mentions_filter", "direct_chain_verification", "raw_event_archive", "paper_create_normalization"],
+                "confidence": 0.7 if self.solana_logs_status.status == "connected" else (0.5 if solana_ready else 0.0),
+                "details": {
+                    "role": "verification_path",
+                    "wss_configured": solana_configured,
+                    "mentions_address_configured": solana_mentions_configured,
+                    "paper_normalization_enabled": self.settings.direct_solana_paper_enabled,
+                    "paper_normalization_min_confidence": self.settings.direct_solana_min_confidence,
+                    "mentions_address": self.solana_logs_mentions_address,
+                    "endpoint_configured": solana_configured,
+                    "filter": "mentions",
+                    "subscription_limit": "one address per logsSubscribe subscription",
+                    "last_event_at": self.solana_logs_status.last_event_at.isoformat() if self.solana_logs_status.last_event_at else "",
+                    "reconnect_attempts": self.solana_logs_status.reconnect_attempts,
+                    "operator_action": "Set SOLANA_WSS_ENDPOINT and SOLANA_LOGS_MENTIONS_ADDRESS to archive direct-chain logs for PumpPortal comparison." if not solana_ready else "Direct-chain verifier archives logsSubscribe notifications for source-soak comparison.",
+                },
+            },
         ]
 
     def trade_review_detail(self, token_id: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.id == token_id), None)
         trade = next((item for item in self.storage.load_trades(5000) if item.token_id == token_id), None)
         decisions = [item.to_dict() for item in self.storage.load_strategy_decisions(1000) if item.token_id == token_id]
-        observations = [item.to_dict() for item in self.storage.load_price_observations(1000, mint=token.mint if token else "")]
+        observations = [
+            item.to_dict()
+            for item in self.storage.load_price_observations(1000, mint=token.mint if token else "")
+            if item.token_id == token_id or (token and item.mint == token.mint)
+        ]
+        source_events = [
+            event
+            for event in self.storage.load_source_events(1000)
+            if event.normalized_token_id == token_id
+            or (token and token.mint and self._source_event_mint(event) == token.mint)
+        ]
         pnl_breakdown = {}
         if trade:
             gross = trade.pnl_sol or 0.0
@@ -3025,6 +9216,83 @@ class BotState:
             "observations": observations,
             "timeline": self.replay_timeline(token_id),
             "pnl_breakdown": pnl_breakdown,
+            "review_workflow": self._trade_review_workflow(token_id, trade, decisions, observations, source_events),
+        }
+
+    def _trade_review_workflow(
+        self,
+        token_id: str,
+        trade: TradeRecord | None,
+        decisions: list[dict[str, object]],
+        observations: list[dict[str, object]],
+        source_events: list[SourceEvent],
+    ) -> dict[str, object]:
+        closed = sorted(
+            [item for item in self.storage.load_trades(5000) if item.closed_at and item.pnl_sol is not None],
+            key=lambda item: item.closed_at or item.opened_at or utc_now(),
+            reverse=True,
+        )
+        token_ids = [item.token_id for item in closed]
+        index = token_ids.index(token_id) if token_id in token_ids else -1
+        labels = self.storage.load_trade_labels(5000)
+        latest_label = next((label for label in sorted(labels, key=lambda item: item.created_at, reverse=True) if label.token_id == token_id), None)
+        rejected_prices = [item for item in observations if not bool(item.get("accepted"))]
+        accepted_prices = [item for item in observations if bool(item.get("accepted"))]
+        suggested_labels: list[str] = []
+        if trade:
+            if trade.source_price_confidence < 0.65 or rejected_prices:
+                suggested_labels.append("bad_price_data")
+            if (trade.pnl_sol or 0.0) < 0:
+                suggested_labels.append("bad_entry")
+            if int(trade.hold_duration_seconds or 0) >= max(300, int(self.settings.minimum_hold_time_seconds or 0) * 3):
+                suggested_labels.append("held_too_long")
+            if (trade.pnl_sol or 0.0) >= 0 and not suggested_labels:
+                suggested_labels.append("good_entry")
+            if trade.exit_reason and "too early" in trade.exit_reason.lower():
+                suggested_labels.append("exited_too_early")
+        checklist = [
+            {
+                "id": "source_events",
+                "label": "Source events",
+                "status": "pass" if source_events else "missing",
+                "count": len(source_events),
+                "ids": [event.id for event in source_events[:8]],
+                "operator_action": "Open the timeline source rows before labeling the entry." if source_events else "Find or replay raw source evidence before trusting this trade.",
+            },
+            {
+                "id": "decisions",
+                "label": "Strategy decisions",
+                "status": "pass" if decisions else "missing",
+                "count": len(decisions),
+                "ids": [str(item.get("id", "")) for item in decisions[:8]],
+                "operator_action": "Review the decision stack and score breakdown." if decisions else "Missing decisions should be labeled or excluded from tuning.",
+            },
+            {
+                "id": "price_observations",
+                "label": "Price observations",
+                "status": "warn" if rejected_prices else ("pass" if accepted_prices else "missing"),
+                "count": len(observations),
+                "ids": [str(item.get("id", "")) for item in observations[:8]],
+                "operator_action": "Rejected price observations need bad-price review." if rejected_prices else "Accepted price observations support PnL review.",
+            },
+            {
+                "id": "pnl",
+                "label": "PnL evidence",
+                "status": "pass" if trade and trade.pnl_sol is not None else "missing",
+                "count": 1 if trade and trade.pnl_sol is not None else 0,
+                "ids": [trade.id] if trade else [],
+                "operator_action": "Compare net PnL with fees, slippage, hold time, and exit reason.",
+            },
+        ]
+        return {
+            "current_index": index,
+            "total_closed": len(closed),
+            "previous_token_id": token_ids[index - 1] if index > 0 else "",
+            "next_token_id": token_ids[index + 1] if index >= 0 and index + 1 < len(token_ids) else "",
+            "selected_label": latest_label.label if latest_label else "",
+            "suggested_labels": list(dict.fromkeys(suggested_labels)),
+            "checklist": checklist,
+            "operator_action": "Use the checklist, apply a label, then move to the next trade in the queue.",
         }
 
     def replay_timeline(self, token_id: str) -> list[dict[str, object]]:
@@ -3200,6 +9468,27 @@ class BotState:
         cutoff = utc_now() - window
         return [trade for trade in trades if (trade.closed_at or trade.opened_at or utc_now()) >= cutoff]
 
+    def _timeframe_cutoff(self, timeframe: str) -> datetime | None:
+        timeframe = str(timeframe or "all").strip().lower()
+        if timeframe in {"all", "any", ""}:
+            return None
+        if timeframe.endswith("m"):
+            try:
+                return utc_now() - timedelta(minutes=max(1, min(10080, int(timeframe[:-1]))))
+            except ValueError:
+                return utc_now() - timedelta(hours=24)
+        if timeframe.endswith("h"):
+            try:
+                return utc_now() - timedelta(hours=max(1, min(168, int(timeframe[:-1]))))
+            except ValueError:
+                return utc_now() - timedelta(hours=24)
+        if timeframe.endswith("d"):
+            try:
+                return utc_now() - timedelta(days=max(1, min(30, int(timeframe[:-1]))))
+            except ValueError:
+                return utc_now() - timedelta(hours=24)
+        return utc_now() - timedelta(hours=24)
+
     def export_data(self, target: str) -> dict[str, object]:
         if target == "tokens":
             return {"tokens": [token.to_dict() for token in self.storage.load_all_tokens()]}
@@ -3233,6 +9522,8 @@ class BotState:
             return {"live_intents": [item.to_dict() for item in self.storage.load_live_intents(5000)]}
         if target == "live_ledger_positions":
             return {"live_ledger_positions": [item.to_dict() for item in self.storage.load_live_ledger_positions(5000)]}
+        if target == "source_soak_history":
+            return {"source_soak_history": self.storage.load_source_soak_history(5000)}
         return {
             "tokens": [token.to_dict() for token in self.storage.load_all_tokens()],
             "events": [event.to_dict() for event in self.storage.load_all_events()],
@@ -3251,6 +9542,7 @@ class BotState:
             "live_execution_audits": [item.to_dict() for item in self.storage.load_live_execution_audits(5000)],
             "live_intents": [item.to_dict() for item in self.storage.load_live_intents(5000)],
             "live_ledger_positions": [item.to_dict() for item in self.storage.load_live_ledger_positions(5000)],
+            "source_soak_history": self.storage.load_source_soak_history(5000),
         }
 
     def data_summary(self) -> dict[str, int]:
@@ -3273,6 +9565,7 @@ class BotState:
             "live_intents": self.storage.count_live_intents(),
             "live_ledger_positions": self.storage.count_live_ledger_positions(),
             "backup_restore_history": self.storage.count_backup_restore_history(),
+            "source_soak_history": self.storage.count_source_soak_history(),
         }
 
     def clear_data(self, target: str) -> dict[str, int]:
@@ -3315,17 +9608,22 @@ class BotState:
             self.storage.clear_live_intents()
         if target in {"live_ledger_positions", "all"}:
             self.storage.clear_live_ledger_positions()
+        if target in {"source_soak_history", "all"}:
+            self.storage.clear_source_soak_history()
         self.add_event("warning", f"Data cleared: {target}")
         self.recalculate_stats()
         return self.data_summary()
 
     def open_position_count(self) -> int:
-        return sum(1 for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING})
+        open_ids = {token.id for token in self._load_open_storage_tokens()}
+        open_ids.update(token.id for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING})
+        return len(open_ids)
 
     def recalculate_stats(self) -> None:
+        self._ensure_active_tokens_loaded()
         self._normalize_active_tokens()
         skipped = [token for token in self.tokens if token.status == TokenStatus.SKIPPED]
-        open_tokens = [token for token in self.tokens if token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}]
+        open_tokens = self._load_open_storage_tokens()
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
         closed_ids = {trade.token_id for trade in closed}
         closed.extend(
@@ -3341,6 +9639,11 @@ class BotState:
         gross_win = sum(wins)
         gross_loss = abs(sum(losses))
         decisive = len(wins) + len(losses)
+        open_entry_fees = sum(float(token.fee_paid_sol or 0.0) for token in open_tokens if token.id not in closed_ids)
+        closed_entry_fees = sum(float(trade.entry_fee_sol or 0.0) for trade in closed)
+        closed_exit_fees = sum(float(trade.exit_fee_sol or 0.0) for trade in closed)
+        entry_fees = round(closed_entry_fees + open_entry_fees, 9)
+        exit_fees = round(closed_exit_fees, 9)
         pnl_curve = []
         running = 0.0
         max_seen = 0.0
@@ -3365,6 +9668,9 @@ class BotState:
             scratch_rate_pct=int((len(scratches) / len(closed)) * 100) if closed else 0,
             scratch_threshold_sol=scratch_threshold,
             total_pnl_sol=round(sum(trade.pnl_sol or 0.0 for trade in closed), 6),
+            entry_fees_sol=entry_fees,
+            exit_fees_sol=exit_fees,
+            total_fees_sol=round(entry_fees + exit_fees, 9),
             best_trade_sol=round(max([trade.pnl_sol or 0.0 for trade in closed], default=0.0), 6),
             worst_trade_sol=round(min([trade.pnl_sol or 0.0 for trade in closed], default=0.0), 6),
             average_win_sol=round(gross_win / len(wins), 6) if wins else 0.0,
@@ -3396,10 +9702,10 @@ class BotState:
             source_status=self.source_status,
         )
 
-    def _snapshot_tokens(self) -> list[TokenSignal]:
+    def _snapshot_tokens(self, limit: int = 300) -> list[TokenSignal]:
         current = list(self.tokens)
         by_id = {token.id: token for token in current}
-        for token in self.storage.load_all_tokens(5000):
+        for token in self.storage.load_tokens(limit):
             if token.status != TokenStatus.SKIPPED:
                 by_id[token.id] = token
-        return sorted(by_id.values(), key=lambda token: token.detected_at, reverse=True)
+        return sorted(by_id.values(), key=lambda token: token.detected_at, reverse=True)[:limit]

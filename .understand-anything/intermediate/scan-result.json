@@ -1,0 +1,969 @@
+{
+  "projectName": "CryptoARC v2",
+  "projectDescription": "CryptoARC v2 is a local-first FastAPI + React dashboard for Pump.fun and PumpPortal monitoring, research, backtesting, paper trading, and carefully gated localhost live execution.",
+  "name": "CryptoARC v2",
+  "description": "CryptoARC v2 is a local-first FastAPI + React dashboard for Pump.fun and PumpPortal monitoring, research, backtesting, paper trading, and carefully gated localhost live execution.",
+  "languages": [
+    "markdown",
+    "typescript",
+    "python",
+    "powershell",
+    "yaml",
+    "unknown",
+    "config",
+    "dockerfile",
+    "json",
+    "txt",
+    "html",
+    "conf",
+    "css"
+  ],
+  "frameworks": [
+    "FastAPI",
+    "React",
+    "Uvicorn"
+  ],
+  "files": [
+    {
+      "path": ".dockerignore",
+      "language": "unknown",
+      "sizeLines": 9,
+      "fileCategory": "infra"
+    },
+    {
+      "path": ".env.example",
+      "language": "config",
+      "sizeLines": 19,
+      "fileCategory": "config"
+    },
+    {
+      "path": ".env.production.example",
+      "language": "config",
+      "sizeLines": 13,
+      "fileCategory": "config"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "language": "yaml",
+      "sizeLines": 47,
+      "fileCategory": "infra"
+    },
+    {
+      "path": ".understand-anything/.understandignore",
+      "language": "unknown",
+      "sizeLines": 52,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/__init__.py",
+      "language": "python",
+      "sizeLines": 1,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/auth.py",
+      "language": "python",
+      "sizeLines": 100,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/config.py",
+      "language": "python",
+      "sizeLines": 33,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/__init__.py",
+      "language": "python",
+      "sizeLines": 1,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/alerts.py",
+      "language": "python",
+      "sizeLines": 118,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/hot_wallet.py",
+      "language": "python",
+      "sizeLines": 238,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/integrity.py",
+      "language": "python",
+      "sizeLines": 123,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/models.py",
+      "language": "python",
+      "sizeLines": 771,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/paper_trader.py",
+      "language": "python",
+      "sizeLines": 174,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/price_pipeline.py",
+      "language": "python",
+      "sizeLines": 185,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/pumpfun_intelligence.py",
+      "language": "python",
+      "sizeLines": 58,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/risk.py",
+      "language": "python",
+      "sizeLines": 83,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/scoring.py",
+      "language": "python",
+      "sizeLines": 79,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/simulator.py",
+      "language": "python",
+      "sizeLines": 57,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/solana_readonly.py",
+      "language": "python",
+      "sizeLines": 69,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/sources.py",
+      "language": "python",
+      "sizeLines": 269,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/state.py",
+      "language": "python",
+      "sizeLines": 5023,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/storage.py",
+      "language": "python",
+      "sizeLines": 1125,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/core/strategy.py",
+      "language": "python",
+      "sizeLines": 86,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/app/main.py",
+      "language": "python",
+      "sizeLines": 1217,
+      "fileCategory": "code"
+    },
+    {
+      "path": "backend/requirements.txt",
+      "language": "txt",
+      "sizeLines": 6,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docker-compose.production.yml",
+      "language": "yaml",
+      "sizeLines": 28,
+      "fileCategory": "infra"
+    },
+    {
+      "path": "docker-compose.yml",
+      "language": "yaml",
+      "sizeLines": 29,
+      "fileCategory": "infra"
+    },
+    {
+      "path": "Dockerfile",
+      "language": "dockerfile",
+      "sizeLines": 12,
+      "fileCategory": "infra"
+    },
+    {
+      "path": "docs/AI_HANDOFF.md",
+      "language": "markdown",
+      "sizeLines": 75,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/DEPLOYMENT.md",
+      "language": "markdown",
+      "sizeLines": 39,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/LIVE_TRADING_DESIGN.md",
+      "language": "markdown",
+      "sizeLines": 84,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/01-overview.md",
+      "language": "markdown",
+      "sizeLines": 103,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/02-quickstart.md",
+      "language": "markdown",
+      "sizeLines": 106,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/03-dashboard-tour.md",
+      "language": "markdown",
+      "sizeLines": 106,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/04-monitor-guide.md",
+      "language": "markdown",
+      "sizeLines": 68,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/05-analysis-guide.md",
+      "language": "markdown",
+      "sizeLines": 51,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/06-backtests-guide.md",
+      "language": "markdown",
+      "sizeLines": 65,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/07-review-guide.md",
+      "language": "markdown",
+      "sizeLines": 46,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/08-data-safety-guide.md",
+      "language": "markdown",
+      "sizeLines": 84,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/09-settings-reference.md",
+      "language": "markdown",
+      "sizeLines": 174,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/10-wallets-and-live-trading.md",
+      "language": "markdown",
+      "sizeLines": 162,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/11-operations-and-recovery.md",
+      "language": "markdown",
+      "sizeLines": 81,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/12-developer-architecture.md",
+      "language": "markdown",
+      "sizeLines": 142,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/13-api-and-data-reference.md",
+      "language": "markdown",
+      "sizeLines": 214,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/14-roadmap-and-evolution.md",
+      "language": "markdown",
+      "sizeLines": 38,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/15-troubleshooting.md",
+      "language": "markdown",
+      "sizeLines": 112,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/assets/diagrams/README.md",
+      "language": "markdown",
+      "sizeLines": 13,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/assets/screenshots/README.md",
+      "language": "markdown",
+      "sizeLines": 35,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/manual/INDEX.md",
+      "language": "markdown",
+      "sizeLines": 76,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/PUMPFUN_RESEARCH.md",
+      "language": "markdown",
+      "sizeLines": 67,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/RELEASE_CHECKLIST.md",
+      "language": "markdown",
+      "sizeLines": 47,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/ROADMAP.md",
+      "language": "markdown",
+      "sizeLines": 7,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/01-current-state-audit.md",
+      "language": "markdown",
+      "sizeLines": 65,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/02-foundation-tooling-release-discipline.md",
+      "language": "markdown",
+      "sizeLines": 68,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/03-data-source-reliability.md",
+      "language": "markdown",
+      "sizeLines": 69,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/04-evidence-loop-strategy.md",
+      "language": "markdown",
+      "sizeLines": 68,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/05-sniper-execution-speed.md",
+      "language": "markdown",
+      "sizeLines": 70,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/06-live-autonomy-safety.md",
+      "language": "markdown",
+      "sizeLines": 80,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/07-operator-ui-alerts.md",
+      "language": "markdown",
+      "sizeLines": 61,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/08-ledger-recovery-observability.md",
+      "language": "markdown",
+      "sizeLines": 69,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/09-finished-acceptance-plan.md",
+      "language": "markdown",
+      "sizeLines": 82,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/10-feature-backlog.md",
+      "language": "markdown",
+      "sizeLines": 60,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/roadmap/README.md",
+      "language": "markdown",
+      "sizeLines": 47,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "docs/SECURITY.md",
+      "language": "markdown",
+      "sizeLines": 22,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "frontend/Dockerfile",
+      "language": "dockerfile",
+      "sizeLines": 12,
+      "fileCategory": "infra"
+    },
+    {
+      "path": "frontend/index.html",
+      "language": "html",
+      "sizeLines": 12,
+      "fileCategory": "markup"
+    },
+    {
+      "path": "frontend/nginx.conf",
+      "language": "conf",
+      "sizeLines": 32,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/package.json",
+      "language": "json",
+      "sizeLines": 30,
+      "fileCategory": "config"
+    },
+    {
+      "path": "frontend/src/api.ts",
+      "language": "typescript",
+      "sizeLines": 598,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/App.tsx",
+      "language": "typescript",
+      "sizeLines": 3904,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/AnimatedNumber.tsx",
+      "language": "typescript",
+      "sizeLines": 19,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/AppLayout.tsx",
+      "language": "typescript",
+      "sizeLines": 131,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Badge.tsx",
+      "language": "typescript",
+      "sizeLines": 28,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Button.tsx",
+      "language": "typescript",
+      "sizeLines": 44,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Card.tsx",
+      "language": "typescript",
+      "sizeLines": 35,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Modal.tsx",
+      "language": "typescript",
+      "sizeLines": 73,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/PageHeader.tsx",
+      "language": "typescript",
+      "sizeLines": 39,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/PnlChart.tsx",
+      "language": "typescript",
+      "sizeLines": 103,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/SettingsModal.tsx",
+      "language": "typescript",
+      "sizeLines": 829,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Sidebar.tsx",
+      "language": "typescript",
+      "sizeLines": 354,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/Skeleton.tsx",
+      "language": "typescript",
+      "sizeLines": 25,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/StatsGrid.tsx",
+      "language": "typescript",
+      "sizeLines": 118,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/TokenDetail.tsx",
+      "language": "typescript",
+      "sizeLines": 210,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/TokenTable.tsx",
+      "language": "typescript",
+      "sizeLines": 356,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/components/utils.ts",
+      "language": "typescript",
+      "sizeLines": 6,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/main.tsx",
+      "language": "typescript",
+      "sizeLines": 9,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/pages/AnalysisPage.tsx",
+      "language": "typescript",
+      "sizeLines": 424,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/pages/BacktestsPage.tsx",
+      "language": "typescript",
+      "sizeLines": 198,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/pages/DataPage.tsx",
+      "language": "typescript",
+      "sizeLines": 1173,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/pages/MonitorPage.tsx",
+      "language": "typescript",
+      "sizeLines": 225,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/pages/ReviewPage.tsx",
+      "language": "typescript",
+      "sizeLines": 422,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/styles.css",
+      "language": "css",
+      "sizeLines": 2674,
+      "fileCategory": "markup"
+    },
+    {
+      "path": "frontend/src/types.ts",
+      "language": "typescript",
+      "sizeLines": 1279,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/src/vite-env.d.ts",
+      "language": "typescript",
+      "sizeLines": 1,
+      "fileCategory": "code"
+    },
+    {
+      "path": "frontend/tsconfig.json",
+      "language": "json",
+      "sizeLines": 20,
+      "fileCategory": "config"
+    },
+    {
+      "path": "frontend/vite.config.ts",
+      "language": "typescript",
+      "sizeLines": 23,
+      "fileCategory": "code"
+    },
+    {
+      "path": "README.md",
+      "language": "markdown",
+      "sizeLines": 85,
+      "fileCategory": "docs"
+    },
+    {
+      "path": "scripts/bootstrap.ps1",
+      "language": "powershell",
+      "sizeLines": 59,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/check-doc-links.ps1",
+      "language": "powershell",
+      "sizeLines": 40,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/healthcheck.ps1",
+      "language": "powershell",
+      "sizeLines": 12,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/restart-dev.ps1",
+      "language": "powershell",
+      "sizeLines": 16,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/runtime.ps1",
+      "language": "powershell",
+      "sizeLines": 148,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/start-dev.ps1",
+      "language": "powershell",
+      "sizeLines": 93,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/status-dev.ps1",
+      "language": "powershell",
+      "sizeLines": 21,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/stop-dev.ps1",
+      "language": "powershell",
+      "sizeLines": 21,
+      "fileCategory": "script"
+    },
+    {
+      "path": "scripts/verify.ps1",
+      "language": "powershell",
+      "sizeLines": 40,
+      "fileCategory": "script"
+    },
+    {
+      "path": "tests/test_core.py",
+      "language": "python",
+      "sizeLines": 2128,
+      "fileCategory": "code"
+    }
+  ],
+  "totalFiles": 108,
+  "filteredByIgnore": 0,
+  "estimatedComplexity": "moderate",
+  "stats": {
+    "filesScanned": 108,
+    "byCategory": {
+      "infra": 6,
+      "config": 4,
+      "code": 49,
+      "docs": 38,
+      "markup": 2,
+      "script": 9
+    },
+    "byLanguage": {
+      "unknown": 2,
+      "config": 2,
+      "yaml": 3,
+      "python": 21,
+      "txt": 1,
+      "dockerfile": 2,
+      "markdown": 37,
+      "html": 1,
+      "conf": 1,
+      "json": 2,
+      "typescript": 26,
+      "css": 1,
+      "powershell": 9
+    }
+  },
+  "importMap": {
+    ".dockerignore": [],
+    ".env.example": [],
+    ".env.production.example": [],
+    ".github/workflows/ci.yml": [],
+    ".understand-anything/.understandignore": [],
+    "backend/app/__init__.py": [],
+    "backend/app/auth.py": [],
+    "backend/app/config.py": [],
+    "backend/app/core/__init__.py": [],
+    "backend/app/core/alerts.py": [],
+    "backend/app/core/hot_wallet.py": [
+      "backend/app/core/solana_readonly.py"
+    ],
+    "backend/app/core/integrity.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/models.py": [],
+    "backend/app/core/paper_trader.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/price_pipeline.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/pumpfun_intelligence.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/risk.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/scoring.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/simulator.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/solana_readonly.py": [],
+    "backend/app/core/sources.py": [
+      "backend/app/core/models.py",
+      "backend/app/core/price_pipeline.py",
+      "backend/app/core/simulator.py"
+    ],
+    "backend/app/core/state.py": [
+      "backend/app/core/alerts.py",
+      "backend/app/core/hot_wallet.py",
+      "backend/app/core/integrity.py",
+      "backend/app/core/models.py",
+      "backend/app/core/paper_trader.py",
+      "backend/app/core/price_pipeline.py",
+      "backend/app/core/pumpfun_intelligence.py",
+      "backend/app/core/risk.py",
+      "backend/app/core/scoring.py",
+      "backend/app/core/simulator.py",
+      "backend/app/core/solana_readonly.py",
+      "backend/app/core/sources.py",
+      "backend/app/core/storage.py",
+      "backend/app/core/strategy.py"
+    ],
+    "backend/app/core/storage.py": [
+      "backend/app/core/models.py"
+    ],
+    "backend/app/core/strategy.py": [
+      "backend/app/core/models.py",
+      "backend/app/core/risk.py",
+      "backend/app/core/scoring.py"
+    ],
+    "backend/app/main.py": [
+      "backend/app/auth.py",
+      "backend/app/config.py",
+      "backend/app/core/alerts.py",
+      "backend/app/core/models.py",
+      "backend/app/core/sources.py",
+      "backend/app/core/state.py"
+    ],
+    "backend/requirements.txt": [],
+    "docker-compose.production.yml": [],
+    "docker-compose.yml": [],
+    "Dockerfile": [],
+    "docs/AI_HANDOFF.md": [],
+    "docs/DEPLOYMENT.md": [],
+    "docs/LIVE_TRADING_DESIGN.md": [],
+    "docs/manual/01-overview.md": [],
+    "docs/manual/02-quickstart.md": [],
+    "docs/manual/03-dashboard-tour.md": [],
+    "docs/manual/04-monitor-guide.md": [],
+    "docs/manual/05-analysis-guide.md": [],
+    "docs/manual/06-backtests-guide.md": [],
+    "docs/manual/07-review-guide.md": [],
+    "docs/manual/08-data-safety-guide.md": [],
+    "docs/manual/09-settings-reference.md": [],
+    "docs/manual/10-wallets-and-live-trading.md": [],
+    "docs/manual/11-operations-and-recovery.md": [],
+    "docs/manual/12-developer-architecture.md": [],
+    "docs/manual/13-api-and-data-reference.md": [],
+    "docs/manual/14-roadmap-and-evolution.md": [],
+    "docs/manual/15-troubleshooting.md": [],
+    "docs/manual/assets/diagrams/README.md": [],
+    "docs/manual/assets/screenshots/README.md": [],
+    "docs/manual/INDEX.md": [],
+    "docs/PUMPFUN_RESEARCH.md": [],
+    "docs/RELEASE_CHECKLIST.md": [],
+    "docs/ROADMAP.md": [],
+    "docs/roadmap/01-current-state-audit.md": [],
+    "docs/roadmap/02-foundation-tooling-release-discipline.md": [],
+    "docs/roadmap/03-data-source-reliability.md": [],
+    "docs/roadmap/04-evidence-loop-strategy.md": [],
+    "docs/roadmap/05-sniper-execution-speed.md": [],
+    "docs/roadmap/06-live-autonomy-safety.md": [],
+    "docs/roadmap/07-operator-ui-alerts.md": [],
+    "docs/roadmap/08-ledger-recovery-observability.md": [],
+    "docs/roadmap/09-finished-acceptance-plan.md": [],
+    "docs/roadmap/10-feature-backlog.md": [],
+    "docs/roadmap/README.md": [],
+    "docs/SECURITY.md": [],
+    "frontend/Dockerfile": [],
+    "frontend/index.html": [],
+    "frontend/nginx.conf": [],
+    "frontend/package.json": [],
+    "frontend/src/api.ts": [
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/App.tsx": [
+      "frontend/src/api.ts",
+      "frontend/src/components/AppLayout.tsx",
+      "frontend/src/components/Modal.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/pages/DataPage.tsx",
+      "frontend/src/pages/MonitorPage.tsx",
+      "frontend/src/styles.css",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/components/AnimatedNumber.tsx": [],
+    "frontend/src/components/AppLayout.tsx": [
+      "frontend/src/components/Sidebar.tsx"
+    ],
+    "frontend/src/components/Badge.tsx": [
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/Button.tsx": [
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/Card.tsx": [
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/Modal.tsx": [
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/PageHeader.tsx": [
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/PnlChart.tsx": [
+      "frontend/src/components/Skeleton.tsx"
+    ],
+    "frontend/src/components/SettingsModal.tsx": [
+      "frontend/src/api.ts",
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Modal.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/components/Sidebar.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/Skeleton.tsx": [
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/StatsGrid.tsx": [
+      "frontend/src/components/AnimatedNumber.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/components/TokenDetail.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/Modal.tsx",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/components/TokenTable.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/components/utils.ts": [],
+    "frontend/src/main.tsx": [
+      "frontend/src/App.tsx"
+    ],
+    "frontend/src/pages/AnalysisPage.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/PageHeader.tsx",
+      "frontend/src/components/PnlChart.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/pages/BacktestsPage.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/PageHeader.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/pages/DataPage.tsx": [
+      "frontend/src/api.ts",
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/PageHeader.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/pages/MonitorPage.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/PageHeader.tsx",
+      "frontend/src/components/PnlChart.tsx",
+      "frontend/src/components/Skeleton.tsx",
+      "frontend/src/components/StatsGrid.tsx",
+      "frontend/src/components/TokenTable.tsx",
+      "frontend/src/components/utils.ts"
+    ],
+    "frontend/src/pages/ReviewPage.tsx": [
+      "frontend/src/components/Badge.tsx",
+      "frontend/src/components/Button.tsx",
+      "frontend/src/components/Card.tsx",
+      "frontend/src/components/PageHeader.tsx",
+      "frontend/src/components/utils.ts",
+      "frontend/src/types.ts"
+    ],
+    "frontend/src/styles.css": [],
+    "frontend/src/types.ts": [],
+    "frontend/src/vite-env.d.ts": [],
+    "frontend/tsconfig.json": [],
+    "frontend/vite.config.ts": [],
+    "README.md": [],
+    "scripts/bootstrap.ps1": [],
+    "scripts/check-doc-links.ps1": [],
+    "scripts/healthcheck.ps1": [],
+    "scripts/restart-dev.ps1": [],
+    "scripts/runtime.ps1": [],
+    "scripts/start-dev.ps1": [],
+    "scripts/status-dev.ps1": [],
+    "scripts/stop-dev.ps1": [],
+    "scripts/verify.ps1": [],
+    "tests/test_core.py": []
+  },
+  "importStats": {
+    "filesScanned": 108,
+    "filesWithImports": 34,
+    "totalEdges": 115
+  }
+}

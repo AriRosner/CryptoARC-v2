@@ -1,4 +1,4 @@
-import type { BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, RestoreArtifactPreview, SafetyStatus, SecurityStatus, SettingsVersion, SignerStatus, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SettingsVersion, SetupReadinessReport, SignerStatus, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -104,8 +104,59 @@ export async function fetchBacktests(): Promise<BacktestResult[]> {
   return request("/api/backtests");
 }
 
-export async function fetchSourceEvents(): Promise<SourceEvent[]> {
-  return request("/api/source-events");
+export interface SourceEventOptions {
+  limit?: number;
+  status?: string;
+  mint?: string;
+  source?: string;
+  event_kind?: string;
+  parser_result?: string;
+}
+
+export async function fetchSourceEvents(options: SourceEventOptions = {}): Promise<SourceEvent[]> {
+  const params = new URLSearchParams();
+  if (options.limit) params.set("limit", String(options.limit));
+  if (options.status) params.set("status", options.status);
+  if (options.mint) params.set("mint", options.mint);
+  if (options.source) params.set("source", options.source);
+  if (options.event_kind) params.set("event_kind", options.event_kind);
+  if (options.parser_result) params.set("parser_result", options.parser_result);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/source-events${suffix}`);
+}
+
+export async function fetchSourceParserReplay(limit = 120, profile = ""): Promise<SourceParserReplayReport> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (profile) params.set("profile", profile);
+  return request(`/api/source-events/parser-replay?${params.toString()}`);
+}
+
+export function sourceParserReplayExportUrl(limit = 120, profile = ""): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (profile) params.set("profile", profile);
+  return `${API_BASE}/api/source-events/parser-replay/export?${params.toString()}`;
+}
+
+export async function fetchSolanaLogsVerification(limit = 500): Promise<SolanaLogsVerificationReport> {
+  return request(`/api/source-events/solana-logs-verification?limit=${encodeURIComponent(String(limit))}`);
+}
+
+export async function fetchSourceSoakAcceptance(limit = 500): Promise<SourceSoakAcceptanceReport> {
+  return request(`/api/source-events/source-soak?limit=${encodeURIComponent(String(limit))}`);
+}
+
+export async function recordSourceSoakSnapshot(limit = 500): Promise<SourceSoakAcceptanceReport> {
+  return request(`/api/source-events/source-soak/snapshot?limit=${encodeURIComponent(String(limit))}`, { method: "POST" });
+}
+
+export function solanaLogsVerificationExportUrl(limit = 500): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return `${API_BASE}/api/source-events/solana-logs-verification/export?${params.toString()}`;
+}
+
+export function sourceSoakAcceptanceExportUrl(limit = 500): string {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return `${API_BASE}/api/source-events/source-soak/export?${params.toString()}`;
 }
 
 export async function fetchTrades(): Promise<TradeRecord[]> {
@@ -184,6 +235,37 @@ export async function fetchReadinessStatus(): Promise<ReadinessStatus> {
   return request("/api/readiness/status");
 }
 
+export async function fetchPilotReadiness(walletPublicKey = "", signerMode = "browser_wallet"): Promise<PilotReadinessReport> {
+  return request(`/api/reports/pilot-readiness?wallet_public_key=${encodeURIComponent(walletPublicKey)}&signer_mode=${encodeURIComponent(signerMode)}`);
+}
+
+export async function fetchSetupReadiness(): Promise<SetupReadinessReport> {
+  return request("/api/reports/setup-readiness");
+}
+
+export async function fetchReleaseReadiness(): Promise<ReleaseReadinessReport> {
+  return request("/api/reports/release-readiness");
+}
+
+export async function recordReleaseVerification(payload: {
+  app_version?: string;
+  verify_passed: boolean;
+  diff_reviewed: boolean;
+  docs_reviewed: boolean;
+  note?: string;
+}): Promise<ReleaseVerificationAttestation> {
+  return request("/api/reports/release-readiness/verification", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function fetchPostRunReview(timeframe = "24h", walletPublicKey = ""): Promise<PostRunReviewReport> {
+  const params = new URLSearchParams({ timeframe });
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  return request(`/api/reports/post-run-review?${params.toString()}`);
+}
+
 export async function fetchWatchdogStatus(): Promise<WatchdogStatus> {
   return request("/api/watchdog/status");
 }
@@ -260,6 +342,14 @@ export async function disarmLiveBackend(): Promise<Record<string, unknown>> {
   return request("/api/live/backend/disarm", { method: "POST" });
 }
 
+export async function setLiveKillSwitch(enabled: boolean, reason = ""): Promise<Record<string, unknown>> {
+  return request("/api/live/kill-switch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled, reason })
+  });
+}
+
 export interface LiveQuoteRequest {
   action: "buy" | "sell";
   mint: string;
@@ -310,6 +400,10 @@ export async function fetchLivePositions(walletPublicKey = ""): Promise<LivePosi
 
 export async function fetchLiveAudit(): Promise<LiveExecutionAudit[]> {
   return request("/api/live/audit");
+}
+
+export async function fetchProfitSweepHistory(limit = 100): Promise<LiveExecutionAudit[]> {
+  return request(`/api/live/profit-sweeps?limit=${encodeURIComponent(String(limit))}`);
 }
 
 export async function recoverUnresolvedLiveAudit(): Promise<{ summary: Record<string, unknown>; audits: LiveExecutionAudit[] }> {
@@ -371,6 +465,20 @@ export async function reconcileLiveIntent(intentId: string): Promise<Record<stri
   return request(`/api/live/intents/${encodeURIComponent(intentId)}/reconcile`, { method: "POST" });
 }
 
+export async function recordLiveExpertOverride(payload: {
+  target_gate: string;
+  action: "buy" | "sell";
+  reason: string;
+  wallet_public_key?: string;
+  signer_mode?: string;
+}): Promise<Record<string, unknown>> {
+  return request("/api/live/override", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+}
+
 export async function createManualLiveRequest(action: "buy" | "sell", mint: string, amount_sol: number): Promise<LiveExecutionRequest> {
   return request("/api/live/manual-request", {
     method: "POST",
@@ -391,6 +499,13 @@ export async function fetchOperationalMonitoring(): Promise<OperationalMonitorin
   return request("/api/monitoring/ops");
 }
 
+export async function fetchOperatorLogs(timeframe = "24h", level = "", subsystem = "", limit = 200): Promise<OperatorLogsReport> {
+  const params = new URLSearchParams({ timeframe, limit: String(limit) });
+  if (level) params.set("level", level);
+  if (subsystem) params.set("subsystem", subsystem);
+  return request(`/api/reports/operator-logs?${params.toString()}`);
+}
+
 export async function fetchExperiments(): Promise<ExperimentRun[]> {
   return request("/api/experiments");
 }
@@ -405,6 +520,10 @@ export async function createExperiment(name: string, profile?: string, limit?: n
 
 export async function fetchTradeLabels(): Promise<TradeLabel[]> {
   return request("/api/trade-labels");
+}
+
+export async function fetchTradeReviewQueue(): Promise<TradeReviewQueue> {
+  return request("/api/trade-review/queue");
 }
 
 export async function labelTrade(tokenId: string, label: string, note = ""): Promise<TradeLabel> {
@@ -439,6 +558,10 @@ export async function createBackupArtifact(): Promise<{ filename: string; artifa
   return request("/api/data/backup-artifact", { method: "POST" });
 }
 
+export async function runRestoreSmokeTest(): Promise<RestoreSmokeTestReport> {
+  return request("/api/data/restore/smoke-test", { method: "POST" });
+}
+
 export async function previewRestoreArtifact(artifact: Record<string, unknown>): Promise<RestoreArtifactPreview> {
   return request("/api/data/restore/preview", {
     method: "POST",
@@ -459,8 +582,40 @@ export async function fetchSourceHealth(): Promise<SourceHealth> {
   return request("/api/source-health");
 }
 
+export async function fetchLatencyStatus(): Promise<LatencyStatus> {
+  return request("/api/latency/status");
+}
+
+export function sourceHealthExportUrl(limit = 300): string {
+  return `${API_BASE}/api/source-health/export?limit=${encodeURIComponent(String(limit))}`;
+}
+
 export async function fetchSecurityStatus(): Promise<SecurityStatus> {
   return request("/api/security/status");
+}
+
+export async function fetchAlertStatus(): Promise<AlertStatus> {
+  return request("/api/alerts/status");
+}
+
+export async function sendTestAlert(): Promise<Record<string, unknown>> {
+  return request("/api/alerts/test", { method: "POST" });
+}
+
+export async function startMobilePairing(api_base_url: string, scopes = ["mobile:monitor", "mobile:control"]): Promise<MobilePairingStartResponse> {
+  return request("/api/mobile/pairing/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ api_base_url, scopes })
+  });
+}
+
+export async function fetchMobileDevices(include_revoked = true): Promise<MobileDevicesResponse> {
+  return request(`/api/mobile/devices?include_revoked=${include_revoked ? "true" : "false"}`);
+}
+
+export async function revokeMobileDevice(deviceId: string): Promise<void> {
+  await request(`/api/mobile/devices/${encodeURIComponent(deviceId)}/revoke`, { method: "POST" });
 }
 
 export async function updatePassword(current_password: string, new_password: string): Promise<void> {
@@ -494,12 +649,120 @@ export async function fetchDataSummary(): Promise<DataSummary> {
   return request("/api/data/summary");
 }
 
-export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all"): Promise<DataSummary> {
+export async function clearData(target: "tokens" | "events" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "source_soak_history" | "all"): Promise<DataSummary> {
   return request(`/api/data/clear/${target}`, { method: "POST" });
 }
 
-export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "all"): string {
-  return `${API_BASE}/api/export/${target}${authToken ? `?token=${encodeURIComponent(authToken)}` : ""}`;
+export async function recoverOpenPaperPositions(note = "operator stopped run"): Promise<{ closed_positions: number; total_recovered_pnl_sol: number; exit_reason: string; token_ids: string[]; status: string; operator_action: string }> {
+  return request("/api/paper/recover-open", {
+    method: "POST",
+    body: JSON.stringify({ note })
+  });
+}
+
+export function exportUrl(target: "tokens" | "source_events" | "backtests" | "trades" | "price_observations" | "strategy_decisions" | "trade_sessions" | "settings_versions" | "experiments" | "trade_labels" | "strategy_presets" | "live_execution_requests" | "live_sessions" | "live_execution_audits" | "live_intents" | "live_ledger_positions" | "source_soak_history" | "all"): string {
+  return `${API_BASE}/api/export/${target}`;
+}
+
+export function sessionReportExportUrl(timeframe = "24h", walletPublicKey = ""): string {
+  const params = new URLSearchParams({ timeframe });
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  return `${API_BASE}/api/reports/session/export?${params.toString()}`;
+}
+
+export async function fetchSessionReport(timeframe = "24h", walletPublicKey = ""): Promise<OperatorSessionReport> {
+  const params = new URLSearchParams({ timeframe });
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  return request(`/api/reports/session?${params.toString()}`);
+}
+
+export async function fetchEvidenceModeSeparation(): Promise<EvidenceModeSeparationReport> {
+  return request("/api/reports/evidence-mode-separation");
+}
+
+export function evidenceModeSeparationExportUrl(): string {
+  return `${API_BASE}/api/reports/evidence-mode-separation/export`;
+}
+
+export function operatorLogsExportUrl(timeframe = "24h", level = "", subsystem = "", limit = 200): string {
+  const params = new URLSearchParams({ timeframe, limit: String(limit) });
+  if (level) params.set("level", level);
+  if (subsystem) params.set("subsystem", subsystem);
+  return `${API_BASE}/api/reports/operator-logs/export?${params.toString()}`;
+}
+
+export function pilotReadinessExportUrl(walletPublicKey = "", signerMode = "browser_wallet"): string {
+  const params = new URLSearchParams({ signer_mode: signerMode });
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  return `${API_BASE}/api/reports/pilot-readiness/export?${params.toString()}`;
+}
+
+export function setupReadinessExportUrl(): string {
+  return `${API_BASE}/api/reports/setup-readiness/export`;
+}
+
+export function releaseReadinessExportUrl(): string {
+  return `${API_BASE}/api/reports/release-readiness/export`;
+}
+
+export function postRunReviewExportUrl(timeframe = "24h", walletPublicKey = ""): string {
+  const params = new URLSearchParams({ timeframe });
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  return `${API_BASE}/api/reports/post-run-review/export?${params.toString()}`;
+}
+
+export async function fetchOutcomeExplanations(timeframe = "24h", limit = 80): Promise<OutcomeExplanationsReport> {
+  const params = new URLSearchParams({ timeframe, limit: String(limit) });
+  return request(`/api/reports/outcome-explanations?${params.toString()}`);
+}
+
+export function outcomeExplanationsExportUrl(timeframe = "24h", limit = 80): string {
+  const params = new URLSearchParams({ timeframe, limit: String(limit) });
+  return `${API_BASE}/api/reports/outcome-explanations/export?${params.toString()}`;
+}
+
+export function incidentExportUrl(auditId: string): string {
+  return `${API_BASE}/api/live/audit/${encodeURIComponent(auditId)}/incident-export`;
+}
+
+export async function recordIncidentExportReview(
+  auditId: string,
+  payload: { exported?: boolean; reviewed?: boolean; note?: string } = {},
+): Promise<IncidentExportReviewAttestation> {
+  return request(`/api/live/audit/${encodeURIComponent(auditId)}/incident-export/review`, {
+    method: "POST",
+    body: JSON.stringify({
+      exported: payload.exported ?? true,
+      reviewed: payload.reviewed ?? true,
+      note: payload.note ?? "",
+    }),
+  });
+}
+
+export function backupRestoreExportUrl(entryId = ""): string {
+  const params = new URLSearchParams();
+  if (entryId) params.set("entry_id", entryId);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return `${API_BASE}/api/data/backup-restore/export${suffix}`;
+}
+
+export async function downloadAuthenticatedExport(url: string, fallbackFilename = "cryptoarc-export.json"): Promise<void> {
+  const response = await fetch(url, { headers: headers() });
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="?([^";]+)"?/i);
+  const filename = match?.[1] || fallbackFilename;
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(objectUrl);
 }
 
 export function openSnapshotSocket(onSnapshot: (snapshot: BotSnapshot) => void): WebSocket {

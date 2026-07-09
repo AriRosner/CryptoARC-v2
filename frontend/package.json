@@ -6,15 +6,18 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:polling": "node scripts/check-polling-stability.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.4",
     "@tailwindcss/vite": "^4.2.2",
+    "@types/qrcode": "^1.5.6",
     "@vitejs/plugin-react": "^4.3.4",
     "clsx": "^2.1.1",
     "framer-motion": "^12.38.0",
     "lucide-react": "^0.468.0",
+    "qrcode": "^1.5.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.8.1",
@@ -22,6 +25,11 @@
     "tailwindcss": "^4.2.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
+  },
+  "overrides": {
+    "jayson": {
+      "uuid": "^11.1.1"
+    }
   },
   "devDependencies": {
     "@types/react": "^19.2.14",

@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import QRCode from "qrcode";
 import { 
   Database, 
   Target, 
@@ -16,14 +17,21 @@ import {
   Sparkles,
   TimerReset,
   Cpu,
-  KeyRound
+  KeyRound,
+  QrCode,
+  RefreshCw,
+  Copy,
+  Ban,
+  Landmark,
+  History,
+  WalletCards
 } from "lucide-react";
 import { Modal } from "./Modal";
 import { Button } from "./Button";
 import { Badge } from "./Badge";
 import { cn } from "./utils";
-import { updatePassword, setupTotp, verifyTotp, disableTotp } from "../api";
-import type { BotSettings } from "../types";
+import { updatePassword, setupTotp, verifyTotp, disableTotp, startMobilePairing, fetchMobileDevices, revokeMobileDevice, fetchProfitSweepHistory } from "../api";
+import type { BotSettings, LiveExecutionAudit, MobileDevice, MobilePairingStartResponse } from "../types";
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -60,15 +68,65 @@ const SettingRow: React.FC<{
   label: string;
   description?: string;
   children: React.ReactNode;
-}> = ({ label, description, children }) => (
-  <div className="flex flex-col gap-2 rounded-xl border border-white/5 bg-white/[0.01] p-4 transition-colors hover:bg-white/[0.03]">
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-xs font-bold text-zinc-300">{label}</span>
-      <div className="flex-shrink-0">{children}</div>
+}> = ({ label, description, children }) => {
+  const labelledChildren = React.Children.map(children, (child) => {
+    if (!React.isValidElement(child) || typeof child.type !== "string") return child;
+    if (!["input", "select", "textarea"].includes(child.type)) return child;
+    const props = child.props as { "aria-label"?: string };
+    return React.cloneElement(child, { "aria-label": props["aria-label"] ?? label } as Record<string, unknown>);
+  });
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border border-white/5 bg-white/[0.01] p-4 transition-colors hover:bg-white/[0.03]">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <span className="text-xs font-bold text-zinc-300">{label}</span>
+        <div className="min-w-0 max-w-full sm:flex-shrink-0">{labelledChildren}</div>
+      </div>
+      {description && <p className="text-[10px] text-zinc-500 leading-relaxed">{description}</p>}
     </div>
-    {description && <p className="text-[10px] text-zinc-500 leading-relaxed">{description}</p>}
-  </div>
+  );
+};
+
+const FieldControl: React.FC<{
+  label: string;
+  unit?: string;
+  children: React.ReactNode;
+}> = ({ label, unit, children }) => (
+  <label className="flex min-w-0 flex-col gap-1">
+    <span className="text-[10px] font-bold text-zinc-400">
+      {label}
+      {unit ? <span className="font-medium text-zinc-600"> ({unit})</span> : null}
+    </span>
+    {children}
+  </label>
 );
+
+function formatMobileTime(value?: string): string {
+  if (!value) return "Never";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Unknown";
+  return date.toLocaleString();
+}
+
+function formatSol(value: unknown, digits = 6): string {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) return "0 SOL";
+  return `${numeric.toFixed(digits).replace(/\.?0+$/, "")} SOL`;
+}
+
+function compactAddress(value: unknown): string {
+  const text = String(value || "").trim();
+  if (!text) return "Not recorded";
+  if (text.length <= 16) return text;
+  return `${text.slice(0, 8)}...${text.slice(-6)}`;
+}
+
+function statusVariant(status: string): "success" | "danger" | "warning" | "neutral" {
+  if (["submitted", "confirmed", "reconciled"].includes(status)) return "success";
+  if (["failed", "needs_review"].includes(status)) return "danger";
+  if (["ready", "pending"].includes(status)) return "warning";
+  return "neutral";
+}
 
 const strategyPresets: Record<string, Partial<BotSettings>> = {
   conservative: {
@@ -129,8 +187,15 @@ function validateSettings(settings: BotSettings): string[] {
   if (!settings.filter_honeypots || !settings.filter_rug_risk) warnings.push("One or more safety filters are disabled.");
   if (settings.paper_failed_fill_pct > 20) warnings.push("Failed fill rate above 20% can heavily skew replay results.");
   if (settings.min_price_confidence < 0.45) warnings.push("Low price confidence can allow weaker PumpPortal price hints into P&L.");
+  if (!settings.entry_confirmation_enabled) warnings.push("Entry confirmation gate is disabled; weak launches can enter on score alone.");
   if (settings.max_first_observed_move_pct > 1000) warnings.push("Very high first-move limits can let unit mismatches distort P&L.");
+  if (settings.direct_solana_paper_enabled && settings.direct_solana_min_confidence < 0.65) warnings.push("Direct Solana paper normalization is safest with decoded-create confidence at 0.65 or higher.");
   if (settings.live_trading_enabled) warnings.push("Live trading request is set, but backend execution remains blocked unless explicitly enabled by environment.");
+  if (settings.profit_sweep_enabled) {
+    const hasMinimumProfit = (settings.profit_sweep_min_profit_sol || settings.profit_sweep_threshold_sol) > 0;
+    const hasSweepAmount = settings.profit_sweep_mode === "percentage" ? settings.profit_sweep_percentage > 0 : settings.profit_sweep_amount_sol > 0;
+    if (!settings.profit_sweep_destination_wallet || !hasMinimumProfit || !hasSweepAmount) warnings.push("Profit sweep is enabled but needs a vault wallet, minimum profit, and sweep amount or percentage.");
+  }
   return warnings;
 }
 
@@ -154,6 +219,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [totpSetup, setTotpSetup] = useState<{ secret: string; otpauth_url: string } | null>(null);
   const [totpCode, setTotpCode] = useState("");
   const [securityMessage, setSecurityMessage] = useState("");
+  const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
+  const [mobileApiBaseUrl, setMobileApiBaseUrl] = useState("");
+  const [mobilePairing, setMobilePairing] = useState<MobilePairingStartResponse | null>(null);
+  const [mobileQrDataUrl, setMobileQrDataUrl] = useState("");
+  const [mobileLoading, setMobileLoading] = useState(false);
+  const [sweepHistory, setSweepHistory] = useState<LiveExecutionAudit[]>([]);
+  const [sweepHistoryLoading, setSweepHistoryLoading] = useState(false);
+  const [sweepHistoryError, setSweepHistoryError] = useState("");
   const warnings = validateSettings(draft);
 
   const updateDraft = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => {
@@ -176,6 +249,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const NumberInput = ({ field, step = "1", className = "w-24" }: { field: keyof BotSettings; step?: string; className?: string }) => (
     <input
+      aria-label={String(field).replace(/_/g, " ")}
       type="number"
       step={step}
       value={Number(draft[field] ?? 0)}
@@ -186,10 +260,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const Toggle = ({ field }: { field: keyof BotSettings }) => (
     <input
+      aria-label={String(field).replace(/_/g, " ")}
       type="checkbox"
       checked={Boolean(draft[field])}
       onChange={(e) => updateDraft(field, e.target.checked as never)}
       className="h-4 w-4 rounded border-white/10 bg-black/40 text-amber-500"
+    />
+  );
+
+  const TextInput = ({ field, placeholder = "" }: { field: keyof BotSettings; placeholder?: string }) => (
+    <input
+      aria-label={String(field).replace(/_/g, " ")}
+      type="text"
+      value={String(draft[field] ?? "")}
+      placeholder={placeholder}
+      onChange={(e) => updateDraft(field, e.target.value as never)}
+      className="w-96 max-w-full rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white placeholder-zinc-600"
     />
   );
 
@@ -203,13 +289,80 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
+  const refreshMobileDevices = async () => {
+    setMobileLoading(true);
+    try {
+      const response = await fetchMobileDevices(true);
+      setMobileDevices(response.devices);
+    } catch (err: any) {
+      setSecurityMessage(`Error: ${err.message}`);
+    } finally {
+      setMobileLoading(false);
+    }
+  };
+
+  const handleStartMobilePairing = async () => {
+    setMobileLoading(true);
+    try {
+      const pairing = await startMobilePairing(mobileApiBaseUrl);
+      setMobilePairing(pairing);
+      const qrText = JSON.stringify(pairing.qr_payload);
+      setMobileQrDataUrl(await QRCode.toDataURL(qrText, { width: 180, margin: 1 }));
+      setSecurityMessage("Mobile pairing code created.");
+      await refreshMobileDevices();
+    } catch (err: any) {
+      setSecurityMessage(`Error: ${err.message}`);
+      setMobileQrDataUrl("");
+    } finally {
+      setMobileLoading(false);
+    }
+  };
+
+  const handleCopyMobilePayload = async () => {
+    if (!mobilePairing) return;
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(mobilePairing.qr_payload));
+      setSecurityMessage("Mobile pairing payload copied.");
+    } catch {
+      setSecurityMessage("Clipboard permission was denied.");
+    }
+  };
+
+  const handleRevokeMobileDevice = async (device: MobileDevice) => {
+    const confirmed = window.confirm(`Revoke ${device.name || "this mobile device"}?`);
+    if (!confirmed) return;
+    setMobileLoading(true);
+    try {
+      await revokeMobileDevice(device.id);
+      setSecurityMessage("Mobile device revoked.");
+      await refreshMobileDevices();
+    } catch (err: any) {
+      setSecurityMessage(`Error: ${err.message}`);
+    } finally {
+      setMobileLoading(false);
+    }
+  };
+
+  const refreshSweepHistory = async () => {
+    setSweepHistoryLoading(true);
+    setSweepHistoryError("");
+    try {
+      setSweepHistory(await fetchProfitSweepHistory(100));
+    } catch (err: any) {
+      setSweepHistoryError(`Unable to load sweep history: ${err.message}`);
+    } finally {
+      setSweepHistoryLoading(false);
+    }
+  };
+
   const tabs = [
     { id: "source", label: "Source", icon: Database, keywords: "source launch pumpportal mock detect" },
     { id: "strategy", label: "Strategy", icon: Target, keywords: "strategy profile size slippage speed open positions weights" },
-    { id: "risk", label: "Risk", icon: Shield, keywords: "risk tolerance score creator hold loss honeypot rug age trades cooldown" },
+    { id: "risk", label: "Risk", icon: Shield, keywords: "risk tolerance score creator hold loss honeypot rug age trades cooldown entry confirmation gate velocity pressure metadata initial buy observed" },
     { id: "exits", label: "Exits", icon: Clock, keywords: "exit profit loss hold time ticks trailing partial break even stalled pressure" },
     { id: "simulation", label: "Simulation", icon: Gauge, keywords: "simulation launch interval volatility wallet cap rpc address toasts live mode" },
-    { id: "advanced", label: "Advanced", icon: SlidersHorizontal, keywords: "advanced stale reconnect backtest subscriptions confidence move market cap price impact fill" },
+    { id: "profit-vault", label: "Profit Vault", icon: Landmark, keywords: "profit vault sweep auto send sol wallet reserve history audit local hot wallet" },
+    { id: "advanced", label: "Advanced", icon: SlidersHorizontal, keywords: "advanced stale reconnect backtest subscriptions confidence move market cap price impact fill hourly paper throttle" },
     { id: "security", label: "Security", icon: Lock, keywords: "security password 2fa totp authenticator" }
   ];
 
@@ -230,13 +383,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   }, [filteredTabs, activeTabExists]);
 
+  React.useEffect(() => {
+    if (isOpen && activeTab === "security") {
+      void refreshMobileDevices();
+    }
+  }, [isOpen, activeTab]);
+
+  React.useEffect(() => {
+    if (isOpen && activeTab === "profit-vault") {
+      void refreshSweepHistory();
+    }
+  }, [isOpen, activeTab]);
+
   return (
     <Modal
       isOpen={isOpen}
       onClose={onClose}
       title="System Configuration"
       description="Fine-tune your sniper bot's behavior and risk parameters."
-      className="max-w-4xl"
+      className="max-w-5xl"
     >
       <div className="flex h-[600px] gap-6">
         <div className="flex w-52 flex-col space-y-1 border-r border-white/5 pr-4">
@@ -244,7 +409,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <Search className="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
             <input
               type="text"
-              placeholder="Search..."
+              aria-label="Search settings"
+              placeholder="Search settings…"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="dashboard-search-input h-9 w-full rounded-lg border border-white/10 bg-black/40 pr-3 text-xs text-white focus:border-amber-500/50 focus:outline-none"
@@ -313,6 +479,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       onChange={(e) => updateDraft("detect_new_tokens", e.target.checked)}
                       className="h-4 w-4 rounded border-white/10 bg-black/40 text-amber-500"
                     />
+                  </SettingRow>
+                  <SettingRow label="Direct Solana Paper" description="Let high-confidence logsSubscribe create evidence enter paper monitoring only.">
+                    <input
+                      type="checkbox"
+                      checked={draft.direct_solana_paper_enabled}
+                      onChange={(e) => updateDraft("direct_solana_paper_enabled", e.target.checked)}
+                      className="h-4 w-4 rounded border-white/10 bg-black/40 text-amber-500"
+                    />
+                  </SettingRow>
+                  <SettingRow label="Direct Confidence" description="Minimum decoded direct-create confidence before paper normalization.">
+                    <NumberInput field="direct_solana_min_confidence" step="0.05" />
                   </SettingRow>
                 </div>
 
@@ -465,6 +642,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <SettingRow label="Min Metadata Score" description="Reject entries below this metadata quality floor.">
                     <NumberInput field="min_metadata_score" step="0.01" />
                   </SettingRow>
+                  <SettingRow label="Entry Confirmation Gate" description="Require early source or launch confirmation before a paper buy can be queued.">
+                    <Toggle field="entry_confirmation_enabled" />
+                  </SettingRow>
+                  <SettingRow label="Gate Buy Velocity" description="Minimum early buy velocity needed for launch confirmation.">
+                    <NumberInput field="entry_confirmation_min_buy_velocity" step="0.01" />
+                  </SettingRow>
+                  <SettingRow label="Gate Sell Pressure" description="Maximum sell pressure allowed for launch confirmation.">
+                    <NumberInput field="entry_confirmation_max_sell_pressure" step="0.01" />
+                  </SettingRow>
+                  <SettingRow label="Gate Metadata Score" description="Minimum metadata score required for launch confirmation.">
+                    <NumberInput field="entry_confirmation_min_metadata_score" step="0.01" />
+                  </SettingRow>
+                  <SettingRow label="Gate Initial Buy SOL" description="Initial buy size that can confirm a fresh launch.">
+                    <NumberInput field="entry_confirmation_min_initial_buy_sol" step="0.01" />
+                  </SettingRow>
+                  <SettingRow label="Gate Price Confidence" description="Minimum accepted price confidence for observation-based confirmation.">
+                    <NumberInput field="entry_confirmation_min_price_confidence" step="0.05" />
+                  </SettingRow>
+                  <SettingRow label="Gate Observed Trades" description="Accepted observed trade updates needed for observation-based confirmation.">
+                    <NumberInput field="entry_confirmation_min_observed_trades" className="w-16" />
+                  </SettingRow>
                   <SettingRow label="Max Token Age Seconds" description="Reject launches older than this age.">
                     <NumberInput field="max_token_age_seconds" />
                   </SettingRow>
@@ -603,10 +801,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <NumberInput field="live_priority_fee_cap_sol" step="0.00001" className="w-20" />
                     </div>
                   </SettingRow>
-                  <SettingRow label="Live Signer Mode" description="Browser wallet works now; local signer remains future-gated.">
+                  <SettingRow label="Live Signer Mode" description="Browser wallet is manual; local hot wallet is the encrypted local executor; signer daemon remains localhost-gated.">
                     <select value={draft.live_signer_mode} onChange={(e) => updateDraft("live_signer_mode", e.target.value as BotSettings["live_signer_mode"])} className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">
                       <option value="browser_wallet">browser wallet</option>
-                      <option value="local_signer_daemon">local signer daemon later</option>
+                      <option value="local_hot_wallet">local hot wallet</option>
+                      <option value="local_signer_daemon">local signer daemon</option>
                     </select>
                   </SettingRow>
                   <SettingRow label="Readiness Halt" description="Optionally halt paper entries after enough evidence when readiness is low.">
@@ -624,10 +823,157 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <SettingRow label="Manual Live Request Capture" description="Enable audit capture for manual live requests.">
                     <Toggle field="manual_live_enabled" />
                   </SettingRow>
-                  <SettingRow label="Autonomous Live Request" description="Future-only request flag; no autonomous executor is enabled.">
+                  <SettingRow label="Autonomous Live Request" description="Allows the armed local backend to execute only when every autonomy gate passes.">
                     <Toggle field="autonomous_live_enabled" />
                   </SettingRow>
                 </div>
+              </>
+            )}
+
+            {activeTab === "profit-vault" && (
+              <>
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h4 className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-amber-500/80">
+                      <Landmark size={13} />
+                      Profit Vault Sweep
+                    </h4>
+                    <p className="mt-2 max-w-3xl text-xs leading-6 text-zinc-400">
+                      Profit Vault Sweep only acts on realized live PnL from the live ledger. When the threshold is reached, the armed local hot wallet builds a SOL transfer to your vault wallet, simulates it, and submits only if the simulation passes. Every attempt is stored as a live audit with action <span className="font-mono text-zinc-200">profit_sweep</span>.
+                    </p>
+                  </div>
+                  <Badge variant={draft.profit_sweep_enabled ? "success" : "neutral"}>
+                    {draft.profit_sweep_enabled ? "Enabled" : "Disabled"}
+                  </Badge>
+                </div>
+
+                <section className="rounded-2xl border border-white/5 bg-white/[0.015] p-5">
+                  <div className="mb-4 flex items-center gap-2 text-xs font-black text-white">
+                    <WalletCards size={15} className="text-amber-500" />
+                    Sweep Controls
+                  </div>
+                  <div className="grid gap-3">
+                    <SettingRow label="Enable Auto-Sweep" description="Turns on automatic profit transfer after realized live profit crosses the configured threshold.">
+                      <Toggle field="profit_sweep_enabled" />
+                    </SettingRow>
+                    <SettingRow label="Minimum Profit" description="The sweep will not run until realized live profit reaches this SOL amount. This is a SOL number, not a percentage.">
+                      <div className="w-full min-w-0 sm:w-48">
+                        <FieldControl label="Minimum profit to sweep" unit="SOL number">
+                          <NumberInput field="profit_sweep_min_profit_sol" step="0.001" className="w-full" />
+                        </FieldControl>
+                      </div>
+                    </SettingRow>
+                    <SettingRow label="Sweep Mode" description="Choose whether the bot sends a fixed SOL amount or a percentage of realized live profit.">
+                      <div className="grid w-full min-w-0 grid-cols-1 gap-3 sm:w-[26rem] sm:grid-cols-2">
+                        <FieldControl label="Mode">
+                          <select
+                            value={draft.profit_sweep_mode}
+                            onChange={(e) => updateDraft("profit_sweep_mode", e.target.value as BotSettings["profit_sweep_mode"])}
+                            className="dashboard-select h-[30px] w-full rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white"
+                          >
+                            <option value="fixed_sol">Fixed SOL</option>
+                            <option value="percentage">Percentage of profit</option>
+                          </select>
+                        </FieldControl>
+                        {draft.profit_sweep_mode === "percentage" ? (
+                          <FieldControl label="Sweep percentage" unit="% number">
+                            <NumberInput field="profit_sweep_percentage" step="0.1" className="w-full" />
+                          </FieldControl>
+                        ) : (
+                          <FieldControl label="Fixed sweep amount" unit="SOL number">
+                            <NumberInput field="profit_sweep_amount_sol" step="0.001" className="w-full" />
+                          </FieldControl>
+                        )}
+                      </div>
+                    </SettingRow>
+                    <SettingRow label="Vault Wallet" description="Destination wallet for protected profits. Use a different wallet than the trading hot wallet.">
+                      <FieldControl label="Destination wallet" unit="public key">
+                        <TextInput field="profit_sweep_destination_wallet" placeholder="Vault wallet public key" />
+                      </FieldControl>
+                    </SettingRow>
+                    <SettingRow label="Reserve And Rate Limits" description="Reserve is a SOL amount. Cooldown and daily cap are plain numbers, not percentages.">
+                      <div className="grid w-full min-w-0 grid-cols-1 gap-3 sm:w-[36rem] sm:grid-cols-3">
+                        <FieldControl label="Minimum reserve" unit="SOL number">
+                          <NumberInput field="profit_sweep_min_reserve_sol" step="0.001" className="w-full" />
+                        </FieldControl>
+                        <FieldControl label="Cooldown" unit="seconds">
+                          <NumberInput field="profit_sweep_cooldown_seconds" className="w-full" />
+                        </FieldControl>
+                        <FieldControl label="Max sweeps/day" unit="count">
+                          <NumberInput field="profit_sweep_max_per_day" className="w-full" />
+                        </FieldControl>
+                      </div>
+                    </SettingRow>
+                  </div>
+                </section>
+
+                <section className="rounded-2xl border border-white/5 bg-black/20 p-5">
+                  <div className="mb-4 flex items-center justify-between gap-3">
+                    <div>
+                      <h5 className="flex items-center gap-2 text-xs font-black text-white">
+                        <History size={15} className="text-amber-500" />
+                        Sweep History
+                      </h5>
+                      <p className="mt-1 text-[10px] leading-5 text-zinc-500">Latest recorded profit-sweep audits. Failed attempts stay visible so you can inspect blockers before the next run.</p>
+                    </div>
+                    <Button variant="ghost" size="sm" onClick={refreshSweepHistory} disabled={sweepHistoryLoading} title="Refresh sweep history">
+                      <RefreshCw size={13} />
+                    </Button>
+                  </div>
+
+                  {sweepHistoryError ? (
+                    <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 p-3 text-[11px] text-rose-200">
+                      {sweepHistoryError}
+                    </div>
+                  ) : sweepHistoryLoading ? (
+                    <div className="space-y-2">
+                      {[0, 1, 2].map((item) => (
+                        <div key={item} className="h-12 animate-pulse rounded-lg bg-white/[0.04]" />
+                      ))}
+                    </div>
+                  ) : sweepHistory.length === 0 ? (
+                    <div className="rounded-xl border border-white/5 bg-white/[0.015] p-4 text-[11px] leading-5 text-zinc-500">
+                      No profit sweeps have been recorded yet. Once a sweep is attempted, it will appear here with status, amount, destination, signature, and any errors.
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[760px] text-left text-[11px]">
+                        <thead className="border-b border-white/10 text-[9px] font-black uppercase tracking-wider text-zinc-500">
+                          <tr>
+                            <th className="px-2 py-2">Time</th>
+                            <th className="px-2 py-2">Status</th>
+                            <th className="px-2 py-2 text-right">Amount</th>
+                            <th className="px-2 py-2 text-right">Trigger PnL</th>
+                            <th className="px-2 py-2">Vault</th>
+                            <th className="px-2 py-2">Signature</th>
+                            <th className="px-2 py-2">Notes</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-white/5">
+                          {sweepHistory.map((audit) => {
+                            const status = audit.final_status || audit.status;
+                            const destination = audit.quote?.destination_wallet;
+                            const realizedPnl = audit.quote?.realized_pnl_sol;
+                            const notes = [...(audit.errors || []), ...(audit.warnings || [])].filter(Boolean);
+                            return (
+                              <tr key={audit.id} className="align-top text-zinc-300">
+                                <td className="px-2 py-3 text-zinc-500">{formatMobileTime(audit.created_at)}</td>
+                                <td className="px-2 py-3"><Badge variant={statusVariant(status)}>{status}</Badge></td>
+                                <td className="px-2 py-3 text-right font-mono text-zinc-100">{formatSol(audit.amount)}</td>
+                                <td className="px-2 py-3 text-right font-mono text-emerald-300">{formatSol(realizedPnl)}</td>
+                                <td className="px-2 py-3 font-mono" title={String(destination || "")}>{compactAddress(destination)}</td>
+                                <td className="px-2 py-3 font-mono" title={audit.transaction_signature}>{compactAddress(audit.transaction_signature)}</td>
+                                <td className="px-2 py-3 text-zinc-500">
+                                  {notes.length ? notes.slice(0, 2).join("; ") : audit.recommended_action || "Recorded"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </section>
               </>
             )}
 
@@ -653,6 +999,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <SettingRow label="Max Trade Subscriptions" description="Maximum active PumpPortal trade subscriptions.">
                     <NumberInput field="max_trade_subscriptions" />
                   </SettingRow>
+                  <SettingRow label="Max Trades Per Hour" description="Enable and tune the hourly paper-entry throttle used while collecting evidence. Live hard caps are configured separately.">
+                    <div className="flex items-center gap-2">
+                      <Toggle field="max_trades_per_hour_enabled" />
+                      <NumberInput field="max_trades_per_hour" className="w-20" />
+                    </div>
+                  </SettingRow>
                   <SettingRow label="Min Price Confidence" description="Minimum confidence score for PumpPortal price hints.">
                     <NumberInput field="min_price_confidence" step="0.05" />
                   </SettingRow>
@@ -665,8 +1017,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <SettingRow label="Paper Fill Delay (Ticks)" description="Ticks to wait before considering a buy order filled.">
                     <NumberInput field="paper_fill_delay_ticks" />
                    </SettingRow>
-                   <SettingRow label="Paper Fee (BPS)" description="Simulated execution fee in basis points.">
+                   <SettingRow label="Paper Provider Fee (BPS)" description="Simulated PumpPortal Local provider fee in basis points. PumpPortal Local is currently 50 bps.">
                     <NumberInput field="paper_fee_bps" />
+                  </SettingRow>
+                  <SettingRow label="Paper Priority Fee" description="Simulated Solana priority fee per paper transaction.">
+                    <NumberInput field="paper_priority_fee_sol" step="0.000001" />
                   </SettingRow>
                   <SettingRow label="Paper Price Impact %" description="Simulated price impact applied to paper fills.">
                     <NumberInput field="paper_price_impact_pct" step="0.01" />
@@ -809,6 +1164,99 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           </Button>
                         </div>
                       )}
+                    </div>
+                  </section>
+
+                  <section className="rounded-2xl border border-white/5 bg-white/[0.01] p-5">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <h5 className="text-xs font-bold text-white flex items-center gap-2">
+                        <Smartphone size={14} className="text-zinc-500" />
+                        Mobile Devices
+                      </h5>
+                      <Button variant="ghost" size="sm" onClick={refreshMobileDevices} disabled={mobileLoading} title="Refresh mobile devices">
+                        <RefreshCw size={13} />
+                      </Button>
+                    </div>
+                    <div className="space-y-4">
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          placeholder="Private tunnel API base URL"
+                          value={mobileApiBaseUrl}
+                          onChange={(e) => setMobileApiBaseUrl(e.target.value)}
+                          className="h-9 min-w-0 flex-1 rounded-lg border border-white/10 bg-black px-3 text-xs text-white placeholder-zinc-600"
+                        />
+                        <Button size="sm" variant="outline" onClick={handleStartMobilePairing} disabled={mobileLoading} className="gap-2">
+                          <QrCode size={13} />
+                          Pair
+                        </Button>
+                      </div>
+
+                      {mobilePairing && (
+                        <div className="grid gap-4 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 sm:grid-cols-[auto_1fr]">
+                          <div className="flex items-center justify-center rounded-lg bg-white p-2">
+                            {mobileQrDataUrl ? (
+                              <img src={mobileQrDataUrl} alt="Mobile pairing QR code" className="h-36 w-36" />
+                            ) : (
+                              <QrCode className="h-16 w-16 text-zinc-900" />
+                            )}
+                          </div>
+                          <div className="min-w-0 space-y-3">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge variant="warning">Expires {formatMobileTime(mobilePairing.expires_at)}</Badge>
+                              {mobilePairing.dashboard_totp_enabled ? <Badge variant="success">TOTP</Badge> : <Badge variant="neutral">TOTP off</Badge>}
+                            </div>
+                            <div>
+                              <span className="text-[10px] font-black uppercase tracking-wider text-zinc-500">Manual Code</span>
+                              <p className="mt-1 font-mono text-2xl font-black tracking-[0.22em] text-amber-300">{mobilePairing.manual_code}</p>
+                            </div>
+                            <p className="break-all text-[10px] leading-5 text-zinc-400">{mobilePairing.api_base_url || "Set MOBILE_PUBLIC_API_BASE_URL or enter the private tunnel URL before pairing."}</p>
+                            <div className="flex flex-wrap gap-2">
+                              <Button size="sm" variant="secondary" onClick={handleCopyMobilePayload} className="gap-2">
+                                <Copy size={13} />
+                                Payload
+                              </Button>
+                              <span className="flex items-center text-[10px] text-zinc-500">{mobilePairing.pairing_security_note}</span>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="space-y-2">
+                        {mobileDevices.length === 0 ? (
+                          <div className="rounded-xl border border-white/5 bg-black/20 p-4 text-[10px] text-zinc-500">
+                            No paired mobile devices.
+                          </div>
+                        ) : (
+                          mobileDevices.map((device) => {
+                            const revoked = Boolean(device.revoked_at);
+                            return (
+                              <div key={device.id} className="flex flex-col gap-3 rounded-xl border border-white/5 bg-black/20 p-4 sm:flex-row sm:items-center sm:justify-between">
+                                <div className="min-w-0">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="truncate text-xs font-black text-white">{device.name || "Mobile device"}</span>
+                                    <Badge variant={revoked ? "danger" : "success"}>{revoked ? "Revoked" : "Active"}</Badge>
+                                    <Badge variant="neutral">{device.platform || "unknown"}</Badge>
+                                  </div>
+                                  <p className="mt-2 text-[10px] leading-5 text-zinc-500">
+                                    Last seen {formatMobileTime(device.last_seen_at)} | Scopes {device.scopes.join(", ")}
+                                  </p>
+                                </div>
+                                <Button
+                                  variant="danger"
+                                  size="sm"
+                                  onClick={() => handleRevokeMobileDevice(device)}
+                                  disabled={mobileLoading || revoked}
+                                  className="gap-2"
+                                >
+                                  <Ban size={13} />
+                                  Revoke
+                                </Button>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
                     </div>
                   </section>
 

@@ -32,7 +32,7 @@ const statusVariant = (status: TokenSignal["status"]): "success" | "danger" | "w
   return "neutral";
 };
 
-const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 116px 132px 118px 76px";
+const tokenGridColumns = "minmax(220px,1.8fr) 96px 126px 116px 132px 118px 112px 76px";
 const TOKEN_ROW_HEIGHT = 62;
 const TOKEN_OVERSCAN = 8;
 
@@ -77,14 +77,24 @@ const TokenRow = React.memo(function TokenRow({
   nowMs
 }: TokenRowProps) {
   const pnl = token.pnl_sol || 0;
+  const totalTokenFeesSol = token.total_fees_sol || ((token.fee_paid_sol || 0) + (token.exit_fee_sol || 0)) || token.quote_shadow_total_cost_sol || 0;
   const ageLabel = formatTokenAge(tokenAgeFromDetectedAt(token.detected_at, nowMs));
 
   return (
     <div
       onClick={() => onSelectToken(token.id)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelectToken(token.id);
+        }
+      }}
+      role="button"
+      tabIndex={0}
+      aria-label={`View ${token.symbol} details`}
       style={{ gridTemplateColumns: tokenGridColumns }}
       className={cn(
-        "group grid h-[62px] cursor-pointer items-center border-b border-white/5 transition-colors hover:bg-white/[0.03]",
+        "group grid h-[62px] cursor-pointer items-center border-b border-white/5 transition-colors hover:bg-white/[0.03] focus:outline-none focus-visible:bg-amber-500/[0.06] focus-visible:ring-2 focus-visible:ring-amber-500/40",
         selected && "bg-amber-500/[0.06] hover:bg-amber-500/[0.09]"
       )}
     >
@@ -146,8 +156,22 @@ const TokenRow = React.memo(function TokenRow({
           {pnl ? `${pnl > 0 ? "+" : ""}${pnl.toFixed(4)}` : "0.0000"}
         </span>
       </div>
+      <div className="px-3 py-2.5">
+        <span className="whitespace-nowrap text-xs font-black tracking-tight text-orange-300">
+          {totalTokenFeesSol ? totalTokenFeesSol.toFixed(6) : "0.000000"}
+        </span>
+      </div>
       <div className="px-4 py-2.5 text-right">
-        <Button variant="ghost" size="icon" className="h-8 w-8 opacity-70 transition-opacity group-hover:opacity-100">
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-8 w-8 opacity-70 transition-opacity group-hover:opacity-100"
+          aria-label={`View ${token.symbol} details`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onSelectToken(token.id);
+          }}
+        >
           <Eye size={14} />
         </Button>
       </div>
@@ -164,7 +188,11 @@ const TokenRow = React.memo(function TokenRow({
   prev.token.score === next.token.score &&
   prev.token.status === next.token.status &&
   prev.token.detected_at === next.token.detected_at &&
-  prev.token.pnl_sol === next.token.pnl_sol
+  prev.token.pnl_sol === next.token.pnl_sol &&
+  prev.token.fee_paid_sol === next.token.fee_paid_sol &&
+  prev.token.exit_fee_sol === next.token.exit_fee_sol &&
+  prev.token.total_fees_sol === next.token.total_fees_sol &&
+  prev.token.quote_shadow_total_cost_sol === next.token.quote_shadow_total_cost_sol
 ));
 
 export const TokenTable: React.FC<TokenTableProps> = React.memo(({
@@ -234,7 +262,8 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
           <Search className="pointer-events-none absolute left-4 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
           <input
             type="text"
-            placeholder="Search tokens..."
+            aria-label="Search tokens"
+            placeholder="Search tokens…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="dashboard-search-input h-9 w-full rounded-lg border border-white/10 bg-black/40 pr-3 text-xs font-semibold text-white placeholder-zinc-600 transition-all focus:border-amber-500/50 focus:outline-none focus:ring-4 focus:ring-amber-500/10"
@@ -279,7 +308,7 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
       </div>
 
       <div ref={scrollRef} className="crypto-scrollbar flex-1 overflow-auto">
-        <div className="min-w-[780px]">
+        <div className="min-w-[900px]">
           <div
             style={{ gridTemplateColumns: tokenGridColumns }}
             className="sticky top-0 z-20 grid h-9 items-center border-b border-white/5 bg-[#10121c]/95 text-[10px] font-black uppercase tracking-widest text-zinc-500 backdrop-blur-md"
@@ -290,6 +319,7 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
             <div className="px-3">Status</div>
             <div className="px-3">Age</div>
             <div className="px-3">P&L (SOL)</div>
+            <div className="px-3">Fees</div>
             <div className="px-4 text-right">Action</div>
           </div>
           <div>
@@ -315,6 +345,7 @@ export const TokenTable: React.FC<TokenTableProps> = React.memo(({
                     <div className="px-3 py-2.5"><Skeleton className="h-6 w-20 rounded-full" /></div>
                     <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-14 rounded-full" /></div>
                     <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-16 rounded-full" /></div>
+                    <div className="px-3 py-2.5"><Skeleton className="h-3.5 w-20 rounded-full" /></div>
                     <div className="px-4 py-2.5 text-right"><Skeleton className="ml-auto h-8 w-8 rounded-lg" /></div>
                   </div>
                 ))}

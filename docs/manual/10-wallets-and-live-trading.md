@@ -63,6 +63,7 @@ After setup, the workspace exposes:
 
 - backend access
 - blocker and cap review
+- execution-readiness status for dry-run and shadow comparison
 - autonomy control plane
 - intent queue
 - quote preview
@@ -71,6 +72,24 @@ After setup, the workspace exposes:
 - latest audit
 
 Screenshot: `assets/screenshots/live/live-wallet-workspace-overview.png`
+
+Execution readiness summarizes quote attempts, stale quote pressure, blocked quote pressure, unresolved audits, live policy caps, bounded slippage/priority-fee recommendations, and shadow comparison results. Policy recommendations include cap room, quote issue categories, missed landing rate, timing evidence, and reasons so the operator can see why a suggestion exists. Every live quote audit records structured `preflight_checks` for the environment, mint, wallet, signer, amount, slippage, priority fee, pool, caps, and aggregate blockers before the quote can proceed. Live submission and autonomous execution refuse audits with failed preflight rows, so a quote cannot move to signing after cap, signer, pool, wallet, or aggregate blocker evidence fails. Ready dry-run buy quotes record a `shadow_comparison` on the live audit so later accepted prices, configured exit rules, and landing-delay windows can estimate whether a fast live entry would have won, lost, scratched, missed, or gone stale. When submitted/confirmed live audits exist, the landing windows are calibrated from recorded quote-to-submit and submit-to-confirm timing. A shadow-ready state means the quote/audit path is healthy enough for comparison work; it does not bypass signing, simulation, caps, or audit recovery.
+
+Live cap readiness also requires settings-version evidence that the current cap values were saved through the operator settings flow. Direct database or in-memory cap changes are treated as missing operator intent and block the pilot cap gate.
+
+Unsigned stale quotes remain quote-quality evidence and can block shadow readiness through stale quote pressure. They do not create live recovery debt because no transaction was submitted. Submitted, failed, needs-review, or signed unreconciled audits remain recovery debt until recovered or reviewed.
+
+Post-run live review excludes shadow-only evidence audits. A pilot review is not satisfied by shadow-only quotes; it requires actual live audit evidence from the selected wallet/run.
+
+The live status payload also exposes an `autonomy` object with separate `entry` and `exit` gate states. It reports whether the selected backend matches the armed backend, whether unresolved recovery debt blocks new entries, and whether expert override recording is available. Override recording is audit-only; it records target gate, action, reason, timestamp, blockers, active backend, kill-switch state, and caps, but it does not bypass live blockers.
+
+`execution_backend` shows the selected submit path. Browser wallet reports `browser_wallet_manual_signature` and always requires operator approval. Local hot wallet reports `encrypted_local_hot_wallet`; it can submit unattended only when the encrypted wallet is unlocked, live env is enabled, and the matching backend is armed. Local signer daemon reports `localhost_signer_daemon` and remains blocked unless a localhost-only daemon is connected and healthy. Both daemon health and execute calls reject non-localhost endpoints before any signer request is sent.
+
+Hot-wallet status and launch-readiness reports expose only public wallet metadata, lock state, and the `local_encrypted_sidecar` storage scope. They do not expose the vault filesystem path, seed phrases, private keys, or encrypted payload fields. Database backup artifacts restore ledger and app state, but they intentionally do not embed the hot-wallet sidecar; after a restore, re-check the hot-wallet status and re-import or unlock the local wallet before arming `local_hot_wallet`. If the restored database still has old hot-wallet metadata but the sidecar is missing, startup, restore reload, and status checks clear the stale public key and label from live settings, persist that cleanup, and disarm any stale `local_hot_wallet` backend authorization.
+
+`full_sniper_gate` is the final unattended buy-and-sell gate. It is ready only when entry autonomy, exit autonomy, active backend match, normal source mode, fresh pre-run backup, and a recent clean confirmed/reconciled manual-live proof for the selected wallet and selected signer path all pass. A proof audit with recorded errors, pending reconciliation, or review debt does not qualify. Override records remain audit-only and do not mark this gate ready.
+
+Live status also includes `pre_run_backup`. New live buy entries require a fresh local backup artifact, currently within 24 hours and newer than the latest restore. Missing, stale, or restore-superseded backup evidence blocks entries until the operator creates a new backup artifact from the Data workspace.
 
 ## Active Backend And Arming
 
@@ -84,6 +103,12 @@ Arming means:
 
 Disarming stops new autonomous execution through that backend.
 
+Live-session acknowledgement records the current caps, active backend, kill-switch state, and timestamp in the event log. This is an operator acknowledgement, not a bypass.
+
+The live workspace exposes explicit kill-switch controls. Enabling the kill switch records the reason and risk state, immediately blocks new entries, and leaves protective exits available when the selected backend can still sign. Buy submission re-checks the kill switch at the signing boundary, so a ready quote cannot be submitted after the operator stops entries. Clearing the kill switch is also audited and only allows entries again when all other gates pass.
+
+Buy submission also re-checks entry policy before accepting a browser-wallet signature or invoking a local backend signer. If source trust, wallet exposure, daily loss, max open positions, signer health, or unresolved live-audit recovery debt changes after quote creation, the ready quote must be discarded and re-quoted after the blocker is resolved.
+
 ## Blockers And Caps
 
 Common live blockers include:
@@ -91,11 +116,14 @@ Common live blockers include:
 - environment disabled
 - missing caps
 - missing session acknowledgement
+- missing, stale, or restore-superseded pre-run backup
 - no connected signer or wallet
 - kill switch enabled
 - readiness failures
+- low replay confidence when the replay halt setting is enabled
+- unresolved live-audit recovery debt
 
-The workspace exposes blocker fix flows and confirmation steps for supported fixes.
+Protective exits can remain preparable when source trust or replay confidence blocks new entries, but only when signer, wallet, session, and cap requirements still pass. The workspace exposes blocker fix flows and confirmation steps for supported fixes.
 
 Screenshot: `assets/screenshots/live/live-blocker-fix-flow.png`
 
@@ -118,8 +146,11 @@ Autonomous live depends on:
 - matching wallet
 - passing readiness, caps, and kill-switch checks
 - backend capability support
+- no unresolved live-audit recovery debt for new entries
 
 If backend health degrades, entry autonomy can halt while protective exits remain allowed if the active backend can still execute them.
+
+`GET /api/live/status` exposes `source_degraded_mode` so the Live workspace can show the current source-driven operating mode. `normal` means source trust is not forcing a downgrade. `paper_only` means live entries are blocked and the operator should keep collecting evidence. `exit_only` means source trust blocks new live entries while protective exit preparation remains available through the selected backend.
 
 ## Audit, Confirmation, And Recovery
 
@@ -134,6 +165,8 @@ Live execution is always centered on:
 - recovery endpoints
 
 The recovery/review surfaces are meant to help reconcile recorded activity. They should not be treated as silent resubmission machinery.
+
+Recovery has a bounded retry policy. If RPC repeatedly cannot find a submitted signature, the audit escalates to `needs_review` after the retry cap, keeps the recovery-attempt count and last recovery error, and requires operator inspection instead of silent resubmission. Batch recovery summaries report checked, updated, needs-review, error, and max-attempt counts.
 
 Screenshot: `assets/screenshots/live/live-recovery-review.png`
 

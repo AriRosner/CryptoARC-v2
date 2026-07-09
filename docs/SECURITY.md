@@ -19,4 +19,4 @@ CryptoARC v2 starts paper-only. Live trading is intentionally deferred until mon
 - Daily loss cap is configurable and enforced.
 - Trade size cap is configurable and enforced.
 - Emergency stop remains available in the primary dashboard.
-- Encrypted local hot wallet support, if added, is opt-in and local-only.
+- Encrypted local hot wallet support is opt-in and local-only.

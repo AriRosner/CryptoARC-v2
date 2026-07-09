@@ -1,5 +1,5 @@
 import React from "react";
-import { Activity, RefreshCw, TrendingUp, TrendingDown, Target, Zap } from "lucide-react";
+import { Activity, RefreshCw, TrendingUp, TrendingDown, Target, Zap, ReceiptText } from "lucide-react";
 import { Card } from "./Card";
 import { AnimatedNumber } from "./AnimatedNumber";
 import { Skeleton } from "./Skeleton";
@@ -10,6 +10,7 @@ interface StatsGridProps {
     total_trades: number;
     win_rate_pct: number;
     total_pnl_sol: number;
+    total_fees_sol: number;
     open_positions: number;
   };
   pnlCurrency?: "SOL" | "USD";
@@ -20,9 +21,10 @@ interface StatsGridProps {
 
 export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurrency = "SOL", solUsdPrice = 0, onTogglePnlCurrency, loading = false }) => {
   const showUsd = pnlCurrency === "USD" && solUsdPrice > 0;
+  const feeDisplayValue = showUsd ? stats.total_fees_sol * solUsdPrice : stats.total_fees_sol;
   const items = React.useMemo(() => [
     {
-      label: "Total P&L",
+      label: "Net P&L",
       value: showUsd ? stats.total_pnl_sol * solUsdPrice : stats.total_pnl_sol,
       precision: showUsd ? 2 : 4,
       prefix: showUsd ? "$" : "",
@@ -55,6 +57,17 @@ export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurre
       canToggle: false
     },
     {
+      label: "Fees Paid",
+      value: feeDisplayValue || 0,
+      precision: showUsd ? 2 : 6,
+      prefix: showUsd ? "$" : "",
+      suffix: showUsd ? "" : " SOL",
+      icon: ReceiptText,
+      color: "text-orange-400",
+      bg: "bg-orange-500/10",
+      canToggle: false
+    },
+    {
       label: "Open Positions",
       value: stats.open_positions,
       precision: 0,
@@ -65,10 +78,10 @@ export const StatsGrid: React.FC<StatsGridProps> = React.memo(({ stats, pnlCurre
       bg: "bg-purple-500/10",
       canToggle: false
     }
-  ], [showUsd, stats.total_pnl_sol, solUsdPrice, stats.win_rate_pct, stats.total_trades, stats.open_positions]);
+  ], [feeDisplayValue, showUsd, stats.total_pnl_sol, solUsdPrice, stats.win_rate_pct, stats.total_trades, stats.open_positions]);
 
   return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
       {items.map((item, index) => (
         <Card key={item.label} className="p-6" hover={true} transition={{ delay: index * 0.1 }}>
           <div className="flex items-center justify-between">

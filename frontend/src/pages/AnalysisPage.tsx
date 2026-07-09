@@ -64,6 +64,12 @@ const BarMetric: React.FC<{ label: string; value: number; max: number; color?: s
   </div>
 );
 
+function formatLatency(ms: number): string {
+  if (!ms) return "0ms";
+  if (ms >= 1000) return `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s`;
+  return `${ms}ms`;
+}
+
 export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   tokens,
   trades,
@@ -88,6 +94,10 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   const avgHold = closed.length
     ? closed.reduce((total, t) => total + (t.hold_duration_seconds || 0), 0) / closed.length
     : 0;
+  const promotion = readinessStatus?.strategy_promotion;
+  const promotionTone = promotion?.can_promote ? "success" : promotion?.status === "not_enough_data" ? "warning" : "danger";
+  const execution = readinessStatus?.execution_readiness;
+  const executionTone = execution?.can_shadow ? "success" : execution?.status === "not_enough_quote_data" ? "warning" : "danger";
 
   return (
     <div className="space-y-6">
@@ -124,8 +134,8 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
         <AnalysisMetric label="Win Rate" value={`${stats.win_rate_pct}%`} color="text-amber-500" />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <div className="space-y-6 lg:col-span-2">
+      <div className="grid grid-cols-1 gap-6 2xl:grid-cols-2">
+        <div className="space-y-6">
           <Card className="p-6" hover={false}>
             <div className="mb-6 flex items-center justify-between">
               <h3 className="text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
@@ -169,10 +179,355 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                 <BarMetric label="Analyzing" value={tokens.filter(t => t.status === "analyzing").length} max={tokens.length} color="bg-amber-500/50" />
               </div>
             </Card>
+
+            <Card className="p-6" hover={false}>
+              <h3 className="mb-6 text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
+                <TrendingUp size={16} />
+                Creator Reputation
+              </h3>
+              {!pumpfunReport ? (
+                <div className="space-y-3">
+                  <Skeleton className="h-12 w-full" />
+                  <Skeleton className="h-12 w-full" />
+                  <Skeleton className="h-12 w-full" />
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {pumpfunReport.creator_performance.slice(0, 4).map((creator) => (
+                    <div key={creator.creator} className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px]">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="truncate font-bold text-zinc-300">{creator.creator}</span>
+                        <Badge variant={creator.reputation === "positive" ? "success" : creator.reputation === "negative" || creator.reputation === "exclude_or_review" ? "danger" : "warning"}>
+                          {creator.reputation.replace(/_/g, " ")}
+                        </Badge>
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-3 text-[10px] text-zinc-500">
+                        <span>{creator.launches} launches / {creator.closed_trades} closed</span>
+                        <span className={cn("font-black", creator.pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400")}>{creator.pnl_sol.toFixed(4)} SOL</span>
+                      </div>
+                      <BarMetric label="Creator win rate" value={creator.win_rate_pct} max={100} color={creator.win_rate_pct >= 50 ? "bg-emerald-500/40" : "bg-rose-500/40"} />
+                    </div>
+                  ))}
+                  {!pumpfunReport.creator_performance.length ? <p className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-xs text-zinc-500">No creator performance evidence yet.</p> : null}
+                </div>
+              )}
+            </Card>
           </div>
         </div>
 
-        <div className="space-y-6">
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 2xl:grid-cols-1">
+          <Card className="p-6" hover={false}>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h3 className="text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
+                <Shield size={16} />
+                Promotion Gates
+              </h3>
+              <Badge variant={promotionTone}>{promotion?.status?.replace(/_/g, " ") ?? "unknown"}</Badge>
+            </div>
+            {!promotion ? (
+              <div className="space-y-3">
+                <Skeleton className="h-12 w-full" />
+                <Skeleton className="h-12 w-full" />
+                <Skeleton className="h-12 w-full" />
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <p className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] font-bold text-zinc-300">{promotion.summary}</p>
+                {promotion.out_of_sample ? (
+                  <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest text-zinc-500">Out-of-sample</span>
+                      <span className={cn("font-black", promotion.out_of_sample.collapse_warning ? "text-rose-400" : "text-emerald-400")}>
+                        {promotion.out_of_sample.collapse_warning ? "collapse" : "stable"}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="rounded-lg bg-black/20 p-2">
+                        <span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">Train</span>
+                        <span className="font-black text-white">{promotion.out_of_sample.train.estimated_pnl_sol.toFixed(4)} SOL</span>
+                        <span className="mt-0.5 block text-[10px] text-zinc-500">PF {promotion.out_of_sample.train.profit_factor.toFixed(2)} / {promotion.out_of_sample.split.train_tokens} tokens</span>
+                      </div>
+                      <div className="rounded-lg bg-black/20 p-2">
+                        <span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">Validate</span>
+                        <span className={cn("font-black", promotion.out_of_sample.validate.estimated_pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400")}>{promotion.out_of_sample.validate.estimated_pnl_sol.toFixed(4)} SOL</span>
+                        <span className="mt-0.5 block text-[10px] text-zinc-500">PF {promotion.out_of_sample.validate.profit_factor.toFixed(2)} / {promotion.out_of_sample.split.validate_tokens} tokens</span>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+                {promotion.gates.slice(0, 6).map((gate) => (
+                  <div key={gate.id} className="rounded-xl bg-white/[0.02] p-3 text-[11px]">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-bold text-zinc-400">{gate.label}</span>
+                      <span className={cn("font-black", gate.status === "pass" ? "text-emerald-500" : "text-rose-400")}>{String(gate.value)}</span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between gap-3 text-[10px] text-zinc-600">
+                      <span>{gate.reason}</span>
+                      <span>{String(gate.target)}</span>
+                    </div>
+                  </div>
+                ))}
+                {promotion.blockers.length ? (
+                  <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+                    {promotion.blockers.slice(0, 3).map((blocker) => <div key={blocker}>{blocker}</div>)}
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </Card>
+
+          <Card className="p-6" hover={false}>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h3 className="text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
+                <Clock size={16} />
+                Execution Readiness
+              </h3>
+              <Badge variant={executionTone}>{execution?.status?.replace(/_/g, " ") ?? "unknown"}</Badge>
+            </div>
+            {!execution ? (
+              <div className="space-y-3">
+                <Skeleton className="h-12 w-full" />
+                <Skeleton className="h-12 w-full" />
+                <Skeleton className="h-12 w-full" />
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Quotes</div>
+                    <div className="mt-1 text-lg font-black text-white">{execution.metrics.quote_attempts}</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Stale</div>
+                    <div className="mt-1 text-lg font-black text-amber-400">{Math.round(execution.metrics.stale_quote_rate * 100)}%</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Blocked</div>
+                    <div className="mt-1 text-lg font-black text-rose-400">{Math.round(execution.metrics.blocked_quote_rate * 100)}%</div>
+                  </div>
+                </div>
+                {execution.quote_issues?.total_issues ? (
+                  <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest text-zinc-500">Quote Issues</span>
+                      <span className="font-black text-white">{execution.quote_issues.total_issues}</span>
+                    </div>
+                    {execution.quote_issues.categories.slice(0, 4).map((issue) => (
+                      <div key={issue.category} className="mt-2 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-bold text-zinc-400">{issue.category.replace(/_/g, " ")}</div>
+                          <div className="truncate text-[10px] text-zinc-600">{issue.reasons[0] ?? "No reason recorded"}</div>
+                        </div>
+                        <span className="shrink-0 font-black text-white">{issue.count}</span>
+                      </div>
+                    ))}
+                    {execution.quote_issues.recent.slice(0, 2).map((issue) => (
+                      <div key={issue.audit_id} className="mt-2 flex items-center justify-between gap-3 border-t border-white/5 pt-2 text-[10px] text-zinc-600">
+                        <span className="truncate">{issue.mint}</span>
+                        <span className="shrink-0 font-bold text-zinc-400">{issue.status.replace(/_/g, " ")}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {execution.failure_stages?.total_failures ? (
+                  <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest text-zinc-500">Failure Stages</span>
+                      <span className="font-black text-white">{execution.failure_stages.total_failures}</span>
+                    </div>
+                    {execution.failure_stages.stages.filter((stage) => stage.count > 0).slice(0, 5).map((stage) => (
+                      <div key={stage.stage} className="mt-2 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="font-bold text-zinc-400">{stage.stage.replace(/_/g, " ")}</div>
+                          <div className="truncate text-[10px] text-zinc-600">{stage.categories[0]?.category.replace(/_/g, " ") ?? stage.reasons[0] ?? "No category recorded"}</div>
+                        </div>
+                        <span className="shrink-0 font-black text-white">{stage.count}</span>
+                      </div>
+                    ))}
+                    <p className="mt-2 border-t border-white/5 pt-2 text-[10px] text-zinc-500">{execution.failure_stages.operator_action}</p>
+                  </div>
+                ) : null}
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Shadow</div>
+                    <div className="mt-1 text-lg font-black text-white">{execution.metrics.shadow_evaluated}/{execution.metrics.shadow_samples}</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Win</div>
+                    <div className="mt-1 text-lg font-black text-emerald-400">{execution.metrics.shadow_win_rate_pct}%</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Est P&L</div>
+                    <div className={cn("mt-1 text-lg font-black", execution.metrics.shadow_estimated_pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400")}>{execution.metrics.shadow_estimated_pnl_sol.toFixed(4)}</div>
+                  </div>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Delay</div>
+                    <div className="mt-1 text-lg font-black text-white">{execution.metrics.shadow_landing_evaluated}/{execution.metrics.shadow_landing_windows}</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">D-Win</div>
+                    <div className="mt-1 text-lg font-black text-emerald-400">{execution.metrics.shadow_landing_win_rate_pct}%</div>
+                  </div>
+                  <div className="rounded-xl bg-white/[0.02] p-3">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Range</div>
+                    <div className="mt-1 text-xs font-black text-zinc-300">{execution.metrics.shadow_landing_worst_pnl_sol.toFixed(4)} / {execution.metrics.shadow_landing_best_pnl_sol.toFixed(4)}</div>
+                  </div>
+                </div>
+                <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                  <div className="mb-3 flex items-center justify-between gap-3 border-b border-white/5 pb-2">
+                    <span className="font-black uppercase tracking-widest text-zinc-500">Latency</span>
+                    <Badge variant={execution.latency_summary.status === "fast" ? "success" : execution.latency_summary.status === "slow" ? "danger" : "warning"}>
+                      {execution.latency_summary.status.replace(/_/g, " ")}
+                    </Badge>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Signal &gt; Quote</div>
+                      <div className="mt-1 font-black text-white">{formatLatency(execution.latency_summary.signal_to_quote_p50_ms)} / {formatLatency(execution.latency_summary.signal_to_quote_p90_ms)}</div>
+                    </div>
+                    <div>
+                      <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Quote &gt; Submit</div>
+                      <div className="mt-1 font-black text-white">{formatLatency(execution.latency_summary.quote_to_submit_p50_ms)} / {formatLatency(execution.latency_summary.quote_to_submit_p90_ms)}</div>
+                    </div>
+                  </div>
+                  {execution.latency_summary.issues.slice(0, 2).map((issue) => (
+                    <div key={issue} className="mt-2 text-[10px] font-bold text-amber-300">{issue}</div>
+                  ))}
+                </div>
+                <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                  <div className="mb-3 flex items-center justify-between gap-3 border-b border-white/5 pb-2">
+                    <span className="font-black uppercase tracking-widest text-zinc-500">Execution Policy</span>
+                    <Badge variant={execution.policy.recommendation?.status === "stable" ? "success" : execution.policy.recommendation?.status === "blocked" ? "danger" : "warning"}>
+                      {(execution.policy.recommendation?.status ?? "policy").replace(/_/g, " ")}
+                    </Badge>
+                  </div>
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-bold text-zinc-500">Slippage suggestion</span>
+                    <span className="font-black text-white">{execution.policy.suggested_slippage_pct}%</span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="font-bold text-zinc-500">Priority fee suggestion</span>
+                    <span className="font-black text-white">{execution.policy.suggested_priority_fee_sol} SOL</span>
+                  </div>
+                  {execution.policy.recommendation ? (
+                    <>
+                      <div className="mt-2 flex items-center justify-between gap-3">
+                        <span className="font-bold text-zinc-500">Cap room</span>
+                        <span className="font-black text-zinc-300">{execution.policy.recommendation.cap_room.slippage_pct}% / {execution.policy.recommendation.cap_room.priority_fee_sol} SOL</span>
+                      </div>
+                      <div className="mt-2 flex items-center justify-between gap-3">
+                        <span className="font-bold text-zinc-500">Missed landing</span>
+                        <span className="font-black text-zinc-300">{Math.round(execution.policy.recommendation.inputs.missed_landing_rate * 100)}%</span>
+                      </div>
+                      {execution.policy.recommendation.reasons.slice(0, 2).map((reason) => (
+                        <div key={reason} className="mt-2 rounded-lg border border-white/5 bg-black/20 p-2 text-[10px] leading-4 text-zinc-400">{reason}</div>
+                      ))}
+                    </>
+                  ) : null}
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="font-bold text-zinc-500">Landing calibration</span>
+                    <span className="font-black text-white">{execution.landing_calibration.source} / {execution.landing_calibration.samples}</span>
+                  </div>
+                  <div className="mt-2 flex items-center justify-between gap-3">
+                    <span className="font-bold text-zinc-500">Quote submit p50/p90/p99</span>
+                    <span className="font-black text-white">{execution.landing_calibration.quote_to_submit_p50_ms} / {execution.landing_calibration.quote_to_submit_p90_ms} / {execution.landing_calibration.quote_to_submit_p99_ms} ms</span>
+                  </div>
+                  {Object.entries(execution.landing_calibration.by_signer_mode).slice(0, 2).map(([mode, timing]) => (
+                    <div key={mode} className="mt-2 flex items-center justify-between gap-3">
+                      <span className="font-bold text-zinc-500">{mode.replace(/_/g, " ")}</span>
+                      <span className="font-black text-white">{timing.samples} / {timing.quote_to_submit_p90_ms}ms</span>
+                    </div>
+                  ))}
+                  {Object.entries(execution.landing_calibration.by_pool).slice(0, 1).map(([pool, timing]) => (
+                    <div key={pool} className="mt-2 flex items-center justify-between gap-3">
+                      <span className="font-bold text-zinc-500">Pool {pool}</span>
+                      <span className="font-black text-white">{timing.samples} / {timing.quote_to_submit_p90_ms}ms</span>
+                    </div>
+                  ))}
+                  {Object.entries(execution.landing_calibration.by_quote_source).slice(0, 1).map(([source, timing]) => (
+                    <div key={source} className="mt-2 flex items-center justify-between gap-3">
+                      <span className="font-bold text-zinc-500">{source.replace(/_/g, " ")}</span>
+                      <span className="font-black text-white">{timing.samples} / {timing.quote_to_submit_p90_ms}ms</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
+                  <div className="mb-2 flex items-center justify-between gap-3">
+                    <span className="font-black uppercase tracking-widest text-zinc-500">Pipeline Latency</span>
+                    <span className="font-black text-white">{execution.pipeline_latency.samples} samples</span>
+                  </div>
+                  {[
+                    ["Signal -> Quote", "signal_to_quote_ms"],
+                    ["Source -> Token", "source_to_token_ms"],
+                    ["Token -> Decision", "token_to_decision_ms"],
+                    ["Decision -> Intent", "decision_to_intent_ms"],
+                    ["Intent -> Quote", "intent_to_quote_ms"],
+                    ["Quote -> Submit", "quote_to_submit_ms"]
+                  ].map(([label, key]) => {
+                    const stage = execution.pipeline_latency.totals[key];
+                    return (
+                      <div key={key} className="mt-2 flex items-center justify-between gap-3">
+                        <span className="font-bold text-zinc-500">{label}</span>
+                        <span className="font-black text-white">{formatLatency(stage?.p50_ms ?? 0)} / {formatLatency(stage?.p90_ms ?? 0)}</span>
+                      </div>
+                    );
+                  })}
+                  <div className="mt-2 flex items-center justify-between gap-3 border-t border-white/5 pt-2">
+                    <span className="font-bold text-zinc-500">Evidence gaps</span>
+                    <span className="font-black text-zinc-300">
+                      S {execution.pipeline_latency.missing_evidence.source_events} / D {execution.pipeline_latency.missing_evidence.decisions} / I {execution.pipeline_latency.missing_evidence.intents}
+                    </span>
+                  </div>
+                </div>
+                {execution.gates.slice(0, 4).map((gate) => (
+                  <div key={gate.id} className="rounded-xl bg-white/[0.02] p-3 text-[11px]">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-bold text-zinc-400">{gate.label}</span>
+                      <span className={cn("font-black", gate.status === "pass" ? "text-emerald-500" : "text-rose-400")}>{String(gate.value)}</span>
+                    </div>
+                    <div className="mt-1 text-[10px] text-zinc-600">{gate.reason}</div>
+                  </div>
+                ))}
+                {execution.shadow_comparisons.length ? (
+                  <div className="space-y-2">
+                    {execution.shadow_comparisons.slice(0, 3).map((shadow) => (
+                      <div key={shadow.audit_id} className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px]">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="truncate font-bold text-zinc-300">{shadow.mint}</span>
+                          <span className={cn("font-black", shadow.estimated_pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400")}>{shadow.estimated_pnl_sol.toFixed(4)} SOL</span>
+                        </div>
+                        <div className="mt-1 flex items-center justify-between gap-3 text-[10px] text-zinc-600">
+                          <span>{shadow.exit_reason || shadow.status.replace(/_/g, " ")}</span>
+                          <span>{shadow.move_pct === null ? "pending" : `${shadow.move_pct.toFixed(1)}%`}</span>
+                        </div>
+                        {shadow.landing_windows?.length ? (
+                          <div className="mt-2 flex flex-wrap gap-1">
+                            {shadow.landing_windows.slice(0, 3).map((window) => (
+                              <span key={`${shadow.audit_id}-${window.delay_ms}`} className="rounded border border-white/5 bg-black/20 px-1.5 py-0.5 text-[9px] font-bold text-zinc-500">
+                                {window.delay_ms}ms {window.outcome}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {execution.blockers.length ? (
+                  <div className="rounded-xl border border-rose-500/20 bg-rose-500/10 p-3 text-[11px] text-rose-100">
+                    {execution.blockers.slice(0, 3).map((blocker) => <div key={blocker}>{blocker}</div>)}
+                  </div>
+                ) : (
+                  <p className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-3 text-[11px] font-bold text-emerald-100">
+                    Shadow execution comparison can run without submitting transactions.
+                  </p>
+                )}
+              </div>
+            )}
+          </Card>
+
           <Card className="p-6" hover={false}>
              <h3 className="mb-6 text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
               <Sparkles size={16} />
@@ -191,6 +546,12 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                     <Badge variant="info">{Math.round(item.confidence * 100)}%</Badge>
                   </div>
                   <p className="text-[10px] text-zinc-500 leading-relaxed italic">&ldquo;{item.reason}&rdquo;</p>
+                  {item.expected_benefit ? <p className="mt-2 text-[10px] leading-relaxed text-zinc-400">{item.expected_benefit}</p> : null}
+                  <div className="mt-3 grid grid-cols-3 gap-2 text-[9px] font-bold uppercase tracking-widest text-zinc-500">
+                    <span className="rounded-lg bg-black/20 p-2">Samples <b className="block pt-1 text-xs text-white">{item.supporting_sample_size ?? 0}</b></span>
+                    <span className="rounded-lg bg-black/20 p-2">PnL <b className="block pt-1 text-xs text-white">{(item.supporting_pnl_sol ?? 0).toFixed(4)}</b></span>
+                    <span className="rounded-lg bg-black/20 p-2">Risk <b className="block pt-1 text-xs text-white">{item.overfit_risk ?? "review"}</b></span>
+                  </div>
                   <div className="mt-3 flex items-center justify-between border-t border-white/5 pt-2">
                     <span className="text-[9px] font-bold text-zinc-600 uppercase">Suggested</span>
                     <span className="text-[10px] font-black text-amber-500 uppercase">{String(item.suggested_value)}</span>
@@ -206,6 +567,47 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                   </Button>
                 </div>
               ))}
+            </div>
+          </Card>
+
+          <Card className="p-6" hover={false}>
+            <h3 className="mb-4 text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">
+              <Activity size={16} />
+              Wallet Performance
+            </h3>
+            <div className="space-y-4">
+              {!analytics ? (
+                <>
+                  <Skeleton className="h-14 w-full" />
+                  <Skeleton className="h-14 w-full" />
+                </>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-2 text-[10px]">
+                    {Object.entries(analytics.mode_comparison ?? {}).map(([mode, row]) => (
+                      <div key={mode} className="rounded-lg bg-black/20 p-2">
+                        <span className="block uppercase tracking-wider text-zinc-500">{row.mode}</span>
+                        <span className={cn("mt-1 block font-black", row.pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400")}>{row.pnl_sol.toFixed(4)} SOL</span>
+                        <span className="mt-1 block truncate text-zinc-600">{row.samples} samples / {row.confidence}</span>
+                      </div>
+                    ))}
+                  </div>
+                  {(analytics.wallets ?? []).slice(0, 3).map((wallet) => (
+                    <div key={wallet.wallet_public_key} className="rounded-xl border border-white/5 bg-white/[0.02] p-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="truncate text-[10px] font-black uppercase tracking-tight text-white">{wallet.wallet_public_key}</span>
+                        <Badge variant={wallet.pnl_confidence === "needs_review" ? "danger" : wallet.pnl_confidence === "audited" ? "success" : "warning"}>{wallet.pnl_confidence}</Badge>
+                      </div>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px]">
+                        <span className="text-zinc-500">Pos <b className="text-white">{wallet.positions}</b></span>
+                        <span className="text-zinc-500">Open <b className="text-white">{wallet.open_positions}</b></span>
+                        <span className={wallet.total_pnl_sol >= 0 ? "text-emerald-400" : "text-rose-400"}>{wallet.total_pnl_sol.toFixed(4)} SOL</span>
+                      </div>
+                    </div>
+                  ))}
+                  {!(analytics.wallets ?? []).length ? <p className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-xs text-zinc-500">No live wallet ledger performance yet.</p> : null}
+                </>
+              )}
             </div>
           </Card>
 

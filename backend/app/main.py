@@ -6,7 +6,9 @@ import json
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,8 +16,9 @@ from pydantic import BaseModel, Field
 
 from app.auth import AuthManager, random_totp_secret, verify_totp
 from app.config import get_config
-from app.core.models import SourceStatus
-from app.core.sources import LaunchEvent, make_source
+from app.core.alerts import AlertRouter
+from app.core.models import SourceStatus, utc_now
+from app.core.sources import LaunchEvent, SolanaLogsSource, make_source
 from app.core.state import BotState
 
 
@@ -71,12 +74,21 @@ class SettingsPatch(BaseModel):
     partial_take_profit_fraction: float | None = Field(default=None, ge=0.05, le=1)
     cooldown_after_loss_enabled: bool | None = None
     cooldown_after_loss_seconds: int | None = Field(default=None, ge=0, le=86400)
+    entry_confirmation_enabled: bool | None = None
+    entry_confirmation_min_buy_velocity: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmation_max_sell_pressure: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmation_min_metadata_score: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmation_min_initial_buy_sol: float | None = Field(default=None, ge=0, le=100)
+    entry_confirmation_min_price_confidence: float | None = Field(default=None, ge=0, le=1)
+    entry_confirmation_min_observed_trades: int | None = Field(default=None, ge=0, le=100)
     max_trades_per_hour_enabled: bool | None = None
     max_trades_per_hour: int | None = Field(default=None, ge=1, le=10000)
     velocity_slippage_enabled: bool | None = None
     max_same_creator_buys_enabled: bool | None = None
     max_same_creator_buys: int | None = Field(default=None, ge=1, le=1000)
     stop_on_source_degraded: bool | None = None
+    direct_solana_paper_enabled: bool | None = None
+    direct_solana_min_confidence: float | None = Field(default=None, ge=0, le=1)
     max_rejected_price_streak_enabled: bool | None = None
     max_rejected_price_streak: int | None = Field(default=None, ge=0, le=1000)
     strategy_weight_metadata: float | None = Field(default=None, ge=0, le=3)
@@ -115,6 +127,16 @@ class SettingsPatch(BaseModel):
     live_hot_wallet_enabled: bool | None = None
     live_hot_wallet_public_key: str | None = Field(default=None, max_length=100)
     live_hot_wallet_label: str | None = Field(default=None, max_length=120)
+    profit_sweep_enabled: bool | None = None
+    profit_sweep_mode: Literal["fixed_sol", "percentage"] | None = None
+    profit_sweep_threshold_sol: float | None = Field(default=None, ge=0, le=1000)
+    profit_sweep_amount_sol: float | None = Field(default=None, ge=0, le=1000)
+    profit_sweep_percentage: float | None = Field(default=None, ge=0, le=100)
+    profit_sweep_min_profit_sol: float | None = Field(default=None, ge=0, le=1000)
+    profit_sweep_destination_wallet: str | None = Field(default=None, max_length=100)
+    profit_sweep_min_reserve_sol: float | None = Field(default=None, ge=0, le=1000)
+    profit_sweep_cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
+    profit_sweep_max_per_day: int | None = Field(default=None, ge=0, le=1000)
 
 
 class BacktestRequest(BaseModel):
@@ -153,9 +175,27 @@ class TradeLabelRequest(BaseModel):
     note: str = ""
 
 
+class PaperRecoveryRequest(BaseModel):
+    note: str = Field(default="operator stopped run", max_length=160)
+
+
 class ApplyTuningSuggestionRequest(BaseModel):
     setting: str = Field(min_length=1, max_length=100)
     suggested_value: bool | int | float | str
+
+
+class ReleaseVerificationRequest(BaseModel):
+    app_version: str | None = None
+    verify_passed: bool
+    diff_reviewed: bool
+    docs_reviewed: bool
+    note: str = Field(default="", max_length=500)
+
+
+class IncidentExportReviewRequest(BaseModel):
+    exported: bool = True
+    reviewed: bool = True
+    note: str = Field(default="", max_length=500)
 
 
 class RestoreArtifactPayload(BaseModel):
@@ -193,6 +233,7 @@ class LiveQuotePayload(BaseModel):
     pool: Literal["pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto"] = "pump"
     wallet_public_key: str = Field(default="", max_length=100)
     signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
+    shadow_only: bool = False
 
 
 class LiveIntentPayload(BaseModel):
@@ -229,10 +270,40 @@ class LiveBackendArmPayload(BaseModel):
     signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
 
 
+class LiveKillSwitchPayload(BaseModel):
+    enabled: bool
+    reason: str = Field(default="", max_length=500)
+
+
+class MobilePairingStartRequest(BaseModel):
+    api_base_url: str = Field(default="", max_length=300)
+    scopes: list[str] = Field(default_factory=lambda: ["mobile:monitor", "mobile:control"], max_length=5)
+
+
+class MobilePairingClaimRequest(BaseModel):
+    pairing_id: str = Field(min_length=1, max_length=80)
+    code: str = Field(min_length=4, max_length=40)
+    device_name: str = Field(default="Mobile device", max_length=80)
+    platform: str = Field(default="android", max_length=40)
+
+
+class MobileKillSwitchPayload(BaseModel):
+    enabled: bool = True
+    reason: str = Field(default="", max_length=500)
+
+
 class LiveIntentQuotePayload(BaseModel):
     slippage_pct: float = Field(ge=0, le=100)
     priority_fee_sol: float = Field(ge=0, le=1)
     pool: Literal["pump", "raydium", "pump-amm", "launchlab", "raydium-cpmm", "bonk", "auto"] = "pump"
+
+
+class LiveExpertOverridePayload(BaseModel):
+    target_gate: Literal["entry_autonomy", "exit_autonomy", "source_trust", "recovery_debt", "signer_boundary"]
+    action: Literal["buy", "sell"] = "buy"
+    reason: str = Field(min_length=12, max_length=1000)
+    wallet_public_key: str = Field(default="", max_length=100)
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
 
 
 class LiveSimulationPayload(BaseModel):
@@ -254,14 +325,43 @@ class LiveConfirmPayload(BaseModel):
     error: str = Field(default="", max_length=500)
 
 
-def require_auth(authorization: str | None = Header(default=None), token_query: str | None = Query(default=None, alias="token")) -> None:
+def require_auth(authorization: str | None = Header(default=None)) -> None:
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1]
-    if token_query:
-        token = token_query
     if not auth.valid(token):
         raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _mobile_bearer_token(authorization: str | None) -> str:
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1]
+    return token
+
+
+def require_mobile_auth(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    device = state.validate_mobile_token(
+        _mobile_bearer_token(authorization),
+        required_scope=BotState.MOBILE_MONITOR_SCOPE,
+    )
+    if not device:
+        raise HTTPException(status_code=401, detail="Mobile authentication required")
+    return device
+
+
+def require_mobile_control(
+    authorization: str | None = Header(default=None),
+) -> dict[str, object]:
+    device = state.validate_mobile_token(
+        _mobile_bearer_token(authorization),
+        required_scope=BotState.MOBILE_CONTROL_SCOPE,
+    )
+    if not device:
+        raise HTTPException(status_code=403, detail="Mobile control scope required")
+    return device
 
 
 config = get_config()
@@ -270,22 +370,50 @@ state = BotState(
     database_path=config.database_path,
     default_source=config.pumpfun_source,
     default_solana_rpc_url=config.solana_rpc_url,
+    default_solana_wss_endpoint=config.solana_wss_endpoint,
+    default_solana_logs_mentions_address=config.solana_logs_mentions_address,
     default_watch_wallet_address=config.watch_wallet_address,
     signer_daemon_url=config.live_signer_daemon_url,
     signer_daemon_auth_token=config.live_signer_daemon_auth_token,
+    alert_router=AlertRouter(
+        telegram_bot_token=config.telegram_bot_token,
+        telegram_chat_id=config.telegram_chat_id,
+        telegram_enabled=config.telegram_alerts_enabled,
+        min_interval_seconds=config.telegram_alert_min_interval_seconds,
+    ),
 )
+state.MOBILE_TOKEN_TTL_DAYS = max(1, min(365, int(config.mobile_token_ttl_days or state.MOBILE_TOKEN_TTL_DAYS)))
 clients: set[WebSocket] = set()
+mobile_clients: dict[WebSocket, dict[str, object]] = {}
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
+solana_logs_task: asyncio.Task | None = None
+solana_logs_key: tuple[str, str] | None = None
 last_broadcast_payload: str | None = None
+latency_status: dict[str, object] = {
+    "artifact_type": "cryptoarc_latency_status",
+    "format_version": 1,
+    "updated_at": None,
+    "api_loop_ms": None,
+    "pumpportal_public_ms": None,
+    "pumpportal_state": "unknown",
+    "pumpportal_error": "",
+}
+
+
+def websocket_snapshot_payload() -> dict:
+    payload = state.snapshot().to_dict()
+    payload["tokens"] = []
+    payload["events"] = payload.get("events", [])[:25]
+    return payload
 
 
 async def broadcast_snapshot(force: bool = False) -> None:
     global last_broadcast_payload
     if not clients:
         return
-    payload = state.snapshot().to_dict()
+    payload = websocket_snapshot_payload()
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     if not force and serialized == last_broadcast_payload:
         return
@@ -301,14 +429,36 @@ async def broadcast_snapshot(force: bool = False) -> None:
         clients.discard(websocket)
 
 
+async def broadcast_mobile_cockpit() -> None:
+    if not mobile_clients:
+        return
+    disconnected: list[WebSocket] = []
+    for websocket, device in list(mobile_clients.items()):
+        try:
+            await websocket.send_json(
+                state.mobile_cockpit(
+                    config.live_trading_enabled,
+                    local_auth_enabled=auth.enabled,
+                    device=device,
+                )
+            )
+        except Exception:
+            disconnected.append(websocket)
+
+    for websocket in disconnected:
+        mobile_clients.pop(websocket, None)
+
+
 async def bot_loop() -> None:
     while True:
         try:
             await ensure_source_task()
+            await ensure_solana_logs_task()
             await drain_launch_queue()
             state.tick()
             state.run_live_autonomy(config.live_trading_enabled)
             await broadcast_snapshot()
+            await broadcast_mobile_cockpit()
         except Exception as exc:
             state.record_bot_loop_error(exc)
         await asyncio.sleep(bot_tick_seconds())
@@ -321,6 +471,61 @@ async def live_audit_poll_loop() -> None:
         except Exception as exc:
             state.add_event("warning", f"Live audit poller warning: {exc.__class__.__name__}: {exc}")
         await asyncio.sleep(15)
+
+
+async def latency_probe_loop() -> None:
+    while True:
+        try:
+            await update_latency_status()
+        except Exception as exc:
+            latency_status.update(
+                {
+                    "updated_at": time.time(),
+                    "pumpportal_state": "error",
+                    "pumpportal_error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
+        await asyncio.sleep(30)
+
+
+async def update_latency_status() -> dict[str, object]:
+    started = time.perf_counter()
+    await asyncio.sleep(0)
+    api_loop_ms = round((time.perf_counter() - started) * 1000, 1)
+    pumpportal_ms: float | None = None
+    pumpportal_state = "disabled"
+    pumpportal_error = ""
+    if state.settings.launch_source == "pumpportal" and config.pumpportal_ws_url.strip():
+        pumpportal_state = "probing"
+        probe_started = time.perf_counter()
+        try:
+            async with websockets.connect(public_pumpportal_ws_url(), open_timeout=5, ping_interval=None, close_timeout=1) as websocket:
+                await websocket.send(json.dumps({"method": "subscribeNewToken"}))
+            pumpportal_ms = round((time.perf_counter() - probe_started) * 1000, 1)
+            pumpportal_state = "connected"
+        except Exception as exc:
+            pumpportal_state = "error"
+            pumpportal_error = f"{exc.__class__.__name__}: {exc}"
+    source_connection = state.source_health().get("connection", {})
+    latency_status.update(
+        {
+            "artifact_type": "cryptoarc_latency_status",
+            "format_version": 1,
+            "updated_at": time.time(),
+            "api_loop_ms": api_loop_ms,
+            "pumpportal_public_ms": pumpportal_ms,
+            "pumpportal_state": pumpportal_state,
+            "pumpportal_error": pumpportal_error,
+            "source_connection": source_connection,
+        }
+    )
+    return latency_status
+
+
+def public_pumpportal_ws_url() -> str:
+    parts = urlsplit(config.pumpportal_ws_url)
+    query = urlencode([(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key.lower() != "api-key"])
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 def bot_tick_seconds() -> float:
@@ -343,7 +548,7 @@ async def ensure_source_task() -> None:
         if error:
             state.source_status.status = "error"
             state.source_status.message = f"Source task failed: {error.__class__.__name__}: {error}"
-            state.add_event("danger", state.source_status.message)
+            state.add_event("danger", state.source_status.message, subsystem="source")
         source_task = None
         source_key = None
 
@@ -363,7 +568,7 @@ async def ensure_source_task() -> None:
     if source_task:
         source_task.cancel()
 
-    state.source_status = SourceStatus(source=state.settings.launch_source, status="connecting")
+    state.source_status = SourceStatus(source=state.settings.launch_source, status="connecting", connection_requested_at=utc_now())
     source = make_source(
         name=state.settings.launch_source,
         launch_interval_seconds=state.settings.launch_interval_seconds,
@@ -372,6 +577,53 @@ async def ensure_source_task() -> None:
     )
     source_key = desired_key
     source_task = asyncio.create_task(source.run(launch_queue, state.source_status))
+
+
+async def ensure_solana_logs_task() -> None:
+    global solana_logs_key, solana_logs_task
+
+    if solana_logs_task and solana_logs_task.done():
+        try:
+            error = solana_logs_task.exception()
+        except asyncio.CancelledError:
+            error = None
+        if error:
+            state.solana_logs_status.status = "error"
+            state.solana_logs_status.message = f"Solana logs verifier failed: {error.__class__.__name__}: {error}"
+            state.add_event("warning", state.solana_logs_status.message, subsystem="source")
+        solana_logs_task = None
+        solana_logs_key = None
+
+    endpoint = config.solana_wss_endpoint.strip()
+    mentions_address = config.solana_logs_mentions_address.strip()
+    state.solana_wss_endpoint = endpoint
+    state.solana_logs_mentions_address = mentions_address
+
+    if state.status.value != "running" or not state.settings.detect_new_tokens or not endpoint or not mentions_address:
+        if solana_logs_task:
+            solana_logs_task.cancel()
+            solana_logs_task = None
+            solana_logs_key = None
+        state.solana_logs_status.status = "offline"
+        if not endpoint:
+            state.solana_logs_status.message = "Solana logs verifier is idle; SOLANA_WSS_ENDPOINT is not configured"
+        elif not mentions_address:
+            state.solana_logs_status.message = "Solana logs verifier is idle; SOLANA_LOGS_MENTIONS_ADDRESS is not configured"
+        else:
+            state.solana_logs_status.message = "Solana logs verifier is idle"
+        return
+
+    desired_key = (endpoint, mentions_address)
+    if solana_logs_task and solana_logs_key == desired_key and not solana_logs_task.done():
+        return
+
+    if solana_logs_task:
+        solana_logs_task.cancel()
+
+    state.solana_logs_status = SourceStatus(source="solana_logs", status="connecting")
+    verifier = SolanaLogsSource(wss_endpoint=endpoint, mentions_address=mentions_address)
+    solana_logs_key = desired_key
+    solana_logs_task = asyncio.create_task(verifier.run(launch_queue, state.solana_logs_status))
 
 
 async def drain_launch_queue() -> None:
@@ -401,30 +653,41 @@ def clear_launch_queue() -> int:
 
 
 async def stop_runtime_tasks() -> dict[str, object]:
-    global source_key, source_task
+    global source_key, source_task, solana_logs_key, solana_logs_task
 
     cancelled_source = False
+    cancelled_solana_logs = False
     source_stop_warning = ""
+    def _consume_source_task_result(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            state.add_event("warning", f"Source stop warning: {exc.__class__.__name__}: {exc}")
+
     if source_task and not source_task.done():
         cancelled_source = True
         source_task.cancel()
-        def _consume_source_task_result(task: asyncio.Task) -> None:
-            try:
-                task.exception()
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                state.add_event("warning", f"Source stop warning: {exc.__class__.__name__}: {exc}")
-
         source_task.add_done_callback(_consume_source_task_result)
+
+    if solana_logs_task and not solana_logs_task.done():
+        cancelled_solana_logs = True
+        solana_logs_task.cancel()
+        solana_logs_task.add_done_callback(_consume_source_task_result)
 
     source_task = None
     source_key = None
+    solana_logs_task = None
+    solana_logs_key = None
     queued_launches_dropped = clear_launch_queue()
     state.source_status.status = "offline"
     state.source_status.message = "Source stopped"
+    state.solana_logs_status.status = "offline"
+    state.solana_logs_status.message = "Solana logs verifier stopped"
     return {
         "source_task_cancelled": cancelled_source,
+        "solana_logs_task_cancelled": cancelled_solana_logs,
         "queued_launches_dropped": queued_launches_dropped,
         "source_stop_warning": source_stop_warning,
     }
@@ -434,19 +697,27 @@ async def stop_runtime_tasks() -> dict[str, object]:
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     task = asyncio.create_task(bot_loop())
     live_poll_task = asyncio.create_task(live_audit_poll_loop())
+    latency_task = asyncio.create_task(latency_probe_loop())
     try:
         yield
     finally:
         if source_task:
             source_task.cancel()
+        if solana_logs_task:
+            solana_logs_task.cancel()
         task.cancel()
         live_poll_task.cancel()
+        latency_task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
         try:
             await live_poll_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await latency_task
         except asyncio.CancelledError:
             pass
 
@@ -511,6 +782,154 @@ async def security_status() -> dict:
     }
 
 
+@app.get("/api/alerts/status", dependencies=[Depends(require_auth)])
+async def alerts_status() -> dict:
+    return state.alerts.status()
+
+
+@app.post("/api/alerts/test", dependencies=[Depends(require_auth)])
+async def alerts_test() -> dict:
+    return state.alerts.test()
+
+
+@app.get("/api/mobile/health")
+async def mobile_health() -> dict:
+    return {
+        "status": "ok",
+        "artifact_type": "cryptoarc_mobile_health",
+        "format_version": 1,
+        "server_time": time.time(),
+        "dashboard_auth_enabled": auth.enabled,
+        "dashboard_totp_enabled": auth.totp_enabled,
+        "mobile_pairing_available": True,
+        "websocket_path": "/ws/mobile?token=...",
+        "private_tunnel_required": True,
+    }
+
+
+@app.get("/api/latency/status", dependencies=[Depends(require_auth)])
+async def latency_status_endpoint() -> dict[str, object]:
+    payload = dict(latency_status)
+    payload["server_time"] = time.time()
+    payload["source_connection"] = state.source_health().get("connection", {})
+    return payload
+
+
+@app.post("/api/mobile/pairing/start", dependencies=[Depends(require_auth)])
+async def mobile_pairing_start(payload: MobilePairingStartRequest | None = None) -> dict:
+    payload = payload or MobilePairingStartRequest()
+    pairing = state.create_mobile_pairing(
+        api_base_url=payload.api_base_url.strip() or config.mobile_public_api_base_url.strip(),
+        scopes=payload.scopes,
+        ttl_seconds=config.mobile_pairing_ttl_seconds,
+    )
+    pairing["dashboard_auth_enabled"] = auth.enabled
+    pairing["dashboard_totp_enabled"] = auth.totp_enabled
+    pairing["pairing_security_note"] = (
+        "Dashboard password and TOTP are recommended before pairing mobile devices."
+        if not auth.enabled or not auth.totp_enabled
+        else "Pair only over the private tunnel."
+    )
+    await broadcast_mobile_cockpit()
+    return pairing
+
+
+@app.post("/api/mobile/pairing/claim")
+async def mobile_pairing_claim(payload: MobilePairingClaimRequest) -> dict:
+    try:
+        claimed = state.claim_mobile_pairing(
+            pairing_id=payload.pairing_id,
+            code=payload.code,
+            device_name=payload.device_name,
+            platform=payload.platform,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await broadcast_mobile_cockpit()
+    return claimed
+
+
+@app.get("/api/mobile/devices", dependencies=[Depends(require_auth)])
+async def mobile_devices(include_revoked: bool = False) -> dict:
+    return {
+        "devices": state.mobile_devices(include_revoked=include_revoked),
+        "pairing_ttl_seconds": config.mobile_pairing_ttl_seconds,
+        "token_ttl_days": state.MOBILE_TOKEN_TTL_DAYS,
+    }
+
+
+@app.post("/api/mobile/devices/{device_id}/revoke", dependencies=[Depends(require_auth)])
+async def mobile_device_revoke(device_id: str) -> dict:
+    try:
+        device = state.revoke_mobile_device(device_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await broadcast_mobile_cockpit()
+    return {"revoked": True, "device": device}
+
+
+@app.get("/api/mobile/cockpit")
+async def mobile_cockpit(device: dict[str, object] = Depends(require_mobile_auth)) -> dict:
+    return state.mobile_cockpit(config.live_trading_enabled, local_auth_enabled=auth.enabled, device=device)
+
+
+@app.get("/api/mobile/feed")
+async def mobile_feed(
+    level: str = "",
+    subsystem: str = "",
+    limit: int = 100,
+    device: dict[str, object] = Depends(require_mobile_auth),
+) -> dict:
+    return {**state.mobile_feed(level=level, subsystem=subsystem, limit=limit), "device": device}
+
+
+@app.get("/api/mobile/alerts/status")
+async def mobile_alerts_status(device: dict[str, object] = Depends(require_mobile_auth)) -> dict:
+    return {"device": device, "alerts": state.alerts.status()}
+
+
+@app.post("/api/mobile/actions/start")
+async def mobile_action_start(device: dict[str, object] = Depends(require_mobile_control)) -> dict:
+    mode = state.settings.mode.value if hasattr(state.settings.mode, "value") else state.settings.mode
+    if mode == "live_locked" or state.settings.live_trading_enabled:
+        state.add_event("danger", "Mobile cockpit start denied by live safety boundary", subsystem="mobile")
+        await broadcast_snapshot()
+        await broadcast_mobile_cockpit()
+        return state.mobile_cockpit(config.live_trading_enabled, local_auth_enabled=auth.enabled, device=device)
+    payload = state.mobile_start_bot(config.live_trading_enabled, local_auth_enabled=auth.enabled)
+    payload["device"] = device
+    await broadcast_snapshot()
+    await broadcast_mobile_cockpit()
+    return payload
+
+
+@app.post("/api/mobile/actions/stop")
+async def mobile_action_stop(device: dict[str, object] = Depends(require_mobile_control)) -> dict:
+    payload = state.mobile_stop_bot(config.live_trading_enabled, local_auth_enabled=auth.enabled)
+    payload["stop_runtime"] = await stop_runtime_tasks()
+    payload["device"] = device
+    await broadcast_snapshot()
+    await broadcast_mobile_cockpit()
+    return payload
+
+
+@app.post("/api/mobile/actions/kill-switch")
+async def mobile_action_kill_switch(
+    payload: MobileKillSwitchPayload,
+    device: dict[str, object] = Depends(require_mobile_control),
+) -> dict:
+    cockpit = state.mobile_set_kill_switch(
+        payload.enabled,
+        payload.reason,
+        live_trading_enabled=config.live_trading_enabled,
+        local_auth_enabled=auth.enabled,
+    )
+    cockpit["device"] = device
+    await broadcast_snapshot()
+    await broadcast_mobile_cockpit()
+    return cockpit
+
+
 @app.post("/api/security/password", dependencies=[Depends(require_auth)])
 async def update_password(payload: PasswordUpdateRequest) -> dict:
     if auth.enabled and not hmac.compare_digest(payload.current_password, auth.password):
@@ -553,10 +972,14 @@ async def start() -> dict:
     if mode == "live_locked" or state.settings.live_trading_enabled:
         state.add_event("danger", "Live execution is disabled by safety boundary")
         await broadcast_snapshot()
-        return state.snapshot().to_dict()
-    snapshot = state.start().to_dict()
+        return websocket_snapshot_payload()
+    state.start()
+    await ensure_source_task()
+    deadline = time.perf_counter() + 1.0
+    while state.source_status.status in {"connecting", "reconnecting"} and time.perf_counter() < deadline:
+        await asyncio.sleep(0.05)
     await broadcast_snapshot()
-    return snapshot
+    return websocket_snapshot_payload()
 
 
 @app.post("/api/stop", dependencies=[Depends(require_auth)])
@@ -564,7 +987,7 @@ async def stop() -> dict:
     state.stop()
     runtime = await stop_runtime_tasks()
     await broadcast_snapshot()
-    payload = state.snapshot().to_dict()
+    payload = websocket_snapshot_payload()
     payload["stop_runtime"] = runtime
     return payload
 
@@ -625,8 +1048,74 @@ async def backtests() -> list[dict]:
 
 
 @app.get("/api/source-events", dependencies=[Depends(require_auth)])
-async def source_events() -> list[dict]:
-    return state.source_events()
+async def source_events(
+    limit: int = Query(default=80, ge=1, le=1000),
+    status: str = Query(default="", max_length=40),
+    mint: str = Query(default="", max_length=120),
+    source: str = Query(default="", max_length=40),
+    event_kind: str = Query(default="", max_length=40),
+    parser_result: str = Query(default="", max_length=40),
+) -> list[dict]:
+    return state.source_events(limit=limit, status=status, mint=mint, source=source, event_kind=event_kind, parser_result=parser_result)
+
+
+@app.get("/api/source-events/parser-replay", dependencies=[Depends(require_auth)])
+async def source_parser_replay(
+    limit: int = Query(default=120, ge=1, le=5000),
+    profile: str = Query(default="", max_length=40),
+    date_from: str = Query(default="", max_length=40),
+    date_to: str = Query(default="", max_length=40),
+) -> dict:
+    return state.source_parser_replay_report(limit=limit, profile=profile or None, date_from=date_from or None, date_to=date_to or None)
+
+
+@app.get("/api/source-events/parser-replay/export", dependencies=[Depends(require_auth)])
+async def source_parser_replay_export(
+    limit: int = Query(default=120, ge=1, le=5000),
+    profile: str = Query(default="", max_length=40),
+    date_from: str = Query(default="", max_length=40),
+    date_to: str = Query(default="", max_length=40),
+) -> JSONResponse:
+    content = state.source_parser_replay_report(limit=limit, profile=profile or None, date_from=date_from or None, date_to=date_to or None)
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-source-parser-replay-{limit}.json"'},
+    )
+
+
+@app.get("/api/source-events/solana-logs-verification", dependencies=[Depends(require_auth)])
+async def solana_logs_verification(limit: int = Query(default=500, ge=1, le=5000)) -> dict:
+    return state.solana_logs_verification_report(limit=limit)
+
+
+@app.get("/api/source-events/solana-logs-verification/export", dependencies=[Depends(require_auth)])
+async def solana_logs_verification_export(limit: int = Query(default=500, ge=1, le=5000)) -> JSONResponse:
+    content = state.solana_logs_verification_report(limit=limit)
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-solana-logs-verification-{limit}.json"'},
+    )
+
+
+@app.get("/api/source-events/source-soak", dependencies=[Depends(require_auth)])
+async def source_soak_acceptance(limit: int = Query(default=500, ge=1, le=5000)) -> dict:
+    return state.source_soak_acceptance_report(limit=limit)
+
+
+@app.post("/api/source-events/source-soak/snapshot", dependencies=[Depends(require_auth)])
+async def source_soak_acceptance_snapshot(limit: int = Query(default=500, ge=1, le=5000)) -> dict:
+    result = state.record_source_soak_snapshot(limit=limit)
+    await broadcast_snapshot()
+    return result
+
+
+@app.get("/api/source-events/source-soak/export", dependencies=[Depends(require_auth)])
+async def source_soak_acceptance_export(limit: int = Query(default=500, ge=1, le=5000)) -> JSONResponse:
+    content = state.source_soak_acceptance_report(limit=limit)
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-source-soak-{limit}.json"'},
+    )
 
 
 @app.get("/api/trades", dependencies=[Depends(require_auth)])
@@ -706,6 +1195,11 @@ async def trade_labels() -> list[dict]:
     return state.trade_labels()
 
 
+@app.get("/api/trade-review/queue", dependencies=[Depends(require_auth)])
+async def trade_review_queue() -> dict:
+    return state.trade_review_queue()
+
+
 @app.post("/api/trade-labels/{token_id}", dependencies=[Depends(require_auth)])
 async def label_trade(token_id: str, payload: TradeLabelRequest) -> dict:
     result = state.label_trade(token_id, payload.label, payload.note)
@@ -733,6 +1227,13 @@ async def replay_timeline(token_id: str) -> list[dict]:
 @app.get("/api/trade-review/{token_id}", dependencies=[Depends(require_auth)])
 async def trade_review_detail(token_id: str) -> dict:
     return state.trade_review_detail(token_id)
+
+
+@app.post("/api/paper/recover-open", dependencies=[Depends(require_auth)])
+async def recover_open_paper_positions(payload: PaperRecoveryRequest) -> dict:
+    result = state.recover_open_paper_positions(payload.note)
+    await broadcast_snapshot()
+    return result
 
 
 @app.get("/api/data/integrity", dependencies=[Depends(require_auth)])
@@ -784,7 +1285,7 @@ async def live_requests() -> list[dict]:
 
 @app.get("/api/live/status", dependencies=[Depends(require_auth)])
 async def live_status(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
-    return state.live_status(config.live_trading_enabled, wallet_public_key, signer_mode)
+    return state.live_status(config.live_trading_enabled, wallet_public_key, signer_mode, local_auth_enabled=auth.enabled)
 
 
 @app.get("/api/live/intents", dependencies=[Depends(require_auth)])
@@ -923,6 +1424,26 @@ async def live_backend_disarm() -> dict:
     return state.disarm_live_backend()
 
 
+@app.post("/api/live/kill-switch", dependencies=[Depends(require_auth)])
+async def live_kill_switch(payload: LiveKillSwitchPayload) -> dict:
+    return state.set_live_kill_switch(payload.enabled, payload.reason)
+
+
+@app.post("/api/live/override", dependencies=[Depends(require_auth)])
+async def live_expert_override(payload: LiveExpertOverridePayload) -> dict:
+    try:
+        return state.record_expert_override(
+            auth.enabled,
+            payload.target_gate,
+            payload.action,
+            payload.reason,
+            payload.wallet_public_key,
+            payload.signer_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=403 if "auth" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
 @app.post("/api/live/session/acknowledge", dependencies=[Depends(require_auth)])
 async def live_session_acknowledge() -> dict:
     return state.acknowledge_live_session()
@@ -942,6 +1463,7 @@ async def live_quote(payload: LiveQuotePayload) -> dict:
             payload.pool,
             payload.wallet_public_key,
             payload.signer_mode,
+            shadow_only=payload.shadow_only,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -981,6 +1503,11 @@ async def live_audit() -> list[dict]:
     return state.live_audit()
 
 
+@app.get("/api/live/profit-sweeps", dependencies=[Depends(require_auth)])
+async def live_profit_sweeps(limit: int = Query(default=100, ge=1, le=500)) -> list[dict]:
+    return state.profit_sweep_history(limit=limit)
+
+
 @app.post("/api/live/audit/recover-unresolved", dependencies=[Depends(require_auth)])
 async def live_audit_recover_unresolved() -> dict:
     return state.recover_unresolved_live_audits()
@@ -1017,6 +1544,151 @@ async def operational_monitoring() -> dict:
     return state.operational_monitoring()
 
 
+@app.get("/api/reports/operator-logs", dependencies=[Depends(require_auth)])
+async def operator_logs_report(
+    timeframe: str = "24h",
+    level: str = "",
+    subsystem: str = "",
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    return state.operator_logs_report(timeframe, level, subsystem, limit)
+
+
+@app.get("/api/reports/operator-logs/export", dependencies=[Depends(require_auth)])
+async def operator_logs_report_export(
+    timeframe: str = "24h",
+    level: str = "",
+    subsystem: str = "",
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> JSONResponse:
+    return JSONResponse(
+        content=state.operator_logs_report(timeframe, level, subsystem, limit),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-operator-logs-{timeframe}.json"'},
+    )
+
+
+@app.get("/api/reports/session", dependencies=[Depends(require_auth)])
+async def operator_session_report(timeframe: str = "24h", wallet_public_key: str = "") -> dict:
+    return state.operator_session_report(timeframe, wallet_public_key)
+
+
+@app.get("/api/reports/session/export", dependencies=[Depends(require_auth)])
+async def operator_session_report_export(timeframe: str = "24h", wallet_public_key: str = "") -> JSONResponse:
+    return JSONResponse(
+        content=state.operator_session_report(timeframe, wallet_public_key),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-session-report-{timeframe}.json"'},
+    )
+
+
+@app.get("/api/reports/evidence-mode-separation", dependencies=[Depends(require_auth)])
+async def evidence_mode_separation_report() -> dict:
+    return state.evidence_mode_separation_report()
+
+
+@app.get("/api/reports/evidence-mode-separation/export", dependencies=[Depends(require_auth)])
+async def evidence_mode_separation_report_export() -> JSONResponse:
+    return JSONResponse(
+        content=state.evidence_mode_separation_report(),
+        headers={"Content-Disposition": 'attachment; filename="cryptoarc-evidence-mode-separation.json"'},
+    )
+
+
+@app.get("/api/reports/setup-readiness", dependencies=[Depends(require_auth)])
+async def setup_readiness_report() -> dict:
+    return state.setup_readiness_report(config.live_trading_enabled, local_auth_enabled=auth.enabled)
+
+
+@app.get("/api/reports/setup-readiness/export", dependencies=[Depends(require_auth)])
+async def setup_readiness_report_export() -> JSONResponse:
+    return JSONResponse(
+        content=state.setup_readiness_report(config.live_trading_enabled, local_auth_enabled=auth.enabled),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-setup-readiness.json"'},
+    )
+
+
+@app.get("/api/reports/release-readiness", dependencies=[Depends(require_auth)])
+async def release_readiness_report() -> dict:
+    return state.release_readiness_report(app.version, config.live_trading_enabled, local_auth_enabled=auth.enabled)
+
+
+@app.get("/api/reports/release-readiness/export", dependencies=[Depends(require_auth)])
+async def release_readiness_report_export() -> JSONResponse:
+    return JSONResponse(
+        content=state.release_readiness_report(app.version, config.live_trading_enabled, local_auth_enabled=auth.enabled),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-release-readiness.json"'},
+    )
+
+
+@app.post("/api/reports/release-readiness/verification", dependencies=[Depends(require_auth)])
+async def record_release_verification(payload: ReleaseVerificationRequest) -> dict:
+    return state.record_release_verification(
+        payload.app_version or app.version,
+        verify_passed=payload.verify_passed,
+        diff_reviewed=payload.diff_reviewed,
+        docs_reviewed=payload.docs_reviewed,
+        note=payload.note,
+    )
+
+
+@app.get("/api/reports/pilot-readiness", dependencies=[Depends(require_auth)])
+async def pilot_readiness_report(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet") -> dict:
+    return state.pilot_readiness_report(config.live_trading_enabled, wallet_public_key, signer_mode, local_auth_enabled=auth.enabled)
+
+
+@app.get("/api/reports/pilot-readiness/export", dependencies=[Depends(require_auth)])
+async def pilot_readiness_report_export(wallet_public_key: str = "", signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet") -> JSONResponse:
+    return JSONResponse(
+        content=state.pilot_readiness_report(config.live_trading_enabled, wallet_public_key, signer_mode, local_auth_enabled=auth.enabled),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-pilot-readiness.json"'},
+    )
+
+
+@app.get("/api/reports/post-run-review", dependencies=[Depends(require_auth)])
+async def post_run_review_report(timeframe: str = "24h", wallet_public_key: str = "") -> dict:
+    return state.post_run_review_report(timeframe, wallet_public_key)
+
+
+@app.get("/api/reports/post-run-review/export", dependencies=[Depends(require_auth)])
+async def post_run_review_report_export(timeframe: str = "24h", wallet_public_key: str = "") -> JSONResponse:
+    return JSONResponse(
+        content=state.post_run_review_report(timeframe, wallet_public_key),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-post-run-review-{timeframe}.json"'},
+    )
+
+
+@app.get("/api/reports/outcome-explanations", dependencies=[Depends(require_auth)])
+async def outcome_explanations_report(timeframe: str = "24h", limit: int = 80) -> dict:
+    return state.outcome_explanations_report(timeframe, limit)
+
+
+@app.get("/api/reports/outcome-explanations/export", dependencies=[Depends(require_auth)])
+async def outcome_explanations_report_export(timeframe: str = "24h", limit: int = 80) -> JSONResponse:
+    return JSONResponse(
+        content=state.outcome_explanations_report(timeframe, limit),
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-outcome-explanations-{timeframe}.json"'},
+    )
+
+
+@app.get("/api/live/audit/{audit_id}/incident-export", dependencies=[Depends(require_auth)])
+async def live_incident_export(audit_id: str) -> JSONResponse:
+    try:
+        content = state.incident_export(audit_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-live-incident-{audit_id}.json"'},
+    )
+
+
+@app.post("/api/live/audit/{audit_id}/incident-export/review", dependencies=[Depends(require_auth)])
+async def record_incident_export_review(audit_id: str, payload: IncidentExportReviewRequest) -> dict:
+    try:
+        return state.record_incident_export_review(audit_id, payload.exported, payload.reviewed, payload.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
 @app.get("/api/source-adapters", dependencies=[Depends(require_auth)])
 async def source_adapters() -> list[dict]:
     return state.source_adapters()
@@ -1030,6 +1702,16 @@ async def backup_database() -> dict:
 @app.post("/api/data/backup-artifact", dependencies=[Depends(require_auth)])
 async def backup_artifact() -> dict:
     return state.backup_artifact()
+
+
+@app.post("/api/data/restore/smoke-test", dependencies=[Depends(require_auth)])
+async def restore_smoke_test() -> dict:
+    try:
+        result = state.restore_smoke_test()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await broadcast_snapshot()
+    return result
 
 
 @app.post("/api/data/restore/preview", dependencies=[Depends(require_auth)])
@@ -1050,9 +1732,31 @@ async def confirm_restore_artifact(payload: RestoreArtifactPayload) -> dict:
     return result
 
 
+@app.get("/api/data/backup-restore/export", dependencies=[Depends(require_auth)])
+async def backup_restore_export(entry_id: str = "") -> JSONResponse:
+    try:
+        content = state.backup_restore_export(entry_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+    suffix = entry_id or "latest"
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-backup-restore-{suffix}.json"'},
+    )
+
+
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])
 async def source_health() -> dict:
     return state.source_health()
+
+
+@app.get("/api/source-health/export", dependencies=[Depends(require_auth)])
+async def source_health_export(limit: int = Query(default=300, ge=1, le=5000)) -> JSONResponse:
+    content = state.source_health_report(limit=limit)
+    return JSONResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="cryptoarc-source-health-{limit}.json"'},
+    )
 
 
 @app.get("/api/data/summary", dependencies=[Depends(require_auth)])
@@ -1061,18 +1765,47 @@ async def data_summary() -> dict:
 
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
-async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "all"]) -> dict:
+async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "source_soak_history", "all"]) -> dict:
     result = state.clear_data(target)
     await broadcast_snapshot()
     return result
 
 
 @app.get("/api/export/{target}", dependencies=[Depends(require_auth)])
-async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "all"]) -> JSONResponse:
+async def export_data(target: Literal["tokens", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "source_soak_history", "all"]) -> JSONResponse:
     return JSONResponse(
         content=state.export_data(target),
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-{target}.json"'},
     )
+
+
+@app.websocket("/ws/mobile")
+async def mobile_websocket_endpoint(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("token", "")
+    device = state.validate_mobile_token(token, required_scope=BotState.MOBILE_MONITOR_SCOPE)
+    if not device:
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    mobile_clients[websocket] = device
+    try:
+        await websocket.send_json(
+            state.mobile_cockpit(
+                config.live_trading_enabled,
+                local_auth_enabled=auth.enabled,
+                device=device,
+            )
+        )
+    except WebSocketDisconnect:
+        mobile_clients.pop(websocket, None)
+        return
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        mobile_clients.pop(websocket, None)
+    except RuntimeError:
+        mobile_clients.pop(websocket, None)
 
 
 @app.websocket("/ws")
@@ -1085,7 +1818,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.accept()
     clients.add(websocket)
     try:
-        await websocket.send_json(state.snapshot().to_dict())
+        await websocket.send_json(websocket_snapshot_payload())
     except WebSocketDisconnect:
         clients.discard(websocket)
         return

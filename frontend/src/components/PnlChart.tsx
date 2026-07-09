@@ -1,5 +1,5 @@
 import React from "react";
-import { Area, AreaChart, ReferenceLine, ResponsiveContainer, Tooltip } from "recharts";
+import { Area, AreaChart, ReferenceLine, Tooltip } from "recharts";
 import { Skeleton } from "./Skeleton";
 
 interface PnlChartProps {
@@ -12,6 +12,8 @@ interface PnlChartProps {
 
 export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 100, unit = "SOL", animationKey = "default", loading = false }) => {
   const id = React.useId();
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
+  const [containerSize, setContainerSize] = React.useState({ width: 0, height: 0 });
   const gradientId = `pnlGradient-${id.replace(/:/g, "")}`;
   const lastAnimationKeyRef = React.useRef<string | null>(null);
   const hasData = data.length > 0;
@@ -27,8 +29,28 @@ export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 10
     lastAnimationKeyRef.current = animationKey;
   }, [animationKey]);
 
+  React.useEffect(() => {
+    const node = containerRef.current;
+    if (!node) return;
+
+    const updateSize = () => {
+      const rect = node.getBoundingClientRect();
+      setContainerSize({
+        width: Math.max(0, Math.floor(rect.width)),
+        height: Math.max(0, Math.floor(rect.height))
+      });
+    };
+
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const containerReady = containerSize.width > 0 && containerSize.height > 0;
+
   return (
-    <div className="relative overflow-hidden rounded-lg" style={{ width: "100%", height }}>
+    <div ref={containerRef} className="relative overflow-hidden rounded-lg" style={{ width: "100%", height }}>
       {loading ? (
         <div className="absolute inset-0 z-10 flex items-center justify-center bg-[#090b13]/78 backdrop-blur-sm">
           <div className="w-[min(86%,320px)] space-y-3 rounded-xl border border-white/10 bg-[#0d1018]/88 px-4 py-4 shadow-[0_18px_50px_rgba(0,0,0,0.35)]">
@@ -53,49 +75,49 @@ export const PnlChart: React.FC<PnlChartProps> = React.memo(({ data, height = 10
           </div>
         </div>
       ) : null}
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={chartData}>
-          <defs>
-            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-              <stop
-                offset="5%"
-                stopColor={isPositive ? "#10b981" : "#f43f5e"}
-                stopOpacity={0.3}
-              />
-              <stop
-                offset="95%"
-                stopColor={isPositive ? "#10b981" : "#f43f5e"}
-                stopOpacity={0}
-              />
-            </linearGradient>
-          </defs>
-          <ReferenceLine y={0} stroke="#3f3f46" strokeDasharray="3 3" />
-          <Area
-            type="monotone"
-            dataKey="value"
-            stroke={isPositive ? "#10b981" : "#f43f5e"}
-            strokeWidth={2}
-            fillOpacity={1}
-            fill={`url(#${gradientId})`}
-            isAnimationActive={shouldAnimate}
-            animationDuration={450}
-          />
-          <Tooltip
-            content={({ active, payload }) => {
-              if (active && payload && payload.length) {
-                return (
-                  <div className="rounded-lg border border-white/10 bg-[#090b13] p-2 text-xs shadow-xl">
-                    <p className="font-bold text-white">
-                      {unit === "USD" ? "$" : ""}{payload[0].value?.toLocaleString(undefined, { minimumFractionDigits: unit === "USD" ? 2 : 4, maximumFractionDigits: unit === "USD" ? 2 : 4 })} {unit === "USD" ? "" : "SOL"}
-                    </p>
-                  </div>
-                );
-              }
-              return null;
-            }}
-          />
-        </AreaChart>
-      </ResponsiveContainer>
+      {containerReady ? (
+          <AreaChart width={containerSize.width} height={containerSize.height} data={chartData}>
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop
+                  offset="5%"
+                  stopColor={isPositive ? "#10b981" : "#f43f5e"}
+                  stopOpacity={0.3}
+                />
+                <stop
+                  offset="95%"
+                  stopColor={isPositive ? "#10b981" : "#f43f5e"}
+                  stopOpacity={0}
+                />
+              </linearGradient>
+            </defs>
+            <ReferenceLine y={0} stroke="#3f3f46" strokeDasharray="3 3" />
+            <Area
+              type="monotone"
+              dataKey="value"
+              stroke={isPositive ? "#10b981" : "#f43f5e"}
+              strokeWidth={2}
+              fillOpacity={1}
+              fill={`url(#${gradientId})`}
+              isAnimationActive={shouldAnimate}
+              animationDuration={450}
+            />
+            <Tooltip
+              content={({ active, payload }) => {
+                if (active && payload && payload.length) {
+                  return (
+                    <div className="rounded-lg border border-white/10 bg-[#090b13] p-2 text-xs shadow-xl">
+                      <p className="font-bold text-white">
+                        {unit === "USD" ? "$" : ""}{payload[0].value?.toLocaleString(undefined, { minimumFractionDigits: unit === "USD" ? 2 : 4, maximumFractionDigits: unit === "USD" ? 2 : 4 })} {unit === "USD" ? "" : "SOL"}
+                      </p>
+                    </div>
+                  );
+                }
+                return null;
+              }}
+            />
+          </AreaChart>
+      ) : null}
     </div>
   );
 });

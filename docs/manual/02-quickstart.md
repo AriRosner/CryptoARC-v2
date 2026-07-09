@@ -5,14 +5,66 @@ This guide gets a new user from clone to safe first use.
 ## Prerequisites
 
 - Windows PowerShell environment
-- Python installed
-- Node.js and npm installed
+- Python installed, or `CRYPTOARC_PYTHON` set to a `python.exe` path
+- Node.js and npm installed, or `CRYPTOARC_NPM` / `CRYPTOARC_PNPM` set to a package-manager path
 - Local browser
 - PumpPortal access only if using the live source
 
 ## Local Setup
 
-### Backend
+### One-command bootstrap
+
+From the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1
+```
+
+This creates `.venv`, installs backend dependencies, installs frontend dependencies, and creates `.env` from `.env.example` when `.env` is missing.
+
+### Verification
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\verify.ps1
+```
+
+This is the canonical local health check. It runs setup diagnostics, a backend import smoke test, backend unit tests, frontend build, and local Markdown link check.
+
+### Frontend dependency audit
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1
+```
+
+This wraps `npm audit --json` with the project release policy. High, critical, and unacknowledged moderate advisories block release work. The current moderate `@solana/web3.js -> jayson -> uuid` advisory is treated as an acknowledged review item because npm's available fix downgrades `@solana/web3.js` to `0.0.3`.
+
+### Setup diagnostics
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1
+```
+
+Use this before or after bootstrap when the workstation feels misconfigured. It checks the repository root, Python availability, `.venv`, backend imports including `solders`, Node/npm or pnpm, `frontend\node_modules`, `@solana/web3.js`, and `.env`. Add `-Json` for a machine-readable report or `-Strict` to return a failing exit code when required setup is missing.
+
+### Start or restart the local app
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\restart-dev.ps1
+```
+
+Default backend: `http://127.0.0.1:8000`
+
+Default frontend: `http://127.0.0.1:5173`
+
+If a default port is busy, the script automatically uses the next free local port and prints the active URLs. To check the current session later:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\status-dev.ps1
+```
+
+The active backend and frontend URLs are also stored in `data\logs\dev-ports.json`.
+
+### Manual backend fallback
 
 ```powershell
 py -m venv .venv
@@ -22,18 +74,12 @@ $env:PYTHONPATH = "backend"
 py -m uvicorn app.main:app --reload --app-dir backend
 ```
 
-### Frontend
+### Manual frontend fallback
 
 ```powershell
 cd frontend
 npm install
 npm run dev
-```
-
-### One-command local restart
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\restart-dev.ps1
 ```
 
 ## First Login

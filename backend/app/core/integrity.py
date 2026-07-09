@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.models import PriceObservation, SourceEvent, StrategyDecisionRecord, TokenSignal, TradeRecord
+from app.core.sources import PUMPPORTAL_NON_LAUNCH_MINTS
 
 
 @dataclass(slots=True)
@@ -42,8 +43,15 @@ class DataIntegrityAnalyzer:
         decision_token_ids = {decision.token_id for decision in decisions}
         token_mints_by_id = {token.id: token.mint for token in tokens}
         observations_by_mint = Counter(observation.mint for observation in observations)
-        duplicate_mints = sum(count - 1 for count in Counter(token.mint for token in tokens).values() if count > 1)
-        malformed_source = len([event for event in source_events if event.status == "raw"])
+        traded_mints = [token_mints_by_id[trade.token_id] for trade in trades if trade.token_id in token_mints_by_id]
+        duplicate_mints = sum(count - 1 for count in Counter(traded_mints).values() if count > 1)
+        malformed_source = len(
+            [
+                event
+                for event in source_events
+                if event.status == "raw" and not self._is_operational_status_event(event)
+            ]
+        )
         rejected_prices = len([observation for observation in observations if not observation.accepted])
         missing_trade_tokens = len([trade for trade in trades if trade.token_id not in token_ids])
         missing_decisions = len([trade for trade in trades if trade.token_id not in decision_token_ids])
@@ -86,6 +94,17 @@ class DataIntegrityAnalyzer:
             "replay_confidence": self.replay_confidence(tokens, trades, observations, source_events),
             "determinism_fingerprint": self.fingerprint(tokens, observations, source_events),
         }
+
+    def _is_operational_status_event(self, event: SourceEvent) -> bool:
+        text = f"{event.message} {json.dumps(event.raw_payload, default=str)}".lower()
+        if event.source == "pumpportal" and "minimum balance" in text and ("websocket data" in text or "pumpswap" in text):
+            return True
+        if event.source == "pumpportal" and "balance" in text and ("subscribetokentrade" in text or "trade subscription" in text):
+            return True
+        mint = str((event.raw_payload or {}).get("mint") or (event.raw_payload or {}).get("tokenMint") or "").strip()
+        if event.source == "pumpportal" and mint in PUMPPORTAL_NON_LAUNCH_MINTS:
+            return True
+        return False
 
     def replay_confidence(
         self,

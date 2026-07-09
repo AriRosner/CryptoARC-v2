@@ -34,3 +34,14 @@ jobs:
       - name: Build frontend
         run: npm run build
         working-directory: frontend
+      - name: Check frontend dependency audit policy
+        shell: pwsh
+        run: ./scripts/audit-frontend.ps1 -Strict
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check local Markdown links
+        shell: pwsh
+        run: ./scripts/check-doc-links.ps1

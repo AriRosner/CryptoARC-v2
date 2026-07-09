@@ -36,6 +36,14 @@ export const TokenDetail: React.FC<TokenDetailProps> = ({ token, isOpen, onClose
 
   const isProfit = (token.pnl_sol || 0) > 0;
   const isLoss = (token.pnl_sol || 0) < 0;
+  const entryFeeSol = token.fee_paid_sol || 0;
+  const exitFeeSol = token.exit_fee_sol || 0;
+  const totalFeesSol = token.total_fees_sol || entryFeeSol + exitFeeSol;
+  const providerFeeSol = (token.entry_provider_fee_sol || 0) + (token.exit_provider_fee_sol || 0);
+  const networkFeeSol = (token.entry_network_fee_sol || 0) + (token.exit_network_fee_sol || 0);
+  const priorityFeeSol = (token.entry_priority_fee_sol || 0) + (token.exit_priority_fee_sol || 0);
+  const shadowQuoteCostSol = token.quote_shadow_total_cost_sol || 0;
+  const formatSol = (value: number) => `${(value || 0).toFixed(6)} SOL`;
 
   return (
     <Modal
@@ -56,9 +64,12 @@ export const TokenDetail: React.FC<TokenDetailProps> = ({ token, isOpen, onClose
           <Metric label="Success Est." value={`${token.success_rate_pct}%`} />
           <Metric label="Hold Time" value={`${token.hold_duration_seconds}s`} />
           <Metric label="Slippage" value={`${(token.slippage_paid_pct || 0).toFixed(2)}%`} />
-          <Metric label="Fees" value={`${(token.fee_paid_sol || 0).toFixed(6)} SOL`} />
+          <Metric label="Entry Fee" value={formatSol(entryFeeSol)} />
+          <Metric label="Exit Fee" value={formatSol(exitFeeSol)} />
+          <Metric label="Total Fees" value={formatSol(totalFeesSol)} color="text-orange-300" />
           <Metric label="Impact" value={`${(token.price_impact_pct || 0).toFixed(2)}%`} />
           <Metric label="Ticks Held" value={token.ticks_held} />
+          <Metric label="Shadow Quote Cost" value={formatSol(shadowQuoteCostSol)} color="text-amber-300" />
         </div>
 
         <section className="space-y-3">
@@ -107,6 +118,19 @@ export const TokenDetail: React.FC<TokenDetailProps> = ({ token, isOpen, onClose
             <DetailRow label="Observed Ticks" value={token.observed_price_updates || 0} />
             <DetailRow label="Price Source" value={`${token.price_source || "-"} / confidence ${(token.price_confidence || 0).toFixed(2)}`} />
             <DetailRow label="Last Trade Tick" value={token.last_observed_trade_at ? new Date(token.last_observed_trade_at).toLocaleString() : "no trade ticks"} />
+            <DetailRow label="Entry Fee" value={formatSol(entryFeeSol)} />
+            <DetailRow label="Exit Fee" value={formatSol(exitFeeSol)} />
+            <DetailRow label="Total Fees" value={formatSol(totalFeesSol)} />
+            <DetailRow label="Provider Fee" value={`${formatSol(providerFeeSol)} (${formatSol(token.entry_provider_fee_sol || 0)} entry / ${formatSol(token.exit_provider_fee_sol || 0)} exit)`} />
+            <DetailRow label="Network Fee" value={`${formatSol(networkFeeSol)} (${formatSol(token.entry_network_fee_sol || 0)} entry / ${formatSol(token.exit_network_fee_sol || 0)} exit)`} />
+            <DetailRow label="Priority Fee" value={`${formatSol(priorityFeeSol)} (${formatSol(token.entry_priority_fee_sol || 0)} entry / ${formatSol(token.exit_priority_fee_sol || 0)} exit)`} />
+            <DetailRow label="Slippage Cost" value={formatSol(token.entry_slippage_cost_sol || 0)} />
+            <DetailRow label="Impact Cost" value={formatSol(token.entry_price_impact_cost_sol || 0)} />
+            <DetailRow label="Shadow Fees" value={formatSol(token.quote_shadow_fee_sol || 0)} />
+            <DetailRow label="Shadow Priority" value={formatSol(token.quote_shadow_priority_fee_sol || 0)} />
+            <DetailRow label="Shadow Impact" value={formatSol(token.quote_shadow_impact_sol || 0)} />
+            <DetailRow label="Shadow Quote Cost" value={formatSol(shadowQuoteCostSol)} />
+            <DetailRow label="Shadow Status" value={token.quote_shadow_status || "-"} />
             {token.price_reject_reason ? <DetailRow label="Price Reject" value={token.price_reject_reason} /> : null}
           </div>
         </section>
@@ -122,7 +146,7 @@ export const TokenDetail: React.FC<TokenDetailProps> = ({ token, isOpen, onClose
               ["Intelligence", (token.intelligence_tags ?? []).join(", ") || "neutral"],
               ["Score", `${token.score} / ${token.success_rate_pct}% success estimate`],
               ["Risk", token.entry_risk_filters?.join(", ") || token.reason],
-              ["Execution", token.fill_failed ? "fill failed" : `${token.status} / impact ${(token.price_impact_pct || 0).toFixed(2)}% / fees ${(token.fee_paid_sol || 0).toFixed(6)} SOL`],
+              ["Execution", token.fill_failed ? "fill failed" : `${token.status} / impact ${(token.price_impact_pct || 0).toFixed(2)}% / total fees ${totalFeesSol.toFixed(6)} SOL / shadow ${shadowQuoteCostSol.toFixed(6)} SOL`],
               ["Exit", token.exit_reason || "open or skipped"]
             ].map(([label, value], index) => (
               <div key={label} className="rounded-xl border border-white/5 bg-white/[0.02] p-3">

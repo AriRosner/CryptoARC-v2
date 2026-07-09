@@ -60,6 +60,8 @@ This manual is the canonical documentation set for CryptoARC v2. It is written f
   Current gaps, future-state plans, and evolution notes.
 - [`15-troubleshooting.md`](15-troubleshooting.md)
   Symptom-driven troubleshooting for operators and developers.
+- [`../MOBILE_COCKPIT.md`](../MOBILE_COCKPIT.md)
+  Android-first private-tunnel companion app, pairing, verification, and internal APK notes.
 
 ## Screenshot And Diagram Assets
 
@@ -71,6 +73,7 @@ This manual is the canonical documentation set for CryptoARC v2. It is written f
 - Deployment: [`../DEPLOYMENT.md`](../DEPLOYMENT.md)
 - Live trading design: [`../LIVE_TRADING_DESIGN.md`](../LIVE_TRADING_DESIGN.md)
 - Security: [`../SECURITY.md`](../SECURITY.md)
+- Mobile cockpit: [`../MOBILE_COCKPIT.md`](../MOBILE_COCKPIT.md)
 - Pump.fun research: [`../PUMPFUN_RESEARCH.md`](../PUMPFUN_RESEARCH.md)
 - Roadmap: [`../ROADMAP.md`](../ROADMAP.md)
 - AI handoff: [`../AI_HANDOFF.md`](../AI_HANDOFF.md)

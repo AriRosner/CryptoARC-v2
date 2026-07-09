@@ -59,6 +59,7 @@ class DecisionPipeline:
             "modules": [
                 {"name": "entry_scoring", "enabled": True, "version": "score-v3"},
                 {"name": "risk_guards", "enabled": True, "version": "risk-v3"},
+                {"name": "entry_confirmation", "enabled": settings.entry_confirmation_enabled, "version": "entry-confirm-v1"},
                 {"name": "position_sizing", "enabled": True, "trade_size_sol": settings.trade_size_sol},
                 {"name": "exit_engine", "enabled": True, "version": "exit-v3"},
                 {"name": "source_quality", "enabled": settings.stop_on_source_degraded},
@@ -77,6 +78,15 @@ class DecisionPipeline:
                 "break_even_stop_enabled": settings.break_even_stop_enabled,
                 "stalled_trade_exit_enabled": settings.stalled_trade_exit_enabled,
                 "sell_pressure_exit_enabled": settings.sell_pressure_exit_enabled,
+            },
+            "entry_confirmation": {
+                "enabled": settings.entry_confirmation_enabled,
+                "min_buy_velocity": settings.entry_confirmation_min_buy_velocity,
+                "max_sell_pressure": settings.entry_confirmation_max_sell_pressure,
+                "min_metadata_score": settings.entry_confirmation_min_metadata_score,
+                "min_initial_buy_sol": settings.entry_confirmation_min_initial_buy_sol,
+                "min_price_confidence": settings.entry_confirmation_min_price_confidence,
+                "min_observed_trades": settings.entry_confirmation_min_observed_trades,
             },
             "raw": asdict(settings),
         }

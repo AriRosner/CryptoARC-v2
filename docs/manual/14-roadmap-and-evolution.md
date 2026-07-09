@@ -35,4 +35,4 @@ Non-negotiable constraints for future work:
 
 ## Relationship To Existing Roadmap
 
-See [`../ROADMAP.md`](../ROADMAP.md) for broader planning notes. This manual section is meant to translate roadmap thinking into practical “what may change next” guidance for operators and developers.
+See [`../ROADMAP.md`](../ROADMAP.md) for the lean autonomous launch roadmap. This manual section is meant to translate roadmap thinking into practical "what may change next" guidance for operators and developers.

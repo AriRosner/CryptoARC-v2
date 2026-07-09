@@ -46,6 +46,7 @@ export interface BotSettings {
   compact_table_mode: boolean;
   paper_fill_delay_ticks: number;
   paper_fee_bps: number;
+  paper_priority_fee_sol: number;
   paper_price_impact_pct: number;
   paper_failed_fill_pct: number;
   duplicate_symbol_penalty: boolean;
@@ -62,12 +63,21 @@ export interface BotSettings {
   partial_take_profit_fraction: number;
   cooldown_after_loss_enabled: boolean;
   cooldown_after_loss_seconds: number;
+  entry_confirmation_enabled: boolean;
+  entry_confirmation_min_buy_velocity: number;
+  entry_confirmation_max_sell_pressure: number;
+  entry_confirmation_min_metadata_score: number;
+  entry_confirmation_min_initial_buy_sol: number;
+  entry_confirmation_min_price_confidence: number;
+  entry_confirmation_min_observed_trades: number;
   max_trades_per_hour_enabled: boolean;
   max_trades_per_hour: number;
   velocity_slippage_enabled: boolean;
   max_same_creator_buys_enabled: boolean;
   max_same_creator_buys: number;
   stop_on_source_degraded: boolean;
+  direct_solana_paper_enabled: boolean;
+  direct_solana_min_confidence: number;
   max_rejected_price_streak_enabled: boolean;
   max_rejected_price_streak: number;
   strategy_weight_metadata: number;
@@ -99,6 +109,16 @@ export interface BotSettings {
   live_hot_wallet_enabled: boolean;
   live_hot_wallet_public_key: string;
   live_hot_wallet_label: string;
+  profit_sweep_enabled: boolean;
+  profit_sweep_mode: "fixed_sol" | "percentage";
+  profit_sweep_threshold_sol: number;
+  profit_sweep_amount_sol: number;
+  profit_sweep_percentage: number;
+  profit_sweep_min_profit_sol: number;
+  profit_sweep_destination_wallet: string;
+  profit_sweep_min_reserve_sol: number;
+  profit_sweep_cooldown_seconds: number;
+  profit_sweep_max_per_day: number;
 }
 
 export interface TokenSignal {
@@ -144,7 +164,23 @@ export interface TokenSignal {
   hold_duration_seconds: number;
   fill_delay_ticks_remaining: number;
   fee_paid_sol: number;
+  exit_fee_sol: number;
+  total_fees_sol: number;
+  entry_provider_fee_sol: number;
+  exit_provider_fee_sol: number;
+  entry_network_fee_sol: number;
+  exit_network_fee_sol: number;
+  entry_priority_fee_sol: number;
+  exit_priority_fee_sol: number;
+  entry_slippage_cost_sol: number;
+  entry_price_impact_cost_sol: number;
   price_impact_pct: number;
+  quote_shadow_fee_sol: number;
+  quote_shadow_priority_fee_sol: number;
+  quote_shadow_impact_sol: number;
+  quote_shadow_total_cost_sol: number;
+  quote_shadow_slippage_pct: number;
+  quote_shadow_status: string;
   fill_failed: boolean;
   partial_take_profit_taken: boolean;
   realized_pnl_sol: number;
@@ -170,6 +206,8 @@ export interface TradeEvent {
   token_id: string | null;
   subsystem?: string;
   operator_action?: string;
+  session_id?: string;
+  context?: Record<string, unknown>;
 }
 
 export interface BotStats {
@@ -185,6 +223,9 @@ export interface BotStats {
   scratch_rate_pct: number;
   scratch_threshold_sol: number;
   total_pnl_sol: number;
+  entry_fees_sol: number;
+  exit_fees_sol: number;
+  total_fees_sol: number;
   best_trade_sol: number;
   worst_trade_sol: number;
   average_win_sol: number;
@@ -200,6 +241,9 @@ export interface SourceStatus {
   message: string;
   events_received: number;
   last_event_at: string | null;
+  connection_requested_at: string | null;
+  connected_at: string | null;
+  first_event_at: string | null;
   reconnect_attempts: number;
   raw_events_seen: number;
   normalized_events: number;
@@ -212,6 +256,16 @@ export interface SourceStatus {
   status_events_seen: number;
   active_trade_subscriptions: number;
   dropped_trade_subscriptions: number;
+}
+
+export interface SourceConnectionStatus {
+  state: string;
+  requested_at: string | null;
+  connected_at: string | null;
+  first_event_at: string | null;
+  startup_ms: number | null;
+  first_event_ms: number | null;
+  message: string;
 }
 
 export interface BacktestResult {
@@ -238,6 +292,7 @@ export interface BacktestResult {
   trades: Array<Record<string, string | number>>;
   comparison: Array<Record<string, string | number>>;
   replay_source: string;
+  determinism_fingerprint: string;
 }
 
 export interface SourceEvent {
@@ -248,6 +303,134 @@ export interface SourceEvent {
   normalized_token_id: string | null;
   status: string;
   message: string;
+  event_kind?: string;
+  parser_result?: string;
+}
+
+export interface SourceParserReplayReport {
+  artifact_type: "cryptoarc_source_parser_replay" | string;
+  format_version: number;
+  generated_at: string;
+  limit: number;
+  profile: string;
+  date_from: string;
+  date_to: string;
+  summary: {
+    raw_events: number;
+    launch_candidates: number;
+    normalized: number;
+    normalization_failures: number;
+    trade_events: number;
+    normalization_rate: number;
+    parser_counts: Record<string, number>;
+    event_kind_counts: Record<string, number>;
+  };
+  dry_backtest: {
+    tokens_replayed: number;
+    paper_buys: number;
+    skips: number;
+    estimated_pnl_sol: number;
+    win_rate_pct: number;
+    profit_factor: number;
+    replay_source: string;
+  };
+  failures: Array<{
+    event_id: string;
+    received_at: string;
+    source: string;
+    status: string;
+    event_kind: string;
+    parser_result: string;
+    mint: string;
+    normalized_token_id: string | null;
+    symbol: string;
+    failure_reason: string;
+    replay_action: string;
+    message: string;
+  }>;
+  events: Array<Record<string, unknown>>;
+  operator_action: string;
+  privacy_note: string;
+}
+
+export interface SolanaLogsVerificationReport {
+  artifact_type: "cryptoarc_solana_logs_verification" | string;
+  format_version: number;
+  generated_at: string;
+  limit: number;
+  status: "not_configured" | "configured_no_events" | "matching" | "partial" | "review" | "no_matches" | "unknown" | string;
+  configured: boolean;
+  wss_configured: boolean;
+  mentions_address_configured: boolean;
+  summary: {
+    direct_events: number;
+    pumpportal_events: number;
+    direct_create_hints: number;
+    decoded_create_events: number;
+    matches: number;
+    unmatched_direct: number;
+    unmatched_pumpportal: number;
+    conflicts: number;
+  };
+  matches: Array<Record<string, unknown>>;
+  unmatched_direct: Array<Record<string, unknown>>;
+  unmatched_pumpportal: Array<Record<string, unknown>>;
+  conflicts: Array<Record<string, unknown>>;
+  direct_events: Array<Record<string, unknown>>;
+  source_soak: SourceSoakSummary;
+  operator_action: string;
+  action_items: string[];
+  docs: Record<string, string>;
+  privacy_note: string;
+}
+
+export interface SourceSoakSummary {
+  direct_events: number;
+  pumpportal_events: number;
+  direct_create_hints: number;
+  decoded_create_events: number;
+  matches: number;
+  match_rate: number;
+  decoded_create_rate: number;
+  unmatched_direct: number;
+  unmatched_pumpportal: number;
+  conflicts: number;
+  target: Record<string, string | number>;
+}
+
+export interface SourceSoakAcceptanceReport {
+  artifact_type: "cryptoarc_source_soak_acceptance" | string;
+  format_version: number;
+  generated_at: string;
+  status: "ready" | "blocked" | "not_configured" | string;
+  ready: boolean;
+  hard_required: boolean;
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "fail" | string;
+    value: string | number | boolean | Record<string, unknown>;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  blockers: string[];
+  summary: SourceSoakSummary;
+  verification_status: string;
+  history?: SourceSoakAcceptanceReport[];
+  history_summary?: {
+    snapshots: number;
+    ready_snapshots: number;
+    blocked_snapshots: number;
+    latest_status: string;
+    latest_ready: boolean;
+    latest_created_at: string | null;
+    average_match_rate: number;
+    average_decoded_create_rate: number;
+    direct_events_recorded: number;
+    operator_action: string;
+  };
+  operator_action: string;
+  privacy_note: string;
 }
 
 export interface DataSummary {
@@ -269,6 +452,7 @@ export interface DataSummary {
   live_ledger_positions: number;
   live_execution_audits: number;
   backup_restore_history?: number;
+  source_soak_history?: number;
 }
 
 export interface TradeRecord {
@@ -288,6 +472,14 @@ export interface TradeRecord {
   lifecycle_status: string;
   entry_fee_sol: number;
   exit_fee_sol: number;
+  entry_provider_fee_sol: number;
+  exit_provider_fee_sol: number;
+  entry_network_fee_sol: number;
+  exit_network_fee_sol: number;
+  entry_priority_fee_sol: number;
+  exit_priority_fee_sol: number;
+  entry_slippage_cost_sol: number;
+  entry_price_impact_cost_sol: number;
   price_impact_pct: number;
   slippage_paid_pct: number;
   source_price_confidence: number;
@@ -312,10 +504,57 @@ export interface SourceHealth {
   status_events: number;
   active_trade_subscriptions: number;
   dropped_trade_subscriptions: number;
+  connection: SourceConnectionStatus;
   price_observations: number;
   strategy_decisions: number;
   trade_sessions: number;
   reliability_note: string;
+  trust_state: "trusted" | "degraded" | "stale" | "conflicting" | "unknown" | string;
+  trust_blockers: string[];
+  trust_warnings: string[];
+  pumpportal_funding_blocked: boolean;
+  pumpportal_funding_message: string;
+  pumpportal_funding_blocked_at: string | null;
+  shadow_price_observations_blocked: boolean;
+  live_entry_blocked: boolean;
+  paper_collection_allowed: boolean;
+  operator_action: string;
+  raw_event_inspection: {
+    recent_events: number;
+    status_counts: Record<string, number>;
+    source_counts: Record<string, number>;
+    unique_mints: number;
+    duplicate_mints: string[];
+    malformed_events: number;
+    filterable_fields: string[];
+  };
+  quality_history: Array<{
+    bucket_start: string;
+    bucket_end: string;
+    events: number;
+    normalized: number;
+    raw: number;
+    trade: number;
+    malformed: number;
+    unique_mints: number;
+    normalized_ratio: number;
+    trust_state: "trusted" | "degraded" | "conflicting" | "empty" | string;
+  }>;
+}
+
+export interface LatencyStatus {
+  artifact_type: string;
+  format_version: number;
+  updated_at: number | null;
+  server_time: number;
+  dashboard_rtt_ms?: number | null;
+  latency_error?: string;
+  latency_stale?: boolean;
+  api_loop_ms: number | null;
+  pumpportal_public_ms: number | null;
+  pumpportal_state: string;
+  pumpportal_error: string;
+  source_connection: SourceConnectionStatus;
 }
 
 export interface SecurityStatus {
@@ -330,6 +569,37 @@ export interface SecurityStatus {
   failed_attempts: number;
   locked: boolean;
   session_ttl_seconds: number;
+}
+
+export interface MobileDevice {
+  id: string;
+  name: string;
+  platform: string;
+  scopes: string[];
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  revoked_at: string;
+  paired_from_pairing_id?: string;
+}
+
+export interface MobilePairingStartResponse {
+  id: string;
+  code: string;
+  manual_code: string;
+  api_base_url: string;
+  expires_at: string;
+  scopes: string[];
+  qr_payload: Record<string, unknown>;
+  dashboard_auth_enabled: boolean;
+  dashboard_totp_enabled: boolean;
+  pairing_security_note: string;
+}
+
+export interface MobileDevicesResponse {
+  devices: MobileDevice[];
+  pairing_ttl_seconds: number;
+  token_ttl_days: number;
 }
 
 export interface PriceObservation {
@@ -411,6 +681,28 @@ export interface PerformanceGroup {
   avg_hold_seconds: number;
 }
 
+export interface WalletPerformanceRow {
+  wallet_public_key: string;
+  label: string;
+  positions: number;
+  open_positions: number;
+  closed_positions: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number;
+  cost_basis_sol: number;
+  realized_pnl_sol: number;
+  unrealized_pnl_sol: number;
+  total_pnl_sol: number;
+  fees_sol: number;
+  priority_fees_sol: number;
+  needs_review_positions: number;
+  stale_balance_positions: number;
+  pnl_confidence: string;
+  confidence_counts: Record<string, number>;
+  operator_action: string;
+}
+
 export interface PerformanceAnalytics {
   summary: PerformanceGroup;
   by_exit_reason: PerformanceGroup[];
@@ -419,12 +711,35 @@ export interface PerformanceAnalytics {
   by_score_bucket: PerformanceGroup[];
   by_price_confidence: PerformanceGroup[];
   recent_curve: Array<{ at: string; pnl_sol: number; trade_id: string }>;
+  wallets?: WalletPerformanceRow[];
+  wallet_summary?: {
+    wallets: number;
+    positions: number;
+    open_positions: number;
+    closed_positions: number;
+    realized_pnl_sol: number;
+    unrealized_pnl_sol: number;
+    total_pnl_sol: number;
+    needs_review_positions: number;
+    stale_balance_positions: number;
+    pnl_confidence: string;
+  };
+  mode_comparison?: Record<string, {
+    mode: string;
+    pnl_sol: number;
+    samples: number;
+    confidence: string;
+    source: string;
+  }>;
 }
 
 export interface MonitorPnlSummary {
   timeframe: "5m" | "15m" | "1h" | "24h" | "all" | string;
   closed_trade_count: number;
   pnl_sol: number;
+  entry_fees_sol: number;
+  exit_fees_sol: number;
+  total_fees_sol: number;
   history: number[];
 }
 
@@ -434,6 +749,13 @@ export interface TuningSuggestion {
   setting: string;
   suggested_value?: string | number | boolean;
   confidence: number;
+  expected_benefit?: string;
+  supporting_sample_size?: number;
+  supporting_closed_trades?: number;
+  supporting_pnl_sol?: number;
+  overfit_risk?: "low" | "medium" | "high" | string;
+  requires_operator_review?: boolean;
+  review_note?: string;
 }
 
 export interface ReplayTimelineEvent {
@@ -481,6 +803,18 @@ export interface PumpFunReport {
   migration_markers: number;
   field_coverage: Record<string, number>;
   top_creators: Array<{ creator: string; launches: number }>;
+  creator_performance: Array<{
+    creator: string;
+    launches: number;
+    closed_trades: number;
+    wins: number;
+    losses: number;
+    pnl_sol: number;
+    avg_pnl_sol: number;
+    win_rate_pct: number;
+    labels: Record<string, number>;
+    reputation: "positive" | "negative" | "mixed" | "exclude_or_review" | "unproven" | string;
+  }>;
   research_notes: string[];
 }
 
@@ -500,6 +834,20 @@ export interface SafetyStatus {
   live_blockers: string[];
 }
 
+export interface AlertStatus {
+  telegram_enabled: boolean;
+  telegram_configured: boolean;
+  min_interval_seconds: number;
+  last_result: {
+    status: string;
+    reason: string;
+    key?: string;
+    at?: number;
+  };
+  routes: string[];
+  critical_events: string[];
+}
+
 export interface ReadinessGate {
   id: string;
   label: string;
@@ -510,6 +858,292 @@ export interface ReadinessGate {
   reason: string;
 }
 
+export interface StrategyPromotionStatus {
+  can_promote: boolean;
+  status: "eligible" | "blocked" | "not_enough_data" | string;
+  mode: "paper_to_shadow" | string;
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "fail" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  blockers: string[];
+  summary: string;
+  requires_operator_review: boolean;
+  out_of_sample?: {
+    engine_version: string;
+    profile: string;
+    sample_size: number;
+    split: { train_tokens: number; validate_tokens: number };
+    train: BacktestResult & { profit_factor: number };
+    validate: BacktestResult & { profit_factor: number };
+    collapse_warning: boolean;
+    determinism_fingerprint: string;
+  };
+  generated_at: string;
+}
+
+export interface ExecutionReadinessStatus {
+  status: "shadow_ready" | "not_enough_quote_data" | "blocked" | string;
+  can_shadow: boolean;
+  can_live_submit: boolean;
+  mode: "dry_run_to_shadow" | string;
+  quote_ttl_seconds: number;
+  latest_quote_age_seconds: number | null;
+  metrics: {
+    quote_attempts: number;
+    ready_quotes: number;
+    blocked_quotes: number;
+    stale_quotes: number;
+    submitted_audits: number;
+    unresolved_audits: number;
+    stale_quote_rate: number;
+    blocked_quote_rate: number;
+    shadow_samples: number;
+    shadow_evaluated: number;
+    shadow_win_rate_pct: number;
+    shadow_estimated_pnl_sol: number;
+    shadow_landing_windows: number;
+    shadow_landing_evaluated: number;
+    shadow_landing_win_rate_pct: number;
+    shadow_landing_best_pnl_sol: number;
+    shadow_landing_worst_pnl_sol: number;
+    live_landing_samples: number;
+    live_quote_to_submit_p50_ms: number;
+    live_quote_to_submit_p90_ms: number;
+    live_quote_to_submit_p99_ms: number;
+    live_submit_to_confirm_p50_ms: number;
+    live_submit_to_confirm_p90_ms: number;
+    live_submit_to_confirm_p99_ms: number;
+    pipeline_samples: number;
+    signal_to_quote_p50_ms: number;
+    signal_to_quote_p90_ms: number;
+    intent_to_quote_p50_ms: number;
+    intent_to_quote_p90_ms: number;
+  };
+  policy: {
+    max_trade_sol: number;
+    max_slippage_pct: number;
+    priority_fee_cap_sol: number;
+    daily_loss_cap_sol: number;
+    wallet_exposure_cap_sol: number;
+    max_open_positions: number;
+    suggested_slippage_pct: number;
+    suggested_priority_fee_sol: number;
+    recommendation?: {
+      status: string;
+      suggested_slippage_pct: number;
+      suggested_priority_fee_sol: number;
+      cap_room: {
+        slippage_pct: number;
+        priority_fee_sol: number;
+      };
+      inputs: {
+        stale_quote_rate: number;
+        blocked_quote_rate: number;
+        missed_landing_rate: number;
+        landing_windows: number;
+        evaluated_landing_windows: number;
+        quote_to_submit_p90_ms: number;
+        issue_categories: string[];
+      };
+      reasons: string[];
+      operator_action: string;
+    };
+    blockers: string[];
+  };
+  latency_summary: {
+    status: "fast" | "watch" | "slow" | "needs_samples" | string;
+    samples: number;
+    signal_to_quote_p50_ms: number;
+    signal_to_quote_p90_ms: number;
+    intent_to_quote_p50_ms: number;
+    intent_to_quote_p90_ms: number;
+    quote_to_submit_p50_ms: number;
+    quote_to_submit_p90_ms: number;
+    quote_to_submit_samples: number;
+    issues: string[];
+    operator_action: string;
+  };
+  landing_calibration: {
+    samples: number;
+    quote_to_submit_p50_ms: number;
+    quote_to_submit_p90_ms: number;
+    quote_to_submit_p99_ms: number;
+    submit_to_confirm_p50_ms: number;
+    submit_to_confirm_p90_ms: number;
+    submit_to_confirm_p99_ms: number;
+    quote_to_confirm_p50_ms: number;
+    quote_to_confirm_p90_ms: number;
+    quote_to_confirm_p99_ms: number;
+    by_signer_mode: Record<string, {
+      samples: number;
+      quote_to_submit_p50_ms: number;
+      quote_to_submit_p90_ms: number;
+      quote_to_submit_p99_ms: number;
+      submit_to_confirm_p50_ms: number;
+      submit_to_confirm_p90_ms: number;
+      submit_to_confirm_p99_ms: number;
+      quote_to_confirm_p50_ms: number;
+      quote_to_confirm_p90_ms: number;
+      quote_to_confirm_p99_ms: number;
+    }>;
+    by_pool: Record<string, {
+      samples: number;
+      quote_to_submit_p50_ms: number;
+      quote_to_submit_p90_ms: number;
+      quote_to_submit_p99_ms: number;
+      submit_to_confirm_p50_ms: number;
+      submit_to_confirm_p90_ms: number;
+      submit_to_confirm_p99_ms: number;
+      quote_to_confirm_p50_ms: number;
+      quote_to_confirm_p90_ms: number;
+      quote_to_confirm_p99_ms: number;
+    }>;
+    by_quote_source: Record<string, {
+      samples: number;
+      quote_to_submit_p50_ms: number;
+      quote_to_submit_p90_ms: number;
+      quote_to_submit_p99_ms: number;
+      submit_to_confirm_p50_ms: number;
+      submit_to_confirm_p90_ms: number;
+      submit_to_confirm_p99_ms: number;
+      quote_to_confirm_p50_ms: number;
+      quote_to_confirm_p90_ms: number;
+      quote_to_confirm_p99_ms: number;
+    }>;
+    suggested_delay_windows_ms: number[];
+    source: string;
+  };
+  pipeline_latency: {
+    samples: number;
+    totals: Record<string, {
+      samples: number;
+      p50_ms: number;
+      p90_ms: number;
+      p99_ms: number;
+      max_ms: number;
+    }>;
+    recent_samples: Array<{
+      audit_id: string;
+      mint: string;
+      action: string;
+      status: string;
+      quoted_at: string;
+      source_event_id: string;
+      token_id: string;
+      decision_id: string;
+      intent_id: string;
+      stages: Record<string, number | null>;
+    }>;
+    missing_evidence: Record<string, number>;
+  };
+  quote_issues: {
+    total_issues: number;
+    stale_count: number;
+    blocked_count: number;
+    failed_count: number;
+    categories: Array<{
+      category: string;
+      count: number;
+      latest_at: string;
+      reasons: string[];
+      audit_ids: string[];
+    }>;
+    recent: Array<{
+      audit_id: string;
+      mint: string;
+      status: string;
+      category: string;
+      reason: string;
+      created_at: string;
+    }>;
+    operator_action: string;
+  };
+  failure_stages: {
+    total_failures: number;
+    stages: Array<{
+      stage: "quote" | "simulation" | "submit" | "confirmation" | "reconciliation" | string;
+      count: number;
+      latest_at: string;
+      categories: Array<{ category: string; count: number }>;
+      audit_ids: string[];
+      reasons: string[];
+    }>;
+    recent: Array<{
+      audit_id: string;
+      mint: string;
+      action: string;
+      stage: string;
+      category: string;
+      reason: string;
+      status: string;
+      created_at: string;
+    }>;
+    operator_action: string;
+  };
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "fail" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  shadow_comparisons: Array<{
+    mode: string;
+    status: string;
+    evaluation_model: string;
+    audit_id: string;
+    intent_id: string;
+    mint: string;
+    quoted_at: string;
+    would_submit_at: string;
+    amount_sol: number;
+    entry_price: number | null;
+    entry_price_source: string;
+    entry_observed_at: string | null;
+    latest_price: number | null;
+    latest_price_source: string;
+    latest_observed_at: string | null;
+    exit_price: number | null;
+    exit_price_source: string;
+    exit_observed_at: string | null;
+    exit_reason: string;
+    hold_duration_seconds: number;
+    landing_windows: Array<{
+      delay_ms: number;
+      landing_at: string;
+      status: string;
+      entry_price: number | null;
+      entry_price_source: string;
+      entry_observed_at: string | null;
+      exit_price: number | null;
+      exit_price_source: string;
+      exit_observed_at: string | null;
+      exit_reason: string;
+      hold_duration_seconds: number;
+      move_pct: number | null;
+      estimated_pnl_sol: number;
+      outcome: string;
+      fill_status: string;
+      reason: string;
+    }>;
+    move_pct: number | null;
+    estimated_pnl_sol: number;
+    outcome: string;
+    latency_ms: number;
+    rules: Record<string, unknown>;
+    reason: string;
+  }>;
+  blockers: string[];
+  operator_action: string;
+  generated_at: string;
+}
+
 export interface ReadinessStatus {
   engine_version: "readiness-v1";
   score: number;
@@ -517,6 +1151,9 @@ export interface ReadinessStatus {
   entries_allowed: boolean;
   gates: ReadinessGate[];
   recommended_actions: string[];
+  strategy_promotion: StrategyPromotionStatus;
+  execution_readiness: ExecutionReadinessStatus;
+  source_soak: SourceSoakAcceptanceReport;
   sample_size: {
     closed_trades: number;
     source_events: number;
@@ -543,6 +1180,61 @@ export interface OperationalMonitoring {
   recent_errors: TradeEvent[];
   recent_warnings: TradeEvent[];
   events_by_subsystem?: Record<string, TradeEvent[]>;
+  observability?: {
+    generated_at: string;
+    event_count: number;
+    level_counts: Record<string, number>;
+    session_metrics?: {
+      active_session_id: string;
+      session_event_count: number;
+      sessions_seen: number;
+      top_sessions: Array<{ session_id: string; events: number }>;
+    };
+    subsystems: Array<{
+      subsystem: string;
+      events: number;
+      warnings: number;
+      errors: number;
+      latest_at: string;
+      latest_message: string;
+    }>;
+    high_severity: TradeEvent[];
+    readiness_changes: TradeEvent[];
+    source_metrics: Record<string, unknown>;
+    signer_metrics: Record<string, unknown>;
+    recovery_metrics: Record<string, unknown>;
+    operator_action: string;
+  };
+}
+
+export interface OperatorLogsReport {
+  artifact_type: "cryptoarc_operator_logs" | string;
+  format_version: number;
+  generated_at: string;
+  timeframe: string;
+  filters: {
+    level: string;
+    subsystem: string;
+    limit: number;
+  };
+  summary: {
+    total_events: number;
+    returned_events: number;
+    warnings: number;
+    errors: number;
+    subsystems: number;
+    sessions: number;
+    recovery_related_events: number;
+    source_related_events: number;
+    live_related_events: number;
+  };
+  level_counts: Record<string, number>;
+  subsystem_counts: Array<{ subsystem: string; events: number }>;
+  session_counts: Array<{ session_id: string; events: number }>;
+  events: TradeEvent[];
+  action_items: string[];
+  operator_action: string;
+  privacy_note: string;
 }
 
 export interface BacktestV3Result {
@@ -560,6 +1252,23 @@ export interface TradeReviewDetail {
   observations: PriceObservation[];
   timeline: ReplayTimelineEvent[];
   pnl_breakdown: Record<string, number>;
+  review_workflow?: {
+    current_index: number;
+    total_closed: number;
+    previous_token_id: string;
+    next_token_id: string;
+    selected_label: string;
+    suggested_labels: string[];
+    checklist: Array<{
+      id: string;
+      label: string;
+      status: "pass" | "warn" | "missing" | string;
+      count: number;
+      ids: string[];
+      operator_action: string;
+    }>;
+    operator_action: string;
+  };
 }
 
 export interface ExperimentRun {
@@ -583,6 +1292,25 @@ export interface TradeLabel {
   note: string;
 }
 
+export interface TradeReviewQueue {
+  total_closed: number;
+  labeled: number;
+  unlabeled: number;
+  label_counts: Record<string, number>;
+  queues: Array<{
+    id: string;
+    label: string;
+    count: number;
+    sample_token_ids: string[];
+    sample_trade_ids: string[];
+    reason: string;
+  }>;
+  next_queue_id: string;
+  next_token_id: string;
+  operator_action: string;
+  generated_at: string;
+}
+
 export interface StrategyPreset {
   id: string;
   name: string;
@@ -597,6 +1325,7 @@ export interface SourceAdapterStatus {
   status: string;
   capabilities: string[];
   confidence: number;
+  details?: Record<string, string | number | boolean>;
 }
 
 export interface WatchdogStatus {
@@ -613,6 +1342,8 @@ export interface WatchdogStatus {
   loop_iterations: number;
   last_error: string;
   recommended_action: string;
+  shadow_comparison: Record<string, unknown>;
+  execution_timing: Record<string, unknown>;
 }
 
 export interface SolanaStatus {
@@ -664,8 +1395,9 @@ export interface HotWalletStatus {
   label: string;
   imported_at: string;
   last_unlock_at: string;
-  file_path: string;
   version: number;
+  storage_scope: string;
+  recovery_note: string;
 }
 
 export interface MigrationStatus {
@@ -715,10 +1447,73 @@ export interface RestoreArtifactPreview {
   schema_version: number;
   current_schema_version: number;
   summary: Record<string, number>;
+  current_summary?: Record<string, number>;
+  table_deltas?: Record<string, { current: number; artifact: number; delta: number }>;
+  changed_tables?: string[];
+  risk_level?: "low" | "review" | "blocked" | string;
+  recommended_actions?: string[];
   warnings: string[];
   payload_bytes: number;
+  integrity_check?: string;
+  detected_tables?: string[];
   status?: string;
   backup_path?: string;
+}
+
+export interface RestoreSmokeTestReport {
+  artifact_type: string;
+  format_version: number;
+  generated_at: string;
+  status: "pass" | "review" | string;
+  passed: boolean;
+  backup_artifact_created_at?: string | null;
+  schema_version?: number;
+  current_schema_version?: number;
+  database_name?: string | null;
+  payload_bytes?: number;
+  integrity_check?: string;
+  risk_level?: "low" | "review" | "blocked" | string;
+  changed_tables?: string[];
+  table_deltas?: Record<string, { current: number; artifact: number; delta: number }>;
+  summary?: Record<string, number>;
+  current_summary?: Record<string, number>;
+  warnings?: string[];
+  recommended_actions?: string[];
+  operator_action?: string;
+  privacy_note?: string;
+}
+
+export interface PreRunBackupStatus {
+  required: boolean;
+  state: "fresh" | "missing" | "stale" | "superseded_by_restore" | string;
+  fresh: boolean;
+  max_age_hours: number;
+  age_seconds: number | null;
+  latest_backup: BackupRestoreHistoryEntry | null;
+  latest_restore: BackupRestoreHistoryEntry | null;
+  backup_after_restore: boolean;
+  blocks_live_entries: boolean;
+  blocker: string;
+  operator_action: string;
+}
+
+export interface LiveCapOperatorIntent {
+  visible: boolean;
+  settings_version_id: string;
+  recorded_at: string | null;
+  changed_keys: string[];
+  blocker: string;
+  operator_action: string;
+}
+
+export interface LiveCapsSnapshot {
+  max_trade_sol: number;
+  daily_loss_cap_sol: number;
+  wallet_exposure_cap_sol: number;
+  max_open_positions: number;
+  max_slippage_pct: number;
+  priority_fee_cap_sol: number;
+  operator_intent: LiveCapOperatorIntent;
 }
 
 export interface LiveStatus {
@@ -729,14 +1524,82 @@ export interface LiveStatus {
   effective_live_enabled: boolean;
   blockers: string[];
   signer: SignerStatus;
-  caps: Record<string, number>;
+  caps: LiveCapsSnapshot;
   session_acknowledged: boolean;
   readiness: ReadinessStatus;
+  execution_readiness: ExecutionReadinessStatus;
   local_desktop_only: boolean;
   autonomous_live_available: boolean;
   auto_sell_available: boolean;
   auto_buy_available: boolean;
   autonomy_blockers: string[];
+  autonomy: {
+    entry: LiveAutonomyGate;
+    exit: LiveAutonomyGate;
+    active_backend_matches: boolean;
+    recovery_debt: {
+      unresolved_audits: number;
+      recoverable_audits: number;
+      blocks_new_entries: boolean;
+    };
+    override: {
+      available: boolean;
+      local_auth_enabled: boolean;
+      local_only: boolean;
+      bypass_enabled: boolean;
+      supported_targets: string[];
+      operator_action: string;
+      disabled_reason: string;
+    };
+  };
+  mode_visibility: Array<{
+    id: "paper" | "shadow" | "manual_live" | "autonomous_live" | string;
+    label: string;
+    state: "active" | "available" | "ready" | "blocked" | string;
+    tone: "emerald" | "sky" | "amber" | "rose" | string;
+    summary: string;
+    blockers: string[];
+  }>;
+  source_degraded_mode: {
+    mode: "normal" | "paper_only" | "exit_only" | string;
+    state: "ready" | "review" | "degraded" | string;
+    trust_state: string;
+    live_entries_allowed: boolean;
+    paper_collection_allowed: boolean;
+    protective_exits_available: boolean;
+    entry_blockers: string[];
+    exit_blockers: string[];
+    operator_action: string;
+  };
+  full_sniper_gate: {
+    mode: "full_sniper" | string;
+    ready: boolean;
+    state: "ready" | "blocked" | string;
+    entry_ready: boolean;
+    exit_ready: boolean;
+    active_backend_matches: boolean;
+    source_mode: string;
+    pre_run_backup_fresh: boolean;
+    manual_live_verified: boolean;
+    manual_live_audit_id: string;
+    manual_live_verified_at: string | null;
+    manual_live_window_hours: number | null;
+    audited_override_active: boolean;
+    override_effect: string;
+    blockers: string[];
+    operator_action: string;
+  };
+  manual_live_verification: {
+    verified: boolean;
+    audit_id: string;
+    verified_at: string | null;
+    window_hours: number;
+    wallet_public_key: string;
+    signer_mode: string;
+    blocker: string;
+    operator_action: string;
+  };
+  pre_run_backup: PreRunBackupStatus;
   active_intent_count: number;
   stale_quote_count: number;
   unresolved_audit_count: number;
@@ -752,6 +1615,17 @@ export interface LiveStatus {
   };
   latest_reconciliation_status: string;
   wallet_adapter: WalletAdapterStatus;
+  execution_backend: {
+    mode: string;
+    submit_path: string;
+    implemented: boolean;
+    local_only: boolean;
+    manual_approval_required: boolean;
+    unattended_submit_available: boolean;
+    can_submit_now: boolean;
+    blockers: string[];
+    operator_action: string;
+  };
   live_pnl: {
     realized_pnl_sol: number;
     unrealized_pnl_sol: number;
@@ -769,6 +1643,311 @@ export interface LiveStatus {
   backend_capabilities: Record<string, SignerStatus>;
   entry_autonomy_available: boolean;
   exit_autonomy_available: boolean;
+}
+
+export interface LiveAutonomyGate {
+  action: "buy" | "sell" | string;
+  label: string;
+  stage: string;
+  available: boolean;
+  blockers: string[];
+  active_backend_matches: boolean;
+  recovery_debt_blocks_entries: boolean;
+  operator_action: string;
+}
+
+export interface PilotReadinessReport {
+  artifact_type: "cryptoarc_tiny_pilot_readiness" | string;
+  format_version: number;
+  generated_at: string;
+  wallet_public_key: string;
+  signer_mode: string;
+  status: "ready" | "blocked" | string;
+  ready: boolean;
+  stage: string;
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "fail" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  runbook_checklist: Array<{
+    id: "launch" | "run" | "stop" | "recover" | "review" | string;
+    label: string;
+    status: "ready" | "blocked" | string;
+    blockers: string[];
+    actions: Array<{
+      label: string;
+      command?: string;
+    }>;
+    operator_action: string;
+  }>;
+  blockers: string[];
+  operator_action: string;
+  evidence: {
+    source?: SourceHealth;
+    source_soak?: SourceSoakAcceptanceReport;
+    readiness?: Record<string, unknown>;
+    live_status?: LiveStatus;
+    live_ledger?: LiveLedger;
+    backup_restore?: BackupRestoreStatus;
+    pre_run_backup?: Record<string, unknown>;
+    caps?: LiveCapsSnapshot;
+    [key: string]: unknown;
+  };
+  privacy_note: string;
+}
+
+export interface PostRunReviewReport {
+  artifact_type: "cryptoarc_post_run_review" | string;
+  format_version: number;
+  generated_at: string;
+  timeframe: string;
+  wallet_public_key: string;
+  status: "clear" | "review_required" | string;
+  ready: boolean;
+  summary: {
+    audits: number;
+    confirmed_or_reconciled: number;
+    unresolved: number;
+    needs_review: number;
+    incident_export_candidates: number;
+    pending_incident_exports: number;
+  };
+  checklist: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "fail" | "review" | "empty" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  run_controls: {
+    kill_switch_enabled: boolean;
+    kill_switch_events: TradeEvent[];
+    caps: LiveCapsSnapshot;
+    audits_missing_caps_snapshot: number;
+    audit_caps_snapshots: Array<{
+      audit_id: string;
+      mint: string;
+      action: string;
+      caps_snapshot: LiveCapsSnapshot | Record<string, unknown>;
+    }>;
+  };
+  incident_exports: Array<{
+    reviewed: boolean;
+    exported?: boolean;
+    review_event_id?: string;
+    reviewed_at?: string | null;
+    review_note?: string;
+    audit_id: string;
+    mint: string;
+    action: string;
+    status: string;
+    final_status: string;
+    wallet_public_key: string;
+    reason: string;
+    export_path: string;
+  }>;
+  recent_live_audits: LiveExecutionAudit[];
+  action_items: string[];
+  operator_action: string;
+  privacy_note: string;
+}
+
+export interface OpenRiskReport {
+  status: "clear" | "warning" | "blocked" | string;
+  wallet_public_key: string;
+  open_positions: number;
+  active_intents: number;
+  unresolved_audits: number;
+  cost_basis_sol: number;
+  unrealized_pnl_sol: number;
+  realized_pnl_sol: number;
+  total_live_pnl_sol: number;
+  wallet_exposure_cap_sol: number;
+  exposure_ratio: number | null;
+  daily_loss_cap_sol: number;
+  daily_loss_used_ratio: number | null;
+  stale_balance_positions: number;
+  needs_review_positions: number;
+  pnl_confidence: string;
+  blockers: string[];
+  warnings: string[];
+  action_items: string[];
+  operator_action: string;
+}
+
+export interface OperatorSessionReport {
+  artifact_type: "cryptoarc_operator_session_report" | string;
+  format_version: number;
+  generated_at: string;
+  timeframe: string;
+  wallet_public_key: string;
+  bot: Record<string, unknown>;
+  paper_pnl: MonitorPnlSummary;
+  mode_comparison: PerformanceAnalytics["mode_comparison"];
+  live_ledger: LiveLedger;
+  open_risk: OpenRiskReport;
+  source: SourceHealth;
+  source_quality: {
+    status: string;
+    trust_state: string;
+    health_score: number;
+    events: number;
+    normalized: number;
+    trade_events: number;
+    malformed: number;
+    normalized_ratio: number;
+    degraded_buckets: number;
+    bucket_count: number;
+    warnings: string[];
+    operator_action: string;
+  };
+  readiness: Record<string, unknown>;
+  live_recovery: {
+    last_poll_at: string | null;
+    summary: Record<string, unknown>;
+    unresolved_audits: LiveExecutionAudit[];
+  };
+  alerts: AlertStatus;
+  backup_restore: BackupRestoreStatus;
+  recent_events: TradeEvent[];
+  action_items: string[];
+}
+
+export interface EvidenceModeSeparationReport {
+  artifact_type: "cryptoarc_evidence_mode_separation" | string;
+  format_version: number;
+  generated_at: string;
+  status: "clear" | "review" | string;
+  ready: boolean;
+  modes: Array<{
+    mode: "paper" | "replay" | "shadow" | "manual_live" | "autonomous_live" | string;
+    label: string;
+    samples: number;
+    pnl_sol: number;
+    source: string;
+    boundary: string;
+    status: "clear" | "review" | "missing" | string;
+    latest_at: string | null;
+    operator_action: string;
+    evaluated?: number;
+    pending?: number;
+    submitted?: number;
+    fingerprinted?: number;
+    sources?: string[];
+  }>;
+  contamination_warnings: string[];
+  operator_action: string;
+  privacy_note: string;
+}
+
+export interface OutcomeExplanation {
+  id: string;
+  at: string;
+  outcome_type: "buy" | "skip" | "sell" | "block" | "override" | "recovery" | string;
+  status: string;
+  subject: string;
+  mint: string;
+  token_id: string;
+  reason: string;
+  recommended_action: string;
+  evidence: Record<string, unknown>;
+}
+
+export interface OutcomeExplanationsReport {
+  artifact_type: "cryptoarc_outcome_explanations" | string;
+  format_version: number;
+  generated_at: string;
+  timeframe: string;
+  limit: number;
+  summary: {
+    total: number;
+    by_type: Record<string, number>;
+    by_status: Record<string, number>;
+  };
+  outcomes: OutcomeExplanation[];
+  action_items: string[];
+  operator_action: string;
+  privacy_note: string;
+}
+
+export interface SetupReadinessReport {
+  artifact_type: "cryptoarc_setup_readiness" | string;
+  format_version: number;
+  generated_at: string;
+  status: "ready" | "review" | "blocked" | string;
+  ready_for_paper: boolean;
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "warn" | "fail" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  blockers: string[];
+  warnings: string[];
+  operator_action: string;
+  next_steps: string[];
+  evidence: Record<string, unknown>;
+  privacy_note: string;
+}
+
+export interface ReleaseReadinessReport {
+  artifact_type: "cryptoarc_release_readiness" | string;
+  format_version: number;
+  generated_at: string;
+  app_version: string;
+  frontend_version: string;
+  status: "ready" | "review" | "blocked" | string;
+  ready: boolean;
+  gates: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "warn" | "fail" | string;
+    value: string | number | boolean;
+    target: string | number | boolean;
+    reason: string;
+  }>;
+  blockers: string[];
+  warnings: string[];
+  next_steps: string[];
+  operator_action: string;
+  evidence: Record<string, unknown>;
+  privacy_note: string;
+}
+
+export interface ReleaseVerificationAttestation {
+  artifact_type: "cryptoarc_release_verification" | string;
+  app_version: string;
+  verify_passed: boolean;
+  diff_reviewed: boolean;
+  docs_reviewed: boolean;
+  verified: boolean;
+  event_id: string;
+  recorded_at: string;
+  status: "verified" | "incomplete" | string;
+  note?: string;
+  privacy_note: string;
+}
+
+export interface IncidentExportReviewAttestation {
+  artifact_type: "cryptoarc_incident_export_review" | string;
+  audit_id: string;
+  mint: string;
+  wallet_public_key: string;
+  exported: boolean;
+  reviewed: boolean;
+  complete: boolean;
+  event_id: string;
+  recorded_at: string;
+  status: "reviewed" | "incomplete" | string;
+  note?: string;
+  privacy_note: string;
 }
 
 export type LiveIntentSource = "manual" | "watchlist" | "paper_promoted" | "live_position_rules" | string;
@@ -845,7 +2024,7 @@ export interface LiveExecutionAudit {
   id: string;
   created_at: string;
   updated_at: string;
-  action: "buy" | "sell";
+  action: "buy" | "sell" | "profit_sweep" | string;
   mint: string;
   amount: string;
   status: string;
@@ -854,6 +2033,14 @@ export interface LiveExecutionAudit {
   quote: Record<string, unknown>;
   simulation: Record<string, unknown>;
   request: Record<string, unknown>;
+  preflight_checks: Array<{
+    id: string;
+    label: string;
+    status: "pass" | "warn" | "fail" | string;
+    value: unknown;
+    target: unknown;
+    reason: string;
+  }>;
   caps_snapshot: Record<string, unknown>;
   balance_snapshot: Record<string, unknown>;
   transaction_signature: string;
@@ -887,6 +2074,28 @@ export interface LiveFill {
   fee_sol: number;
   priority_fee_sol: number;
   signature: string;
+  accounting?: Record<string, unknown>;
+}
+
+export interface LiveRecentFill {
+  id: string;
+  created_at: string;
+  position_id: string;
+  wallet_public_key: string;
+  mint: string;
+  symbol: string;
+  action: string;
+  amount: string;
+  signature: string;
+  fee_sol: number;
+  priority_fee_sol: number;
+  wallet_sol_delta_sol: number;
+  wallet_sol_received_sol: number;
+  wallet_sol_spent_sol: number;
+  token_delta: number;
+  realized_pnl_delta_sol: number;
+  provenance: string;
+  reconciliation_status: string;
 }
 
 export interface LiveCostBasis {
@@ -908,19 +2117,44 @@ export interface LiveLedgerPosition extends LiveCostBasis {
   total_fees_sol: number;
   total_priority_fees_sol: number;
   fills: LiveFill[];
+  cost_basis_method: string;
+  cost_basis_breakdown: Record<string, unknown>;
+  realized_pnl_events: Array<Record<string, unknown>>;
   reconciliation_status: LiveReconciliationStatus;
   reconciliation: Record<string, unknown>;
   review_notes: string;
+  mark_price_sol: number;
+  mark_price_source: string;
+  mark_price_confidence: number;
+  mark_price_at: string | null;
+  mark_price_age_seconds: number | null;
+  balance_verified_at: string | null;
+  balance_age_seconds: number | null;
+  realized_pnl_confidence: string;
+  unrealized_pnl_confidence: string;
+  pnl_confidence_notes: string[];
 }
 
 export interface LiveLedger {
   positions: LiveLedgerPosition[];
+  recent_fills: LiveRecentFill[];
   summary: {
     realized_pnl_sol: number;
     unrealized_pnl_sol: number;
+    net_pnl_sol: number;
+    total_pnl_sol: number;
     cost_basis_sol: number;
+    total_fees_sol: number;
+    total_priority_fees_sol: number;
     open_positions: number;
     approximate: boolean;
+    pnl_confidence?: string;
+    confidence_counts?: Record<string, number>;
+    stale_mark_positions?: number;
+    stale_balance_positions?: number;
+    needs_review_positions?: number;
+    pnl_note?: string;
+    wallet_public_key?: string;
   };
 }
 

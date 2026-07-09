@@ -18,6 +18,39 @@ This guide is the day-to-day playbook for operating CryptoARC safely and recover
 3. Review unresolved audits or live recovery state if live features were used.
 4. Create a backup if the session included important changes or trades.
 
+## Local Autonomous Pilot Checklist
+
+### Launch
+
+1. Run `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+2. Confirm source health, paper/replay evidence, recent shadow evidence, and manual-live wallet proof.
+3. Create a fresh local backup artifact.
+4. Enable live env only for the intentional local pilot, acknowledge the session, confirm tiny caps, and arm the selected local backend.
+
+### Run
+
+1. Confirm `full_sniper_gate.ready` in live status.
+2. Run only under tiny hard caps.
+3. Watch source, audit, ledger, cap, and wallet evidence.
+
+### Stop
+
+1. Enable the kill switch to stop new entries.
+2. Disarm the backend.
+3. Stop the bot on stale source, wallet mismatch, cap breach, unresolved audit, or ledger confidence blocker.
+
+### Recover
+
+1. Recover or inspect unresolved live audits.
+2. Resolve stale or `needs_review` ledger evidence.
+3. Use backup/restore preview and restore smoke test before trusting restored local state.
+
+### Review
+
+1. Open the post-run review report.
+2. Export incident bundles for failed, stale, blocked, or needs-review audits.
+3. Confirm every live action has audit, transaction, ledger, cap, kill-switch, and PnL evidence before the next pilot.
+
 ## Backup Workflow
 
 Use local backup artifacts before:
@@ -27,13 +60,16 @@ Use local backup artifacts before:
 - restore tests
 - major operating sessions
 
+Use Restore Smoke Test in the Data workspace before any real-money phase. It creates a fresh backup artifact, runs the restore preview validator against it, records a backup/restore audit event, and reports SQLite integrity, schema version, risk, payload size, warnings, and recommended actions without returning the embedded database payload.
+
 ## Restore Workflow
 
 1. Open restore preview.
 2. Validate artifact details.
 3. Confirm restore intentionally.
 4. Re-check schema status, health, and readiness.
-5. Review live audit/recovery state if relevant.
+5. Re-check local hot-wallet status; backup artifacts do not include the encrypted sidecar, and startup or restore reload persists a disarm of stale `local_hot_wallet` backend authorization until the local wallet is re-imported or unlocked and armed again.
+6. Review live audit/recovery state if relevant.
 
 ## Common Operational Scenarios
 

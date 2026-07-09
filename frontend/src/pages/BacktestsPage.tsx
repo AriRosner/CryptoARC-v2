@@ -131,6 +131,7 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
                     Latest Run Results
                   </h3>
                   <p className="mt-1 text-[10px] text-zinc-500">Profile: {latest.profile} | {new Date(latest.created_at).toLocaleTimeString()}</p>
+                  <p className="mt-1 font-mono text-[10px] text-zinc-500">Fingerprint {latest.determinism_fingerprint || "pending"}</p>
                 </div>
                 <Button variant="primary" size="sm" onClick={onSaveExperiment}>Save Experiment</Button>
               </div>
@@ -167,20 +168,24 @@ export const BacktestsPage: React.FC<BacktestsPageProps> = ({
               <Badge variant="info">{runs.length} Runs</Badge>
             </div>
             <div className="flex-1 overflow-auto scrollbar-thin scrollbar-thumb-white/10">
-              <div className="min-w-[590px] text-[11px]">
-                <div className="sticky top-0 z-10 grid h-11 grid-cols-[180px_120px_90px_110px_90px] border-b border-white/5 bg-[#10121c]">
+              <div className="min-w-[720px] text-[11px]">
+                <div className="sticky top-0 z-10 grid h-11 grid-cols-[180px_120px_90px_130px_110px_90px] border-b border-white/5 bg-[#10121c]">
                   <div className="flex items-center px-6 font-black text-zinc-600">Timestamp</div>
                   <div className="flex items-center px-6 font-black text-zinc-600">Profile</div>
                   <div className="flex items-center px-6 font-black text-zinc-600">Limit</div>
+                  <div className="flex items-center px-6 font-black text-zinc-600">Fingerprint</div>
                   <div className="flex items-center justify-end px-6 font-black text-zinc-600">P&amp;L</div>
                   <div className="flex items-center justify-end px-6 font-black text-zinc-600">Win %</div>
                 </div>
                 <div className="divide-y divide-white/5 font-mono">
                   {runs.map((run) => (
-                    <div key={run.id} className="grid h-11 grid-cols-[180px_120px_90px_110px_90px] hover:bg-white/[0.02]">
+                    <div key={run.id} className="grid h-11 grid-cols-[180px_120px_90px_130px_110px_90px] hover:bg-white/[0.02]">
                       <div className="flex items-center whitespace-nowrap px-6 text-zinc-500">{new Date(run.created_at).toLocaleString()}</div>
                       <div className="flex items-center truncate px-6 font-bold text-white">{run.profile}</div>
                       <div className="flex items-center px-6 text-zinc-400">{run.tokens_replayed}</div>
+                      <div className="flex items-center truncate px-6 text-zinc-500" title={run.determinism_fingerprint || "No fingerprint recorded"}>
+                        {run.determinism_fingerprint ? run.determinism_fingerprint.slice(0, 12) : "legacy"}
+                      </div>
                       <div className={cn("flex items-center justify-end px-6 font-black", run.estimated_pnl_sol >= 0 ? "text-emerald-500" : "text-rose-500")}>
                         {run.estimated_pnl_sol.toFixed(4)}
                       </div>

@@ -19,5 +19,8 @@ data/*.sqlite
 data/
 !data/.gitkeep
 coverage/
+mobile/.expo/
+mobile/android/
+mobile/dist-android/
 .DS_Store
 Thumbs.db

@@ -7,12 +7,18 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
 
 from app.core.models import SourceStatus, TokenSignal, TokenStatus, new_id, utc_now
 from app.core.price_pipeline import PricePipeline
 from app.core.simulator import LaunchSimulator
+
+
+PUMPPORTAL_NON_LAUNCH_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+}
 
 
 class LaunchSource(ABC):
@@ -47,10 +53,14 @@ class MockLaunchSource(LaunchSource):
 
     async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
         status.source = self.name
+        status.connection_requested_at = utc_now()
         status.status = "connected"
         status.message = "Mock launch stream active"
+        status.connected_at = utc_now()
         while True:
             now = utc_now()
+            if status.first_event_at is None:
+                status.first_event_at = now
             token = self.simulator.make_token(now)
             await queue.put(
                 LaunchEvent(
@@ -76,19 +86,41 @@ class PumpPortalLaunchSource(LaunchSource):
 
     async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
         status.source = self.name
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max(1, self.max_trade_subscriptions * 4 or 1))
+        tasks = [asyncio.create_task(self._run_launch_stream(queue, status, subscription_queue))]
+        if self.max_trade_subscriptions > 0:
+            tasks.append(asyncio.create_task(self._run_trade_stream(queue, status, subscription_queue)))
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            raise
+
+    async def _run_launch_stream(
+        self,
+        queue: asyncio.Queue[LaunchEvent],
+        status: SourceStatus,
+        subscription_queue: asyncio.Queue[str],
+    ) -> None:
         backoff_seconds = 2
         while True:
             try:
                 status.status = "connecting"
                 status.message = "Connecting to PumpPortal"
-                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
-                    subscribed_mints: deque[str] = deque()
-                    subscribed_lookup: set[str] = set()
+                status.connection_requested_at = utc_now()
+                status.connected_at = None
+                status.first_event_at = None
+                async with websockets.connect(self.launch_ws_url(), ping_interval=20, ping_timeout=20) as websocket:
                     await websocket.send(json.dumps({"method": "subscribeNewToken"}))
                     status.status = "connected"
                     status.message = "PumpPortal new-token stream active"
+                    status.connected_at = utc_now()
+                    status.reconnect_attempts = 0
                     backoff_seconds = 2
                     async for message in websocket:
+                        if status.first_event_at is None:
+                            status.first_event_at = utc_now()
                         status.raw_events_seen += 1
                         try:
                             payload = json.loads(message)
@@ -114,16 +146,7 @@ class PumpPortalLaunchSource(LaunchSource):
                         if token is None:
                             status.normalization_failures += 1
                             continue
-                        if self.max_trade_subscriptions > 0 and token.mint not in subscribed_lookup:
-                            while len(subscribed_mints) >= self.max_trade_subscriptions:
-                                old_mint = subscribed_mints.popleft()
-                                subscribed_lookup.discard(old_mint)
-                                status.dropped_trade_subscriptions += 1
-                                await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
-                            await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [token.mint]}))
-                            subscribed_mints.append(token.mint)
-                            subscribed_lookup.add(token.mint)
-                            status.active_trade_subscriptions = len(subscribed_mints)
+                        self._queue_trade_subscription(subscription_queue, token.mint, status)
                         status.events_received += 1
                         status.launch_events_seen += 1
                         status.normalized_events += 1
@@ -136,6 +159,161 @@ class PumpPortalLaunchSource(LaunchSource):
                 status.reconnect_attempts += 1
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(30, backoff_seconds * 2)
+
+    def _queue_trade_subscription(
+        self,
+        subscription_queue: asyncio.Queue[str],
+        mint: str,
+        status: SourceStatus,
+    ) -> None:
+        if self.max_trade_subscriptions <= 0:
+            return
+        try:
+            subscription_queue.put_nowait(mint)
+        except asyncio.QueueFull:
+            try:
+                subscription_queue.get_nowait()
+                subscription_queue.task_done()
+            except asyncio.QueueEmpty:
+                pass
+            status.dropped_trade_subscriptions += 1
+            try:
+                subscription_queue.put_nowait(mint)
+            except asyncio.QueueFull:
+                status.dropped_trade_subscriptions += 1
+
+    async def _run_trade_stream(
+        self,
+        queue: asyncio.Queue[LaunchEvent],
+        status: SourceStatus,
+        subscription_queue: asyncio.Queue[str],
+    ) -> None:
+        subscribed_mints: deque[str] = deque()
+        subscribed_lookup: set[str] = set()
+        backoff_seconds = 2
+        while True:
+            first_mint = await subscription_queue.get()
+            subscription_queue.task_done()
+            if first_mint not in subscribed_lookup:
+                subscribed_mints.append(first_mint)
+                subscribed_lookup.add(first_mint)
+                status.active_trade_subscriptions = len(subscribed_mints)
+            try:
+                async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
+                    for mint in subscribed_mints:
+                        await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+                    backoff_seconds = 2
+                    while True:
+                        recv_task = asyncio.create_task(websocket.recv())
+                        subscribe_task = asyncio.create_task(subscription_queue.get())
+                        done, pending = await asyncio.wait(
+                            {recv_task, subscribe_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in pending:
+                            task.cancel()
+                        if subscribe_task in done:
+                            mint = subscribe_task.result()
+                            subscription_queue.task_done()
+                            if mint not in subscribed_lookup:
+                                while len(subscribed_mints) >= self.max_trade_subscriptions:
+                                    old_mint = subscribed_mints.popleft()
+                                    subscribed_lookup.discard(old_mint)
+                                    status.dropped_trade_subscriptions += 1
+                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
+                                await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+                                subscribed_mints.append(mint)
+                                subscribed_lookup.add(mint)
+                                status.active_trade_subscriptions = len(subscribed_mints)
+                        if recv_task in done:
+                            received_at = utc_now()
+                            payload = json.loads(recv_task.result())
+                            trade = normalize_pumpportal_trade(payload, received_at)
+                            if trade:
+                                await queue.put(trade)
+                                status.events_received += 1
+                                status.trade_events_seen += 1
+                            elif isinstance(payload.get("message"), str):
+                                status.status_events_seen += 1
+                                await queue.put(LaunchEvent(self.name, received_at, payload, None, payload["message"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status.pumpportal_funding_message = f"PumpPortal trade stream reconnecting in {backoff_seconds}s: {exc.__class__.__name__}"
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(30, backoff_seconds * 2)
+
+    def launch_ws_url(self) -> str:
+        parts = urlsplit(self.ws_url)
+        query = urlencode([(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key.lower() != "api-key"])
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
+@dataclass(slots=True)
+class SolanaLogsSource(LaunchSource):
+    wss_endpoint: str
+    mentions_address: str
+    commitment: str = "confirmed"
+    name: str = "solana_logs"
+
+    async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
+        status.source = self.name
+        backoff_seconds = 2
+        while True:
+            try:
+                status.status = "connecting"
+                status.message = "Connecting to Solana logsSubscribe verifier"
+                status.connection_requested_at = utc_now()
+                status.connected_at = None
+                status.first_event_at = None
+                async with websockets.connect(self.wss_endpoint, ping_interval=20, ping_timeout=20) as websocket:
+                    await websocket.send(json.dumps(solana_logs_subscribe_payload(self.mentions_address, self.commitment)))
+                    status.status = "connected"
+                    status.message = "Solana logsSubscribe verifier active"
+                    status.connected_at = utc_now()
+                    backoff_seconds = 2
+                    async for message in websocket:
+                        if status.first_event_at is None:
+                            status.first_event_at = utc_now()
+                        status.raw_events_seen += 1
+                        received_at = utc_now()
+                        try:
+                            payload = json.loads(message)
+                        except json.JSONDecodeError:
+                            await queue.put(
+                                LaunchEvent(self.name, received_at, {"raw": message}, None, "invalid Solana logs JSON payload", kind="verification")
+                            )
+                            status.normalization_failures += 1
+                            continue
+                        if "result" in payload and "method" not in payload and "params" not in payload:
+                            status.status_events_seen += 1
+                            status.message = f"Solana logsSubscribe subscription id {payload.get('result')}"
+                            await queue.put(LaunchEvent(self.name, received_at, payload, None, status.message, kind="verification_status"))
+                            continue
+                        await queue.put(LaunchEvent(self.name, received_at, payload, None, "Solana logsSubscribe notification", kind="verification"))
+                        status.events_received += 1
+                        status.launch_events_seen += 1
+                        status.last_event_at = received_at
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                status.status = "reconnecting"
+                status.message = f"Solana logsSubscribe reconnecting in {backoff_seconds}s: {exc.__class__.__name__}"
+                status.reconnect_attempts += 1
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(30, backoff_seconds * 2)
+
+
+def solana_logs_subscribe_payload(mentions_address: str, commitment: str = "confirmed") -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "logsSubscribe",
+        "params": [
+            {"mentions": [mentions_address]},
+            {"commitment": commitment},
+        ],
+    }
 
 
 def make_source(name: str, launch_interval_seconds: float, pumpportal_ws_url: str, max_trade_subscriptions: int = 60) -> LaunchSource:
@@ -154,6 +332,8 @@ def normalize_pumpportal_new_token(payload: dict[str, Any], now: datetime) -> To
 
     mint = first_string(payload, "mint", "tokenMint", "token", "ca")
     if not mint:
+        return None
+    if mint in PUMPPORTAL_NON_LAUNCH_MINTS:
         return None
 
     symbol = first_string(payload, "symbol", "ticker") or mint[:5].upper()

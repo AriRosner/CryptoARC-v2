@@ -8,6 +8,7 @@ import { TokenTable } from "../components/TokenTable";
 import { Badge } from "../components/Badge";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
+import type { LiveLedger } from "../types";
 
 interface MonitorPageProps {
   stats: any;
@@ -18,6 +19,7 @@ interface MonitorPageProps {
   solUsdPrice: number;
   onTogglePnlCurrency: () => void;
   pnlCaption: string;
+  liveLedger: LiveLedger | null;
   walletOptions: Array<{ value: string; label: string }>;
   timeframe: string;
   setTimeframe: (t: any) => void;
@@ -51,6 +53,7 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
   solUsdPrice,
   onTogglePnlCurrency,
   pnlCaption,
+  liveLedger,
   walletOptions,
   timeframe,
   setTimeframe,
@@ -189,6 +192,37 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
               <p className="mt-3 border-t border-white/5 pt-3 text-[10px] font-medium text-zinc-500">{pnlCaption}</p>
             )}
           </Card>
+
+          {pnlWallet !== "paper" ? (
+            <Card className="p-6" hover={false}>
+              <h4 className="mb-4 text-sm font-black uppercase tracking-widest text-zinc-500">Live Fill Audit</h4>
+              <div className="max-h-72 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+                {(liveLedger?.recent_fills ?? []).slice(0, 6).map((fill) => {
+                  const solDelta = Number(fill.wallet_sol_delta_sol ?? 0);
+                  const pnlDelta = Number(fill.realized_pnl_delta_sol ?? 0);
+                  const feeSol = Number(fill.fee_sol ?? 0);
+                  return (
+                    <article key={`${fill.id}:${fill.signature}`} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <strong className="block truncate text-xs font-black uppercase tracking-[0.18em] text-white">{fill.action} / {fill.symbol || fill.mint.slice(0, 8)}</strong>
+                          <span className="mt-1 block truncate text-[11px] text-zinc-500">{fill.signature || fill.reconciliation_status}</span>
+                        </div>
+                        <span className={cn("shrink-0 text-xs font-black", solDelta >= 0 ? "text-emerald-400" : "text-rose-400")}>{solDelta >= 0 ? "+" : ""}{solDelta.toFixed(6)} SOL</span>
+                      </div>
+                      <div className="mt-3 grid grid-cols-3 gap-2 text-[10px] font-bold uppercase tracking-widest text-zinc-500">
+                        <span>Fee <strong className="block pt-1 text-xs normal-case tracking-normal text-orange-300">{feeSol.toFixed(6)}</strong></span>
+                        <span>Priority <strong className="block pt-1 text-xs normal-case tracking-normal text-zinc-300">{Number(fill.priority_fee_sol ?? 0).toFixed(6)}</strong></span>
+                        <span>Net PnL <strong className={cn("block pt-1 text-xs normal-case tracking-normal", pnlDelta >= 0 ? "text-emerald-400" : "text-rose-400")}>{pnlDelta >= 0 ? "+" : ""}{pnlDelta.toFixed(6)}</strong></span>
+                      </div>
+                      <p className="mt-2 text-[11px] text-zinc-500">Tokens {Number(fill.token_delta ?? 0).toFixed(4)} / {fill.provenance || "estimated"}</p>
+                    </article>
+                  );
+                })}
+                {!(liveLedger?.recent_fills ?? []).length ? <p className="rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No reconciled live fills for this wallet yet.</p> : null}
+              </div>
+            </Card>
+          ) : null}
 
           <Card className="p-6" hover={false}>
             <h4 className="mb-4 flex items-center gap-2 text-sm font-black uppercase tracking-widest text-zinc-500">

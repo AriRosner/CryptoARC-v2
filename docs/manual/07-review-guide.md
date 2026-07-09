@@ -23,6 +23,8 @@ Screenshot: `assets/screenshots/review/trade-review-page.png`
 - settings version
 - decision log
 - replay timeline context
+- review workflow position, previous/next trade, and suggested labels
+- evidence checklist for source events, decisions, price observations, and PnL
 
 ## Labels
 
@@ -39,8 +41,10 @@ Typical labels include:
 
 ## Recommended Post-Trade Loop
 
-1. Open a recent trade.
-2. Inspect the PnL breakdown.
-3. Read the decision and lifecycle timeline.
-4. Add labels where they will help future tuning.
-5. Cross-reference the settings version if behavior looked surprising.
+1. Start with the Review Queues strip, especially unlabeled losses or bad price evidence.
+2. Use Next Review or the first sample trade from the highest-value queue.
+3. Inspect the PnL breakdown and evidence checklist.
+4. Read the decision stack and lifecycle timeline.
+5. Apply a suggested label or choose a more accurate operator label.
+6. Use Previous/Next to keep moving through the queue.
+7. Cross-reference the settings version if behavior looked surprising.

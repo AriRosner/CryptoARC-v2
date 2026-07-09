@@ -17,11 +17,11 @@ Screenshot: `assets/screenshots/backtests/backtests-page-overview.png`
 
 ### Replay backtest
 
-Replays normalized token history through the configured logic.
+Replays normalized token history through the configured logic. Each saved run includes a deterministic fingerprint derived from the replay inputs, settings, metrics, and trade decisions. Re-running the same evidence should produce the same fingerprint even though the saved run id and timestamp change.
 
 ### Raw replay
 
-Replays raw source material more directly for source-sensitive validation.
+Replays raw source material more directly for source-sensitive validation. Raw replay fingerprints ignore temporary normalized-token ids, so parser-generated replay rows can still be compared across repeated runs.
 
 ### Strategy comparison
 
@@ -33,7 +33,7 @@ Used to compare two decision paths on similar input.
 
 ### Backtesting v3
 
-The more advanced validation path with deterministic fingerprinting and comparison context.
+The more advanced validation path with suite-level deterministic fingerprinting and comparison context.
 
 ## Saved Experiments
 
@@ -53,6 +53,7 @@ Important result fields include:
 - estimated PnL
 - max drawdown
 - profit factor
+- deterministic fingerprint
 - hold duration
 - best / worst trades
 

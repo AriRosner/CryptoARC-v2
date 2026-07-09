@@ -9,6 +9,8 @@ from app.core.models import BotSettings, BotStats, TokenSignal, TokenStatus, utc
 class PaperTrader:
     """Simple deterministic paper trade lifecycle."""
 
+    SOLANA_BASE_FEE_SOL = 0.000005
+
     def buy(self, token: TokenSignal, settings: BotSettings) -> TokenSignal:
         token.status = TokenStatus.BUYING
         if self._fill_failed(token, settings):
@@ -29,7 +31,14 @@ class PaperTrader:
         slippage_multiplier = 1 + ((settings.slippage_tolerance_pct + token.price_impact_pct) / 100)
         token.entry_price = max(0.000001, (token.current_price or 0.00001) * slippage_multiplier)
         token.slippage_paid_pct = settings.slippage_tolerance_pct
-        token.fee_paid_sol = round(settings.trade_size_sol * (settings.paper_fee_bps / 10000), 6)
+        token.entry_provider_fee_sol = self._provider_fee(settings.trade_size_sol, settings)
+        token.entry_network_fee_sol = self.SOLANA_BASE_FEE_SOL
+        token.entry_priority_fee_sol = self._priority_fee(settings)
+        token.entry_slippage_cost_sol = round(settings.trade_size_sol * (settings.slippage_tolerance_pct / 100), 9)
+        token.entry_price_impact_cost_sol = round(settings.trade_size_sol * (token.price_impact_pct / 100), 9)
+        token.fee_paid_sol = round(token.entry_provider_fee_sol + token.entry_network_fee_sol + token.entry_priority_fee_sol, 9)
+        token.exit_fee_sol = 0.0
+        token.total_fees_sol = token.fee_paid_sol
         token.current_price = token.entry_price
         token.peak_price = token.entry_price
         token.trough_price = token.entry_price
@@ -42,7 +51,7 @@ class PaperTrader:
             "rug filter on" if settings.filter_rug_risk else "rug filter off",
         ]
         token.decision_log.append(
-            f"Paper buy filled at {token.entry_price:.8f}; impact {token.price_impact_pct:.2f}%; fee {token.fee_paid_sol:.6f} SOL"
+            f"Paper buy filled at {token.entry_price:.8f}; impact {token.price_impact_pct:.2f}%; provider {token.entry_provider_fee_sol:.9f} SOL; network {token.entry_network_fee_sol:.9f} SOL; priority {token.entry_priority_fee_sol:.9f} SOL"
         )
         token.status = TokenStatus.BUYING if token.fill_delay_ticks_remaining > 0 else TokenStatus.PAPER_BOUGHT
         return token
@@ -131,7 +140,13 @@ class PaperTrader:
             token.hold_duration_seconds = max(0, int((utc_now() - token.opened_at).total_seconds()))
         amount = token.amount_sol or settings.trade_size_sol
         gross_pnl = amount * (move_pct / 100)
-        exit_fee = amount * (settings.paper_fee_bps / 10000)
+        exit_notional = self._exit_notional_sol(amount, token)
+        token.exit_provider_fee_sol = self._provider_fee(exit_notional, settings)
+        token.exit_network_fee_sol = self.SOLANA_BASE_FEE_SOL
+        token.exit_priority_fee_sol = self._priority_fee(settings)
+        token.exit_fee_sol = round(token.exit_provider_fee_sol + token.exit_network_fee_sol + token.exit_priority_fee_sol, 9)
+        token.total_fees_sol = round((token.fee_paid_sol or 0.0) + token.exit_fee_sol, 9)
+        exit_fee = token.exit_fee_sol
         open_pnl = (gross_pnl - token.fee_paid_sol - exit_fee) * max(0.0, token.remaining_fraction)
         token.pnl_sol = round(token.realized_pnl_sol + open_pnl, 6)
 
@@ -144,7 +159,22 @@ class PaperTrader:
         token.exit_reason = reason
         if token.opened_at:
             token.hold_duration_seconds = max(0, int((token.closed_at - token.opened_at).total_seconds()))
-        token.decision_log.append(f"Paper sell filled: {reason}; final P&L {token.pnl_sol or 0.0:+.6f} SOL")
+        token.decision_log.append(
+            f"Paper sell filled: {reason}; final P&L {token.pnl_sol or 0.0:+.6f} SOL; provider {token.exit_provider_fee_sol:.9f} SOL; network {token.exit_network_fee_sol:.9f} SOL; priority {token.exit_priority_fee_sol:.9f} SOL"
+        )
+
+    def _provider_fee(self, amount_sol: float, settings: BotSettings) -> float:
+        return round(float(amount_sol or 0.0) * (float(settings.paper_fee_bps or 0.0) / 10000), 9)
+
+    def _exit_notional_sol(self, amount_sol: float, token: TokenSignal) -> float:
+        entry_price = float(token.entry_price or 0.0)
+        current_price = float(token.current_price or 0.0)
+        if entry_price <= 0 or current_price <= 0:
+            return max(0.0, float(amount_sol or 0.0))
+        return max(0.0, float(amount_sol or 0.0) * (current_price / entry_price))
+
+    def _priority_fee(self, settings: BotSettings) -> float:
+        return round(max(0.0, float(settings.paper_priority_fee_sol or 0.0)), 9)
 
     def _fill_failed(self, token: TokenSignal, settings: BotSettings) -> bool:
         if settings.paper_failed_fill_pct <= 0:

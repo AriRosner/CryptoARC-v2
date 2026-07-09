@@ -145,6 +145,13 @@ These support read-only RPC and wallet balance visibility.
 
 These govern whether live flows are allowed, what backend is active, and what caps apply.
 
+## Direct Solana Paper Collection
+
+- `direct_solana_paper_enabled`
+- `direct_solana_min_confidence`
+
+These allow decoded Solana `logsSubscribe` create evidence to enter paper monitoring only. The default is off. Even when enabled, this path does not grant live-source authority or bypass source-soak, readiness, signer, cap, backup, or recovery gates.
+
 ## UX And Dashboard
 
 - `enable_trade_toasts`
@@ -157,6 +164,17 @@ These settings change operator-facing behavior and display surfaces.
 ## Security
 
 Dashboard password and TOTP configuration are managed through the security surfaces and backend auth endpoints rather than ordinary trading controls.
+
+## Operator Alerts
+
+Telegram alerts are configured with local environment variables, not stored dashboard settings:
+
+- `TELEGRAM_ALERTS_ENABLED`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `TELEGRAM_ALERT_MIN_INTERVAL_SECONDS`
+
+The dashboard can show route status and send a test alert, but it never returns the bot token. Critical alerts are deduplicated by category and rate-limited by the configured interval.
 
 ## Screenshot Placeholder
 

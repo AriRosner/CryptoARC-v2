@@ -67,7 +67,8 @@ class BotSettings:
     enable_trade_toasts: bool = True
     compact_table_mode: bool = False
     paper_fill_delay_ticks: int = 0
-    paper_fee_bps: float = 25.0
+    paper_fee_bps: float = 50.0
+    paper_priority_fee_sol: float = 0.00001
     paper_price_impact_pct: float = 0.15
     paper_failed_fill_pct: float = 0.0
     duplicate_symbol_penalty: bool = True
@@ -84,12 +85,21 @@ class BotSettings:
     partial_take_profit_fraction: float = 0.5
     cooldown_after_loss_enabled: bool = False
     cooldown_after_loss_seconds: int = 0
+    entry_confirmation_enabled: bool = True
+    entry_confirmation_min_buy_velocity: float = 0.7
+    entry_confirmation_max_sell_pressure: float = 0.35
+    entry_confirmation_min_metadata_score: float = 0.65
+    entry_confirmation_min_initial_buy_sol: float = 0.35
+    entry_confirmation_min_price_confidence: float = 0.7
+    entry_confirmation_min_observed_trades: int = 1
     max_trades_per_hour_enabled: bool = True
     max_trades_per_hour: int = 30
     velocity_slippage_enabled: bool = True
     max_same_creator_buys_enabled: bool = True
     max_same_creator_buys: int = 3
     stop_on_source_degraded: bool = False
+    direct_solana_paper_enabled: bool = False
+    direct_solana_min_confidence: float = 0.65
     max_rejected_price_streak_enabled: bool = True
     max_rejected_price_streak: int = 5
     strategy_weight_metadata: float = 1.0
@@ -128,6 +138,16 @@ class BotSettings:
     live_hot_wallet_enabled: bool = False
     live_hot_wallet_public_key: str = ""
     live_hot_wallet_label: str = ""
+    profit_sweep_enabled: bool = False
+    profit_sweep_mode: str = "fixed_sol"
+    profit_sweep_threshold_sol: float = 0.0
+    profit_sweep_amount_sol: float = 0.0
+    profit_sweep_percentage: float = 0.0
+    profit_sweep_min_profit_sol: float = 0.0
+    profit_sweep_destination_wallet: str = ""
+    profit_sweep_min_reserve_sol: float = 0.0
+    profit_sweep_cooldown_seconds: int = 3600
+    profit_sweep_max_per_day: int = 1
 
 
 @dataclass(slots=True)
@@ -174,7 +194,23 @@ class TokenSignal:
     hold_duration_seconds: int = 0
     fill_delay_ticks_remaining: int = 0
     fee_paid_sol: float = 0.0
+    exit_fee_sol: float = 0.0
+    total_fees_sol: float = 0.0
+    entry_provider_fee_sol: float = 0.0
+    exit_provider_fee_sol: float = 0.0
+    entry_network_fee_sol: float = 0.0
+    exit_network_fee_sol: float = 0.0
+    entry_priority_fee_sol: float = 0.0
+    exit_priority_fee_sol: float = 0.0
+    entry_slippage_cost_sol: float = 0.0
+    entry_price_impact_cost_sol: float = 0.0
     price_impact_pct: float = 0.0
+    quote_shadow_fee_sol: float = 0.0
+    quote_shadow_priority_fee_sol: float = 0.0
+    quote_shadow_impact_sol: float = 0.0
+    quote_shadow_total_cost_sol: float = 0.0
+    quote_shadow_slippage_pct: float = 0.0
+    quote_shadow_status: str = ""
     fill_failed: bool = False
     partial_take_profit_taken: bool = False
     realized_pnl_sol: float = 0.0
@@ -209,6 +245,8 @@ class TradeEvent:
     token_id: str | None = None
     subsystem: str = "app"
     operator_action: str = ""
+    session_id: str = ""
+    context: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -229,6 +267,28 @@ class SourceEvent:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["received_at"] = self.received_at.isoformat()
+        raw = self.raw_payload or {}
+        event_kind = str(raw.get("txType") or raw.get("type") or raw.get("event") or raw.get("method") or "").strip().lower()
+        if not event_kind:
+            if self.status == "trade" or any(key in raw for key in ("price", "solAmount", "tokenAmount", "marketCapSol")):
+                event_kind = "trade"
+            elif any(key in raw for key in ("mint", "tokenMint", "bondingCurveKey", "creator")):
+                event_kind = "launch"
+            else:
+                event_kind = "unknown"
+        mint = next((str(raw.get(key) or "").strip() for key in ("mint", "tokenMint", "token", "ca", "normalized_mint") if str(raw.get(key) or "").strip()), "")
+        if self.status == "normalized" or self.normalized_token_id:
+            parser_result = "normalized"
+        elif self.status == "trade":
+            parser_result = "trade"
+        elif not mint:
+            parser_result = "missing_mint"
+        elif self.status == "raw":
+            parser_result = "unparsed"
+        else:
+            parser_result = self.status or "unknown"
+        payload["event_kind"] = event_kind
+        payload["parser_result"] = parser_result
         return payload
 
 
@@ -399,6 +459,7 @@ class LiveExecutionAudit:
     quote: dict[str, Any] = field(default_factory=dict)
     simulation: dict[str, Any] = field(default_factory=dict)
     request: dict[str, Any] = field(default_factory=dict)
+    preflight_checks: list[dict[str, Any]] = field(default_factory=list)
     caps_snapshot: dict[str, Any] = field(default_factory=dict)
     balance_snapshot: dict[str, Any] = field(default_factory=dict)
     transaction_signature: str = ""
@@ -414,6 +475,8 @@ class LiveExecutionAudit:
     recovery_attempts: int = 0
     last_recovery_error: str = ""
     recommended_action: str = ""
+    shadow_comparison: dict[str, Any] = field(default_factory=dict)
+    execution_timing: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -465,11 +528,26 @@ class LiveLedgerPosition:
     reconciliation_status: str = "pending"
     reconciliation: dict[str, Any] = field(default_factory=dict)
     review_notes: str = ""
+    cost_basis_method: str = "weighted_average"
+    cost_basis_breakdown: dict[str, Any] = field(default_factory=dict)
+    realized_pnl_events: list[dict[str, Any]] = field(default_factory=list)
+    mark_price_sol: float = 0.0
+    mark_price_source: str = ""
+    mark_price_confidence: float = 0.0
+    mark_price_at: datetime | None = None
+    mark_price_age_seconds: int | None = None
+    balance_verified_at: datetime | None = None
+    balance_age_seconds: int | None = None
+    realized_pnl_confidence: str = "unknown"
+    unrealized_pnl_confidence: str = "unknown"
+    pnl_confidence_notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
         payload["updated_at"] = self.updated_at.isoformat()
+        payload["mark_price_at"] = self.mark_price_at.isoformat() if isinstance(self.mark_price_at, datetime) else self.mark_price_at
+        payload["balance_verified_at"] = self.balance_verified_at.isoformat() if isinstance(self.balance_verified_at, datetime) else self.balance_verified_at
         return payload
 
 
@@ -575,6 +653,7 @@ class BacktestRun:
     trades: list[dict[str, Any]] = field(default_factory=list)
     comparison: list[dict[str, Any]] = field(default_factory=list)
     replay_source: str = "tokens"
+    determinism_fingerprint: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -596,6 +675,9 @@ class BotStats:
     scratch_rate_pct: int = 0
     scratch_threshold_sol: float = 0.001
     total_pnl_sol: float = 0.0
+    entry_fees_sol: float = 0.0
+    exit_fees_sol: float = 0.0
+    total_fees_sol: float = 0.0
     best_trade_sol: float = 0.0
     worst_trade_sol: float = 0.0
     average_win_sol: float = 0.0
@@ -627,10 +709,20 @@ class SourceStatus:
     status_events_seen: int = 0
     active_trade_subscriptions: int = 0
     dropped_trade_subscriptions: int = 0
+    connection_requested_at: datetime | None = None
+    connected_at: datetime | None = None
+    first_event_at: datetime | None = None
+    pumpportal_funding_blocked: bool = False
+    pumpportal_funding_message: str = ""
+    pumpportal_funding_blocked_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["last_event_at"] = self.last_event_at.isoformat() if self.last_event_at else None
+        payload["connection_requested_at"] = self.connection_requested_at.isoformat() if self.connection_requested_at else None
+        payload["connected_at"] = self.connected_at.isoformat() if self.connected_at else None
+        payload["first_event_at"] = self.first_event_at.isoformat() if self.first_event_at else None
+        payload["pumpportal_funding_blocked_at"] = self.pumpportal_funding_blocked_at.isoformat() if self.pumpportal_funding_blocked_at else None
         return payload
 
 
@@ -652,6 +744,14 @@ class TradeRecord:
     lifecycle_status: str = "closed"
     entry_fee_sol: float = 0.0
     exit_fee_sol: float = 0.0
+    entry_provider_fee_sol: float = 0.0
+    exit_provider_fee_sol: float = 0.0
+    entry_network_fee_sol: float = 0.0
+    exit_network_fee_sol: float = 0.0
+    entry_priority_fee_sol: float = 0.0
+    exit_priority_fee_sol: float = 0.0
+    entry_slippage_cost_sol: float = 0.0
+    entry_price_impact_cost_sol: float = 0.0
     price_impact_pct: float = 0.0
     slippage_paid_pct: float = 0.0
     source_price_confidence: float = 0.0

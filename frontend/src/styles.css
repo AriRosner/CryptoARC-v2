@@ -26,7 +26,8 @@
 
 body {
   margin: 0;
-  min-width: 1180px;
+  min-width: 0;
+  overflow-x: hidden;
   background:
     linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.014) 1px, transparent 1px),
@@ -36,6 +37,12 @@ body {
   background-size: 32px 32px, 32px 32px, auto, auto, auto;
   background-attachment: fixed;
   scroll-behavior: smooth;
+}
+
+@media (min-width: 1180px) {
+  body {
+    min-width: 1180px;
+  }
 }
 
 body::before {
@@ -159,6 +166,38 @@ select option:focus {
   background-repeat: repeat, no-repeat !important;
   background-size: auto, 0.875rem 0.875rem !important;
   padding-right: 2rem;
+}
+
+.wallet-modal p,
+.wallet-modal span,
+.wallet-modal strong {
+  overflow-wrap: anywhere;
+}
+
+.wallet-modal p.text-xs,
+.wallet-modal p.text-sm,
+.wallet-modal span.text-xs,
+.wallet-modal span.text-sm {
+  line-height: 1.55;
+}
+
+.wallet-modal p.mt-1.text-xs,
+.wallet-modal p.mt-1.text-sm,
+.wallet-modal span.mt-1.text-xs,
+.wallet-modal span.mt-1.text-sm {
+  margin-top: 0.375rem;
+}
+
+.wallet-modal p.mt-2.text-xs,
+.wallet-modal p.mt-2.text-sm,
+.wallet-modal span.mt-2.text-xs,
+.wallet-modal span.mt-2.text-sm {
+  margin-top: 0.625rem;
+}
+
+.wallet-modal .break-all,
+.wallet-modal .font-mono {
+  line-height: 1.45;
 }
 
 button {

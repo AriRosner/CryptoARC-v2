@@ -46,9 +46,12 @@ import {
   fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
+  fetchLatencyStatus,
+  fetchAlertStatus,
   fetchHotWalletStatus,
   fetchDataIntegrity,
   fetchMonitorPnlSummary,
+  fetchMonitorTokens,
   fetchOperationalMonitoring,
   fetchPerformanceAnalytics,
   fetchPriceDiagnostics,
@@ -71,6 +74,7 @@ import {
   fetchTrades,
   fetchTradeSessions,
   fetchTradeReviewDetail,
+  fetchTradeReviewQueue,
   fetchTradeLabels,
   fetchTuningSuggestions,
   fetchWatchdogStatus,
@@ -81,6 +85,7 @@ import {
   patchSettings,
   quoteLiveIntent,
   recoverLiveAudit,
+  recoverOpenPaperPositions,
   recoverUnresolvedLiveAudit,
   recoverWatchdog,
   reconcileLiveIntent,
@@ -99,13 +104,15 @@ import {
   stopBot,
   importHotWallet,
   setupTotp,
+  sendTestAlert,
+  setLiveKillSwitch,
   saveStrategyPreset,
   disarmLiveBackend,
   unlockHotWallet,
   updatePassword,
   verifyTotp
 } from "./api";
-import type { BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
@@ -175,7 +182,8 @@ const fallbackSnapshot: BotSnapshot = {
     enable_trade_toasts: true,
     compact_table_mode: false,
     paper_fill_delay_ticks: 0,
-    paper_fee_bps: 25,
+    paper_fee_bps: 50,
+    paper_priority_fee_sol: 0.00001,
     paper_price_impact_pct: 0.15,
     paper_failed_fill_pct: 0,
     duplicate_symbol_penalty: true,
@@ -192,12 +200,21 @@ const fallbackSnapshot: BotSnapshot = {
     partial_take_profit_fraction: 0.5,
     cooldown_after_loss_enabled: false,
     cooldown_after_loss_seconds: 0,
+    entry_confirmation_enabled: true,
+    entry_confirmation_min_buy_velocity: 0.7,
+    entry_confirmation_max_sell_pressure: 0.35,
+    entry_confirmation_min_metadata_score: 0.65,
+    entry_confirmation_min_initial_buy_sol: 0.35,
+    entry_confirmation_min_price_confidence: 0.7,
+    entry_confirmation_min_observed_trades: 1,
     max_trades_per_hour_enabled: true,
     max_trades_per_hour: 30,
     velocity_slippage_enabled: true,
     max_same_creator_buys_enabled: true,
     max_same_creator_buys: 3,
     stop_on_source_degraded: false,
+    direct_solana_paper_enabled: false,
+    direct_solana_min_confidence: 0.65,
     max_rejected_price_streak_enabled: true,
     max_rejected_price_streak: 5,
     strategy_weight_metadata: 1,
@@ -235,7 +252,17 @@ const fallbackSnapshot: BotSnapshot = {
     live_active_wallet_public_key: "",
     live_hot_wallet_enabled: false,
     live_hot_wallet_public_key: "",
-    live_hot_wallet_label: ""
+    live_hot_wallet_label: "",
+    profit_sweep_enabled: false,
+    profit_sweep_mode: "fixed_sol",
+    profit_sweep_threshold_sol: 0,
+    profit_sweep_amount_sol: 0,
+    profit_sweep_percentage: 0,
+    profit_sweep_min_profit_sol: 0,
+    profit_sweep_destination_wallet: "",
+    profit_sweep_min_reserve_sol: 0,
+    profit_sweep_cooldown_seconds: 3600,
+    profit_sweep_max_per_day: 1
   },
   tokens: [],
   events: [],
@@ -252,6 +279,9 @@ const fallbackSnapshot: BotSnapshot = {
     scratch_rate_pct: 0,
     scratch_threshold_sol: 0.001,
     total_pnl_sol: 0,
+    entry_fees_sol: 0,
+    exit_fees_sol: 0,
+    total_fees_sol: 0,
     best_trade_sol: 0,
     worst_trade_sol: 0,
     average_win_sol: 0,
@@ -266,6 +296,9 @@ const fallbackSnapshot: BotSnapshot = {
     message: "Source is idle",
     events_received: 0,
     last_event_at: null,
+    connection_requested_at: null,
+    connected_at: null,
+    first_event_at: null,
     reconnect_attempts: 0,
     raw_events_seen: 0,
     normalized_events: 0,
@@ -481,13 +514,17 @@ function App() {
   const [backtestV3Result, setBacktestV3Result] = React.useState<BacktestV3Result | null>(null);
   const [experiments, setExperiments] = React.useState<ExperimentRun[]>([]);
   const [tradeLabels, setTradeLabels] = React.useState<TradeLabel[]>([]);
+  const [tradeReviewQueue, setTradeReviewQueue] = React.useState<TradeReviewQueue | null>(null);
+  const [reviewLoading, setReviewLoading] = React.useState(false);
   const [strategyPresetsRemote, setStrategyPresetsRemote] = React.useState<StrategyPreset[]>([]);
   const [sourceAdapters, setSourceAdapters] = React.useState<SourceAdapterStatus[]>([]);
   const [selectedReviewTradeId, setSelectedReviewTradeId] = React.useState<string | null>(null);
   const [replayTimeline, setReplayTimeline] = React.useState<ReplayTimelineEvent[]>([]);
   const [tradeReviewDetail, setTradeReviewDetail] = React.useState<TradeReviewDetail | null>(null);
   const [sourceHealth, setSourceHealth] = React.useState<SourceHealth | null>(null);
+  const [latencyStatus, setLatencyStatus] = React.useState<LatencyStatus | null>(null);
   const [securityStatus, setSecurityStatus] = React.useState<SecurityStatus | null>(null);
+  const [alertStatus, setAlertStatus] = React.useState<AlertStatus | null>(null);
   const [watchdogStatus, setWatchdogStatus] = React.useState<WatchdogStatus | null>(null);
   const [solanaStatus, setSolanaStatus] = React.useState<SolanaStatus | null>(null);
   const [liveRequests, setLiveRequests] = React.useState<LiveExecutionRequest[]>([]);
@@ -542,6 +579,9 @@ function App() {
   const strategyPresetsRefreshInFlight = React.useRef(false);
   const liveWalletCoreRefreshInFlight = React.useRef(false);
   const liveWalletDetailRefreshInFlight = React.useRef(false);
+  const solUsdRefreshInFlight = React.useRef(false);
+  const latencyRefreshInFlight = React.useRef(false);
+  const workspaceRefreshKeyRef = React.useRef("");
 
   const pushToast = React.useCallback((message: string, level: TradeEvent["level"] = "info") => {
     const toast: TradeEvent = {
@@ -557,6 +597,15 @@ function App() {
 
   const pushSuccessToast = React.useCallback((message: string) => pushToast(message, "success"), [pushToast]);
   const pushErrorToast = React.useCallback((message: string) => pushToast(message, "danger"), [pushToast]);
+
+  React.useEffect(() => {
+    if (!toasts.length) return;
+    const interval = window.setInterval(() => {
+      const now = Date.now();
+      setToasts((current) => current.filter((toast) => now - new Date(toast.created_at).getTime() < 6500));
+    }, 1000);
+    return () => window.clearInterval(interval);
+  }, [toasts.length]);
 
   React.useEffect(() => {
     let closed = false;
@@ -630,6 +679,64 @@ function App() {
     };
   }, []);
 
+  React.useEffect(() => {
+    let cancelled = false;
+    let timer = 0;
+
+    const refreshLatency = async () => {
+      if (latencyRefreshInFlight.current) return;
+      latencyRefreshInFlight.current = true;
+      const startedAt = performance.now();
+      try {
+        const status = await fetchLatencyStatus();
+        if (!cancelled) {
+          setLatencyStatus({ ...status, dashboard_rtt_ms: Math.round(performance.now() - startedAt), latency_error: "", latency_stale: false });
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : "unknown error";
+          setLatencyStatus((current) => current
+            ? { ...current, dashboard_rtt_ms: null, latency_error: message, latency_stale: true }
+            : {
+              artifact_type: "cryptoarc_latency_status",
+              format_version: 1,
+              updated_at: null,
+              server_time: 0,
+              dashboard_rtt_ms: null,
+              api_loop_ms: null,
+              pumpportal_public_ms: null,
+              pumpportal_state: "unknown",
+              pumpportal_error: "",
+              latency_error: message,
+              latency_stale: true,
+              source_connection: {
+                state: "unknown",
+                requested_at: null,
+                connected_at: null,
+                first_event_at: null,
+                startup_ms: null,
+                first_event_ms: null,
+                message: message,
+              },
+            });
+        }
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(refreshLatency, 5000);
+        }
+        latencyRefreshInFlight.current = false;
+      }
+    };
+
+    if (!authRequired || authed) {
+      refreshLatency();
+    }
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [authRequired, authed]);
+
   const settings = snapshot.settings;
   const stats = snapshot.stats;
   const tokenSource = monitorTokens.length ? monitorTokens : snapshot.tokens;
@@ -639,11 +746,26 @@ function App() {
   const selectedLivePnlWallet = pnlWalletScope === "paper" ? "" : pnlWalletScope;
   const selectedToken = tokenSource.find((token) => token.id === selectedTokenId) ?? null;
   const effectiveBotStatus = botActionStatus || snapshot.status;
+  const sourceConnectionState = sourceHealth?.connection?.state || snapshot.source_status.status;
+  const dashboardRuntimeStatus = botActionStatus
+    || (snapshot.status === "running" && (sourceConnectionState === "connecting" || sourceConnectionState === "reconnecting")
+      ? sourceConnectionState
+      : snapshot.status === "running" && (sourceConnectionState === "offline" || sourceConnectionState === "disconnected" || sourceConnectionState === "error")
+        ? "disconnected"
+        : snapshot.status);
   const shouldPollPnl = workspacePage === "monitor" || liveWalletOpen;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const paperTimeframePnl = Number((paperPnlSummary?.pnl_sol ?? stats.total_pnl_sol ?? 0).toFixed(6));
-  const liveTimeframePnl = Number(((liveLedger?.summary.realized_pnl_sol ?? 0) + (liveLedger?.summary.unrealized_pnl_sol ?? 0)).toFixed(6));
+  const paperTimeframeFees = Number((paperPnlSummary?.total_fees_sol ?? stats.total_fees_sol ?? 0).toFixed(9));
+  const liveTimeframePnl = Number((liveLedger?.summary.net_pnl_sol ?? liveLedger?.summary.total_pnl_sol ?? ((liveLedger?.summary.realized_pnl_sol ?? 0) + (liveLedger?.summary.unrealized_pnl_sol ?? 0))).toFixed(6));
+  const liveTimeframeFees = Number((liveLedger?.summary.total_fees_sol ?? 0).toFixed(9));
   const timeframePnlSol = pnlWalletScope === "paper" ? paperTimeframePnl : liveTimeframePnl;
+  const displayedStats = React.useMemo(() => ({
+    ...stats,
+    total_pnl_sol: timeframePnlSol,
+    total_fees_sol: pnlWalletScope === "paper" ? paperTimeframeFees : liveTimeframeFees,
+    open_positions: pnlWalletScope === "paper" ? stats.open_positions : liveLedger?.summary.open_positions ?? 0,
+  }), [liveLedger?.summary.open_positions, liveTimeframeFees, paperTimeframeFees, pnlWalletScope, stats, timeframePnlSol]);
   const effectivePnlCurrency: PnlCurrency = pnlCurrency === "USD" && solUsdPrice > 0 ? "USD" : "SOL";
   const pnlDisplayMultiplier = effectivePnlCurrency === "USD" ? solUsdPrice : 1;
   const displayPnlValue = Number((timeframePnlSol * pnlDisplayMultiplier).toFixed(effectivePnlCurrency === "USD" ? 2 : 6));
@@ -771,18 +893,9 @@ function App() {
     window.localStorage.setItem("cryptoarc_hide_skipped_tokens", String(value));
   }, []);
 
-  const togglePnlCurrency = React.useCallback(() => {
-    setPnlCurrency((current) => {
-      const next = current === "SOL" ? "USD" : "SOL";
-      window.localStorage.setItem("cryptoarc_pnl_currency", next);
-      if (next === "USD" && solUsdPrice <= 0) {
-        refreshSolUsdPrice().catch(() => undefined);
-      }
-      return next;
-    });
-  }, [solUsdPrice]);
-
-  async function refreshSolUsdPrice() {
+  const refreshSolUsdPrice = React.useCallback(async () => {
+    if (solUsdRefreshInFlight.current) return;
+    solUsdRefreshInFlight.current = true;
     try {
       const quote = await fetchSolUsdPrice();
       setSolUsdPrice(Number(quote.price || 0));
@@ -793,8 +906,21 @@ function App() {
       }
     } catch (error) {
       setSolUsdError(error instanceof Error ? error.message : "unknown error");
+    } finally {
+      solUsdRefreshInFlight.current = false;
     }
-  }
+  }, []);
+
+  const togglePnlCurrency = React.useCallback(() => {
+    setPnlCurrency((current) => {
+      const next = current === "SOL" ? "USD" : "SOL";
+      window.localStorage.setItem("cryptoarc_pnl_currency", next);
+      if (next === "USD" && solUsdPrice <= 0) {
+        refreshSolUsdPrice().catch(() => undefined);
+      }
+      return next;
+    });
+  }, [refreshSolUsdPrice, solUsdPrice]);
 
   async function handleStartBot() {
     setBotActionStatus("starting");
@@ -838,6 +964,7 @@ function App() {
       const message = `Save failed: ${error instanceof Error ? error.message : "unknown error"}`;
       setApiError(message);
       pushErrorToast(message);
+      throw error;
     }
   }
 
@@ -1030,27 +1157,29 @@ function App() {
   const refreshReviewData = React.useCallback(async () => {
     if (reviewRefreshInFlight.current) return;
     reviewRefreshInFlight.current = true;
+    setReviewLoading(true);
     try {
-      const [events, observations, decisions, sessions, versions, labels, analytics, suggestions] = await Promise.all([
-        fetchSourceEvents(),
-        fetchPriceObservations(),
-        fetchStrategyDecisions(),
-        fetchTradeSessions(),
-        fetchSettingsVersions(),
+      const [tradeRows, labels, queue] = await Promise.all([
+        fetchTrades(),
         fetchTradeLabels(),
+        fetchTradeReviewQueue()
+      ]);
+      setTrades(tradeRows);
+      setTradeLabels(labels);
+      setTradeReviewQueue(queue);
+      setReviewLoading(false);
+
+      const [versions, analytics, suggestions] = await Promise.all([
+        fetchSettingsVersions(),
         fetchPerformanceAnalytics(),
         fetchTuningSuggestions()
       ]);
-      setSourceEvents(events);
-      setPriceObservations(observations);
-      setStrategyDecisions(decisions);
-      setTradeSessions(sessions);
       setSettingsVersions(versions);
-      setTradeLabels(labels);
       setPerformanceAnalytics(analytics);
       setTuningSuggestions(suggestions);
     } finally {
       reviewRefreshInFlight.current = false;
+      setReviewLoading(false);
     }
   }, []);
 
@@ -1058,10 +1187,11 @@ function App() {
     if (dataRefreshInFlight.current) return;
     dataRefreshInFlight.current = true;
     try {
-      const [summary, health, security, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, audits, events, observations, decisions, sessions, versions, tradeRows] = await Promise.all([
+      const [summary, health, security, alerts, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, audits, events, observations, decisions, sessions, versions, tradeRows] = await Promise.all([
         fetchDataSummary(),
         fetchSourceHealth(),
         fetchSecurityStatus(),
+        fetchAlertStatus(),
         fetchDataIntegrity(),
         fetchPriceDiagnostics(),
         fetchPumpFunReport(),
@@ -1083,6 +1213,7 @@ function App() {
       setDataSummary(summary);
       setSourceHealth(health);
       setSecurityStatus(security);
+      setAlertStatus(alerts);
       setDataIntegrity(integrity);
       setPriceDiagnostics(price);
       setPumpfunReport(pumpfun);
@@ -1123,6 +1254,20 @@ function App() {
     }
   }, [refreshAnalysisData, refreshBacktestsData, refreshDataPageData, refreshReviewData, workspacePage]);
 
+  const refreshPnlData = React.useCallback(async () => {
+    if (pnlRefreshInFlight.current) return;
+    pnlRefreshInFlight.current = true;
+    try {
+      if (selectedLivePnlWallet) {
+        setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
+        return;
+      }
+      setPaperPnlSummary(await fetchMonitorPnlSummary(pnlTimeframe));
+    } finally {
+      pnlRefreshInFlight.current = false;
+    }
+  }, [pnlTimeframe, selectedLivePnlWallet]);
+
   const refreshAfterMutation = React.useCallback(async (options?: { includeLiveWalletDetail?: boolean; includeSnapshot?: boolean; page?: WorkspacePage }) => {
     const page = options?.page ?? workspacePage;
     await Promise.all([
@@ -1139,6 +1284,9 @@ function App() {
     if (monitorRefreshTimer.current !== null) return;
     monitorRefreshTimer.current = window.setTimeout(() => {
       monitorRefreshTimer.current = null;
+      fetchMonitorTokens()
+        .then((tokens) => setMonitorTokens((current) => mergeMonitorTokens(current, tokens)))
+        .catch(() => undefined);
       refreshPnlData().catch(() => undefined);
       if (liveWalletOpen) {
         refreshLiveWalletCoreData().catch(() => undefined);
@@ -1174,20 +1322,6 @@ function App() {
     }
   }
 
-  async function refreshPnlData() {
-    if (pnlRefreshInFlight.current) return;
-    pnlRefreshInFlight.current = true;
-    try {
-      if (selectedLivePnlWallet) {
-        setLiveLedger(await fetchLiveLedger(selectedLivePnlWallet));
-        return;
-      }
-      setPaperPnlSummary(await fetchMonitorPnlSummary(pnlTimeframe));
-    } finally {
-      pnlRefreshInFlight.current = false;
-    }
-  }
-
   async function loadReplayTimeline(tokenId: string) {
     setSelectedReviewTradeId(tokenId);
     try {
@@ -1206,6 +1340,18 @@ function App() {
       await refreshAfterMutation({ includeSnapshot: true, page: workspacePage });
     } catch (error) {
       setApiError(`Clear failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function recoverPaperPositions() {
+    try {
+      const result = await recoverOpenPaperPositions("dashboard recovery");
+      pushSuccessToast(`Recovered ${result.closed_positions} paper position${result.closed_positions === 1 ? "" : "s"}`);
+      await refreshAfterMutation({ includeSnapshot: true, page: workspacePage });
+    } catch (error) {
+      const message = `Paper recovery failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
     }
   }
 
@@ -1253,6 +1399,22 @@ function App() {
       return true;
     } catch (error) {
       setApiError(`Live acknowledgement failed: ${error instanceof Error ? error.message : "unknown error"}`);
+      return false;
+    }
+  }
+
+  async function toggleLiveKillSwitch(enabled: boolean, reason = ""): Promise<boolean> {
+    try {
+      await setLiveKillSwitch(enabled, reason || (enabled ? "Operator panic stop from live workspace" : "Operator cleared panic stop from live workspace"));
+      const updated = await fetchSnapshot();
+      setSnapshot(updated);
+      await refreshLiveExecutionSurfaces();
+      pushSuccessToast(enabled ? "Live kill switch enabled" : "Live kill switch cleared");
+      return true;
+    } catch (error) {
+      const message = `Kill switch update failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
       return false;
     }
   }
@@ -1585,14 +1747,30 @@ function App() {
     }
   }
 
+  async function handleSendTestAlert(): Promise<void> {
+    try {
+      const result = await sendTestAlert();
+      const status = await fetchAlertStatus();
+      setAlertStatus(status);
+      pushSuccessToast(`Alert test ${String(result.status || "sent")}`);
+    } catch (error) {
+      const message = `Alert test failed: ${error instanceof Error ? error.message : "unknown error"}`;
+      setApiError(message);
+      pushErrorToast(message);
+    }
+  }
+
   React.useEffect(() => {
+    const refreshKey = `${workspacePage}:${pnlTimeframe}:${selectedLivePnlWallet || "paper"}`;
+    if (workspaceRefreshKeyRef.current === refreshKey) return;
+    workspaceRefreshKeyRef.current = refreshKey;
     refreshPnlData().catch(() => undefined);
     refreshSolUsdPrice().catch(() => undefined);
     refreshStrategyPresetData().catch(() => undefined);
     if (workspacePage !== "monitor") {
       refreshWorkspaceData(workspacePage).catch(() => undefined);
     }
-  }, [refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, workspacePage]);
+  }, [pnlTimeframe, refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, selectedLivePnlWallet, workspacePage]);
 
   React.useEffect(() => {
     if (!settingsOpen) return;
@@ -1672,8 +1850,9 @@ function App() {
     <AppLayout
       activePage={workspacePage}
       setActivePage={setWorkspacePage}
-      status={botActionStatus || snapshot.status}
+      status={dashboardRuntimeStatus}
       apiState={apiState}
+      latencyStatus={latencyStatus}
       onStart={handleStartBot}
       onStop={handleStopBot}
       onSettingsOpen={() => setSettingsOpen(true)}
@@ -1687,10 +1866,11 @@ function App() {
       walletPublicKey={walletPublicKey}
       walletBalance={walletBalanceSol}
       toasts={toasts}
+      notifications={snapshot.events}
     >
       {workspacePage === "monitor" && (
         <MonitorPage
-          stats={stats}
+          stats={displayedStats}
           pnlHistory={pnlHistory}
           pnlValue={displayPnlValue}
           pnlCurrency={effectivePnlCurrency}
@@ -1699,7 +1879,8 @@ function App() {
           onTogglePnlCurrency={togglePnlCurrency}
           pnlCaption={pnlWalletScope === "paper"
             ? `${paperPnlSummary?.closed_trade_count ?? 0} closed paper trades in selected range`
-            : `${liveLedger?.summary.open_positions ?? 0} live positions / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"} P&L`}
+            : `${liveLedger?.summary.open_positions ?? 0} live positions / net P&L after ${(liveLedger?.summary.total_fees_sol ?? 0).toFixed(6)} SOL fees / ${(liveLedger?.summary.approximate ?? true) ? "approximate" : "confirmed"}`}
+          liveLedger={liveLedger}
           walletOptions={walletScopeOptions}
           timeframe={pnlTimeframe}
           setTimeframe={setPnlTimeframe}
@@ -1783,10 +1964,13 @@ function App() {
             timeline={replayTimeline}
             detail={tradeReviewDetail}
             labels={tradeLabels}
+            reviewQueue={tradeReviewQueue}
+            loading={reviewLoading}
             onApplySuggestion={handleApplyTuningSuggestion}
             onLabelTrade={async (tokenId, label) => {
               const saved = await labelTrade(tokenId, label);
               setTradeLabels((current) => [saved, ...current]);
+              setTradeReviewQueue(await fetchTradeReviewQueue());
             }}
             onSelectTrade={loadReplayTimeline}
           />
@@ -1800,6 +1984,7 @@ function App() {
             sourceEvents={sourceEvents}
             sourceHealth={sourceHealth}
             securityStatus={securityStatus}
+            alertStatus={alertStatus}
             trades={trades}
             priceObservations={priceObservations}
             strategyDecisions={strategyDecisions}
@@ -1823,7 +2008,9 @@ function App() {
               setSnapshot(updated);
               await refreshAfterMutation({ page: "data" });
             }}
+            onSendTestAlert={handleSendTestAlert}
             onReviewLiveRequest={reviewManualLiveRequest}
+            onRecoverPaperPositions={recoverPaperPositions}
             onClear={clearProjectData}
           />
         </Suspense>
@@ -1879,6 +2066,7 @@ function App() {
           onAcknowledgeLive={acknowledgeLiveRisk}
           onArmBackend={armSelectedLiveBackend}
           onDisarmBackend={disarmSelectedLiveBackend}
+          onSetKillSwitch={toggleLiveKillSwitch}
           onApplyQuickFix={applyLiveQuickFix}
           hotWalletStatus={hotWalletStatus}
           hotWalletPrivateKey={hotWalletPrivateKey}
@@ -1962,8 +2150,27 @@ function App() {
               <div className="mt-1 break-all text-sm font-black text-amber-300">{pendingSuggestion?.suggested_value === undefined ? "-" : String(pendingSuggestion.suggested_value)}</div>
             </div>
           </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <div className="rounded-xl border border-white/5 bg-black/30 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-zinc-500">Evidence Samples</div>
+              <div className="mt-1 text-sm font-black text-white">{pendingSuggestion?.supporting_sample_size ?? 0}/{pendingSuggestion?.supporting_closed_trades ?? 0}</div>
+            </div>
+            <div className="rounded-xl border border-white/5 bg-black/30 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-zinc-500">Evidence PnL</div>
+              <div className="mt-1 text-sm font-black text-white">{(pendingSuggestion?.supporting_pnl_sol ?? 0).toFixed(4)} SOL</div>
+            </div>
+            <div className="rounded-xl border border-white/5 bg-black/30 p-4">
+              <div className="text-[10px] font-black uppercase tracking-widest text-zinc-500">Overfit Risk</div>
+              <div className="mt-1 text-sm font-black text-white">{pendingSuggestion?.overfit_risk ?? "review"}</div>
+            </div>
+          </div>
+          {pendingSuggestion?.expected_benefit ? (
+            <div className="rounded-xl border border-white/5 bg-white/[0.02] p-4 text-[11px] leading-relaxed text-zinc-300">
+              {pendingSuggestion.expected_benefit}
+            </div>
+          ) : null}
           <div className="rounded-xl border border-amber-400/20 bg-amber-500/[0.04] p-4 text-[11px] leading-relaxed text-zinc-300">
-            This will update the live dashboard settings immediately and refresh the research surfaces. It does not place trades or change the paper/live safety boundary.
+            {pendingSuggestion?.review_note ?? "This will update the live dashboard settings immediately and refresh the research surfaces. It does not place trades or change the paper/live safety boundary."}
           </div>
           <div className="flex justify-end gap-3">
             <button
@@ -2012,6 +2219,7 @@ function GuidedLiveWalletModal({
   onAcknowledgeLive,
   onArmBackend,
   onDisarmBackend,
+  onSetKillSwitch,
   onApplyQuickFix,
   hotWalletStatus,
   hotWalletPrivateKey,
@@ -2064,6 +2272,7 @@ function GuidedLiveWalletModal({
   onAcknowledgeLive: () => Promise<boolean>;
   onArmBackend: () => Promise<boolean>;
   onDisarmBackend: () => Promise<boolean>;
+  onSetKillSwitch: (enabled: boolean, reason?: string) => Promise<boolean>;
   onApplyQuickFix: (
     kind: "enable_env" | "configure_caps" | "disable_kill_switch",
     overrides?: Partial<{
@@ -2160,6 +2369,8 @@ function GuidedLiveWalletModal({
   const signerSupportsAutoSell = Boolean(liveStatus?.signer?.supports_auto_sell);
   const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
   const activeBackend = liveStatus?.active_backend;
+  const sourceMode = liveStatus?.source_degraded_mode;
+  const fullSniper = liveStatus?.full_sniper_gate;
   const connectionReady = method === "browser_wallet"
     ? Boolean(walletPublicKey)
     : method === "local_hot_wallet"
@@ -2200,6 +2411,20 @@ function GuidedLiveWalletModal({
     local_hot_wallet: "border-amber-400/40 bg-amber-500/10 text-amber-100",
     local_signer_daemon: "border-sky-400/40 bg-sky-500/10 text-sky-100"
   } as const;
+  const modeVisibility = liveStatus?.mode_visibility?.length ? liveStatus.mode_visibility : [
+    { id: "paper", label: "Paper", state: settings.mode === "paper" ? "active" : "available", tone: "emerald", summary: "Default simulated trading and evidence collection.", blockers: [] },
+    { id: "shadow", label: "Shadow", state: liveStatus?.execution_readiness?.can_shadow ? "ready" : "blocked", tone: "sky", summary: "Would-have-traded comparison without submitting transactions.", blockers: liveStatus?.execution_readiness?.blockers?.slice(0, 3) ?? [] },
+    { id: "manual_live", label: "Manual Live", state: envEnabled && !blockers.length ? "ready" : "blocked", tone: "amber", summary: "Quote, simulate, and submit only with local operator approval.", blockers: blockers.slice(0, 3) },
+    { id: "autonomous_live", label: "Autonomous Live", state: liveStatus?.autonomous_live_available ? "ready" : "blocked", tone: "rose", summary: "Unattended entry or exit execution through the armed local backend.", blockers: autonomyBlockers.slice(0, 3) }
+  ];
+  const modeVisibilityTone = (tone: string, state: string) => {
+    const blocked = state === "blocked";
+    if (tone === "emerald") return blocked ? "border-emerald-400/15 bg-emerald-500/[0.04] text-emerald-200" : "border-emerald-400/35 bg-emerald-500/10 text-emerald-100";
+    if (tone === "sky") return blocked ? "border-sky-400/15 bg-sky-500/[0.04] text-sky-200" : "border-sky-400/35 bg-sky-500/10 text-sky-100";
+    if (tone === "amber") return blocked ? "border-amber-400/15 bg-amber-500/[0.04] text-amber-100" : "border-amber-400/35 bg-amber-500/10 text-amber-100";
+    if (tone === "rose") return blocked ? "border-rose-400/15 bg-rose-500/[0.04] text-rose-100" : "border-rose-400/35 bg-rose-500/10 text-rose-100";
+    return "border-white/10 bg-white/[0.03] text-zinc-200";
+  };
 
   async function handleStepPrimary() {
     if (stepIndex === 0) {
@@ -2549,7 +2774,10 @@ function GuidedLiveWalletModal({
   ].filter(Boolean);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
+    <div
+      className="wallet-modal fixed bottom-0 right-0 top-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
+      style={{ left: "var(--cryptoarc-sidebar-width, 0px)" }}
+    >
       <motion.section
         initial={{ opacity: 0, scale: 0.97, y: 18 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -2802,6 +3030,27 @@ function GuidedLiveWalletModal({
             </div>
           ) : (
             <div className="space-y-4">
+              <section className="grid gap-3 lg:grid-cols-4">
+                {modeVisibility.map((item) => (
+                  <article key={item.id} className={`rounded-2xl border p-4 ${modeVisibilityTone(item.tone, item.state)}`}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className="text-[10px] font-black uppercase tracking-[0.24em] opacity-75">{item.label}</p>
+                        <h4 className="mt-1 truncate text-sm font-black uppercase tracking-[0.16em] text-white">{item.state.replace(/_/g, " ")}</h4>
+                      </div>
+                      <span className={`rounded-full border px-2 py-1 text-[9px] font-black uppercase tracking-[0.18em] ${item.state === "blocked" ? "border-white/10 bg-black/20 text-zinc-300" : "border-white/15 bg-white/10 text-white"}`}>
+                        {item.id.replace(/_/g, " ")}
+                      </span>
+                    </div>
+                    <p className="mt-3 min-h-10 text-xs leading-5 text-zinc-300">{item.summary}</p>
+                    {item.blockers.length ? (
+                      <p className="mt-3 truncate rounded-lg border border-white/5 bg-black/20 px-2 py-2 text-[10px] font-bold text-zinc-300">{item.blockers[0]}</p>
+                    ) : (
+                      <p className="mt-3 rounded-lg border border-white/5 bg-black/20 px-2 py-2 text-[10px] font-bold uppercase tracking-[0.18em] text-white/70">No mode blocker</p>
+                    )}
+                  </article>
+                ))}
+              </section>
               <section className="rounded-2xl border border-white/10 bg-white/[0.035] p-5">
                 <div className="grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
                   <div>
@@ -2821,8 +3070,10 @@ function GuidedLiveWalletModal({
                         ["Armed state", activeBackend?.armed ? "armed" : "disarmed"],
                         ["Readiness", `${readinessScore}% / ${readinessState}`],
                         ["Live gates", liveStatus?.live_execution_available ? "open" : "blocked"],
-                        ["Auto entries", liveStatus?.entry_autonomy_available ? "enabled" : "blocked"],
-                        ["Protective exits", liveStatus?.exit_autonomy_available ? "enabled" : "blocked"]
+                        ["Auto entries", (liveStatus?.autonomy?.entry?.available ?? liveStatus?.entry_autonomy_available) ? "enabled" : "blocked"],
+                        ["Protective exits", (liveStatus?.autonomy?.exit?.available ?? liveStatus?.exit_autonomy_available) ? "enabled" : "blocked"],
+                        ["Backend match", liveStatus?.autonomy?.active_backend_matches ? "yes" : "no"],
+                        ["Recovery debt", liveStatus?.autonomy?.recovery_debt?.blocks_new_entries ? "blocks entries" : "clear"]
                       ].map(([label, value]) => (
                         <div key={label} className="rounded-xl border border-white/5 bg-black/25 p-3">
                           <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">{label}</p>
@@ -2987,6 +3238,14 @@ function GuidedLiveWalletModal({
                           <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Transport</p>
                           <p className="mt-1 text-xs font-bold text-white">{String(liveStatus?.signer?.transport || "localhost_http")}</p>
                         </div>
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Submit path</p>
+                          <p className="mt-1 text-xs font-bold text-white">{String(liveStatus?.execution_backend?.submit_path || "unknown").replace(/_/g, " ")}</p>
+                        </div>
+                        <div className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <p className="text-[10px] font-black uppercase tracking-[0.22em] text-zinc-500">Executor ready</p>
+                          <p className="mt-1 text-xs font-bold text-white">{liveStatus?.execution_backend?.can_submit_now ? "yes" : "blocked"}</p>
+                        </div>
                       </div>
                     </article>
                   </div>
@@ -3058,6 +3317,15 @@ function GuidedLiveWalletModal({
                       <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
                       <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
                       <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                      {activeLiveAudit.preflight_checks?.length ? (
+                        <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+                          {activeLiveAudit.preflight_checks.slice(0, 6).map((check) => (
+                            <span key={check.id} className={`rounded-lg border px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${check.status === "pass" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-200" : "border-amber-500/20 bg-amber-500/10 text-amber-100"}`} title={check.reason}>
+                              {check.label}: {check.status}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                       {activeQuoteStale ? <p className="mt-2 text-xs font-bold text-amber-100">This quote is stale. Refresh the preview before signing.</p> : null}
                     </article>
                   ) : <p className="mt-3 rounded-xl border border-white/5 bg-black/25 p-3 text-xs text-zinc-500">No active quote preview yet.</p>}
@@ -3114,13 +3382,22 @@ function GuidedLiveWalletModal({
                     <Database size={18} className="text-amber-400" />
                   </div>
                   <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-                    {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
-                      <article key={position.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
-                        <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
-                        <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
-                        <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
-                      </article>
-                    ))}
+                    {(liveLedger?.positions ?? []).slice(0, 6).map((position) => {
+                      const latestRealized = position.realized_pnl_events?.[position.realized_pnl_events.length - 1];
+                      return (
+                        <article key={position.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
+                          <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
+                          <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
+                          <span className="mt-1 block text-[11px] text-zinc-500">Basis {position.cost_basis_method || "weighted_average"} / buys {String(position.cost_basis_breakdown?.buy_fills ?? 0)} / sells {String(position.cost_basis_breakdown?.sell_fills ?? 0)}</span>
+                          {latestRealized ? <span className="mt-1 block text-[11px] text-zinc-500">Last realized {Number(latestRealized.realized_pnl_delta_sol ?? 0).toFixed(6)} SOL / basis {Number(latestRealized.cost_basis_consumed_sol ?? 0).toFixed(6)} / proceeds {Number(latestRealized.estimated_proceeds_sol ?? 0).toFixed(6)}</span> : null}
+                          <span className="mt-1 block text-[11px] text-zinc-500">Mark {position.mark_price_sol.toFixed(10)} SOL / {position.mark_price_source || "no mark"} / {position.mark_price_age_seconds ?? "-"}s</span>
+                          <span className="mt-1 block text-[11px] text-zinc-500">Balance verified {position.balance_age_seconds ?? "-"}s ago</span>
+                          <span className="mt-1 block text-[11px] text-zinc-500">PnL confidence: realized {position.realized_pnl_confidence} / unrealized {position.unrealized_pnl_confidence}</span>
+                          {position.pnl_confidence_notes?.length ? <p className="mt-2 text-[11px] text-amber-100">{position.pnl_confidence_notes.slice(0, 2).join(" / ")}</p> : null}
+                          <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
+                        </article>
+                      );
+                    })}
                     {livePositions.slice(0, 6).map((position) => (
                       <article key={position.mint} className="rounded-xl border border-white/5 bg-black/25 p-3">
                         <strong className="block text-xs font-black uppercase tracking-[0.18em] text-white">{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
@@ -3199,6 +3476,7 @@ function LegacyLiveWalletModal({
   onAcknowledgeLive,
   onArmBackend,
   onDisarmBackend,
+  onSetKillSwitch,
   hotWalletStatus,
   hotWalletPrivateKey,
   hotWalletPassword,
@@ -3249,6 +3527,7 @@ function LegacyLiveWalletModal({
   onAcknowledgeLive: () => Promise<void>;
   onArmBackend: () => Promise<void>;
   onDisarmBackend: () => Promise<void>;
+  onSetKillSwitch: (enabled: boolean, reason?: string) => Promise<boolean>;
   hotWalletStatus: HotWalletStatus | null;
   hotWalletPrivateKey: string;
   hotWalletPassword: string;
@@ -3292,9 +3571,14 @@ function LegacyLiveWalletModal({
   const signerSupportsAutoSell = Boolean(liveStatus?.signer?.supports_auto_sell);
   const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
   const activeBackend = liveStatus?.active_backend;
+  const sourceMode = liveStatus?.source_degraded_mode;
+  const fullSniper = liveStatus?.full_sniper_gate;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md">
+    <div
+      className="wallet-modal fixed bottom-0 right-0 top-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-md"
+      style={{ left: "var(--cryptoarc-sidebar-width, 0px)" }}
+    >
       <motion.section
         initial={{ opacity: 0, scale: 0.97, y: 18 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
@@ -3476,6 +3760,20 @@ function LegacyLiveWalletModal({
                   >
                     Disarm
                   </button>
+                  <button
+                    className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/20 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/30"
+                    onClick={() => onSetKillSwitch(true)}
+                    disabled={settings.kill_switch_enabled}
+                  >
+                    Enable Kill Switch
+                  </button>
+                  <button
+                    className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => onSetKillSwitch(false)}
+                    disabled={!settings.kill_switch_enabled}
+                  >
+                    Clear Kill Switch
+                  </button>
                 </div>
               </section>
 
@@ -3498,11 +3796,17 @@ function LegacyLiveWalletModal({
                     ["Supports auto-buy", signerSupportsAutoBuy ? "yes" : "no"],
                     ["Readiness", `${readinessScore}% / ${readinessState}`],
                     ["Signer mode", method.replace(/_/g, " ")],
+                    ["Submit path", String(liveStatus?.execution_backend?.submit_path || "unknown").replace(/_/g, " ")],
+                    ["Executor", liveStatus?.execution_backend?.can_submit_now ? "ready" : "blocked"],
+                    ["Local boundary", liveStatus?.execution_backend?.local_only ? "local only" : "blocked"],
                     ["Daemon transport", String(liveStatus?.signer?.transport || "localhost_http")],
                     ["Daemon auth", liveStatus?.signer?.auth_configured ? "configured" : "not set"],
                     ["Armed backend", activeBackend?.armed ? `${activeBackend.mode.replace(/_/g, " ")} / ${shortAddress(activeBackend.wallet_public_key)}` : "not armed"],
-                    ["Auto entries", liveStatus?.entry_autonomy_available ? "enabled" : "blocked"],
-                    ["Protective exits", liveStatus?.exit_autonomy_available ? "enabled" : "blocked"]
+                    ["Auto entries", (liveStatus?.autonomy?.entry?.available ?? liveStatus?.entry_autonomy_available) ? "enabled" : "blocked"],
+                    ["Protective exits", (liveStatus?.autonomy?.exit?.available ?? liveStatus?.exit_autonomy_available) ? "enabled" : "blocked"],
+                    ["Backend match", liveStatus?.autonomy?.active_backend_matches ? "yes" : "no"],
+                    ["Recovery debt", liveStatus?.autonomy?.recovery_debt?.blocks_new_entries ? "blocks entries" : "clear"],
+                    ["Override", liveStatus?.autonomy?.override?.available ? "audit ready" : "disabled"]
                   ].map(([label, value]) => (
                     <div key={label} className="rounded-lg border border-white/5 bg-black/25 p-3">
                       <p className="text-[10px] font-black uppercase tracking-widest text-zinc-500">{label}</p>
@@ -3517,6 +3821,38 @@ function LegacyLiveWalletModal({
                 ) : null}
                 {signerDisabledReason ? (
                   <p className="mt-3 rounded-lg border border-white/5 bg-black/20 p-3 text-xs text-zinc-400">{signerDisabledReason}</p>
+                ) : null}
+                {sourceMode ? (
+                  <div className={`mt-3 rounded-lg border p-3 text-xs ${sourceMode.mode === "exit_only" ? "border-amber-500/20 bg-amber-500/10 text-amber-100" : sourceMode.mode === "paper_only" ? "border-sky-500/20 bg-sky-500/10 text-sky-100" : "border-emerald-500/20 bg-emerald-500/10 text-emerald-100"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest">Source Mode</span>
+                      <span className="font-black uppercase tracking-widest">{sourceMode.mode.replace(/_/g, " ")}</span>
+                    </div>
+                    <p className="mt-2 text-zinc-300">{sourceMode.operator_action}</p>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Entries <strong className="block pt-1 text-xs text-white">{sourceMode.live_entries_allowed ? "allowed" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Paper <strong className="block pt-1 text-xs text-white">{sourceMode.paper_collection_allowed ? "allowed" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Exits <strong className="block pt-1 text-xs text-white">{sourceMode.protective_exits_available ? "available" : "blocked"}</strong></span>
+                    </div>
+                  </div>
+                ) : null}
+                {fullSniper ? (
+                  <div className={`mt-3 rounded-lg border p-3 text-xs ${fullSniper.ready ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-100" : "border-rose-500/20 bg-rose-500/10 text-rose-100"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest">Full Sniper Gate</span>
+                      <span className="font-black uppercase tracking-widest">{fullSniper.state}</span>
+                    </div>
+                    <p className="mt-2 text-zinc-300">{fullSniper.operator_action}</p>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Buy <strong className="block pt-1 text-xs text-white">{fullSniper.entry_ready ? "ready" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Sell <strong className="block pt-1 text-xs text-white">{fullSniper.exit_ready ? "ready" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Backup <strong className="block pt-1 text-xs text-white">{fullSniper.pre_run_backup_fresh ? "fresh" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Override <strong className="block pt-1 text-xs text-white">{fullSniper.audited_override_active ? "active" : "audit only"}</strong></span>
+                    </div>
+                    {fullSniper.blockers.length ? (
+                      <p className="mt-2 truncate text-[10px] text-zinc-400">{fullSniper.blockers[0]}</p>
+                    ) : null}
+                  </div>
                 ) : null}
                 <div className="mt-3 space-y-2">
                   {autonomyBlockers.map((blocker) => (
@@ -3640,6 +3976,15 @@ function LegacyLiveWalletModal({
                     <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
                     <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
                     <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                    {activeLiveAudit.preflight_checks?.length ? (
+                      <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
+                        {activeLiveAudit.preflight_checks.slice(0, 6).map((check) => (
+                          <span key={check.id} className={`rounded-lg border px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${check.status === "pass" ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-200" : "border-amber-500/20 bg-amber-500/10 text-amber-100"}`} title={check.reason}>
+                            {check.label}: {check.status}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
                   </article>
                 ) : null}
               </section>
@@ -3708,13 +4053,22 @@ function LegacyLiveWalletModal({
                 <Database size={18} className="text-amber-400" />
               </div>
               <div className="max-h-64 space-y-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
-                {(liveLedger?.positions ?? []).slice(0, 6).map((position) => (
-                  <article key={position.id} className="rounded-lg border border-white/5 bg-black/25 p-3">
-                    <strong className="block text-xs font-black uppercase tracking-widest text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
-                    <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
-                    <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
-                  </article>
-                ))}
+                {(liveLedger?.positions ?? []).slice(0, 6).map((position) => {
+                  const latestRealized = position.realized_pnl_events?.[position.realized_pnl_events.length - 1];
+                  return (
+                    <article key={position.id} className="rounded-lg border border-white/5 bg-black/25 p-3">
+                      <strong className="block text-xs font-black uppercase tracking-widest text-white">{position.symbol || position.mint.slice(0, 8)} / {position.status} / {position.token_balance}</strong>
+                      <span className="mt-1 block text-xs text-zinc-400">Cost {position.cost_basis_sol.toFixed(6)} SOL / Realized {position.realized_pnl_sol.toFixed(6)} SOL / Recon {position.reconciliation_status}</span>
+                      <span className="mt-1 block text-[11px] text-zinc-500">Basis {position.cost_basis_method || "weighted_average"} / buys {String(position.cost_basis_breakdown?.buy_fills ?? 0)} / sells {String(position.cost_basis_breakdown?.sell_fills ?? 0)}</span>
+                      {latestRealized ? <span className="mt-1 block text-[11px] text-zinc-500">Last realized {Number(latestRealized.realized_pnl_delta_sol ?? 0).toFixed(6)} SOL / basis {Number(latestRealized.cost_basis_consumed_sol ?? 0).toFixed(6)} / proceeds {Number(latestRealized.estimated_proceeds_sol ?? 0).toFixed(6)}</span> : null}
+                      <span className="mt-1 block text-[11px] text-zinc-500">Mark {position.mark_price_sol.toFixed(10)} SOL / {position.mark_price_source || "no mark"} / {position.mark_price_age_seconds ?? "-"}s</span>
+                      <span className="mt-1 block text-[11px] text-zinc-500">Balance verified {position.balance_age_seconds ?? "-"}s ago</span>
+                      <span className="mt-1 block text-[11px] text-zinc-500">PnL confidence: realized {position.realized_pnl_confidence} / unrealized {position.unrealized_pnl_confidence}</span>
+                      {position.pnl_confidence_notes?.length ? <p className="mt-2 text-[11px] text-amber-100">{position.pnl_confidence_notes.slice(0, 2).join(" / ")}</p> : null}
+                      <p className="mt-2 truncate text-xs text-zinc-500">{position.mint}</p>
+                    </article>
+                  );
+                })}
                 {livePositions.slice(0, 6).map((position) => (
                   <article key={position.mint} className="rounded-lg border border-white/5 bg-black/25 p-3">
                     <strong className="block text-xs font-black uppercase tracking-widest text-white">{position.symbol || position.mint.slice(0, 8)} / {position.token_balance}</strong>
@@ -3811,10 +4165,15 @@ function shortAddress(value: string): string {
 function emptyLiveLedger(): LiveLedger {
   return {
     positions: [],
+    recent_fills: [],
     summary: {
       realized_pnl_sol: 0,
       unrealized_pnl_sol: 0,
+      net_pnl_sol: 0,
+      total_pnl_sol: 0,
       cost_basis_sol: 0,
+      total_fees_sol: 0,
+      total_priority_fees_sol: 0,
       open_positions: 0,
       approximate: true
     }

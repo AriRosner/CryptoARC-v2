@@ -1,0 +1,49 @@
+param(
+  [switch]$SkipFrontendBuild,
+  [switch]$SkipBackendTests,
+  [switch]$SkipMobileBuild
+)
+
+$ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "runtime.ps1")
+
+$root = Get-CryptoArcRoot
+$frontendRoot = Join-Path $root "frontend"
+$python = Resolve-CryptoArcPython
+
+Set-Location $root
+
+Write-Host "Running setup diagnostics"
+& (Join-Path $PSScriptRoot "doctor.ps1") -Strict
+
+Write-Host "Running backend import smoke test"
+$env:PYTHONPATH = "backend"
+Invoke-CryptoArcNative -FilePath $python -Arguments @("-c", "from app.core.state import BotState; from solders.keypair import Keypair; print('backend imports ok')")
+
+if (-not $SkipBackendTests) {
+  Write-Host "Running backend unit tests"
+  Invoke-CryptoArcNative -FilePath $python -Arguments @("-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-q")
+}
+
+if (-not $SkipFrontendBuild) {
+  Assert-CryptoArcFrontendDependencies
+  $packageManager = Resolve-CryptoArcPackageManager
+  Write-Host "Running frontend build"
+  Push-Location $frontendRoot
+  try {
+    Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "build")
+  } finally {
+    Pop-Location
+  }
+}
+
+if (-not $SkipMobileBuild) {
+  Write-Host "Running mobile verification"
+  & (Join-Path $PSScriptRoot "verify-mobile.ps1")
+}
+
+Write-Host "Checking local Markdown links"
+& (Join-Path $PSScriptRoot "check-doc-links.ps1")
+
+Write-Host "All verification checks passed."

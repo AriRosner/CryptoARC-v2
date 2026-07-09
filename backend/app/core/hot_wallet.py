@@ -10,7 +10,11 @@ from secrets import token_bytes
 from typing import Any
 
 from solders.keypair import Keypair
+from solders.hash import Hash
 from solders.message import to_bytes_versioned
+from solders.message import MessageV0
+from solders.pubkey import Pubkey
+from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
 
 from app.core.solana_readonly import SolanaReadOnlyClient
@@ -39,8 +43,9 @@ class HotWalletVault:
             "label": str(payload.get("label") or "") if payload else "",
             "imported_at": str(payload.get("imported_at") or "") if payload else "",
             "last_unlock_at": self._last_unlock_at,
-            "file_path": str(self.path),
             "version": int(payload.get("version") or self.VERSION) if payload else self.VERSION,
+            "storage_scope": "local_encrypted_sidecar",
+            "recovery_note": "Hot wallet sidecar is local-only and is not embedded in database backup artifacts.",
         }
 
     def import_private_key(self, private_key: str, password: str, label: str = "") -> dict[str, Any]:
@@ -129,6 +134,52 @@ class HotWalletVault:
             **signing,
             "signature": str(signature or signing["transaction_signature"]),
             "simulation": simulation,
+        }
+
+    def transfer_sol(self, destination: str, amount_sol: float, rpc_url: str) -> dict[str, Any]:
+        keypair = self._require_unlocked_keypair()
+        destination_pubkey = Pubkey.from_string(destination.strip())
+        lamports = int(round(float(amount_sol) * 1_000_000_000))
+        if lamports <= 0:
+            raise ValueError("transfer amount must be greater than zero")
+        client = SolanaReadOnlyClient(rpc_url)
+        blockhash_payload = client.rpc("getLatestBlockhash", [{"commitment": "confirmed"}]).get("result") or {}
+        value = blockhash_payload.get("value") or {}
+        blockhash = Hash.from_string(str(value.get("blockhash") or ""))
+        instruction = transfer(
+            TransferParams(
+                from_pubkey=keypair.pubkey(),
+                to_pubkey=destination_pubkey,
+                lamports=lamports,
+            )
+        )
+        message = MessageV0.try_compile(keypair.pubkey(), [instruction], [], blockhash)
+        signed = VersionedTransaction(message, [keypair])
+        signed_transaction_base64 = base64.b64encode(bytes(signed)).decode("utf-8")
+        simulation = self._simulate(client, signed_transaction_base64)
+        if not simulation.get("ok"):
+            detail = str(simulation.get("error") or simulation.get("warning") or "simulation failed")
+            raise ValueError(f"SOL transfer simulation failed: {detail}")
+        signature = client.rpc(
+            "sendTransaction",
+            [
+                signed_transaction_base64,
+                {
+                    "encoding": "base64",
+                    "skipPreflight": False,
+                    "preflightCommitment": "confirmed",
+                    "maxRetries": 3,
+                },
+            ],
+        ).get("result")
+        return {
+            "transaction_signature": str(signed.signatures[0]),
+            "signed_transaction_base64": signed_transaction_base64,
+            "signature": str(signature or signed.signatures[0]),
+            "simulation": simulation,
+            "destination": destination.strip(),
+            "amount_sol": round(float(amount_sol), 9),
+            "lamports": lamports,
         }
 
     def _simulate(self, client: SolanaReadOnlyClient, signed_transaction_base64: str) -> dict[str, Any]:
