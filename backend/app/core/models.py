@@ -211,6 +211,7 @@ class TokenSignal:
     quote_shadow_total_cost_sol: float = 0.0
     quote_shadow_slippage_pct: float = 0.0
     quote_shadow_status: str = ""
+    wallet_public_key: str = ""
     fill_failed: bool = False
     partial_take_profit_taken: bool = False
     realized_pnl_sol: float = 0.0
@@ -754,6 +755,11 @@ class TradeRecord:
     entry_price_impact_cost_sol: float = 0.0
     price_impact_pct: float = 0.0
     slippage_paid_pct: float = 0.0
+    paper_model_cost_sol: float = 0.0
+    shadow_quote_cost_sol: float = 0.0
+    quote_adjustment_sol: float = 0.0
+    quote_adjusted_pnl_sol: float | None = None
+    simulation_accuracy_status: str = "paper_only"
     source_price_confidence: float = 0.0
     decision_log: list[str] = field(default_factory=list)
     settings_version_id: str = ""

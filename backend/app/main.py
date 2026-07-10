@@ -1375,6 +1375,11 @@ async def live_wallet_status(wallet_public_key: str = "", signer_mode: Literal["
     return state.signer_status(signer_mode, wallet_public_key)
 
 
+@app.get("/api/live/wallet/balance", dependencies=[Depends(require_auth)])
+async def live_wallet_balance(wallet_public_key: str = "") -> dict:
+    return state.live_wallet_balance(wallet_public_key)
+
+
 @app.get("/api/live/hot-wallet/status", dependencies=[Depends(require_auth)])
 async def live_hot_wallet_status() -> dict:
     return state.hot_wallet_status()
@@ -1590,6 +1595,19 @@ async def evidence_mode_separation_report_export() -> JSONResponse:
     return JSONResponse(
         content=state.evidence_mode_separation_report(),
         headers={"Content-Disposition": 'attachment; filename="cryptoarc-evidence-mode-separation.json"'},
+    )
+
+
+@app.get("/api/reports/simulation-accuracy", dependencies=[Depends(require_auth)])
+async def simulation_accuracy_report(wallet_public_key: str = "") -> dict:
+    return state.simulation_accuracy_report(wallet_public_key)
+
+
+@app.get("/api/reports/simulation-accuracy/export", dependencies=[Depends(require_auth)])
+async def simulation_accuracy_report_export(wallet_public_key: str = "") -> JSONResponse:
+    return JSONResponse(
+        content=state.simulation_accuracy_report(wallet_public_key),
+        headers={"Content-Disposition": 'attachment; filename="cryptoarc-simulation-accuracy.json"'},
     )
 
 

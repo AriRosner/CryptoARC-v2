@@ -61,6 +61,8 @@ from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, normalize
 
 LAMPORTS_PER_SOL = 1_000_000_000
 SOLANA_SIGNATURE_BASE_FEE_LAMPORTS = 5_000
+LIVE_BUY_TOKEN_ACCOUNT_SETUP_RENT_SOL = 0.00391848
+LIVE_BUY_PROGRAM_FEE_BUFFER_SOL = 0.00002
 from app.core.strategy import DecisionPipeline
 
 
@@ -71,6 +73,7 @@ class BotState:
     MOBILE_PAIRING_TTL_SECONDS = 300
     MOBILE_PAIRING_MAX_FAILED_ATTEMPTS = 5
     MOBILE_TOKEN_TTL_DAYS = 30
+    READINESS_CACHE_TTL_SECONDS = 5.0
     live_recovery_max_attempts = 3
     LIVE_CAP_SETTING_KEYS = (
         "live_max_trade_sol",
@@ -105,6 +108,8 @@ class BotState:
         self.active_live_session_id = ""
         self._cached_signer_status: dict[str, object] | None = None
         self._cached_signer_status_at: datetime | None = None
+        self._cached_readiness_status: dict[str, object] | None = None
+        self._cached_readiness_status_at = 0.0
         self.status = BotStatus.STOPPED
         has_saved_settings = self.storage.has_settings()
         self.settings = self.storage.load_settings()
@@ -312,7 +317,7 @@ class BotState:
     ) -> dict[str, object]:
         snapshot = self.snapshot()
         source = self.source_health()
-        readiness = self.readiness_status()
+        readiness = self._recent_readiness_status()
         live = self.live_status(live_trading_enabled, local_auth_enabled=local_auth_enabled)
         events = self.storage.load_all_events(80)
         latest_alerts = [
@@ -555,6 +560,7 @@ class BotState:
         self.settings = BotSettings(**current)
         self.source_status.source = self.settings.launch_source
         self.storage.save_settings(self.settings)
+        self._invalidate_readiness_cache()
         self.current_settings_version_id = self.ensure_settings_version("settings save", changed_keys)
         changed = ", ".join(changed_keys or sorted(clean_patch.keys()))
         self.add_event("info", f"Settings saved: {changed}")
@@ -976,6 +982,16 @@ class BotState:
         token.intelligence_tags = tags
 
     def trade_from_token(self, token: TokenSignal) -> TradeRecord:
+        paper_model_cost = self._paper_model_cost_sol(token)
+        shadow_quote_cost = round(float(token.quote_shadow_total_cost_sol or 0.0), 9)
+        quote_adjustment = round(max(0.0, shadow_quote_cost - paper_model_cost), 9)
+        quote_adjusted_pnl = None
+        accuracy_status = "paper_only"
+        if token.pnl_sol is not None and shadow_quote_cost > 0:
+            quote_adjusted_pnl = round(float(token.pnl_sol or 0.0) - quote_adjustment, 9)
+            accuracy_status = "quote_adjusted"
+        elif token.quote_shadow_status:
+            accuracy_status = str(token.quote_shadow_status)
         return TradeRecord(
             id=f"trd_{token.id}",
             token_id=token.id,
@@ -1004,8 +1020,22 @@ class BotState:
             entry_price_impact_cost_sol=token.entry_price_impact_cost_sol,
             price_impact_pct=token.price_impact_pct,
             slippage_paid_pct=token.slippage_paid_pct,
+            paper_model_cost_sol=paper_model_cost,
+            shadow_quote_cost_sol=shadow_quote_cost,
+            quote_adjustment_sol=quote_adjustment,
+            quote_adjusted_pnl_sol=quote_adjusted_pnl,
+            simulation_accuracy_status=accuracy_status,
             source_price_confidence=token.price_confidence,
             settings_version_id=token.settings_version_id or self.current_settings_version_id,
+        )
+
+    def _paper_model_cost_sol(self, token: TokenSignal) -> float:
+        return round(
+            float(token.fee_paid_sol or 0.0)
+            + float(token.exit_fee_sol or 0.0)
+            + float(token.entry_slippage_cost_sol or 0.0)
+            + float(token.entry_price_impact_cost_sol or 0.0),
+            9,
         )
 
     def decision_record_from_token(self, token: TokenSignal, decision) -> StrategyDecisionRecord:
@@ -2549,6 +2579,65 @@ class BotState:
             },
         }
 
+    def simulation_accuracy_report(self, wallet_public_key: str = "") -> dict[str, object]:
+        trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
+        quote_adjusted = [trade for trade in trades if trade.quote_adjusted_pnl_sol is not None]
+        audits = self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(500)))
+        shadow_audits = [audit for audit in audits if isinstance(audit.quote, dict) and bool(audit.quote.get("shadow_only"))]
+        shadow_evaluated = [audit for audit in shadow_audits if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison.get("status") == "evaluated"]
+        shadow_failed = [
+            audit
+            for audit in shadow_audits
+            if audit.status != "ready" or audit.final_status in {"blocked", "failed"} or bool(audit.errors)
+        ]
+        live_ledger = self.live_ledger(wallet_public_key)
+        live_positions_count = len(live_ledger.get("positions", [])) if isinstance(live_ledger.get("positions"), list) else 0
+        paper_pnl = round(sum(float(trade.pnl_sol or 0.0) for trade in trades), 6)
+        quote_adjusted_pnl = round(sum(float(trade.quote_adjusted_pnl_sol if trade.quote_adjusted_pnl_sol is not None else trade.pnl_sol or 0.0) for trade in trades), 6)
+        shadow_pnl = round(sum(float(audit.shadow_comparison.get("estimated_pnl_sol", 0.0) or 0.0) for audit in shadow_evaluated), 6)
+        live_pnl = round(float(live_ledger.get("summary", {}).get("net_pnl_sol", live_ledger.get("summary", {}).get("total_pnl_sol", 0.0)) or 0.0), 6)
+        avg_shadow_latency = 0
+        if shadow_evaluated:
+            avg_shadow_latency = int(
+                sum(float(audit.shadow_comparison.get("latency_ms", 0.0) or 0.0) for audit in shadow_evaluated) / len(shadow_evaluated)
+            )
+        paper_minus_shadow = round(quote_adjusted_pnl - shadow_pnl, 6) if shadow_evaluated else None
+        shadow_minus_live = round(shadow_pnl - live_pnl, 6) if shadow_evaluated and live_positions_count else None
+        return {
+            "artifact_type": "cryptoarc_simulation_accuracy_report",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "wallet_public_key": wallet_public_key.strip(),
+            "paper": {
+                "samples": len(trades),
+                "pnl_sol": paper_pnl,
+                "quote_adjusted_samples": len(quote_adjusted),
+                "quote_adjusted_pnl_sol": quote_adjusted_pnl,
+                "quote_adjustment_sol": round(sum(float(trade.quote_adjustment_sol or 0.0) for trade in trades), 6),
+                "shadow_quote_cost_sol": round(sum(float(trade.shadow_quote_cost_sol or 0.0) for trade in trades), 6),
+            },
+            "shadow": {
+                "samples": len(shadow_evaluated),
+                "attempts": len(shadow_audits),
+                "failures": len(shadow_failed),
+                "failure_rate_pct": round((len(shadow_failed) / len(shadow_audits) * 100) if shadow_audits else 0.0, 2),
+                "estimated_pnl_sol": shadow_pnl,
+                "avg_quote_latency_ms": avg_shadow_latency,
+            },
+            "live": {
+                "samples": live_positions_count,
+                "pnl_sol": live_pnl,
+                "total_fees_sol": round(float(live_ledger.get("summary", {}).get("total_fees_sol", 0.0) or 0.0), 9),
+                "pnl_confidence": str(live_ledger.get("summary", {}).get("pnl_confidence", "none")),
+            },
+            "error": {
+                "paper_minus_shadow_sol": paper_minus_shadow,
+                "shadow_minus_live_sol": shadow_minus_live,
+                "paper_minus_live_sol": round(quote_adjusted_pnl - live_pnl, 6) if live_positions_count else None,
+            },
+            "operator_action": "Use quote-adjusted paper and shadow-vs-live error before raising real-money size.",
+        }
+
     def _wallet_performance_analytics(self) -> dict[str, object]:
         positions = self._live_ledger_positions("")
         grouped: dict[str, list[LiveLedgerPosition]] = {}
@@ -3052,10 +3141,6 @@ class BotState:
                 out_of_sample=out_of_sample,
                 source_soak=source_soak,
             ),
-            "execution_readiness": self._execution_readiness_status(
-                source=source,
-                strategy_promotion=None,
-            ),
             "sample_size": {
                 "closed_trades": closed_count,
                 "source_events": source_events,
@@ -3073,6 +3158,20 @@ class BotState:
         )
         result["entries_allowed"] = self.readiness_halt_reason(result) is None
         return result
+
+    def _invalidate_readiness_cache(self) -> None:
+        self._cached_readiness_status = None
+        self._cached_readiness_status_at = 0.0
+
+    def _recent_readiness_status(self) -> dict[str, object]:
+        now = time.perf_counter()
+        cached = self._cached_readiness_status
+        if cached is not None and now - self._cached_readiness_status_at <= self.READINESS_CACHE_TTL_SECONDS:
+            return cached
+        refreshed = self.readiness_status()
+        self._cached_readiness_status = refreshed
+        self._cached_readiness_status_at = time.perf_counter()
+        return refreshed
 
     def _execution_readiness_status(
         self,
@@ -4771,9 +4870,18 @@ class BotState:
         wallet_public_key: str,
         signer_mode: str,
         autonomous: bool = False,
+        signer: dict[str, object] | None = None,
+        caps: dict[str, object] | None = None,
+        wallet_metrics: dict[str, object] | None = None,
+        unresolved: list[LiveExecutionAudit] | None = None,
+        source_health: dict[str, object] | None = None,
+        backup: dict[str, object] | None = None,
+        stale_balance_positions: list[LiveLedgerPosition] | None = None,
+        readiness_halt: str | None = None,
+        confirmed_buy_spend_over_trade_cap: bool | None = None,
     ) -> list[str]:
-        signer = self.signer_status(signer_mode, wallet_public_key)
-        caps = self.live_caps_snapshot()
+        signer = signer if signer is not None else self.signer_status(signer_mode, wallet_public_key)
+        caps = caps if caps is not None else self.live_caps_snapshot()
         blockers: list[str] = []
         if not env_live_enabled:
             blockers.append("LIVE_TRADING_ENABLED is false")
@@ -4793,12 +4901,12 @@ class BotState:
         if signer_mode != "browser_wallet" and not signer.get("can_sign"):
             blockers.append(str(signer.get("disabled_reason") or f"{signer_mode.replace('_', ' ')} cannot sign transactions right now"))
 
-        wallet_metrics = self._wallet_live_metrics(wallet_public_key)
+        wallet_metrics = wallet_metrics if wallet_metrics is not None else self._wallet_live_metrics(wallet_public_key)
         if action == "buy":
-            unresolved = [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(200)) if self._is_unresolved_live_audit(audit)]
+            unresolved = unresolved if unresolved is not None else [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(200)) if self._is_unresolved_live_audit(audit)]
             if unresolved:
                 blockers.append("unresolved live audit recovery debt blocks new entries")
-            source_health = self.source_health()
+            source_health = source_health if source_health is not None else self.source_health()
             source_blocker = self._source_live_entry_blocker(source_health)
             if source_blocker:
                 blockers.append(source_blocker)
@@ -4811,6 +4919,8 @@ class BotState:
                 blockers.append(f"{signer_mode.replace('_', ' ')} is unhealthy")
             if wallet_metrics["cost_basis_sol"] >= float(self.settings.live_wallet_exposure_cap_sol or 0):
                 blockers.append("wallet exposure cap reached")
+            if confirmed_buy_spend_over_trade_cap if confirmed_buy_spend_over_trade_cap is not None else self._has_confirmed_buy_spend_over_trade_cap(wallet_public_key):
+                blockers.append("confirmed live buy spend exceeded max trade cap; review cap/rent exposure before new buys")
             if wallet_metrics["realized_pnl_sol"] + wallet_metrics["unrealized_pnl_sol"] <= -abs(float(self.settings.live_daily_loss_cap_sol or 0)):
                 blockers.append("wallet daily loss cap reached")
             if wallet_metrics["open_positions"] >= float(self.settings.live_max_open_positions or 0):
@@ -4821,10 +4931,10 @@ class BotState:
 
         if autonomous:
             if action == "buy":
-                backup = self._pre_run_backup_status()
+                backup = backup if backup is not None else self._pre_run_backup_status()
                 if backup.get("blocks_live_entries"):
                     blockers.append(str(backup.get("blocker") or "pre-run backup is required before live entries"))
-            stale_balance_positions = self._stale_balance_positions(wallet_public_key)
+            stale_balance_positions = stale_balance_positions if stale_balance_positions is not None else self._stale_balance_positions(wallet_public_key)
             if stale_balance_positions:
                 blockers.append(f"stale token-balance verification blocks autonomy for {len(stale_balance_positions)} position{'s' if len(stale_balance_positions) != 1 else ''}")
             if not self.settings.autonomous_live_enabled:
@@ -4841,7 +4951,7 @@ class BotState:
                 blockers.append("active backend does not support autonomous entries")
             if action == "sell" and not signer.get("supports_auto_sell"):
                 blockers.append("active backend does not support protective exits")
-            readiness_halt = self.readiness_halt_reason()
+            readiness_halt = readiness_halt if readiness_halt is not None else self.readiness_halt_reason()
             if readiness_halt and action == "buy":
                 blockers.append(readiness_halt)
 
@@ -5094,13 +5204,31 @@ class BotState:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         signer = self.signer_status(signer_mode, wallet_public_key)
         caps = self.live_caps_snapshot()
-        blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=False)
-        sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=False)
-        autonomy_buy_blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=True)
-        autonomy_sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=True)
-        readiness = self.readiness_status()
+        readiness = self._recent_readiness_status()
         source_health = self.source_health()
-        execution_readiness = self._execution_readiness_status(
+        wallet_metrics = self._wallet_live_metrics(wallet_public_key)
+        audit_rows = self._normalize_live_audits(self.storage.load_live_execution_audits(200))
+        unresolved = [audit for audit in audit_rows if self._is_unresolved_live_audit(audit)]
+        backup = self._pre_run_backup_status()
+        stale_balance_positions = self._stale_balance_positions(wallet_public_key)
+        readiness_halt = self.readiness_halt_reason(readiness)
+        confirmed_buy_spend_over_trade_cap = self._has_confirmed_buy_spend_over_trade_cap(wallet_public_key)
+        blocker_context = {
+            "signer": signer,
+            "caps": caps,
+            "wallet_metrics": wallet_metrics,
+            "unresolved": unresolved,
+            "source_health": source_health,
+            "backup": backup,
+            "stale_balance_positions": stale_balance_positions,
+            "readiness_halt": readiness_halt,
+            "confirmed_buy_spend_over_trade_cap": confirmed_buy_spend_over_trade_cap,
+        }
+        blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=False, **blocker_context)
+        sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=False, **blocker_context)
+        autonomy_buy_blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=True, **blocker_context)
+        autonomy_sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=True, **blocker_context)
+        execution_readiness = readiness.get("execution_readiness") if isinstance(readiness.get("execution_readiness"), dict) else self._execution_readiness_status(
             source=source_health,
             strategy_promotion=readiness.get("strategy_promotion") if isinstance(readiness, dict) else None,
             env_live_enabled=env_live_enabled,
@@ -5109,8 +5237,6 @@ class BotState:
         )
         intents = self._decorate_live_intents(self._mark_stale_live_intents(self.storage.load_live_intents(200)), readiness)
         ledger = self._live_ledger_positions(wallet_public_key)
-        audit_rows = self._normalize_live_audits(self.storage.load_live_execution_audits(200))
-        unresolved = [audit for audit in audit_rows if self._is_unresolved_live_audit(audit)]
         recoverable = [audit for audit in unresolved if audit.transaction_signature]
         stale_quotes = sum(1 for intent in intents if intent.stale and intent.quote_id)
         latest_reconciliation = next((position.reconciliation_status for position in ledger), "pending")
@@ -5140,9 +5266,8 @@ class BotState:
             autonomy=autonomy,
             active_backend=active_backend,
         )
-        live_metrics = self._wallet_live_metrics(wallet_public_key)
-        live_pnl = {**live_metrics, "open_positions": int(live_metrics["open_positions"]), "approximate": True}
-        pre_run_backup = self._pre_run_backup_status()
+        live_pnl = {**wallet_metrics, "open_positions": int(wallet_metrics["open_positions"]), "approximate": True}
+        pre_run_backup = backup
         source_degraded_mode = self._source_degraded_mode(source_health, env_live_enabled=env_live_enabled, sell_blockers=sell_blockers)
         manual_live_verification = self._manual_live_verification_status(wallet_public_key, signer_mode)
         full_sniper_gate = self._full_sniper_gate(
@@ -5412,14 +5537,19 @@ class BotState:
     def live_positions(self, wallet_public_key: str = "") -> list[dict[str, object]]:
         if not wallet_public_key.strip():
             return []
-        mints = {audit.mint for audit in self.storage.load_live_execution_audits(500) if audit.mint}
+        wallet = wallet_public_key.strip()
+        mints = {
+            position.mint
+            for position in self.storage.load_live_ledger_positions(500)
+            if position.wallet_public_key == wallet and position.status == "open" and position.token_balance > 0 and position.mint
+        }
         positions: list[dict[str, object]] = []
         for mint in sorted(mints):
             token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
             warning = ""
             balance = 0.0
             try:
-                balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet_public_key, mint) or 0.0
+                balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet, mint) or 0.0
             except Exception as exc:
                 warning = f"{exc.__class__.__name__}: {exc}"
             positions.append(
@@ -5695,6 +5825,7 @@ class BotState:
                     intent.warnings.append(f"Automatic shadow quote failed: {exc}")
                     intent.updated_at = utc_now()
                     self.storage.save_live_intent(intent)
+                    self._record_shadow_quote_failure_for_token(intent.mint, str(exc))
                     updated_candidates.append(intent)
             else:
                 updated_candidates.append(intent)
@@ -5729,6 +5860,13 @@ class BotState:
         validation_error = self._validate_live_order(action, amount, denominated_in_sol, slippage_pct, priority_fee_sol, wallet_public_key, signer_mode, shadow_only=shadow_only)
         if validation_error:
             blockers.append(validation_error)
+        wallet_spend_estimate: dict[str, object] = {}
+        if action == "buy" and denominated_in_sol:
+            wallet_spend_estimate = self._estimate_live_buy_wallet_spend(amount, priority_fee_sol)
+            if not shadow_only and wallet_spend_estimate.get("exceeds_max_trade_cap"):
+                blockers.append(
+                    f"estimated wallet spend exceeds live max trade cap ({wallet_spend_estimate['estimated_wallet_spend_sol']:.6f} SOL > {wallet_spend_estimate['max_trade_cap_sol']:.6f} SOL)"
+                )
         preflight_checks = self._live_order_preflight_checks(
             env_live_enabled=quote_env_enabled,
             action=action,
@@ -5743,6 +5881,17 @@ class BotState:
             blockers=blockers,
             shadow_only=shadow_only,
         )
+        if wallet_spend_estimate:
+            preflight_checks.append(
+                self._preflight_check(
+                    "estimated_wallet_spend",
+                    "Estimated Wallet Spend",
+                    "fail" if wallet_spend_estimate.get("exceeds_max_trade_cap") and not shadow_only else "pass",
+                    wallet_spend_estimate,
+                    "<= live max trade cap",
+                    "Buy previews must estimate full wallet spend, including first-token account setup rent and network fees.",
+                )
+            )
         if action == "sell":
             balance = self._wallet_token_balance(wallet_public_key, mint)
             if balance["error"]:
@@ -5820,6 +5969,8 @@ class BotState:
         )
         audit.quote["shadow_only"] = bool(shadow_only)
         audit.quote["live_env_enabled_at_quote"] = bool(env_live_enabled)
+        if wallet_spend_estimate:
+            audit.quote["wallet_spend_estimate"] = wallet_spend_estimate
         audit.shadow_comparison = self._build_shadow_comparison(audit)
         intent.quote_id = quote.id
         intent.audit_id = audit.id
@@ -5829,6 +5980,39 @@ class BotState:
         self.storage.save_live_execution_audit(audit)
         self.add_event("warning", f"Live {action} quote {quote.status} for {mint[:8] or 'unknown'}", subsystem="live")
         return audit.to_dict()
+
+    def _estimate_live_buy_wallet_spend(self, amount: str, priority_fee_sol: float) -> dict[str, object]:
+        try:
+            requested_amount = max(0.0, float(str(amount).replace("%", "")))
+        except ValueError:
+            requested_amount = 0.0
+        priority_fee = max(0.0, float(priority_fee_sol or 0.0))
+        base_fee = round(SOLANA_SIGNATURE_BASE_FEE_LAMPORTS / LAMPORTS_PER_SOL, 9)
+        network_fee = round(base_fee + priority_fee, 9)
+        setup_rent = LIVE_BUY_TOKEN_ACCOUNT_SETUP_RENT_SOL
+        program_fee_buffer = LIVE_BUY_PROGRAM_FEE_BUFFER_SOL
+        estimated = round(requested_amount + network_fee + setup_rent + program_fee_buffer, 9)
+        cap = round(float(self.settings.live_max_trade_sol or 0.0), 9)
+        return {
+            "estimated_wallet_spend_sol": estimated,
+            "requested_amount_sol": round(requested_amount, 9),
+            "max_trade_cap_sol": cap,
+            "exceeds_max_trade_cap": bool(cap > 0 and estimated > cap),
+            "confidence": "conservative_static_estimate",
+            "components": {
+                "requested_amount_sol": round(requested_amount, 9),
+                "token_account_setup_rent_sol": setup_rent,
+                "network_fee_sol": network_fee,
+                "base_signature_fee_sol": base_fee,
+                "priority_fee_sol": round(priority_fee, 9),
+                "program_fee_buffer_sol": program_fee_buffer,
+            },
+            "assumptions": [
+                "first buy for a mint may create wallet token and pump program accounts",
+                "estimate is intentionally conservative before signing",
+                "confirmed transaction metadata remains the accounting source of truth after submission",
+            ],
+        }
 
     def quote_live_intent(self, env_live_enabled: bool, intent_id: str, slippage_pct: float, priority_fee_sol: float, pool: str, shadow_only: bool = False) -> dict[str, object]:
         intent = self._require_live_intent(intent_id)
@@ -5906,6 +6090,22 @@ class BotState:
                 token.quote_shadow_total_cost_sol = float(costs.get("total_cost_sol", 0.0) or 0.0)
                 token.quote_shadow_slippage_pct = float(costs.get("slippage_pct", 0.0) or 0.0)
                 token.quote_shadow_status = str(audit.status or audit.final_status or "")
+                self.storage.save_token(token)
+
+    def _record_shadow_quote_failure_for_token(self, mint: str, reason: str) -> None:
+        message = f"Shadow quote failed: {reason}"
+        updated = False
+        for token in self.tokens:
+            if token.mint != mint:
+                continue
+            token.quote_shadow_status = "quote_failed"
+            token.decision_log.append(message)
+            self.storage.save_token(token)
+            updated = True
+        if not updated:
+            for token in [item for item in self.storage.load_tokens(300) if item.mint == mint]:
+                token.quote_shadow_status = "quote_failed"
+                token.decision_log.append(message)
                 self.storage.save_token(token)
 
     def live_simulate(self, audit_id: str, ok: bool, warning: str = "", error: str = "", result: dict[str, Any] | None = None) -> dict[str, object]:
@@ -6509,6 +6709,17 @@ class BotState:
         except Exception as exc:
             return {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": f"{exc.__class__.__name__}: {exc}"}
 
+    def live_wallet_balance(self, wallet_public_key: str) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        if not wallet:
+            return {"wallet_public_key": "", "balance_sol": 0.0, "error": "wallet public key is required"}
+        result = self._wallet_sol_balance(wallet)
+        return {
+            "wallet_public_key": str(result.get("wallet_public_key") or wallet),
+            "balance_sol": float(result.get("balance_sol") or 0.0),
+            "error": str(result.get("error") or ""),
+        }
+
     def reconcile_live_intent(self, intent_id: str) -> dict[str, object]:
         intent = self._require_live_intent(intent_id)
         audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
@@ -6757,13 +6968,17 @@ class BotState:
 
     def _decorate_live_intents(self, intents: list[LiveExecutionIntent], readiness: dict[str, object] | None = None) -> list[LiveExecutionIntent]:
         shared_readiness = readiness or self.readiness_status()
+        blocker_cache: dict[tuple[str, str, str], list[str]] = {}
         for intent in intents:
-            self._decorate_live_intent(intent, shared_readiness)
+            key = (intent.action, intent.wallet_public_key, intent.signer_mode)
+            if key not in blocker_cache:
+                blocker_cache[key] = self._live_execution_blockers(True, intent.action, intent.wallet_public_key, intent.signer_mode, autonomous=True)
+            self._decorate_live_intent(intent, shared_readiness, autonomy_blockers=blocker_cache[key])
         return intents
 
-    def _decorate_live_intent(self, intent: LiveExecutionIntent, readiness: dict[str, object] | None = None) -> LiveExecutionIntent:
+    def _decorate_live_intent(self, intent: LiveExecutionIntent, readiness: dict[str, object] | None = None, autonomy_blockers: list[str] | None = None) -> LiveExecutionIntent:
         readiness = readiness or self.readiness_status()
-        blockers = self._live_execution_blockers(True, intent.action, intent.wallet_public_key, intent.signer_mode, autonomous=True)
+        blockers = autonomy_blockers if autonomy_blockers is not None else self._live_execution_blockers(True, intent.action, intent.wallet_public_key, intent.signer_mode, autonomous=True)
         previous_blocked = intent.autonomy_blocked
         previous_blockers = list(intent.autonomy_blockers)
         previous_recommendation = intent.operator_recommendation
@@ -6856,6 +7071,9 @@ class BotState:
         existing = next((position for position in self.storage.load_live_ledger_positions(500) if position.mint == audit.mint and position.wallet_public_key == wallet), None)
         now = utc_now()
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == audit.mint), None)
+        if token and token.wallet_public_key != wallet:
+            token.wallet_public_key = wallet
+            self.storage.save_token(token)
         position = existing or LiveLedgerPosition(
             id=new_id("livepos"),
             created_at=now,
@@ -6993,6 +7211,27 @@ class BotState:
         wallet_sol_delta = 0.0
         if wallet_index is not None and wallet_index < len(pre_balances) and wallet_index < len(post_balances):
             wallet_sol_delta = round((float(post_balances[wallet_index]) - float(pre_balances[wallet_index])) / LAMPORTS_PER_SOL, 9)
+        positive_deltas = []
+        account_creation_lamports = 0
+        if isinstance(account_keys, list):
+            for index, (pre_balance, post_balance) in enumerate(zip(pre_balances, post_balances)):
+                if index == wallet_index:
+                    continue
+                delta = int(post_balance) - int(pre_balance)
+                if delta <= 0:
+                    continue
+                positive_deltas.append(
+                    {
+                        "index": index,
+                        "pubkey": self._account_key_pubkey(account_keys[index]) if index < len(account_keys) else "",
+                        "pre_lamports": int(pre_balance),
+                        "post_lamports": int(post_balance),
+                        "delta_sol": round(delta / LAMPORTS_PER_SOL, 9),
+                        "likely_account_creation": int(pre_balance) == 0,
+                    }
+                )
+                if int(pre_balance) == 0:
+                    account_creation_lamports += delta
         pre_tokens = self._token_balance_total_from_meta(meta.get("preTokenBalances"), audit.mint, audit.wallet_public_key)
         post_tokens = self._token_balance_total_from_meta(meta.get("postTokenBalances"), audit.mint, audit.wallet_public_key)
         token_delta = round(post_tokens - pre_tokens, 9)
@@ -7001,6 +7240,15 @@ class BotState:
         network_fee_sol = round(float(meta.get("fee") or 0.0) / LAMPORTS_PER_SOL, 9)
         base_fee_sol = round((signature_count * SOLANA_SIGNATURE_BASE_FEE_LAMPORTS) / LAMPORTS_PER_SOL, 9)
         priority_fee_sol = round(max(0.0, network_fee_sol - base_fee_sol), 9)
+        wallet_spent = round(max(0.0, -wallet_sol_delta), 9)
+        account_creation_sol = round(account_creation_lamports / LAMPORTS_PER_SOL, 9)
+        spend_breakdown = {
+            "wallet_spent_sol": wallet_spent,
+            "network_fee_sol": network_fee_sol,
+            "net_account_creation_sol": account_creation_sol,
+            "net_trade_and_program_sol": round(max(0.0, wallet_spent - network_fee_sol - account_creation_sol), 9),
+            "positive_account_deltas": positive_deltas,
+        }
         return {
             "ok": True,
             "source": "getTransaction",
@@ -7013,6 +7261,7 @@ class BotState:
             "network_fee_sol": network_fee_sol,
             "base_fee_sol": base_fee_sol,
             "priority_fee_sol": priority_fee_sol,
+            "spend_breakdown": spend_breakdown,
         }
 
     def _apply_live_transaction_effects(self, audit: LiveExecutionAudit, position: LiveLedgerPosition, effects: dict[str, object]) -> None:
@@ -7030,6 +7279,11 @@ class BotState:
         fill["priority_fee_sol"] = round(priority_fee_sol, 9)
         if audit.action == "buy":
             wallet_spent = round(max(0.0, -wallet_sol_delta), 9)
+            try:
+                requested_amount = float(audit.amount)
+            except ValueError:
+                requested_amount = 0.0
+            spend_breakdown = effects.get("spend_breakdown") if isinstance(effects.get("spend_breakdown"), dict) else {}
             fill["token_amount"] = round(max(token_delta, 0.0), 9)
             fill["accounting"] = {
                 "type": "buy",
@@ -7037,12 +7291,17 @@ class BotState:
                 "provenance": "transaction_meta",
                 "wallet_sol_delta_sol": round(wallet_sol_delta, 9),
                 "wallet_sol_spent_sol": wallet_spent,
+                "requested_amount_sol": round(requested_amount, 9),
+                "confirmed_spend_over_request_sol": round(max(0.0, wallet_spent - requested_amount), 9),
                 "token_delta": round(token_delta, 9),
                 "network_fee_sol": round(network_fee_sol, 9),
                 "base_fee_sol": round(base_fee_sol, 9),
                 "priority_fee_sol": round(priority_fee_sol, 9),
                 "cost_basis_added_sol": wallet_spent,
+                "spend_breakdown": spend_breakdown,
             }
+            if requested_amount > 0 and wallet_spent > requested_amount + 0.000001:
+                position.review_notes = self._append_review_note(position.review_notes, "confirmed wallet spend exceeded requested amount")
         else:
             wallet_received = round(max(0.0, wallet_sol_delta), 9)
             fill["token_amount"] = round(abs(min(token_delta, 0.0)), 9)
@@ -7060,6 +7319,31 @@ class BotState:
                 "priority_fee_sol": round(priority_fee_sol, 9),
             }
         self._recompute_live_position_accounting(position)
+
+    def _append_review_note(self, current: str, note: str) -> str:
+        notes = [item.strip() for item in str(current or "").split(";") if item.strip()]
+        if note not in notes:
+            notes.append(note)
+        return "; ".join(notes)
+
+    def _has_confirmed_buy_spend_over_trade_cap(self, wallet_public_key: str) -> bool:
+        wallet = wallet_public_key.strip()
+        cap = float(self.settings.live_max_trade_sol or 0.0)
+        if not wallet or cap <= 0:
+            return False
+        for position in self.storage.load_live_ledger_positions(500):
+            if position.wallet_public_key != wallet:
+                continue
+            for fill in position.fills:
+                if str(fill.get("action") or "").lower() != "buy":
+                    continue
+                accounting = fill.get("accounting") if isinstance(fill.get("accounting"), dict) else {}
+                if accounting.get("provenance") != "transaction_meta":
+                    continue
+                spent = float(accounting.get("wallet_sol_spent_sol", 0.0) or 0.0)
+                if spent > cap + 0.000001:
+                    return True
+        return False
 
     def _recompute_live_position_accounting(self, position: LiveLedgerPosition) -> None:
         cost_basis = 0.0

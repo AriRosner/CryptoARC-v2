@@ -181,6 +181,7 @@ export interface TokenSignal {
   quote_shadow_total_cost_sol: number;
   quote_shadow_slippage_pct: number;
   quote_shadow_status: string;
+  wallet_public_key: string;
   fill_failed: boolean;
   partial_take_profit_taken: boolean;
   realized_pnl_sol: number;
@@ -482,9 +483,49 @@ export interface TradeRecord {
   entry_price_impact_cost_sol: number;
   price_impact_pct: number;
   slippage_paid_pct: number;
+  paper_model_cost_sol: number;
+  shadow_quote_cost_sol: number;
+  quote_adjustment_sol: number;
+  quote_adjusted_pnl_sol: number | null;
+  simulation_accuracy_status: string;
   source_price_confidence: number;
   decision_log: string[];
   settings_version_id: string;
+}
+
+export interface SimulationAccuracyReport {
+  artifact_type: string;
+  format_version: number;
+  generated_at: string;
+  wallet_public_key: string;
+  paper: {
+    samples: number;
+    pnl_sol: number;
+    quote_adjusted_samples: number;
+    quote_adjusted_pnl_sol: number;
+    quote_adjustment_sol: number;
+    shadow_quote_cost_sol: number;
+  };
+  shadow: {
+    samples: number;
+    attempts: number;
+    failures: number;
+    failure_rate_pct: number;
+    estimated_pnl_sol: number;
+    avg_quote_latency_ms: number;
+  };
+  live: {
+    samples: number;
+    pnl_sol: number;
+    total_fees_sol: number;
+    pnl_confidence: string;
+  };
+  error: {
+    paper_minus_shadow_sol: number | null;
+    shadow_minus_live_sol: number | null;
+    paper_minus_live_sol: number | null;
+  };
+  operator_action: string;
 }
 
 export interface SourceHealth {

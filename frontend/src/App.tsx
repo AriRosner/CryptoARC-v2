@@ -46,6 +46,7 @@ import {
   fetchLiveLedger,
   fetchLivePositions,
   fetchLiveStatus,
+  fetchLiveWalletBalance,
   fetchLatencyStatus,
   fetchAlertStatus,
   fetchHotWalletStatus,
@@ -136,6 +137,42 @@ type BrowserSolanaProvider = {
   signAndSendTransaction?: (transaction: any) => Promise<{ signature: string }>;
   signTransaction?: (transaction: any) => Promise<any>;
 };
+
+type WalletSpendEstimate = {
+  estimated_wallet_spend_sol: number;
+  requested_amount_sol: number;
+  max_trade_cap_sol: number;
+  exceeds_max_trade_cap: boolean;
+  confidence?: string;
+  components?: Record<string, number>;
+};
+
+function walletSpendEstimate(audit: LiveExecutionAudit | null): WalletSpendEstimate | null {
+  const value = audit?.quote?.wallet_spend_estimate;
+  if (!value || typeof value !== "object") return null;
+  const estimate = value as Record<string, unknown>;
+  const estimated = Number(estimate.estimated_wallet_spend_sol ?? 0);
+  if (!Number.isFinite(estimated) || estimated <= 0) return null;
+  return {
+    estimated_wallet_spend_sol: estimated,
+    requested_amount_sol: Number(estimate.requested_amount_sol ?? 0),
+    max_trade_cap_sol: Number(estimate.max_trade_cap_sol ?? 0),
+    exceeds_max_trade_cap: Boolean(estimate.exceeds_max_trade_cap),
+    confidence: String(estimate.confidence ?? ""),
+    components: typeof estimate.components === "object" && estimate.components ? estimate.components as Record<string, number> : undefined,
+  };
+}
+
+function WalletSpendEstimateLine({ audit }: { audit: LiveExecutionAudit | null }) {
+  const estimate = walletSpendEstimate(audit);
+  if (!estimate) return null;
+  return (
+    <div className={`mt-3 border-l-2 px-3 py-2 text-xs ${estimate.exceeds_max_trade_cap ? "border-rose-400 bg-rose-500/10 text-rose-100" : "border-emerald-400 bg-emerald-500/10 text-emerald-100"}`}>
+      <span className="block font-black uppercase tracking-widest">Estimated wallet spend: {estimate.estimated_wallet_spend_sol.toFixed(6)} SOL</span>
+      <span className="mt-1 block text-[11px] text-zinc-300">Requested {estimate.requested_amount_sol.toFixed(6)} SOL / cap {estimate.max_trade_cap_sol.toFixed(6)} SOL / setup rent {(Number(estimate.components?.token_account_setup_rent_sol ?? 0)).toFixed(6)} SOL</span>
+    </div>
+  );
+}
 
 declare global {
   interface Window {
@@ -582,6 +619,7 @@ function App() {
   const solUsdRefreshInFlight = React.useRef(false);
   const latencyRefreshInFlight = React.useRef(false);
   const workspaceRefreshKeyRef = React.useRef("");
+  const liveLedgerRef = React.useRef<LiveLedger | null>(null);
 
   const pushToast = React.useCallback((message: string, level: TradeEvent["level"] = "info") => {
     const toast: TradeEvent = {
@@ -753,7 +791,7 @@ function App() {
       : snapshot.status === "running" && (sourceConnectionState === "offline" || sourceConnectionState === "disconnected" || sourceConnectionState === "error")
         ? "disconnected"
         : snapshot.status);
-  const shouldPollPnl = workspacePage === "monitor" || liveWalletOpen;
+  const shouldPollPnl = workspacePage === "monitor" && !liveWalletOpen;
   const watchSet = React.useMemo(() => new Set(watchlist), [watchlist]);
   const paperTimeframePnl = Number((paperPnlSummary?.pnl_sol ?? stats.total_pnl_sol ?? 0).toFixed(6));
   const paperTimeframeFees = Number((paperPnlSummary?.total_fees_sol ?? stats.total_fees_sol ?? 0).toFixed(9));
@@ -813,6 +851,9 @@ function App() {
   }, [hotWalletStatus?.wallet_public_key, liveStatus?.signer?.wallet_public_key, liveWallets, snapshot.settings.live_active_wallet_public_key, walletPublicKey]);
   const filteredTokens = React.useMemo(() => {
     let tokens = tokenSource;
+    if (selectedLivePnlWallet) {
+      tokens = tokens.filter((token) => token.wallet_public_key === selectedLivePnlWallet);
+    }
     const query = deferredTokenSearch.trim().toLowerCase();
     if (query) {
       tokens = tokens.filter((token) =>
@@ -844,7 +885,7 @@ function App() {
       if (queueSort === "creator") return (right.creator_hold_pct || 0) - (left.creator_hold_pct || 0);
       return new Date(right.detected_at).getTime() - new Date(left.detected_at).getTime();
     });
-  }, [deferredTokenSearch, queueFilter, queueSort, snapshot.stats.scratch_threshold_sol, tokenSource, showWatchlistOnly, hideSkippedTokens, watchSet]);
+  }, [deferredTokenSearch, queueFilter, queueSort, selectedLivePnlWallet, snapshot.stats.scratch_threshold_sol, tokenSource, showWatchlistOnly, hideSkippedTokens, watchSet]);
 
   React.useEffect(() => {
     if (pnlWalletScope !== "live") return;
@@ -1049,18 +1090,20 @@ function App() {
       return;
     }
     try {
-      const { Connection, PublicKey } = await loadSolanaWeb3();
-      const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
-      const lamports = await connection.getBalance(new PublicKey(publicKey));
-      setWalletBalanceSol(lamports / 1_000_000_000);
+      const balance = await fetchLiveWalletBalance(publicKey);
+      setWalletBalanceSol(Number(balance.balance_sol ?? 0));
     } catch {
       setWalletBalanceSol(null);
     }
-  }, [snapshot.settings.solana_rpc_url, walletPublicKey]);
+  }, [walletPublicKey]);
 
   React.useEffect(() => {
     window.localStorage.setItem("cryptoarc_live_wallet_method", liveWalletMethod);
   }, [liveWalletMethod]);
+
+  React.useEffect(() => {
+    liveLedgerRef.current = liveLedger;
+  }, [liveLedger]);
 
   const refreshLiveWalletCoreData = React.useCallback(async (publicKey = walletPublicKey) => {
     if (!publicKey && !liveWalletOpen) return;
@@ -1094,7 +1137,7 @@ function App() {
       const [audits, intents, ledger] = await Promise.all([
         fetchLiveAudit(),
         fetchLiveIntents(),
-        selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(emptyLiveLedger())
+        force && selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(liveLedgerRef.current ?? emptyLiveLedger())
       ]);
       setLiveAudit(audits);
       setLiveIntents(intents);
@@ -1764,13 +1807,15 @@ function App() {
     const refreshKey = `${workspacePage}:${pnlTimeframe}:${selectedLivePnlWallet || "paper"}`;
     if (workspaceRefreshKeyRef.current === refreshKey) return;
     workspaceRefreshKeyRef.current = refreshKey;
-    refreshPnlData().catch(() => undefined);
+    if (!liveWalletOpen) {
+      refreshPnlData().catch(() => undefined);
+    }
     refreshSolUsdPrice().catch(() => undefined);
     refreshStrategyPresetData().catch(() => undefined);
     if (workspacePage !== "monitor") {
       refreshWorkspaceData(workspacePage).catch(() => undefined);
     }
-  }, [pnlTimeframe, refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, selectedLivePnlWallet, workspacePage]);
+  }, [liveWalletOpen, pnlTimeframe, refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, selectedLivePnlWallet, workspacePage]);
 
   React.useEffect(() => {
     if (!settingsOpen) return;
@@ -1820,7 +1865,7 @@ function App() {
     if (!liveWalletOpen) return;
     const interval = window.setInterval(() => {
       refreshLiveWalletDetailData().catch(() => undefined);
-    }, effectiveBotStatus === "running" ? 9000 : 20000);
+    }, effectiveBotStatus === "running" ? 15000 : 25000);
     return () => window.clearInterval(interval);
   }, [effectiveBotStatus, liveWalletOpen, refreshLiveWalletDetailData]);
 
@@ -3317,6 +3362,7 @@ function GuidedLiveWalletModal({
                       <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
                       <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
                       <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                      <WalletSpendEstimateLine audit={activeLiveAudit} />
                       {activeLiveAudit.preflight_checks?.length ? (
                         <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
                           {activeLiveAudit.preflight_checks.slice(0, 6).map((check) => (
@@ -3976,6 +4022,7 @@ function LegacyLiveWalletModal({
                     <span className="mt-1 block truncate text-xs text-zinc-400">{activeLiveAudit.transaction_signature ? `Signature ${activeLiveAudit.transaction_signature}` : "No signature submitted yet"}</span>
                     <span className="mt-1 block text-xs text-zinc-400">Simulation: {String(activeLiveAudit.simulation?.status ?? "not run")} / Reconciliation: {activeLiveAudit.reconciliation_status ?? "pending"}</span>
                     <p className="mt-2 text-xs text-zinc-500">{[...activeLiveAudit.warnings, ...activeLiveAudit.errors].join(" / ") || activeLiveAudit.final_status}</p>
+                    <WalletSpendEstimateLine audit={activeLiveAudit} />
                     {activeLiveAudit.preflight_checks?.length ? (
                       <div className="mt-3 grid gap-1.5 sm:grid-cols-2">
                         {activeLiveAudit.preflight_checks.slice(0, 6).map((check) => (

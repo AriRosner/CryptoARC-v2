@@ -1323,6 +1323,42 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(reviewed["payload"]["paper_only_boundary"])
             self.assertEqual(loaded.status, "rejected")
 
+    def test_live_wallet_balance_uses_backend_rpc_helper(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.123456789, "error": ""}  # type: ignore[method-assign]
+
+            balance = state.live_wallet_balance("WalletBalance")
+
+            self.assertEqual(balance["wallet_public_key"], "WalletBalance")
+            self.assertEqual(balance["balance_sol"], 0.123456789)
+            self.assertEqual(balance["error"], "")
+
+    def test_live_fill_stamps_token_with_wallet_public_key(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.id = "tok_live_wallet"
+            token.mint = "MintLiveWallet"
+            state.storage.save_token(token)
+            audit = LiveExecutionAudit(
+                id="audit_live_wallet",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                action="buy",
+                mint="MintLiveWallet",
+                amount="0.001",
+                wallet_public_key="WalletLiveToken",
+                signer_mode="browser_wallet",
+                status="submitted",
+                final_status="submitted",
+            )
+
+            state._record_live_fill(audit)
+            loaded = next(item for item in state.storage.load_all_tokens() if item.id == "tok_live_wallet")
+
+            self.assertEqual(loaded.wallet_public_key, "WalletLiveToken")
+
     def configure_live_caps(self, state: BotState, include_backup: bool = True) -> None:
         state.settings.live_max_trade_sol = 0.01
         state.settings.live_daily_loss_cap_sol = 0.05
@@ -1479,6 +1515,84 @@ class CoreLogicTests(unittest.TestCase):
             self.assertFalse(daemon["wallet_adapter"]["supports_auto_sell"])
             self.assertEqual(daemon["execution_backend"]["submit_path"], "localhost_signer_daemon")
             self.assertFalse(daemon["execution_backend"]["implemented"])
+
+    def test_live_status_reuses_recent_readiness_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            calls = 0
+            original_readiness = state.readiness_status
+
+            def counted_readiness() -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                return original_readiness()
+
+            state.readiness_status = counted_readiness  # type: ignore[method-assign]
+
+            first = state.live_status(True, "Wallet111", "browser_wallet")
+            second = state.live_status(True, "Wallet111", "browser_wallet")
+
+            self.assertEqual(first["readiness"]["engine_version"], "readiness-v1")
+            self.assertEqual(second["readiness"]["engine_version"], "readiness-v1")
+            self.assertEqual(calls, 1)
+
+    def test_readiness_status_computes_execution_readiness_once(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            calls = 0
+            original_execution = state._execution_readiness_status
+
+            def counted_execution(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                return original_execution(*args, **kwargs)
+
+            state._execution_readiness_status = counted_execution  # type: ignore[method-assign]
+
+            readiness = state.readiness_status()
+
+            self.assertEqual(readiness["execution_readiness"]["mode"], "dry_run_to_shadow")
+            self.assertEqual(calls, 1)
+
+    def test_live_status_uses_readiness_execution_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            calls = 0
+            original_execution = state._execution_readiness_status
+
+            def counted_execution(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                return original_execution(*args, **kwargs)
+
+            state._execution_readiness_status = counted_execution  # type: ignore[method-assign]
+
+            status = state.live_status(True, "Wallet111", "browser_wallet")
+
+            self.assertEqual(status["execution_readiness"]["mode"], "dry_run_to_shadow")
+            self.assertEqual(calls, 1)
+
+    def test_live_status_reuses_wallet_metrics_for_blockers(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            calls = 0
+            original_metrics = state._wallet_live_metrics
+
+            def counted_metrics(wallet_public_key: str) -> dict[str, object]:
+                nonlocal calls
+                calls += 1
+                return original_metrics(wallet_public_key)
+
+            state._wallet_live_metrics = counted_metrics  # type: ignore[method-assign]
+
+            status = state.live_status(True, "Wallet111", "browser_wallet")
+
+            self.assertEqual(status["live_pnl"]["open_positions"], 0)
+            self.assertEqual(calls, 1)
 
     def test_hot_wallet_import_lock_unlock_and_status(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1695,6 +1809,46 @@ class CoreLogicTests(unittest.TestCase):
             stored = state.storage.load_live_execution_audit(audit["id"])
             self.assertTrue(stored.preflight_checks)
 
+    def test_live_buy_quote_blocks_estimated_wallet_spend_over_trade_cap(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.001
+            state.storage.save_settings(state.settings)
+            calls: list[dict[str, object]] = []
+            state._pumpportal_local_transaction = lambda **kwargs: calls.append(kwargs) or ({"ok": True}, "dHgi", "")  # type: ignore[method-assign]
+
+            audit = state.live_quote(True, "buy", "MintSpendEstimate", "0.001", True, 5, 0.00001, "pump", "WalletSpendEstimate")
+
+            checks = {check["id"]: check for check in audit["preflight_checks"]}
+            estimate = audit["quote"]["wallet_spend_estimate"]
+            self.assertEqual(audit["status"], "blocked")
+            self.assertEqual(calls, [])
+            self.assertGreater(estimate["estimated_wallet_spend_sol"], 0.0049)
+            self.assertEqual(estimate["requested_amount_sol"], 0.001)
+            self.assertEqual(estimate["max_trade_cap_sol"], 0.001)
+            self.assertTrue(estimate["exceeds_max_trade_cap"])
+            self.assertEqual(checks["estimated_wallet_spend"]["status"], "fail")
+            self.assertTrue(any("estimated wallet spend exceeds live max trade cap" in error for error in audit["errors"]))
+
+    def test_live_buy_quote_records_estimated_wallet_spend_when_within_trade_cap(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.006
+            state.storage.save_settings(state.settings)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            audit = state.live_quote(True, "buy", "MintSpendEstimate", "0.001", True, 5, 0.00001, "pump", "WalletSpendEstimate")
+
+            checks = {check["id"]: check for check in audit["preflight_checks"]}
+            estimate = audit["quote"]["wallet_spend_estimate"]
+            self.assertEqual(audit["status"], "ready")
+            self.assertFalse(estimate["exceeds_max_trade_cap"])
+            self.assertEqual(checks["estimated_wallet_spend"]["status"], "pass")
+            self.assertEqual(estimate["components"]["token_account_setup_rent_sol"], 0.00391848)
+            self.assertGreaterEqual(estimate["estimated_wallet_spend_sol"], estimate["requested_amount_sol"] + estimate["components"]["token_account_setup_rent_sol"])
+
     def test_live_quote_validates_caps_and_disabled_signer(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
@@ -1773,6 +1927,9 @@ class CoreLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.configure_live_caps(state)
+            state.settings.trade_size_sol = 0.001
+            state.settings.live_max_trade_sol = 0.006
+            state.storage.save_settings(state.settings)
             for index in range(12):
                 token = self.make_token()
                 token.id = f"tok_live_{index}"
@@ -1845,6 +2002,118 @@ class CoreLogicTests(unittest.TestCase):
             self.assertAlmostEqual(audit.shadow_comparison["costs"]["priority_fee_sol"], 0.0001)
             self.assertAlmostEqual(refreshed_token.quote_shadow_total_cost_sol, audit.shadow_comparison["costs"]["total_cost_sol"])
             self.assertEqual(refreshed_token.quote_shadow_status, "ready")
+
+    def test_quote_adjusted_trade_pnl_subtracts_only_unmodeled_shadow_costs(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.id = "tok_quote_adjusted"
+            token.status = TokenStatus.PAPER_SOLD
+            token.amount_sol = 0.1
+            token.pnl_sol = 0.02
+            token.fee_paid_sol = 0.0005
+            token.exit_fee_sol = 0.0005
+            token.entry_price_impact_cost_sol = 0.0002
+            token.quote_shadow_total_cost_sol = 0.002
+            token.quote_shadow_status = "ready"
+
+            trade = state.trade_from_token(token)
+
+            self.assertAlmostEqual(trade.paper_model_cost_sol, 0.0012)
+            self.assertAlmostEqual(trade.shadow_quote_cost_sol, 0.002)
+            self.assertAlmostEqual(trade.quote_adjustment_sol, 0.0008)
+            self.assertAlmostEqual(trade.quote_adjusted_pnl_sol, 0.0192)
+            self.assertEqual(trade.simulation_accuracy_status, "quote_adjusted")
+
+    def test_shadow_quote_failure_is_recorded_on_promoted_paper_token(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.001
+            state.settings.trade_size_sol = 0.001
+            token = self.make_token()
+            token.id = "tok_shadow_failure"
+            token.mint = "MintShadowFailure"
+            token.symbol = "FAIL"
+            token.score = 95
+            token.status = TokenStatus.PAPER_BOUGHT
+            state.tokens.appendleft(token)
+
+            def fail_local_transaction(**kwargs):
+                raise RuntimeError("quote provider unavailable")
+
+            state._pumpportal_local_transaction = fail_local_transaction
+
+            intents = state.generate_live_intents("WalletShadow")
+            promoted = next(intent for intent in intents if intent["mint"] == "MintShadowFailure")
+            refreshed_token = next(item for item in state.tokens if item.mint == "MintShadowFailure")
+
+            self.assertEqual(promoted["source"], "paper_promoted")
+            self.assertIn("Automatic shadow quote failed", " ".join(promoted["warnings"]))
+            self.assertEqual(refreshed_token.quote_shadow_status, "quote_failed")
+            self.assertIn("quote provider unavailable", " ".join(refreshed_token.decision_log))
+
+    def test_simulation_accuracy_report_compares_paper_shadow_and_live(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            state.storage.save_trade(
+                TradeRecord(
+                    id="trd_accuracy",
+                    token_id="tok_accuracy",
+                    mode="paper",
+                    strategy_profile="balanced",
+                    entry_price=0.00001,
+                    exit_price=0.000012,
+                    amount_sol=0.1,
+                    pnl_sol=0.02,
+                    entry_reason="test",
+                    exit_reason="test",
+                    opened_at=now - timedelta(seconds=10),
+                    closed_at=now,
+                    quote_adjusted_pnl_sol=0.018,
+                    shadow_quote_cost_sol=0.002,
+                    quote_adjustment_sol=0.001,
+                    simulation_accuracy_status="quote_adjusted",
+                )
+            )
+            audit = LiveExecutionAudit(
+                id="audit_accuracy_shadow",
+                created_at=now,
+                updated_at=now,
+                action="buy",
+                mint="MintAccuracy",
+                amount="0.1",
+                status="ready",
+                signer_mode="browser_wallet",
+                wallet_public_key="WalletAccuracy",
+                quote={"shadow_only": True},
+                shadow_comparison={"status": "evaluated", "estimated_pnl_sol": 0.015, "latency_ms": 250, "outcome": "win"},
+            )
+            state.storage.save_live_execution_audit(audit)
+            state.storage.save_live_ledger_position(
+                LiveLedgerPosition(
+                    id="pos_accuracy_live",
+                    created_at=now,
+                    updated_at=now,
+                    mint="MintAccuracy",
+                    wallet_public_key="WalletAccuracy",
+                    status="closed",
+                    realized_pnl_sol=0.012,
+                    total_fees_sol=0.0002,
+                    realized_pnl_confidence="audited",
+                )
+            )
+
+            report = state.simulation_accuracy_report("WalletAccuracy")
+
+            self.assertEqual(report["paper"]["samples"], 1)
+            self.assertEqual(report["paper"]["quote_adjusted_pnl_sol"], 0.018)
+            self.assertEqual(report["shadow"]["samples"], 1)
+            self.assertEqual(report["live"]["samples"], 1)
+            self.assertAlmostEqual(report["error"]["paper_minus_shadow_sol"], 0.003)
+            self.assertAlmostEqual(report["error"]["shadow_minus_live_sol"], 0.003)
+            self.assertEqual(report["operator_action"], "Use quote-adjusted paper and shadow-vs-live error before raising real-money size.")
 
     def test_recalculate_stats_reports_total_paper_fees(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1973,6 +2242,8 @@ class CoreLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.03
+            state.storage.save_settings(state.settings)
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
@@ -2009,6 +2280,9 @@ class CoreLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.configure_live_caps(state)
+            state.settings.trade_size_sol = 0.001
+            state.settings.live_max_trade_sol = 0.006
+            state.storage.save_settings(state.settings)
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
@@ -2174,6 +2448,9 @@ class CoreLogicTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.configure_live_caps(state)
+            state.settings.trade_size_sol = 0.001
+            state.settings.live_max_trade_sol = 0.006
+            state.storage.save_settings(state.settings)
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             state.arm_live_backend(True, "local_hot_wallet")
@@ -3190,6 +3467,8 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.seed_readiness_dataset(state)
             self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.02
+            state.storage.save_settings(state.settings)
             state.settings.take_profit_pct = 50
             token = self.make_token()
             token.mint = "MintShadowTp"
@@ -3237,6 +3516,8 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.seed_readiness_dataset(state)
             self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.02
+            state.storage.save_settings(state.settings)
             state.settings.take_profit_pct = 50
             state.settings.stop_loss_pct = 30
             state.settings.minimum_hold_time_seconds = 10
@@ -3286,6 +3567,8 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.seed_readiness_dataset(state)
             self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.02
+            state.storage.save_settings(state.settings)
             state.settings.take_profit_pct = 50
             state.settings.stop_loss_pct = 30
             token = self.make_token()
@@ -3331,6 +3614,8 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             self.seed_readiness_dataset(state)
             self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.02
+            state.storage.save_settings(state.settings)
             token = self.make_token()
             token.mint = "MintShadowStaleWindow"
             token.current_price = 0.00001
@@ -3564,6 +3849,146 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(position["total_priority_fees_sol"], 0.00001)
             self.assertEqual(position["cost_basis_sol"], 0.100015)
             self.assertEqual(position["cost_basis_breakdown"]["explanation"], "Weighted-average live cost basis from confirmed wallet deltas when transaction metadata is available.")
+
+    def test_live_buy_reconciliation_exposes_confirmed_spend_breakdown(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.006
+            state.settings.live_wallet_exposure_cap_sol = 0.01
+            state.storage.save_settings(state.settings)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state._wallet_token_balance = lambda wallet, mint: {"wallet_public_key": wallet, "mint": mint, "token_balance": 22851.04325, "error": ""}
+            state._transaction_details = lambda signature: {
+                "ok": True,
+                "found": True,
+                "signature": signature,
+                "transaction": {
+                    "transaction": {
+                        "signatures": [signature],
+                        "message": {
+                            "accountKeys": [
+                                {"pubkey": "WalletSpend"},
+                                {"pubkey": "AtaAccount"},
+                                {"pubkey": "BondingCurve"},
+                                {"pubkey": "Other"},
+                                {"pubkey": "PlatformFee"},
+                                {"pubkey": "PumpAccount"},
+                            ]
+                        },
+                    },
+                    "meta": {
+                        "fee": 15000,
+                        "preBalances": [123441000, 0, 7541609307, 0, 26382144, 0],
+                        "postBalances": [118489588, 2074080, 7542609730, 0, 26385146, 1844400],
+                        "preTokenBalances": [],
+                        "postTokenBalances": [
+                            {
+                                "mint": "MintSpend",
+                                "owner": "WalletSpend",
+                                "uiTokenAmount": {"uiAmount": 22851.04325, "amount": "22851043250", "decimals": 6},
+                            }
+                        ],
+                    },
+                },
+            }
+
+            quote = state.live_quote(True, "buy", "MintSpend", "0.001", True, 5, 0.00001, "pump", "WalletSpend")
+            state.live_submit(quote["id"], "sigspend")
+            state.live_confirm(quote["id"], "confirmed")
+            ledger = state.live_ledger("WalletSpend")
+
+            accounting = ledger["positions"][0]["fills"][0]["accounting"]
+            self.assertEqual(accounting["wallet_sol_spent_sol"], 0.004951412)
+            self.assertEqual(accounting["requested_amount_sol"], 0.001)
+            self.assertEqual(accounting["confirmed_spend_over_request_sol"], 0.003951412)
+            self.assertEqual(accounting["spend_breakdown"]["wallet_spent_sol"], 0.004951412)
+            self.assertEqual(accounting["spend_breakdown"]["network_fee_sol"], 0.000015)
+            self.assertEqual(accounting["spend_breakdown"]["net_account_creation_sol"], 0.00391848)
+            self.assertEqual(accounting["spend_breakdown"]["net_trade_and_program_sol"], 0.001017932)
+            self.assertIn("confirmed wallet spend exceeded requested amount", ledger["positions"][0]["review_notes"])
+
+    def test_live_status_blocks_new_buys_after_confirmed_spend_exceeds_trade_cap(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.001
+            state.settings.live_wallet_exposure_cap_sol = 0.01
+            state.storage.save_settings(state.settings)
+            now = utc_now()
+            state.storage.save_live_ledger_position(
+                LiveLedgerPosition(
+                    id="pos_over_cap",
+                    created_at=now,
+                    updated_at=now,
+                    mint="MintOverCap",
+                    wallet_public_key="WalletOverCap",
+                    status="open",
+                    token_balance=10.0,
+                    cost_basis_sol=0.004951412,
+                    fills=[
+                        {
+                            "id": "fill_over_cap",
+                            "created_at": now.isoformat(),
+                            "audit_id": "audit_over_cap",
+                            "intent_id": "",
+                            "action": "buy",
+                            "mint": "MintOverCap",
+                            "amount": "0.001",
+                            "amount_sol": 0.001,
+                            "token_amount": 10.0,
+                            "fee_sol": 0.000015,
+                            "priority_fee_sol": 0.00001,
+                            "signature": "sig_over_cap",
+                            "accounting": {
+                                "type": "buy",
+                                "provenance": "transaction_meta",
+                                "wallet_sol_spent_sol": 0.004951412,
+                                "requested_amount_sol": 0.001,
+                                "confirmed_spend_over_request_sol": 0.003951412,
+                            },
+                        }
+                    ],
+                    reconciliation_status="matched",
+                )
+            )
+
+            status = state.live_status(True, "WalletOverCap", "browser_wallet")
+
+            self.assertIn("confirmed live buy spend exceeded max trade cap; review cap/rent exposure before new buys", status["blockers"])
+            self.assertFalse(status["live_execution_available"])
+
+    def test_live_intent_decoration_reuses_autonomy_blockers_per_wallet_action(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            calls: list[tuple[str, str, str, bool]] = []
+
+            def fake_blockers(env_live_enabled: bool, action: str, wallet_public_key: str, signer_mode: str, autonomous: bool = False) -> list[str]:
+                calls.append((action, wallet_public_key, signer_mode, autonomous))
+                return ["cached blocker"]
+
+            state._live_execution_blockers = fake_blockers  # type: ignore[method-assign]
+            now = utc_now()
+            intents = [
+                LiveExecutionIntent(
+                    id=f"intent_cache_{index}",
+                    created_at=now,
+                    updated_at=now,
+                    action="buy",
+                    mint=f"MintCache{index}",
+                    amount="0.001",
+                    denominated_in_sol=True,
+                    wallet_public_key="WalletCache",
+                    signer_mode="browser_wallet",
+                )
+                for index in range(25)
+            ]
+
+            decorated = state._decorate_live_intents(intents, readiness={})
+
+            self.assertEqual(len(decorated), 25)
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(all(intent.autonomy_blocked for intent in decorated))
 
     def test_live_sell_reconciliation_uses_confirmed_net_wallet_proceeds(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3900,6 +4325,58 @@ class CoreLogicTests(unittest.TestCase):
             self.assertLessEqual(ledger["positions"][0]["balance_age_seconds"], 2)
             self.assertEqual(ledger["summary"]["stale_balance_positions"], 0)
             self.assertEqual(other_wallet["positions"], [])
+
+    def test_live_positions_only_probe_open_wallet_ledger_mints(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            for mint, wallet, status, balance in (
+                ("MintOpen", "WalletA", "open", 12.5),
+                ("MintClosed", "WalletA", "closed", 0.0),
+                ("MintOther", "WalletB", "open", 9.0),
+            ):
+                state.storage.save_live_execution_audit(
+                    LiveExecutionAudit(
+                        id=f"audit_{mint}",
+                        created_at=now,
+                        updated_at=now,
+                        action="buy",
+                        mint=mint,
+                        amount="0.001",
+                        wallet_public_key=wallet,
+                        signer_mode="browser_wallet",
+                        status="reconciled",
+                    )
+                )
+                state.storage.save_live_ledger_position(
+                    LiveLedgerPosition(
+                        id=f"pos_{mint}",
+                        created_at=now,
+                        updated_at=now,
+                        mint=mint,
+                        wallet_public_key=wallet,
+                        status=status,
+                        token_balance=balance,
+                        reconciliation_status="matched",
+                    )
+                )
+
+            calls: list[tuple[str, str]] = []
+
+            class FakeSolanaClient:
+                def __init__(self, rpc_url: str) -> None:
+                    self.rpc_url = rpc_url
+
+                def token_balance(self, wallet_address: str, mint: str) -> float:
+                    calls.append((wallet_address, mint))
+                    return 12.5
+
+            with patch("app.core.state.SolanaReadOnlyClient", FakeSolanaClient):
+                positions = state.live_positions("WalletA")
+
+            self.assertEqual(calls, [("WalletA", "MintOpen")])
+            self.assertEqual([position["mint"] for position in positions], ["MintOpen"])
+            self.assertEqual(positions[0]["token_balance"], 12.5)
 
     def test_performance_analytics_include_wallet_scoped_live_rows(self) -> None:
         with TemporaryDirectory() as directory:

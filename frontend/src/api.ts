@@ -1,4 +1,4 @@
-import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SettingsVersion, SetupReadinessReport, SignerStatus, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -266,6 +266,13 @@ export async function fetchPostRunReview(timeframe = "24h", walletPublicKey = ""
   return request(`/api/reports/post-run-review?${params.toString()}`);
 }
 
+export async function fetchSimulationAccuracy(walletPublicKey = ""): Promise<SimulationAccuracyReport> {
+  const params = new URLSearchParams();
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return request(`/api/reports/simulation-accuracy${suffix}`);
+}
+
 export async function fetchWatchdogStatus(): Promise<WatchdogStatus> {
   return request("/api/watchdog/status");
 }
@@ -288,6 +295,10 @@ export async function fetchLiveStatus(walletPublicKey = "", signerMode = "browse
 
 export async function fetchLiveWalletStatus(walletPublicKey = "", signerMode = "browser_wallet"): Promise<SignerStatus> {
   return request(`/api/live/wallet/status?wallet_public_key=${encodeURIComponent(walletPublicKey)}&signer_mode=${encodeURIComponent(signerMode)}`);
+}
+
+export async function fetchLiveWalletBalance(walletPublicKey = ""): Promise<{ wallet_public_key: string; balance_sol: number; error: string }> {
+  return request(`/api/live/wallet/balance?wallet_public_key=${encodeURIComponent(walletPublicKey)}`);
 }
 
 export async function acknowledgeLiveSession(): Promise<{ acknowledged: boolean; acknowledged_at: string }> {
@@ -682,6 +693,13 @@ export async function fetchEvidenceModeSeparation(): Promise<EvidenceModeSeparat
 
 export function evidenceModeSeparationExportUrl(): string {
   return `${API_BASE}/api/reports/evidence-mode-separation/export`;
+}
+
+export function simulationAccuracyExportUrl(walletPublicKey = ""): string {
+  const params = new URLSearchParams();
+  if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return `${API_BASE}/api/reports/simulation-accuracy/export${suffix}`;
 }
 
 export function operatorLogsExportUrl(timeframe = "24h", level = "", subsystem = "", limit = 200): string {

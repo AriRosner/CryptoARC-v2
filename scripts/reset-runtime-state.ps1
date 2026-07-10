@@ -99,8 +99,56 @@ with sqlite3.connect(db_path) as connection:
     connection.commit()
     after = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in runtime_tables if table in existing}
     preserved_after = {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in preserved_tables if table in existing}
+    fee_totals = {
+        "entry_fees_sol": 0.0,
+        "exit_fees_sol": 0.0,
+        "total_fees_sol": 0.0,
+        "live_total_fees_sol": 0.0,
+        "live_priority_fees_sol": 0.0,
+    }
+    if "tokens" in existing:
+        row = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CAST(json_extract(payload, '$.fee_paid_sol') AS REAL)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.exit_fee_sol') AS REAL)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.total_fees_sol') AS REAL)), 0)
+            FROM tokens
+            """
+        ).fetchone()
+        fee_totals["entry_fees_sol"] += float(row[0] or 0.0)
+        fee_totals["exit_fees_sol"] += float(row[1] or 0.0)
+        fee_totals["total_fees_sol"] += float(row[2] or 0.0)
+    if "trades" in existing:
+        row = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CAST(json_extract(payload, '$.entry_fee_sol') AS REAL)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.exit_fee_sol') AS REAL)), 0)
+            FROM trades
+            """
+        ).fetchone()
+        fee_totals["entry_fees_sol"] += float(row[0] or 0.0)
+        fee_totals["exit_fees_sol"] += float(row[1] or 0.0)
+        fee_totals["total_fees_sol"] += float(row[0] or 0.0) + float(row[1] or 0.0)
+    if "live_ledger_positions" in existing:
+        row = connection.execute(
+            """
+            SELECT
+              COALESCE(SUM(CAST(json_extract(payload, '$.total_fees_sol') AS REAL)), 0),
+              COALESCE(SUM(CAST(json_extract(payload, '$.total_priority_fees_sol') AS REAL)), 0)
+            FROM live_ledger_positions
+            """
+        ).fetchone()
+        fee_totals["live_total_fees_sol"] += float(row[0] or 0.0)
+        fee_totals["live_priority_fees_sol"] += float(row[1] or 0.0)
+    fee_totals = {key: round(value, 9) for key, value in fee_totals.items()}
+    uncleared_tables = {table: count for table, count in after.items() if count}
+    uncleared_fees = {key: value for key, value in fee_totals.items() if value}
+    if uncleared_tables or uncleared_fees:
+        raise SystemExit(json.dumps({"uncleared_tables": uncleared_tables, "fee_totals": fee_totals}, indent=2))
 
-print(json.dumps({"before": before, "after": after, "preserved_before": preserved_before, "preserved_after": preserved_after}, indent=2))
+print(json.dumps({"before": before, "after": after, "fee_totals": fee_totals, "preserved_before": preserved_before, "preserved_after": preserved_after}, indent=2))
 "@
 
   $script | & $python -

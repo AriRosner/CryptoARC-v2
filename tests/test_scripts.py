@@ -62,6 +62,25 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("/api/data/clear", script)
         self.assertIn("scripts\\start-dev.ps1", script)
         self.assertNotIn("/api/start", script)
+        self.assertIn("fee_totals", script)
+        self.assertIn("entry_fees_sol", script)
+        self.assertIn("exit_fees_sol", script)
+        self.assertIn("total_fees_sol", script)
+
+    def test_frontend_uses_backend_wallet_balance_and_scopes_live_tokens(self) -> None:
+        api = (ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        types = (ROOT / "frontend" / "src" / "types.ts").read_text(encoding="utf-8")
+
+        self.assertIn("fetchLiveWalletBalance", api)
+        self.assertIn("/api/live/wallet/balance", api)
+        self.assertIn("fetchLiveWalletBalance", app)
+        self.assertIn("setWalletBalanceSol(Number(balance.balance_sol ?? 0))", app)
+        balance_block = app[app.index("const refreshConnectedWalletBalance"):app.index("React.useEffect(() => {", app.index("const refreshConnectedWalletBalance"))]
+        self.assertNotIn("new Connection", balance_block)
+        self.assertIn("wallet_public_key", types)
+        self.assertIn("token.wallet_public_key", app)
+        self.assertIn("selectedLivePnlWallet", app)
 
     def test_settings_modal_exposes_paper_trade_hour_limit(self) -> None:
         modal = (ROOT / "frontend" / "src" / "components" / "SettingsModal.tsx").read_text(encoding="utf-8")
