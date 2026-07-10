@@ -67,6 +67,23 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("exit_fees_sol", script)
         self.assertIn("total_fees_sol", script)
 
+    def test_local_signer_daemon_scripts_are_no_trade_and_do_not_echo_private_key(self) -> None:
+        start_path = ROOT / "scripts" / "start-signer-daemon.ps1"
+        check_path = ROOT / "scripts" / "check-signer-daemon.ps1"
+
+        self.assertTrue(start_path.exists())
+        self.assertTrue(check_path.exists())
+        start_script = start_path.read_text(encoding="utf-8")
+        check_script = check_path.read_text(encoding="utf-8")
+
+        self.assertIn("tools.local_signer_daemon", start_script)
+        self.assertIn("CRYPTOARC_SIGNER_PRIVATE_KEY", start_script)
+        self.assertNotIn("Write-Host $env:CRYPTOARC_SIGNER_PRIVATE_KEY", start_script)
+        self.assertIn("/health", check_script)
+        self.assertIn("Authorization", check_script)
+        self.assertNotIn("/execute", check_script)
+        self.assertNotIn("CRYPTOARC_SIGNER_PRIVATE_KEY", check_script)
+
     def test_frontend_uses_backend_wallet_balance_and_scopes_live_tokens(self) -> None:
         api = (ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
         app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")

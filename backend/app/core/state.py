@@ -4627,7 +4627,7 @@ class BotState:
             can_unattended_sign=False,
             supports_auto_sell=False,
             supports_auto_buy=False,
-            disabled_reason="Local signer daemon is design-only in this phase",
+            disabled_reason="Local signer daemon is not connected or not ready.",
             message="Local signer daemon is not connected.",
             endpoint=endpoint,
             transport="localhost_http",
@@ -6262,6 +6262,8 @@ class BotState:
                     "rpc_url": self.settings.solana_rpc_url,
                     "mint": audit.mint,
                     "action": audit.action,
+                    "amount": audit.amount,
+                    "amount_sol": self._audit_amount_sol(audit),
                 }
             ).encode("utf-8")
             request = urllib.request.Request(

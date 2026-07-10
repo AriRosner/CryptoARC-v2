@@ -65,8 +65,9 @@ Check:
 Check:
 
 - endpoint is localhost-only
-- daemon process is actually running
+- daemon process is actually running through `scripts\start-signer-daemon.ps1`
 - health endpoint responds
+- `scripts\check-signer-daemon.ps1` passes its no-trade health check
 - auth/capability is configured correctly
 
 ## Restore completed but system looks wrong

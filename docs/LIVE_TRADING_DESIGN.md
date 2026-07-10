@@ -11,7 +11,7 @@ Implemented today:
 - One active live backend can be armed per session.
 - Browser-wallet execution is assisted/manual unless the wallet environment exposes unattended approval.
 - Encrypted local hot-wallet execution is available for localhost use after explicit private-key import and password unlock.
-- Local signer-daemon support is localhost-only and depends on an external daemon implementing the expected health and execute contract.
+- Local signer-daemon support is localhost-only and the repo ships a minimal guarded daemon for local operator use.
 - Every live path runs through intent, quote, simulation, submission, audit, confirmation, and reconciliation state.
 
 ## Backend Paths
@@ -39,8 +39,9 @@ Current behavior:
 
 - Must stay localhost-only.
 - CryptoARC can probe daemon health/capability state and route through the daemon contract.
-- The repo does not ship the external signer daemon itself.
-- This path should be treated as infrastructure-dependent until the external daemon is present and validated.
+- `scripts\start-signer-daemon.ps1` starts the local daemon and `scripts\check-signer-daemon.ps1` performs a no-trade health check.
+- Submission is disabled by default. The daemon signs/submits only when started with explicit submit mode, a local private key in the operator environment, and a policy that allows the request.
+- This path should still be treated as infrastructure-dependent until the daemon health check, selected wallet, caps, backup, source health, and manual-live proof are current.
 
 ## Execution Flow
 
@@ -79,6 +80,6 @@ Protective exits may still proceed when entry autonomy is halted, as long as the
 - Live execution should remain localhost-only.
 - Seed phrases must not be added.
 - Remote signer exposure must not be added.
-- Any future signer-daemon work must preserve localhost-only endpoint enforcement.
+- Signer-daemon work must preserve localhost-only endpoint enforcement.
 - Live actions must continue to produce durable audit and reconciliation records.
 - Browser-wallet execution should continue to degrade gracefully to assisted/manual behavior when unattended approval is unavailable.

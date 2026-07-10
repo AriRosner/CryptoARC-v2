@@ -14,7 +14,7 @@ The codebase is not a toy. Preserve existing bot logic, state management, settin
 - Browser-wallet live trading is assisted/manual and still depends on user wallet approval unless the browser environment explicitly exposes unattended approval.
 - CryptoARC now supports encrypted local hot-wallet storage for localhost use only. Seed phrases and custodial trading API keys remain out of scope.
 - One active backend can be armed per session. Autonomous live still requires explicit settings enablement, cap configuration, readiness, and wallet-scoped gating.
-- Local signer-daemon support is localhost-only and depends on an external daemon implementing the expected health and execute contract.
+- Local signer-daemon support is localhost-only and includes a repo-shipped guarded daemon contract with submit mode disabled by default.
 - `LIVE_TRADING_ENABLED=false` still blocks live quote/sign/submit paths by default.
 - Recovery and reconciliation remain audit-driven confirmation checks; they do not silently create or replay transactions on their own.
 

@@ -54,8 +54,9 @@ Screenshot: `assets/screenshots/live/live-wallet-stepper.png`
 ### Local signer daemon
 
 - Must stay localhost-only
-- Depends on an external daemon implementing the expected contract
+- Uses the repo-shipped guarded daemon contract when started locally
 - Status and capability are surfaced in the app
+- Submission is disabled by default unless the operator explicitly starts the daemon in submit mode
 
 ## Live Wallet Workspace
 
@@ -84,6 +85,29 @@ Post-run live review excludes shadow-only evidence audits. A pilot review is not
 The live status payload also exposes an `autonomy` object with separate `entry` and `exit` gate states. It reports whether the selected backend matches the armed backend, whether unresolved recovery debt blocks new entries, and whether expert override recording is available. Override recording is audit-only; it records target gate, action, reason, timestamp, blockers, active backend, kill-switch state, and caps, but it does not bypass live blockers.
 
 `execution_backend` shows the selected submit path. Browser wallet reports `browser_wallet_manual_signature` and always requires operator approval. Local hot wallet reports `encrypted_local_hot_wallet`; it can submit unattended only when the encrypted wallet is unlocked, live env is enabled, and the matching backend is armed. Local signer daemon reports `localhost_signer_daemon` and remains blocked unless a localhost-only daemon is connected and healthy. Both daemon health and execute calls reject non-localhost endpoints before any signer request is sent.
+
+## Local Signer Daemon Quick Start
+
+Use this path for unattended automation only after manual-live proof is complete for the same wallet. Do not paste private keys or seed phrases into chat, issue trackers, docs, or logs.
+
+The daemon accepts a private key only from the local operator environment:
+
+```powershell
+$env:CRYPTOARC_SIGNER_PRIVATE_KEY = "<base58-secret-key-or-json-byte-array>"
+$env:CRYPTOARC_SIGNER_AUTH_TOKEN = "<local-random-token>"
+scripts\start-signer-daemon.ps1 -AuthToken $env:CRYPTOARC_SIGNER_AUTH_TOKEN -MaxTradeSol 0.001
+scripts\check-signer-daemon.ps1 -AuthToken $env:CRYPTOARC_SIGNER_AUTH_TOKEN
+```
+
+That startup keeps submit mode off. The health check is a no-trade check and never calls `/execute`.
+
+For the later autonomous pilot, start the daemon only after caps, backup, source health, kill-switch state, and manual-live proof are reviewed:
+
+```powershell
+scripts\start-signer-daemon.ps1 -AuthToken $env:CRYPTOARC_SIGNER_AUTH_TOKEN -MaxTradeSol 0.001 -AllowSubmit
+```
+
+The backend must also be configured with the same token through `LIVE_SIGNER_DAEMON_AUTH_TOKEN` and the local URL through `LIVE_SIGNER_DAEMON_URL`. Keep the URL on `127.0.0.1` or `localhost`; remote signer URLs are rejected before any signer request is sent.
 
 Hot-wallet status and launch-readiness reports expose only public wallet metadata, lock state, and the `local_encrypted_sidecar` storage scope. They do not expose the vault filesystem path, seed phrases, private keys, or encrypted payload fields. Database backup artifacts restore ledger and app state, but they intentionally do not embed the hot-wallet sidecar; after a restore, re-check the hot-wallet status and re-import or unlock the local wallet before arming `local_hot_wallet`. If the restored database still has old hot-wallet metadata but the sidecar is missing, startup, restore reload, and status checks clear the stale public key and label from live settings, persist that cleanup, and disarm any stale `local_hot_wallet` backend authorization.
 

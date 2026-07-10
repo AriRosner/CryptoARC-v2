@@ -735,6 +735,46 @@ class CoreLogicTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "localhost-only"):
                     state._execute_backend_audit(audit)
 
+    def test_local_signer_daemon_execute_sends_amount_context(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"signature":"sig"}'
+
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request: object, timeout: int = 0) -> FakeResponse:
+            captured["timeout"] = timeout
+            captured["data"] = json.loads(getattr(request, "data").decode("utf-8"))
+            return FakeResponse()
+
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"), signer_daemon_url="http://127.0.0.1:8799")
+            audit = LiveExecutionAudit(
+                id="liveaudit_local_signer_amount",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                action="buy",
+                mint="MintLocalSigner",
+                amount="0.001",
+                status="ready",
+                signer_mode="local_signer_daemon",
+                wallet_public_key="WalletLocalSigner",
+                quote={"unsigned_transaction_base64": "dHgi"},
+            )
+
+            with patch("app.core.state.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = state._execute_backend_audit(audit)
+
+            self.assertEqual(result["signature"], "sig")
+            self.assertEqual(captured["data"]["amount"], "0.001")
+            self.assertEqual(captured["data"]["amount_sol"], 0.001)
+
     def test_storage_round_trip_source_event_and_backtest(self) -> None:
         with TemporaryDirectory() as directory:
             storage = Storage(str(Path(directory) / "test.db"))
