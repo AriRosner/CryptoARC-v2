@@ -239,6 +239,23 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("activeAuditWalletMismatch", app)
         self.assertIn("quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale", app)
 
+    def test_settings_search_indexes_actual_setting_labels(self) -> None:
+        modal = (ROOT / "frontend" / "src" / "components" / "SettingsModal.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("settingsSearchIndex", modal)
+        self.assertIn("normalizeSettingsSearch", modal)
+        self.assertIn("queryTerms.every", modal)
+        for label in [
+            "Paper Priority Fee",
+            "Live Signer Mode",
+            "Manual Kill Switch",
+            "Profit Vault",
+            "Source Max Reconnects",
+            "Entry Confirmation Gate",
+            "Watched Wallet Address",
+        ]:
+            self.assertIn(label, modal)
+
     def test_pnl_chart_has_stable_responsive_container_bounds(self) -> None:
         chart = (ROOT / "frontend" / "src" / "components" / "PnlChart.tsx").read_text(encoding="utf-8")
 

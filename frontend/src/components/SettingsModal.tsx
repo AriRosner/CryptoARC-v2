@@ -199,6 +199,123 @@ function validateSettings(settings: BotSettings): string[] {
   return warnings;
 }
 
+function normalizeSettingsSearch(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const settingsSearchIndex: Record<string, string[]> = {
+  source: [
+    "Launch Source",
+    "Auto-Detection",
+    "Direct Solana Paper",
+    "Direct Confidence",
+    "source launch pumpportal mock detect logsSubscribe confidence",
+  ],
+  strategy: [
+    "Active Profile",
+    "Trade Size (SOL)",
+    "Slippage Tolerance (%)",
+    "Max Open Positions",
+    "Trading Speed",
+    "Save Current Strategy Preset",
+    "strategy profile size slippage speed open positions weights",
+  ],
+  risk: [
+    "Risk Tolerance",
+    "Score Threshold",
+    "Max Creator Hold (%)",
+    "Daily Loss Cap (SOL)",
+    "Min Buy Velocity",
+    "Max Sell Pressure",
+    "Min Metadata Score",
+    "Entry Confirmation Gate",
+    "Gate Buy Velocity",
+    "Gate Sell Pressure",
+    "Gate Metadata Score",
+    "Gate Initial Buy SOL",
+    "Gate Price Confidence",
+    "Gate Observed Trades",
+    "Max Token Age Seconds",
+    "Filter Honeypots",
+    "Filter Rug Risks",
+    "Duplicate Symbol Penalty",
+    "Strict Metadata Checks",
+    "Stop On Source Degraded",
+    "Manual Kill Switch",
+    "Consecutive Loss Halt",
+    "Low Replay Confidence Halt",
+    "risk tolerance score creator hold loss honeypot rug age trades cooldown entry confirmation velocity pressure metadata observed",
+  ],
+  exits: [
+    "Take Profit (%)",
+    "Stop Loss (%)",
+    "Trailing Stop",
+    "Break-Even Stop",
+    "Minimum Hold Seconds",
+    "Max Hold Time (Seconds)",
+    "Max Position Ticks",
+    "Partial Take Profit",
+    "Stalled Trade Exit",
+    "Sell Pressure Exit",
+    "Cooldown After Loss",
+    "exit profit loss hold time ticks trailing partial break even stalled pressure",
+  ],
+  simulation: [
+    "RPC URL",
+    "Watched Wallet Address",
+    "Launch Interval (s)",
+    "Paper Volatility (%)",
+    "Future Wallet Cap SOL",
+    "Manual Live Max SOL",
+    "Live Caps",
+    "Live Signer Mode",
+    "Readiness Halt",
+    "Trade Toasts",
+    "Compact Token Table",
+    "Request Live Trading Unlock",
+    "Manual Live Request Capture",
+    "Autonomous Live Request",
+    "simulation launch interval volatility wallet cap rpc address toasts live mode signer browser hot wallet daemon",
+  ],
+  "profit-vault": [
+    "Profit Vault",
+    "Enable Auto-Sweep",
+    "Minimum Profit",
+    "Sweep Mode",
+    "Vault Wallet",
+    "Reserve And Rate Limits",
+    "profit vault sweep auto send sol wallet reserve history audit local hot wallet",
+  ],
+  advanced: [
+    "Source Stale (s)",
+    "Source Max Reconnects",
+    "Backtest Replay Limit",
+    "Raw Replay Limit",
+    "Max Trade Subscriptions",
+    "Max Trades Per Hour",
+    "Min Price Confidence",
+    "Max First Observed Move %",
+    "Rejected Price Streak Guard",
+    "Paper Fill Delay (Ticks)",
+    "Paper Provider Fee (BPS)",
+    "Paper Priority Fee",
+    "Paper Price Impact %",
+    "Paper Failed Fill %",
+    "Velocity Slippage",
+    "Max Same Creator Buys",
+    "Use Observed Prices",
+    "Prefer Market-Cap Price",
+    "advanced stale reconnect backtest subscriptions confidence move market cap price impact fill hourly paper throttle priority fee",
+  ],
+  security: [
+    "Security",
+    "Update Password",
+    "Two-Factor Authentication",
+    "Mobile Devices",
+    "security password 2fa totp authenticator mobile pairing revoke",
+  ],
+};
+
 export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
@@ -367,12 +484,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   ];
 
   const filteredTabs = useMemo(() => {
-    if (!searchQuery) return tabs;
-    const query = searchQuery.toLowerCase();
-    return tabs.filter(tab => 
-      tab.label.toLowerCase().includes(query) || 
-      tab.keywords.toLowerCase().includes(query)
-    );
+    const normalizedQuery = normalizeSettingsSearch(searchQuery);
+    if (!normalizedQuery) return tabs;
+    const queryTerms = normalizedQuery.split(/\s+/).filter(Boolean);
+    return tabs.filter((tab) => {
+      const indexedText = normalizeSettingsSearch([tab.label, tab.keywords, ...(settingsSearchIndex[tab.id] ?? [])].join(" "));
+      return queryTerms.every((term) => indexedText.includes(term));
+    });
   }, [searchQuery]);
   const navScrollable = filteredTabs.length > 8;
 
