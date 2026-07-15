@@ -746,7 +746,7 @@ function App() {
         if (!cancelled) {
           const message = error instanceof Error ? error.message : "unknown error";
           setLatencyStatus((current) => current
-            ? { ...current, dashboard_rtt_ms: null, latency_error: message, latency_stale: true }
+            ? { ...current, latency_error: message, latency_stale: true }
             : {
               artifact_type: "cryptoarc_latency_status",
               format_version: 1,

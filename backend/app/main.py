@@ -814,6 +814,8 @@ async def mobile_health() -> dict:
 
 @app.get("/api/latency/status", dependencies=[Depends(require_auth)])
 async def latency_status_endpoint() -> dict[str, object]:
+    if not latency_status.get("updated_at"):
+        await update_latency_status()
     payload = dict(latency_status)
     payload["server_time"] = time.time()
     payload["source_connection"] = state.source_health().get("connection", {})
