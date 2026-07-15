@@ -232,6 +232,13 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertNotIn("dashboard_rtt_ms: null, latency_error: message, latency_stale: true", app)
         self.assertIn("? { ...current, latency_error: message, latency_stale: true }", app)
 
+    def test_live_sign_send_disables_on_api_disconnect_and_wallet_mismatch(self) -> None:
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("apiDisconnected", app)
+        self.assertIn("activeAuditWalletMismatch", app)
+        self.assertIn("quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale", app)
+
     def test_pnl_chart_has_stable_responsive_container_bounds(self) -> None:
         chart = (ROOT / "frontend" / "src" / "components" / "PnlChart.tsx").read_text(encoding="utf-8")
 

@@ -2975,6 +2975,76 @@ class CoreLogicTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "source trust"):
                 state.live_submit(quote["id"], "sigsource")
 
+    def test_live_quote_blocks_buy_when_rpc_balance_check_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            wallet = "11111111111111111111111111111112"
+            state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": "RPC timeout"}  # type: ignore[method-assign]
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            quote = state.live_quote(True, "buy", "MintRpcDown", "0.001", True, 1, 0.00001, "pump", wallet)
+
+            self.assertEqual(quote["status"], "blocked")
+            self.assertIn("wallet SOL balance check failed: RPC timeout", quote["errors"])
+
+    def test_live_status_exposes_runtime_connectivity_guard(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            wallet = "11111111111111111111111111111112"
+            state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": "RPC unavailable"}  # type: ignore[method-assign]
+
+            status = state.live_status(True, wallet, "browser_wallet")
+            runtime = status["runtime_connectivity"]
+
+            self.assertFalse(runtime["rpc_available"])
+            self.assertFalse(runtime["safe_for_new_entry"])
+            self.assertIn("wallet SOL balance check failed: RPC unavailable", runtime["blockers"])
+
+    def test_live_status_blocks_reconnecting_source_for_new_entries(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.source_status.status = "reconnecting"
+            state.source_status.message = "PumpPortal reconnecting"
+            state.source_status.last_event_at = utc_now()
+
+            status = state.live_status(True, "WalletReconnect", "browser_wallet")
+
+            self.assertIn("source trust requires PumpPortal source connected before live entries", status["runtime_connectivity"]["blockers"])
+            self.assertFalse(status["runtime_connectivity"]["safe_for_new_entry"])
+
+    def test_unresolved_submitted_audit_blocks_new_entry_after_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "test.db")
+            state = BotState(database_path=db_path)
+            self.configure_live_caps(state)
+            state.storage.save_live_execution_audit(
+                LiveExecutionAudit(
+                    id="liveaudit_restart_debt",
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                    action="buy",
+                    mint="MintRestartDebt",
+                    amount="0.001",
+                    status="submitted",
+                    final_status="submitted",
+                    transaction_signature="sigrestart",
+                    wallet_public_key="WalletRestart",
+                    signer_mode="browser_wallet",
+                )
+            )
+
+            reloaded = BotState(database_path=db_path)
+            reloaded.source_status.status = "connected"
+            reloaded.source_status.message = "healthy"
+            reloaded.source_status.last_event_at = utc_now()
+            status = reloaded.live_status(True, "WalletRestart", "browser_wallet")
+
+            self.assertIn("unresolved live audit recovery debt blocks new entries", status["blockers"])
+            self.assertFalse(status["runtime_connectivity"]["recovery_debt_clear"])
+
     def test_live_kill_switch_action_records_risk_state(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))

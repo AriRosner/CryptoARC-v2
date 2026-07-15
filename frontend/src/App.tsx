@@ -2166,6 +2166,7 @@ function App() {
           method={liveWalletMethod}
           onMethodChange={setLiveWalletMethod}
           walletPublicKey={walletPublicKey}
+          apiState={apiState}
           walletBalanceSol={walletBalanceSol}
           settings={settings}
           liveStatus={liveStatus}
@@ -2325,6 +2326,7 @@ function GuidedLiveWalletModal({
   method,
   onMethodChange,
   walletPublicKey,
+  apiState,
   walletBalanceSol,
   settings,
   liveStatus,
@@ -2384,6 +2386,7 @@ function GuidedLiveWalletModal({
   method: LiveWalletMethod;
   onMethodChange: (method: LiveWalletMethod) => void;
   walletPublicKey: string;
+  apiState: string;
   walletBalanceSol: number | null;
   settings: BotSettings;
   liveStatus: LiveStatus | null;
@@ -2495,6 +2498,8 @@ function GuidedLiveWalletModal({
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
   const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
   const quoteBlocked = !envEnabled;
+  const apiDisconnected = apiState !== "connected";
+  const activeAuditWalletMismatch = method === "browser_wallet" && Boolean(activeLiveAudit?.wallet_public_key) && activeLiveAudit?.wallet_public_key !== walletPublicKey;
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
   const activeQuoteStale = activeLiveAudit?.status === "stale" || Boolean(activeLiveAudit?.quote?.stale);
   const recoverableAuditStatuses = new Set(["submitted", "failed", "needs_review", "stale"]);
@@ -3446,7 +3451,7 @@ function GuidedLiveWalletModal({
                   <div className="mt-4 flex flex-wrap gap-2">
                     <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
                     <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                    <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                    <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                   </div>
                   {!envEnabled ? <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Live env is disabled, so quotes and signing are blocked. Wallet checks and setup still work.</p> : null}
                   {activeLiveAudit ? (
@@ -3616,6 +3621,7 @@ function LegacyLiveWalletModal({
   method,
   onMethodChange,
   walletPublicKey,
+  apiState = "offline",
   walletBalanceSol,
   settings,
   liveStatus,
@@ -3667,6 +3673,7 @@ function LegacyLiveWalletModal({
   method: LiveWalletMethod;
   onMethodChange: (method: LiveWalletMethod) => void;
   walletPublicKey: string;
+  apiState?: string;
   walletBalanceSol: number | null;
   settings: BotSettings;
   liveStatus: LiveStatus | null;
@@ -3719,6 +3726,8 @@ function LegacyLiveWalletModal({
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
   const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
   const quoteBlocked = !envEnabled;
+  const apiDisconnected = apiState !== "connected";
+  const activeAuditWalletMismatch = method === "browser_wallet" && Boolean(activeLiveAudit?.wallet_public_key) && activeLiveAudit?.wallet_public_key !== walletPublicKey;
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
   const activeQuoteStale = activeLiveAudit?.status === "stale" || Boolean(activeLiveAudit?.quote?.stale);
   const recoverableAuditStatuses = new Set(["submitted", "failed", "needs_review", "stale"]);
@@ -4126,7 +4135,7 @@ function LegacyLiveWalletModal({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onCreateLivePreview} disabled={quoteBlocked}>Create Preview</button>
                   <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
-                  <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
+                  <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
                 {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and backend status checks still work.</p> : null}
                 {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness warnings now hard-block autonomous entries only when the backend gates require it. Manual/assisted flows can still be reviewed here.</p> : null}

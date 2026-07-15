@@ -1612,6 +1612,16 @@ export interface LiveStatus {
     exit_blockers: string[];
     operator_action: string;
   };
+  runtime_connectivity: {
+    source_connected: boolean;
+    rpc_available: boolean;
+    rpc_balance_checked: boolean;
+    signer_available: boolean;
+    recovery_debt_clear: boolean;
+    safe_for_new_entry: boolean;
+    blockers: string[];
+    operator_action: string;
+  };
   full_sniper_gate: {
     mode: "full_sniper" | string;
     ready: boolean;

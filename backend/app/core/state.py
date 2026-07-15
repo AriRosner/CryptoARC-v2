@@ -4887,6 +4887,7 @@ class BotState:
         stale_balance_positions: list[LiveLedgerPosition] | None = None,
         readiness_halt: str | None = None,
         confirmed_buy_spend_over_trade_cap: bool | None = None,
+        wallet_balance: dict[str, object] | None = None,
     ) -> list[str]:
         signer = signer if signer is not None else self.signer_status(signer_mode, wallet_public_key)
         caps = caps if caps is not None else self.live_caps_snapshot()
@@ -4911,6 +4912,10 @@ class BotState:
 
         wallet_metrics = wallet_metrics if wallet_metrics is not None else self._wallet_live_metrics(wallet_public_key)
         if action == "buy":
+            wallet_balance = wallet_balance if wallet_balance is not None else self._entry_wallet_balance_status(wallet_public_key)
+            balance_error = str(wallet_balance.get("error") or "") if isinstance(wallet_balance, dict) else ""
+            if balance_error:
+                blockers.append(f"wallet SOL balance check failed: {balance_error}")
             unresolved = unresolved if unresolved is not None else [audit for audit in self._normalize_live_audits(self.storage.load_live_execution_audits(200)) if self._is_unresolved_live_audit(audit)]
             if unresolved:
                 blockers.append("unresolved live audit recovery debt blocks new entries")
@@ -4988,6 +4993,55 @@ class BotState:
         if pumpportal_events <= 0:
             return "archived PumpPortal source events are required before live entries"
         return ""
+
+    def _valid_solana_public_key(self, wallet_public_key: str) -> bool:
+        try:
+            Pubkey.from_string(wallet_public_key.strip())
+            return True
+        except Exception:
+            return False
+
+    def _entry_wallet_balance_status(self, wallet_public_key: str) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        if not wallet or not self._valid_solana_public_key(wallet):
+            return {"wallet_public_key": wallet, "balance_sol": 0.0, "error": "", "checked": False}
+        result = self._wallet_sol_balance(wallet)
+        return {
+            "wallet_public_key": str(result.get("wallet_public_key") or wallet),
+            "balance_sol": float(result.get("balance_sol") or 0.0),
+            "error": str(result.get("error") or ""),
+            "checked": True,
+        }
+
+    def _runtime_connectivity_status(
+        self,
+        *,
+        source_health: dict[str, object],
+        signer: dict[str, object],
+        wallet_balance: dict[str, object],
+        unresolved: list[LiveExecutionAudit],
+        blockers: list[str],
+    ) -> dict[str, object]:
+        source_blocker = self._source_live_entry_blocker(source_health)
+        balance_error = str(wallet_balance.get("error") or "")
+        runtime_blockers = list(dict.fromkeys([
+            *([source_blocker] if source_blocker else []),
+            *([f"wallet SOL balance check failed: {balance_error}"] if balance_error else []),
+            *([str(signer.get("disabled_reason") or "signer is unavailable")] if not signer.get("connected") or not signer.get("healthy") else []),
+            *(["unresolved live audit recovery debt blocks new entries"] if unresolved else []),
+            *[blocker for blocker in blockers if any(term in blocker.lower() for term in ("source", "rpc", "signer", "recovery", "wallet sol balance", "kill switch"))],
+        ]))
+        balance_checked = bool(wallet_balance.get("checked"))
+        return {
+            "source_connected": not source_blocker,
+            "rpc_available": not balance_error if balance_checked else True,
+            "rpc_balance_checked": balance_checked,
+            "signer_available": bool(signer.get("connected")) and bool(signer.get("healthy")) and bool(signer.get("can_sign")),
+            "recovery_debt_clear": not unresolved,
+            "safe_for_new_entry": not runtime_blockers,
+            "blockers": runtime_blockers,
+            "operator_action": "Runtime connectivity is clear for a new live entry." if not runtime_blockers else "Resolve runtime connectivity blockers before a new live buy.",
+        }
 
     def replay_confidence_halt_reason(self) -> str | None:
         if not self.settings.halt_on_low_replay_confidence:
@@ -5221,6 +5275,7 @@ class BotState:
         stale_balance_positions = self._stale_balance_positions(wallet_public_key)
         readiness_halt = self.readiness_halt_reason(readiness)
         confirmed_buy_spend_over_trade_cap = self._has_confirmed_buy_spend_over_trade_cap(wallet_public_key)
+        wallet_balance = self._entry_wallet_balance_status(wallet_public_key)
         blocker_context = {
             "signer": signer,
             "caps": caps,
@@ -5231,6 +5286,7 @@ class BotState:
             "stale_balance_positions": stale_balance_positions,
             "readiness_halt": readiness_halt,
             "confirmed_buy_spend_over_trade_cap": confirmed_buy_spend_over_trade_cap,
+            "wallet_balance": wallet_balance,
         }
         blockers = self._live_execution_blockers(env_live_enabled, "buy", wallet_public_key, signer_mode, autonomous=False, **blocker_context)
         sell_blockers = self._live_execution_blockers(env_live_enabled, "sell", wallet_public_key, signer_mode, autonomous=False, **blocker_context)
@@ -5277,6 +5333,13 @@ class BotState:
         live_pnl = {**wallet_metrics, "open_positions": int(wallet_metrics["open_positions"]), "approximate": True}
         pre_run_backup = backup
         source_degraded_mode = self._source_degraded_mode(source_health, env_live_enabled=env_live_enabled, sell_blockers=sell_blockers)
+        runtime_connectivity = self._runtime_connectivity_status(
+            source_health=source_health,
+            signer=signer,
+            wallet_balance=wallet_balance,
+            unresolved=unresolved,
+            blockers=blockers,
+        )
         manual_live_verification = self._manual_live_verification_status(wallet_public_key, signer_mode)
         full_sniper_gate = self._full_sniper_gate(
             autonomy=autonomy,
@@ -5315,6 +5378,7 @@ class BotState:
             "autonomy": autonomy,
             "mode_visibility": mode_visibility,
             "source_degraded_mode": source_degraded_mode,
+            "runtime_connectivity": runtime_connectivity,
             "full_sniper_gate": full_sniper_gate,
             "manual_live_verification": manual_live_verification,
             "pre_run_backup": pre_run_backup,
