@@ -109,6 +109,12 @@ scripts\start-signer-daemon.ps1 -AuthToken $env:CRYPTOARC_SIGNER_AUTH_TOKEN -Max
 
 The backend must also be configured with the same token through `LIVE_SIGNER_DAEMON_AUTH_TOKEN` and the local URL through `LIVE_SIGNER_DAEMON_URL`. Keep the URL on `127.0.0.1` or `localhost`; remote signer URLs are rejected before any signer request is sent.
 
+## Rent Recovery
+
+The live wallet workspace includes a manual Rent Recovery tool for reclaiming SOL locked in unused token-account rent. It scans the selected wallet through RPC, lists only zero-balance token accounts as eligible, and excludes token accounts tied to open live positions.
+
+Closing a token account is permanent. If the wallet later trades that mint again, the token account may need to be recreated and rent paid again. Use the preview step first, then sign the close transaction manually from the browser wallet. Rent recovery never runs automatically during trading and never closes accounts with nonzero token balances.
+
 Hot-wallet status and launch-readiness reports expose only public wallet metadata, lock state, and the `local_encrypted_sidecar` storage scope. They do not expose the vault filesystem path, seed phrases, private keys, or encrypted payload fields. Database backup artifacts restore ledger and app state, but they intentionally do not embed the hot-wallet sidecar; after a restore, re-check the hot-wallet status and re-import or unlock the local wallet before arming `local_hot_wallet`. If the restored database still has old hot-wallet metadata but the sidecar is missing, startup, restore reload, and status checks clear the stale public key and label from live settings, persist that cleanup, and disarm any stale `local_hot_wallet` backend authorization.
 
 `full_sniper_gate` is the final unattended buy-and-sell gate. It is ready only when entry autonomy, exit autonomy, active backend match, normal source mode, fresh pre-run backup, and a recent clean confirmed/reconciled manual-live proof for the selected wallet and selected signer path all pass. A proof audit with recorded errors, pending reconciliation, or review debt does not qualify. Override records remain audit-only and do not mark this gate ready.

@@ -169,6 +169,22 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("quote_shadow_total_cost_sol", types)
         self.assertIn("total_fees_sol", types)
 
+    def test_live_workspace_uses_safe_priority_fee_minimum_and_rent_recovery(self) -> None:
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        api = (ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
+        types = (ROOT / "frontend" / "src" / "types.ts").read_text(encoding="utf-8")
+        main = (ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn('min="0.00001"', app)
+        self.assertNotIn('Priority fee SOL\n                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" type="number" min="0.001"', app)
+        self.assertIn("fetchRentRecoveryScan", api)
+        self.assertIn("createRentRecoveryPreview", api)
+        self.assertIn("Rent Recovery", app)
+        self.assertIn("rentRecoveryScan", app)
+        self.assertIn("signAndSendRentRecovery", app)
+        self.assertIn("RentRecoveryScan", types)
+        self.assertIn("/api/live/rent-recovery", main)
+
     def test_dashboard_exposes_net_pnl_and_live_fill_audit(self) -> None:
         stats = (ROOT / "frontend" / "src" / "components" / "StatsGrid.tsx").read_text(encoding="utf-8")
         monitor = (ROOT / "frontend" / "src" / "pages" / "MonitorPage.tsx").read_text(encoding="utf-8")

@@ -325,6 +325,11 @@ class LiveConfirmPayload(BaseModel):
     error: str = Field(default="", max_length=500)
 
 
+class LiveRentRecoveryPreviewPayload(BaseModel):
+    wallet_public_key: str = Field(min_length=1, max_length=100)
+    token_accounts: list[str] = Field(default_factory=list, min_length=1, max_length=40)
+
+
 def require_auth(authorization: str | None = Header(default=None)) -> None:
     token = None
     if authorization and authorization.lower().startswith("bearer "):
@@ -1506,6 +1511,22 @@ async def live_positions(wallet_public_key: str = "") -> list[dict]:
 @app.get("/api/live/audit", dependencies=[Depends(require_auth)])
 async def live_audit() -> list[dict]:
     return state.live_audit()
+
+
+@app.get("/api/live/rent-recovery", dependencies=[Depends(require_auth)])
+async def live_rent_recovery(wallet_public_key: str) -> dict:
+    try:
+        return state.live_rent_recovery_scan(wallet_public_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/live/rent-recovery/preview", dependencies=[Depends(require_auth)])
+async def live_rent_recovery_preview(payload: LiveRentRecoveryPreviewPayload) -> dict:
+    try:
+        return state.live_rent_recovery_preview(payload.wallet_public_key, payload.token_accounts)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/live/profit-sweeps", dependencies=[Depends(require_auth)])

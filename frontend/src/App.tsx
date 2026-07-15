@@ -31,6 +31,7 @@ import {
   clearHotWallet,
   confirmLiveAudit,
   cancelLiveIntent,
+  createRentRecoveryPreview,
   createLiveIntent,
   createLiveQuote,
   createExperiment,
@@ -47,6 +48,7 @@ import {
   fetchLivePositions,
   fetchLiveStatus,
   fetchLiveWalletBalance,
+  fetchRentRecoveryScan,
   fetchLatencyStatus,
   fetchAlertStatus,
   fetchHotWalletStatus,
@@ -113,7 +115,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
 import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
@@ -143,6 +145,9 @@ type WalletSpendEstimate = {
   requested_amount_sol: number;
   max_trade_cap_sol: number;
   exceeds_max_trade_cap: boolean;
+  rent_dominates_trade?: boolean;
+  wallet_spend_to_trade_ratio?: number;
+  setup_rent_to_trade_ratio?: number;
   confidence?: string;
   components?: Record<string, number>;
 };
@@ -158,6 +163,9 @@ function walletSpendEstimate(audit: LiveExecutionAudit | null): WalletSpendEstim
     requested_amount_sol: Number(estimate.requested_amount_sol ?? 0),
     max_trade_cap_sol: Number(estimate.max_trade_cap_sol ?? 0),
     exceeds_max_trade_cap: Boolean(estimate.exceeds_max_trade_cap),
+    rent_dominates_trade: Boolean(estimate.rent_dominates_trade),
+    wallet_spend_to_trade_ratio: Number(estimate.wallet_spend_to_trade_ratio ?? 0),
+    setup_rent_to_trade_ratio: Number(estimate.setup_rent_to_trade_ratio ?? 0),
     confidence: String(estimate.confidence ?? ""),
     components: typeof estimate.components === "object" && estimate.components ? estimate.components as Record<string, number> : undefined,
   };
@@ -169,7 +177,8 @@ function WalletSpendEstimateLine({ audit }: { audit: LiveExecutionAudit | null }
   return (
     <div className={`mt-3 border-l-2 px-3 py-2 text-xs ${estimate.exceeds_max_trade_cap ? "border-rose-400 bg-rose-500/10 text-rose-100" : "border-emerald-400 bg-emerald-500/10 text-emerald-100"}`}>
       <span className="block font-black uppercase tracking-widest">Estimated wallet spend: {estimate.estimated_wallet_spend_sol.toFixed(6)} SOL</span>
-      <span className="mt-1 block text-[11px] text-zinc-300">Requested {estimate.requested_amount_sol.toFixed(6)} SOL / cap {estimate.max_trade_cap_sol.toFixed(6)} SOL / setup rent {(Number(estimate.components?.token_account_setup_rent_sol ?? 0)).toFixed(6)} SOL</span>
+      <span className="mt-1 block text-[11px] text-zinc-300">Trade {estimate.requested_amount_sol.toFixed(6)} / setup rent {(Number(estimate.components?.token_account_setup_rent_sol ?? 0)).toFixed(6)} / network {(Number(estimate.components?.network_fee_sol ?? 0)).toFixed(6)} / priority {(Number(estimate.components?.priority_fee_sol ?? 0)).toFixed(6)} SOL</span>
+      {estimate.rent_dominates_trade ? <span className="mt-1 block text-[11px] font-bold text-amber-100">Setup rent dominates this dust buy ({estimate.wallet_spend_to_trade_ratio?.toFixed(2)}x wallet spend vs trade size).</span> : null}
     </div>
   );
 }
@@ -589,6 +598,9 @@ function App() {
   const [livePool, setLivePool] = React.useState("pump");
   const [activeLiveAudit, setActiveLiveAudit] = React.useState<LiveExecutionAudit | null>(null);
   const [activeLiveIntentId, setActiveLiveIntentId] = React.useState("");
+  const [rentRecoveryScan, setRentRecoveryScan] = React.useState<RentRecoveryScan | null>(null);
+  const [rentRecoveryPreview, setRentRecoveryPreview] = React.useState<RentRecoveryPreview | null>(null);
+  const [rentRecoverySignature, setRentRecoverySignature] = React.useState("");
   const [backtestLimit, setBacktestLimit] = React.useState(80);
   const [backtestProfile, setBacktestProfile] = React.useState<BotSettings["strategy_profile"]>("balanced");
   const [backtestDateFrom, setBacktestDateFrom] = React.useState("");
@@ -1134,14 +1146,16 @@ function App() {
     if (liveWalletDetailRefreshInFlight.current) return;
     liveWalletDetailRefreshInFlight.current = true;
     try {
-      const [audits, intents, ledger] = await Promise.all([
+      const [audits, intents, ledger, rentScan] = await Promise.all([
         fetchLiveAudit(),
         fetchLiveIntents(),
-        force && selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(liveLedgerRef.current ?? emptyLiveLedger())
+        force && selectedLivePnlWallet ? fetchLiveLedger(selectedLivePnlWallet) : Promise.resolve(liveLedgerRef.current ?? emptyLiveLedger()),
+        selectedLivePnlWallet && selectedLivePnlWallet !== "paper" ? fetchRentRecoveryScan(selectedLivePnlWallet).catch(() => null) : Promise.resolve(null)
       ]);
       setLiveAudit(audits);
       setLiveIntents(intents);
       setLiveLedger(ledger);
+      setRentRecoveryScan(rentScan);
     } finally {
       liveWalletDetailRefreshInFlight.current = false;
     }
@@ -1761,6 +1775,67 @@ function App() {
     }
   }
 
+  async function refreshRentRecovery() {
+    const wallet = selectedLivePnlWallet && selectedLivePnlWallet !== "paper" ? selectedLivePnlWallet : resolvedLiveWallet();
+    if (!wallet) {
+      setApiError("Rent recovery requires a selected live wallet.");
+      return;
+    }
+    try {
+      const scan = await fetchRentRecoveryScan(wallet);
+      setRentRecoveryScan(scan);
+      setRentRecoveryPreview(null);
+      setRentRecoverySignature("");
+      setApiError("");
+    } catch (error) {
+      setApiError(`Rent recovery scan failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function previewRentRecovery() {
+    const wallet = rentRecoveryScan?.wallet_public_key || (selectedLivePnlWallet !== "paper" ? selectedLivePnlWallet : resolvedLiveWallet());
+    const accounts = rentRecoveryScan?.eligible_accounts.map((account) => account.token_account) ?? [];
+    if (!wallet || !accounts.length) {
+      setApiError("No eligible zero-balance token accounts are available to close.");
+      return;
+    }
+    try {
+      const preview = await createRentRecoveryPreview(wallet, accounts);
+      setRentRecoveryPreview(preview);
+      setRentRecoverySignature("");
+      setApiError("");
+    } catch (error) {
+      setApiError(`Rent recovery preview failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
+  async function signAndSendRentRecovery() {
+    if (!rentRecoveryPreview?.unsigned_transaction_base64) return;
+    try {
+      if (!window.solana) throw new Error("Browser wallet not connected");
+      const { Connection, VersionedTransaction } = await loadSolanaWeb3();
+      const bytes = Uint8Array.from(atob(rentRecoveryPreview.unsigned_transaction_base64), (char) => char.charCodeAt(0));
+      const transaction = VersionedTransaction.deserialize(bytes);
+      let signature = "";
+      if (window.solana.signAndSendTransaction) {
+        signature = (await window.solana.signAndSendTransaction(transaction)).signature;
+      } else if (window.solana.signTransaction) {
+        const signed = await window.solana.signTransaction(transaction);
+        const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
+        signature = await connection.sendTransaction(signed);
+      } else {
+        throw new Error("Wallet does not support transaction signing");
+      }
+      setRentRecoverySignature(signature);
+      await refreshConnectedWalletBalance(rentRecoveryPreview.wallet_public_key);
+      await refreshRentRecovery();
+      setRentRecoverySignature(signature);
+      setApiError("");
+    } catch (error) {
+      setApiError(`Rent recovery signing failed: ${error instanceof Error ? error.message : "unknown error"}`);
+    }
+  }
+
   async function refreshLiveExecutionSurfaces() {
     await Promise.all([
       refreshLiveWalletCoreData(),
@@ -2098,6 +2173,9 @@ function App() {
           livePositions={livePositions}
           liveIntents={liveIntents}
           liveLedger={liveLedger}
+          rentRecoveryScan={rentRecoveryScan}
+          rentRecoveryPreview={rentRecoveryPreview}
+          rentRecoverySignature={rentRecoverySignature}
           liveAction={liveAction}
           liveMint={liveMint}
           liveAmount={liveAmount}
@@ -2139,6 +2217,9 @@ function App() {
           onSignAndSendLive={signAndSendLiveAudit}
           onRecoverAllLiveAudits={recoverAllLiveAudits}
           onRecoverLiveAudit={recoverSingleLiveAudit}
+          onRefreshRentRecovery={refreshRentRecovery}
+          onPreviewRentRecovery={previewRentRecovery}
+          onSignAndSendRentRecovery={signAndSendRentRecovery}
         />
       )}
 
@@ -2251,6 +2332,9 @@ function GuidedLiveWalletModal({
   livePositions,
   liveIntents,
   liveLedger,
+  rentRecoveryScan,
+  rentRecoveryPreview,
+  rentRecoverySignature,
   liveAction,
   liveMint,
   liveAmount,
@@ -2291,7 +2375,10 @@ function GuidedLiveWalletModal({
   onSimulateActiveAudit,
   onSignAndSendLive,
   onRecoverAllLiveAudits,
-  onRecoverLiveAudit
+  onRecoverLiveAudit,
+  onRefreshRentRecovery,
+  onPreviewRentRecovery,
+  onSignAndSendRentRecovery
 }: {
   initialView: "setup" | "workspace";
   method: LiveWalletMethod;
@@ -2304,6 +2391,9 @@ function GuidedLiveWalletModal({
   livePositions: LivePosition[];
   liveIntents: LiveIntent[];
   liveLedger: LiveLedger | null;
+  rentRecoveryScan: RentRecoveryScan | null;
+  rentRecoveryPreview: RentRecoveryPreview | null;
+  rentRecoverySignature: string;
   liveAction: "buy" | "sell";
   liveMint: string;
   liveAmount: string;
@@ -2358,6 +2448,9 @@ function GuidedLiveWalletModal({
   onSignAndSendLive: () => Promise<void>;
   onRecoverAllLiveAudits: () => Promise<void>;
   onRecoverLiveAudit: (auditId: string) => Promise<void>;
+  onRefreshRentRecovery: () => Promise<void>;
+  onPreviewRentRecovery: () => Promise<void>;
+  onSignAndSendRentRecovery: () => Promise<void>;
 }) {
   type WorkspaceAction = "acknowledge" | "arm" | "disarm" | "reconnect" | "lock" | "clear";
   type BlockerFixField = {
@@ -3394,6 +3487,27 @@ function GuidedLiveWalletModal({
                   <span className="rounded-xl border border-white/5 bg-black/25 p-3 text-[10px] font-bold uppercase tracking-[0.22em] text-zinc-400">Last check <strong className="block truncate pt-1 text-xs text-white">{liveStatus?.last_live_poll_at ? new Date(liveStatus.last_live_poll_at).toLocaleTimeString() : "not run"}</strong></span>
                 </div>
                 <p className="mb-3 rounded-xl border border-white/5 bg-black/20 p-3 text-xs text-zinc-400">Recovery summary: checked {Number(recoverySummary?.checked ?? 0)}, updated {Number(recoverySummary?.updated ?? 0)}{recoverySummary?.reason ? ` / ${recoverySummary.reason}` : ""}</p>
+                <article className="mb-3 rounded-xl border border-emerald-500/15 bg-emerald-500/[0.045] p-3">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-[10px] font-black uppercase tracking-[0.24em] text-emerald-200">Rent Recovery</p>
+                      <p className="mt-1 text-xs text-zinc-300">Close only zero-balance token accounts for this wallet. Open live positions and nonzero token balances are excluded.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10" onClick={onRefreshRentRecovery}>Scan</button>
+                      <button className="h-8 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 text-[10px] font-bold tracking-wide text-emerald-100 transition hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onPreviewRentRecovery} disabled={!rentRecoveryScan?.eligible_count}>Preview Close</button>
+                      <button className="h-8 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendRentRecovery} disabled={method !== "browser_wallet" || !rentRecoveryPreview?.unsigned_transaction_base64}>Sign & Send</button>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-4">
+                    <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Eligible <strong className="block pt-1 text-xs text-white">{rentRecoveryScan?.eligible_count ?? 0}</strong></span>
+                    <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Recoverable <strong className="block pt-1 text-xs text-white">{(rentRecoveryScan?.recoverable_rent_sol ?? 0).toFixed(6)} SOL</strong></span>
+                    <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Preview <strong className="block pt-1 text-xs text-white">{rentRecoveryPreview?.selected_count ?? 0} accounts</strong></span>
+                    <span className="rounded-lg border border-white/5 bg-black/25 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Mode <strong className="block pt-1 text-xs text-white">{method === "browser_wallet" ? "manual sign" : "browser only"}</strong></span>
+                  </div>
+                  {rentRecoveryScan?.eligible_accounts.length ? <p className="mt-2 truncate text-[11px] text-zinc-400">Next eligible: {rentRecoveryScan.eligible_accounts[0].mint} / {rentRecoveryScan.eligible_accounts[0].rent_sol.toFixed(6)} SOL</p> : null}
+                  {rentRecoverySignature ? <p className="mt-2 truncate text-xs font-bold text-emerald-100">Submitted rent recovery: {rentRecoverySignature}</p> : null}
+                </article>
                 <div className="grid max-h-72 gap-2 overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent lg:grid-cols-2">
                   {reviewAudits.slice(0, 8).map((audit) => (
                     <article key={audit.id} className="rounded-xl border border-white/5 bg-black/25 p-3">
@@ -4000,7 +4114,7 @@ function LegacyLiveWalletModal({
                   </label>
                   <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
                     Priority fee SOL
-                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" type="number" min="0.001" step="0.00001" value={livePriorityFee} onChange={(event) => onLivePriorityFeeChange(Number(event.target.value))} />
+                    <input className="mt-1 h-10 w-full rounded-lg border border-white/10 bg-black/40 px-3 text-xs font-bold normal-case tracking-normal text-white" type="number" min="0.00001" step="0.00001" value={livePriorityFee} onChange={(event) => onLivePriorityFeeChange(Number(event.target.value))} />
                   </label>
                   <label className="text-[10px] font-black uppercase tracking-widest text-zinc-500">
                     Pool

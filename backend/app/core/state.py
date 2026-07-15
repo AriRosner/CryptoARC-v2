@@ -15,6 +15,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from solders.hash import Hash
+from solders.instruction import AccountMeta, Instruction
+from solders.message import MessageV0
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
+
 from app.core.models import (
     BacktestRun,
     BotSettings,
@@ -63,6 +69,8 @@ LAMPORTS_PER_SOL = 1_000_000_000
 SOLANA_SIGNATURE_BASE_FEE_LAMPORTS = 5_000
 LIVE_BUY_TOKEN_ACCOUNT_SETUP_RENT_SOL = 0.00391848
 LIVE_BUY_PROGRAM_FEE_BUFFER_SOL = 0.00002
+SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 from app.core.strategy import DecisionPipeline
 
 
@@ -5892,6 +5900,17 @@ class BotState:
                     "Buy previews must estimate full wallet spend, including first-token account setup rent and network fees.",
                 )
             )
+            if wallet_spend_estimate.get("rent_dominates_trade"):
+                preflight_checks.append(
+                    self._preflight_check(
+                        "rent_dominance",
+                        "Setup Rent Dominance",
+                        "warn" if not shadow_only else "pass",
+                        wallet_spend_estimate.get("wallet_spend_to_trade_ratio"),
+                        "<= 2x requested buy",
+                        "Token-account setup rent dominates this dust buy; use a larger proof size or an existing token account if practical.",
+                    )
+                )
         if action == "sell":
             balance = self._wallet_token_balance(wallet_public_key, mint)
             if balance["error"]:
@@ -5963,7 +5982,10 @@ class BotState:
             caps_snapshot=self.live_caps_snapshot(),
             balance_snapshot=balance,
             errors=blockers,
-            warnings=["Shadow-only quote is evidence-only and cannot be submitted"] if shadow_only and not env_live_enabled else ["Simulation warnings do not absolutely block manual signing"] if not blockers else [],
+            warnings=(
+                ["Shadow-only quote is evidence-only and cannot be submitted"] if shadow_only and not env_live_enabled else ["Simulation warnings do not absolutely block manual signing"] if not blockers else []
+            )
+            + (["Token-account setup rent dominates this buy; review total wallet spend before signing."] if wallet_spend_estimate.get("rent_dominates_trade") and not blockers else []),
             final_status=quote.status,
             intent_id=intent.id,
         )
@@ -5993,11 +6015,16 @@ class BotState:
         program_fee_buffer = LIVE_BUY_PROGRAM_FEE_BUFFER_SOL
         estimated = round(requested_amount + network_fee + setup_rent + program_fee_buffer, 9)
         cap = round(float(self.settings.live_max_trade_sol or 0.0), 9)
+        spend_ratio = round(estimated / requested_amount, 4) if requested_amount > 0 else 0.0
+        rent_ratio = round(setup_rent / requested_amount, 4) if requested_amount > 0 else 0.0
         return {
             "estimated_wallet_spend_sol": estimated,
             "requested_amount_sol": round(requested_amount, 9),
             "max_trade_cap_sol": cap,
             "exceeds_max_trade_cap": bool(cap > 0 and estimated > cap),
+            "wallet_spend_to_trade_ratio": spend_ratio,
+            "setup_rent_to_trade_ratio": rent_ratio,
+            "rent_dominates_trade": bool(requested_amount > 0 and spend_ratio > 2.0),
             "confidence": "conservative_static_estimate",
             "components": {
                 "requested_amount_sol": round(requested_amount, 9),
@@ -6830,7 +6857,7 @@ class BotState:
             return []
         blockers = []
         for row in rows:
-            if str(row.get("status") or "").lower() != "pass":
+            if str(row.get("status") or "").lower() == "fail":
                 label = str(row.get("label") or row.get("id") or "preflight")
                 reason = str(row.get("reason") or "failed")
                 blockers.append(f"{label}: {reason}")
@@ -6843,6 +6870,112 @@ class BotState:
             return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": "", "checked_at": checked_at}
         except Exception as exc:
             return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}", "checked_at": checked_at}
+
+    def live_rent_recovery_scan(self, wallet_public_key: str) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        if not wallet:
+            raise ValueError("wallet public key is required")
+        accounts = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_accounts(wallet)
+        open_mints = {
+            position.mint
+            for position in self.storage.load_live_ledger_positions(500)
+            if position.wallet_public_key == wallet and position.status == "open" and position.mint
+        }
+        eligible: list[dict[str, object]] = []
+        ineligible: list[dict[str, object]] = []
+        for account in accounts:
+            normalized = {
+                "token_account": str(account.get("token_account") or ""),
+                "mint": str(account.get("mint") or ""),
+                "owner": str(account.get("owner") or wallet),
+                "program_id": str(account.get("program_id") or SPL_TOKEN_PROGRAM_ID),
+                "token_amount": float(account.get("token_amount") or 0.0),
+                "token_amount_raw": str(account.get("token_amount_raw") or "0"),
+                "decimals": int(account.get("decimals") or 0),
+                "lamports": int(account.get("lamports") or 0),
+                "rent_sol": round(float(account.get("rent_sol") or 0.0), 9),
+            }
+            reason = ""
+            if not normalized["token_account"] or not normalized["mint"]:
+                reason = "token account or mint is missing"
+            elif normalized["owner"] != wallet:
+                reason = "token account owner does not match selected wallet"
+            elif normalized["program_id"] not in {SPL_TOKEN_PROGRAM_ID, SPL_TOKEN_2022_PROGRAM_ID}:
+                reason = "unsupported token program"
+            elif str(normalized["token_amount_raw"]) not in {"", "0"} or float(normalized["token_amount"] or 0.0) != 0.0:
+                reason = "non-zero token balance"
+            elif normalized["mint"] in open_mints:
+                reason = "mint has an open live position"
+            elif int(normalized["lamports"] or 0) <= 0:
+                reason = "no recoverable rent lamports"
+            if reason:
+                ineligible.append({**normalized, "eligible": False, "reason": reason})
+            else:
+                eligible.append({**normalized, "eligible": True, "reason": "zero-balance token account"})
+        recoverable = round(sum(float(item.get("rent_sol") or 0.0) for item in eligible), 9)
+        return {
+            "wallet_public_key": wallet,
+            "eligible_accounts": eligible,
+            "ineligible_accounts": ineligible,
+            "eligible_count": len(eligible),
+            "ineligible_count": len(ineligible),
+            "recoverable_rent_sol": recoverable,
+            "manual_approval_required": True,
+            "operator_action": "Review eligible zero-balance token accounts, then create a close-account preview for wallet signing.",
+        }
+
+    def live_rent_recovery_preview(self, wallet_public_key: str, token_accounts: list[str]) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        selected = [account.strip() for account in token_accounts if account.strip()]
+        if not wallet:
+            raise ValueError("wallet public key is required")
+        if not selected:
+            raise ValueError("at least one token account is required")
+        scan = self.live_rent_recovery_scan(wallet)
+        eligible_by_account = {str(item["token_account"]): item for item in scan["eligible_accounts"]}
+        missing = [account for account in selected if account not in eligible_by_account]
+        if missing:
+            raise ValueError(f"selected token accounts are not eligible: {', '.join(missing[:5])}")
+        client = SolanaReadOnlyClient(self.settings.solana_rpc_url)
+        blockhash = client.latest_blockhash()
+        payer = Pubkey.from_string(wallet)
+        instructions = [
+            self._close_token_account_instruction(
+                token_account=str(eligible_by_account[account]["token_account"]),
+                destination_wallet=wallet,
+                owner_wallet=wallet,
+                program_id=str(eligible_by_account[account]["program_id"]),
+            )
+            for account in selected
+        ]
+        message = MessageV0.try_compile(payer, instructions, [], Hash.from_string(blockhash))
+        transaction = VersionedTransaction.populate(message, [])
+        selected_accounts = [eligible_by_account[account] for account in selected]
+        recoverable = round(sum(float(item.get("rent_sol") or 0.0) for item in selected_accounts), 9)
+        return {
+            "wallet_public_key": wallet,
+            "selected_accounts": selected_accounts,
+            "selected_count": len(selected_accounts),
+            "recoverable_rent_sol": recoverable,
+            "unsigned_transaction_base64": base64.b64encode(bytes(transaction)).decode("utf-8"),
+            "manual_approval_required": True,
+            "status": "ready_for_signature",
+            "warnings": [
+                "Only zero-balance token accounts are included.",
+                "Closing a token account is permanent; recreating it later requires paying rent again.",
+            ],
+        }
+
+    def _close_token_account_instruction(self, token_account: str, destination_wallet: str, owner_wallet: str, program_id: str) -> Instruction:
+        return Instruction(
+            Pubkey.from_string(program_id),
+            bytes([9]),
+            [
+                AccountMeta(Pubkey.from_string(token_account), False, True),
+                AccountMeta(Pubkey.from_string(destination_wallet), False, True),
+                AccountMeta(Pubkey.from_string(owner_wallet), True, False),
+            ],
+        )
 
     def _signature_status(self, signature: str) -> dict[str, object]:
         signature = signature.strip()

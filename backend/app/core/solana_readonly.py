@@ -47,6 +47,50 @@ class SolanaReadOnlyClient:
             return None
         return round(float(lamports) / 1_000_000_000, 9)
 
+    def latest_blockhash(self) -> str:
+        result = self.rpc("getLatestBlockhash", [{"commitment": "confirmed"}]).get("result") or {}
+        value = result.get("value") or {}
+        return str(value.get("blockhash") or "")
+
+    def token_accounts(self, wallet_address: str) -> list[dict[str, Any]]:
+        wallet_address = wallet_address.strip()
+        if not wallet_address:
+            return []
+        accounts: list[dict[str, Any]] = []
+        for program_id in (
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        ):
+            result = self.rpc(
+                "getTokenAccountsByOwner",
+                [
+                    wallet_address,
+                    {"programId": program_id},
+                    {"encoding": "jsonParsed"},
+                ],
+            ).get("result") or {}
+            for item in result.get("value", []):
+                account = item.get("account", {}) or {}
+                info = account.get("data", {}).get("parsed", {}).get("info", {})
+                token_amount = info.get("tokenAmount", {}) or {}
+                amount_raw = str(token_amount.get("amount") or "0")
+                ui_amount = token_amount.get("uiAmount")
+                lamports = int(account.get("lamports") or 0)
+                accounts.append(
+                    {
+                        "token_account": str(item.get("pubkey") or ""),
+                        "mint": str(info.get("mint") or ""),
+                        "owner": str(info.get("owner") or wallet_address),
+                        "program_id": program_id,
+                        "token_amount": float(ui_amount if ui_amount is not None else 0.0),
+                        "token_amount_raw": amount_raw,
+                        "decimals": int(token_amount.get("decimals") or 0),
+                        "lamports": lamports,
+                        "rent_sol": round(lamports / 1_000_000_000, 9),
+                    }
+                )
+        return accounts
+
     def token_balance(self, wallet_address: str, mint: str) -> float | None:
         wallet_address = wallet_address.strip()
         mint = mint.strip()

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from solders.keypair import Keypair
+from solders.transaction import VersionedTransaction
 
 from app.core.alerts import AlertRouter
 from app.core.models import BacktestRun, BotMode, BotSettings, BotStats, BotStatus, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
@@ -1888,6 +1889,85 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(checks["estimated_wallet_spend"]["status"], "pass")
             self.assertEqual(estimate["components"]["token_account_setup_rent_sol"], 0.00391848)
             self.assertGreaterEqual(estimate["estimated_wallet_spend_sol"], estimate["requested_amount_sol"] + estimate["components"]["token_account_setup_rent_sol"])
+
+    def test_live_buy_quote_marks_rent_dominant_dust_buy(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.006
+            state.storage.save_settings(state.settings)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")  # type: ignore[method-assign]
+
+            audit = state.live_quote(True, "buy", "MintRentDominant", "0.001", True, 5, 0.00001, "pump", "WalletRentDominant")
+
+            checks = {check["id"]: check for check in audit["preflight_checks"]}
+            estimate = audit["quote"]["wallet_spend_estimate"]
+            self.assertTrue(estimate["rent_dominates_trade"])
+            self.assertGreater(estimate["wallet_spend_to_trade_ratio"], 2)
+            self.assertEqual(checks["rent_dominance"]["status"], "warn")
+            self.assertTrue(any("setup rent dominates" in warning.lower() for warning in audit["warnings"]))
+
+    def test_live_rent_recovery_scan_only_allows_zero_balance_non_open_positions(self) -> None:
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def token_accounts(self, wallet_public_key: str) -> list[dict[str, object]]:
+                return [
+                    {"token_account": "AcctEmpty", "mint": "MintEmpty", "token_amount": 0.0, "rent_sol": 0.002, "lamports": 2_000_000, "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"token_account": "AcctNonzero", "mint": "MintNonzero", "token_amount": 1.0, "rent_sol": 0.002, "lamports": 2_000_000, "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                    {"token_account": "AcctOpen", "mint": "MintOpen", "token_amount": 0.0, "rent_sol": 0.002, "lamports": 2_000_000, "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                ]
+
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.storage.save_live_ledger_position(
+                LiveLedgerPosition(
+                    id="pos_open_rent",
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                    mint="MintOpen",
+                    wallet_public_key="WalletRent",
+                    status="open",
+                    token_balance=0.0,
+                )
+            )
+
+            with patch("app.core.state.SolanaReadOnlyClient", FakeClient):
+                scan = state.live_rent_recovery_scan("WalletRent")
+
+            self.assertEqual(scan["eligible_count"], 1)
+            self.assertEqual(scan["recoverable_rent_sol"], 0.002)
+            self.assertEqual(scan["eligible_accounts"][0]["token_account"], "AcctEmpty")
+            ineligible = {item["token_account"]: item["reason"] for item in scan["ineligible_accounts"]}
+            self.assertIn("non-zero", ineligible["AcctNonzero"])
+            self.assertIn("open live position", ineligible["AcctOpen"])
+
+    def test_live_rent_recovery_preview_builds_unsigned_close_transaction(self) -> None:
+        class FakeClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def token_accounts(self, wallet_public_key: str) -> list[dict[str, object]]:
+                return [
+                    {"token_account": "11111111111111111111111111111112", "mint": "MintEmpty", "token_amount": 0.0, "rent_sol": 0.002, "lamports": 2_000_000, "program_id": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                ]
+
+            def latest_blockhash(self) -> str:
+                return "11111111111111111111111111111111"
+
+        wallet = str(Keypair().pubkey())
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            with patch("app.core.state.SolanaReadOnlyClient", FakeClient):
+                preview = state.live_rent_recovery_preview(wallet, ["11111111111111111111111111111112"])
+
+            raw = base64.b64decode(preview["unsigned_transaction_base64"])
+            transaction = VersionedTransaction.from_bytes(raw)
+            self.assertEqual(preview["selected_count"], 1)
+            self.assertEqual(preview["recoverable_rent_sol"], 0.002)
+            self.assertEqual(preview["manual_approval_required"], True)
+            self.assertEqual(len(transaction.message.instructions), 1)
 
     def test_live_quote_validates_caps_and_disabled_signer(self) -> None:
         with TemporaryDirectory() as directory:

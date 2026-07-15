@@ -2199,6 +2199,42 @@ export interface LiveLedger {
   };
 }
 
+export interface RentRecoveryAccount {
+  token_account: string;
+  mint: string;
+  owner: string;
+  program_id: string;
+  token_amount: number;
+  token_amount_raw: string;
+  decimals: number;
+  lamports: number;
+  rent_sol: number;
+  eligible: boolean;
+  reason: string;
+}
+
+export interface RentRecoveryScan {
+  wallet_public_key: string;
+  eligible_accounts: RentRecoveryAccount[];
+  ineligible_accounts: RentRecoveryAccount[];
+  eligible_count: number;
+  ineligible_count: number;
+  recoverable_rent_sol: number;
+  manual_approval_required: boolean;
+  operator_action: string;
+}
+
+export interface RentRecoveryPreview {
+  wallet_public_key: string;
+  selected_accounts: RentRecoveryAccount[];
+  selected_count: number;
+  recoverable_rent_sol: number;
+  unsigned_transaction_base64: string;
+  manual_approval_required: boolean;
+  status: string;
+  warnings: string[];
+}
+
 export interface LivePosition {
   mint: string;
   symbol: string;
