@@ -1373,6 +1373,10 @@ export interface WatchdogStatus {
   status: string;
   bot_running: boolean;
   last_tick_at: string | null;
+  last_tick_tokens_seen: number;
+  last_tick_active_tokens: number;
+  last_tick_closed: number;
+  last_tick_completed_at: string | null;
   tick_age_seconds: number | null;
   last_ingested_launch_at: string | null;
   launch_ingestion_age_seconds: number | null;
@@ -2235,6 +2239,7 @@ export interface RentRecoveryScan {
 }
 
 export interface RentRecoveryPreview {
+  audit_id: string;
   wallet_public_key: string;
   selected_accounts: RentRecoveryAccount[];
   selected_count: number;

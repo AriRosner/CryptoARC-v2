@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,37 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptSafetyTests(unittest.TestCase):
+    def test_signer_health_callers_allow_rpc_probe_timeout_margin(self) -> None:
+        daemon = (ROOT / "tools" / "local_signer_daemon.py").read_text(encoding="utf-8")
+        state = (ROOT / "backend" / "app" / "core" / "state.py").read_text(encoding="utf-8")
+        start_script = (ROOT / "scripts" / "start-signer-daemon.ps1").read_text(encoding="utf-8")
+
+        daemon_timeout = float(re.search(r"RPC_HEALTH_TIMEOUT_SECONDS\s*=\s*([0-9.]+)", daemon).group(1))
+        health_start = state.index("    def _local_signer_daemon_status")
+        health_end = state.index("\n    def _local_signer_daemon_endpoint_allowed", health_start)
+        health_block = state[health_start:health_end]
+        backend_timeout = float(re.search(r"urlopen\(request, timeout=([0-9.]+)\)", health_block).group(1))
+        startup_timeout = float(re.search(r"Invoke-RestMethod[^\r\n]+-TimeoutSec\s+([0-9.]+)", start_script).group(1))
+
+        self.assertEqual(daemon_timeout, 1.0)
+        with self.subTest(caller="backend"):
+            self.assertGreaterEqual(backend_timeout, daemon_timeout + 0.5)
+        with self.subTest(caller="startup_script"):
+            self.assertGreaterEqual(startup_timeout, daemon_timeout + 1.0)
+
+    def test_background_loop_and_compact_websocket_payload_skip_discarded_snapshot_work(self) -> None:
+        main = (ROOT / "backend" / "app" / "main.py").read_text(encoding="utf-8")
+        websocket_start = main.index("def websocket_snapshot_payload()")
+        websocket_end = main.index("\n\nasync def broadcast_snapshot", websocket_start)
+        websocket_payload = main[websocket_start:websocket_end]
+        loop_start = main.index("async def bot_loop()")
+        loop_end = main.index("\n\nasync def live_audit_poll_loop", loop_start)
+        bot_loop = main[loop_start:loop_end]
+
+        self.assertIn("state.snapshot(include_tokens=False).to_dict()", websocket_payload)
+        self.assertNotIn('payload["tokens"] = []', websocket_payload)
+        self.assertIn("state.tick(build_snapshot=False)", bot_loop)
+
     def test_start_dev_records_dynamic_ports_and_frontend_api_base(self) -> None:
         script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
 
@@ -78,6 +110,18 @@ class ScriptSafetyTests(unittest.TestCase):
 
         self.assertIn("tools.local_signer_daemon", start_script)
         self.assertIn("CRYPTOARC_SIGNER_PRIVATE_KEY", start_script)
+        self.assertIn("$hasConfiguredKey", start_script)
+        self.assertIn('if (($hasConfiguredKey -or $AllowSubmit) -and $effectiveAuthToken.Length -lt 32)', start_script)
+        self.assertIn("A configured signer key or AllowSubmit requires a signer auth token of at least 32 characters", start_script)
+        self.assertIn('$healthUrl = "http://$HostName`:$Port/health"', start_script)
+        self.assertIn('"Authorization" = "Bearer $effectiveAuthToken"', start_script)
+        self.assertIn("Invoke-RestMethod", start_script)
+        self.assertIn("$process.HasExited", start_script)
+        self.assertIn("$health.ready_to_submit", start_script)
+        self.assertIn('$readyToSubmit = $health.ready_to_submit -is [bool] -and $health.ready_to_submit -eq $true', start_script)
+        self.assertIn('(-not $AllowSubmit -or $readyToSubmit)', start_script)
+        self.assertIn("Stop-Process -Id $process.Id", start_script)
+        self.assertLess(start_script.index("Invoke-RestMethod"), start_script.index("Signer daemon started"))
         self.assertNotIn("Write-Host $env:CRYPTOARC_SIGNER_PRIVATE_KEY", start_script)
         self.assertIn("/health", check_script)
         self.assertIn("Authorization", check_script)
@@ -238,6 +282,34 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("apiDisconnected", app)
         self.assertIn("activeAuditWalletMismatch", app)
         self.assertIn("quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale", app)
+
+    def test_live_sign_send_records_pending_browser_signature_before_backend_submit(self) -> None:
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("cryptoarc_pending_live_signature", app)
+        self.assertIn("recordPendingLiveSignature", app)
+        self.assertLess(app.index("recordPendingLiveSignature(activeLiveAudit, signature)"), app.index("await submitLiveAudit(activeLiveAudit.id, signature)"))
+        self.assertIn("pendingLiveSignature", app)
+        self.assertIn("A browser-wallet transaction was signed but is not yet recorded by the backend", app)
+
+    def test_live_quick_fix_defaults_are_dust_pilot_caps(self) -> None:
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("settings.live_max_trade_sol : 0.001", app)
+        self.assertIn("settings.live_daily_loss_cap_sol : 0.005", app)
+        self.assertIn("settings.live_wallet_exposure_cap_sol : 0.01", app)
+        self.assertIn("settings.live_max_open_positions : 1", app)
+        self.assertIn("settings.live_priority_fee_cap_sol : 0.00001", app)
+        self.assertIn("recommended: 0.001", app)
+        self.assertIn("recommended: 0.005", app)
+
+    def test_live_workspace_displays_runtime_connectivity_guard(self) -> None:
+        app = (ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("const runtimeConnectivity = liveStatus?.runtime_connectivity", app)
+        self.assertIn("Runtime Connectivity", app)
+        self.assertIn("runtimeConnectivity.safe_for_new_entry", app)
+        self.assertIn("runtimeConnectivity.blockers", app)
 
     def test_settings_search_indexes_actual_setting_labels(self) -> None:
         modal = (ROOT / "frontend" / "src" / "components" / "SettingsModal.tsx").read_text(encoding="utf-8")

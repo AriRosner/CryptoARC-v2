@@ -6,6 +6,7 @@ import json
 import re
 import secrets
 import time
+import uuid
 import urllib.error
 import urllib.request
 from collections import Counter, deque
@@ -158,6 +159,10 @@ class BotState:
         self.last_bot_tick_at: datetime | None = None
         self.last_ingested_launch_at: datetime | None = None
         self.last_tick_error: str = ""
+        self.last_tick_tokens_seen = 0
+        self.last_tick_active_tokens = 0
+        self.last_tick_closed = 0
+        self.last_tick_completed_at: datetime | None = None
         self.bot_loop_iterations = 0
         self.live_last_poll_at: datetime | None = None
         self.live_last_poll_summary: dict[str, object] = {"checked": 0, "updated": 0, "skipped": True, "reason": "not run"}
@@ -272,8 +277,9 @@ class BotState:
     def validate_mobile_token(self, token: str, required_scope: str = MOBILE_MONITOR_SCOPE) -> dict[str, object] | None:
         if not token.strip():
             return None
-        device = self.storage.load_mobile_device_by_token_hash(self._hash_mobile_secret(token.strip()))
         now = utc_now()
+        token_hash = self._hash_mobile_secret(token.strip())
+        device = self.storage.load_mobile_device_by_token_hash(token_hash)
         if not device:
             return None
         if str(device.get("revoked_at") or ""):
@@ -283,8 +289,16 @@ class BotState:
         scopes = [str(scope) for scope in device.get("scopes") or []]
         if required_scope and required_scope not in scopes:
             return None
-        device["last_seen_at"] = now.isoformat()
-        self.storage.save_mobile_device(device)
+        device = self.storage.touch_active_mobile_device_by_token_hash(token_hash, now.isoformat())
+        if not device:
+            return None
+        if str(device.get("revoked_at") or ""):
+            return None
+        if self._parse_mobile_time(device.get("expires_at")) <= now:
+            return None
+        scopes = [str(scope) for scope in device.get("scopes") or []]
+        if required_scope and required_scope not in scopes:
+            return None
         return self._public_mobile_device(device)
 
     def revoke_mobile_device(self, device_id: str) -> dict[str, object]:
@@ -617,7 +631,7 @@ class BotState:
         self.storage.save_event(event)
         self.alerts.alert_event(level, subsystem, message, operator_action)
 
-    def _reload_from_storage(self) -> None:
+    def _reload_from_storage(self, persist_settings_version: bool = True) -> None:
         self.settings = self.storage.load_settings()
         self._sync_hot_wallet_settings(self.hot_wallet.status())
         self.tokens = deque(self._hydrate_active_tokens(), maxlen=80)
@@ -625,7 +639,11 @@ class BotState:
         self.backtest_runs = deque(self.storage.load_backtest_runs(), maxlen=20)
         self.source_status.source = self.settings.launch_source
         self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
-        self.current_settings_version_id = self.ensure_settings_version("restore reload", [])
+        if persist_settings_version:
+            self.current_settings_version_id = self.ensure_settings_version("restore reload", [])
+        else:
+            settings_versions = self.storage.load_settings_versions(1)
+            self.current_settings_version_id = settings_versions[0].id if settings_versions else ""
         self.recalculate_stats()
 
     def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> None:
@@ -797,17 +815,22 @@ class BotState:
             self.storage.save_price_observation(observation)
             break
 
-    def tick(self) -> BotSnapshot:
+    def tick(self, *, build_snapshot: bool = True) -> BotSnapshot | None:
         self._ensure_active_tokens_loaded()
         self.last_bot_tick_at = utc_now()
         self.last_tick_error = ""
         self.bot_loop_iterations += 1
+        tokens_seen = 0
+        active_tokens = 0
+        closed_tokens = 0
         for token in list(self.tokens):
+            tokens_seen += 1
             token.age_seconds = max(0, int((utc_now() - token.detected_at).total_seconds()))
             if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
                 self.storage.save_token(token)
                 continue
 
+            active_tokens += 1
             uses_observed_price = self.settings.use_observed_prices and token.observed_price_updates > 0
             delta_pct = 0.0 if uses_observed_price else self.simulator.price_delta_pct(token, self.settings.paper_price_volatility_pct)
             if self.settings.max_rejected_price_streak_enabled and self.settings.max_rejected_price_streak and token.rejected_price_streak >= self.settings.max_rejected_price_streak:
@@ -817,6 +840,7 @@ class BotState:
                 closed = self.paper.tick(token, self.settings, delta_pct)
             self.storage.save_token(token)
             if closed:
+                closed_tokens += 1
                 pnl = token.pnl_sol or 0.0
                 outcome = self._classify_pnl(pnl)
                 level = "success" if outcome == "win" else "warning"
@@ -827,7 +851,13 @@ class BotState:
                 self.storage.save_trade_session(self.session_from_token(token, "closed"))
 
         self.recalculate_stats()
-        return self.snapshot()
+        snapshot = self.snapshot() if build_snapshot else None
+        completed_at = utc_now()
+        self.last_tick_tokens_seen = tokens_seen
+        self.last_tick_active_tokens = active_tokens
+        self.last_tick_closed = closed_tokens
+        self.last_tick_completed_at = completed_at
+        return snapshot
 
     def recover_open_paper_positions(self, note: str = "") -> dict[str, object]:
         clean_note = (note or "operator recovery").strip()[:160] or "operator recovery"
@@ -4540,6 +4570,10 @@ class BotState:
             "status": "degraded" if tick_stale or source_stale or self.last_tick_error else "ok",
             "bot_running": self.status == BotStatus.RUNNING,
             "last_tick_at": self.last_bot_tick_at.isoformat() if self.last_bot_tick_at else None,
+            "last_tick_tokens_seen": self.last_tick_tokens_seen,
+            "last_tick_active_tokens": self.last_tick_active_tokens,
+            "last_tick_closed": self.last_tick_closed,
+            "last_tick_completed_at": self.last_tick_completed_at.isoformat() if self.last_tick_completed_at else None,
             "tick_age_seconds": tick_age,
             "last_ingested_launch_at": self.last_ingested_launch_at.isoformat() if self.last_ingested_launch_at else None,
             "launch_ingestion_age_seconds": launch_age,
@@ -4654,19 +4688,32 @@ class BotState:
             method="GET",
         )
         try:
-            with urllib.request.urlopen(request, timeout=0.25) as response:
+            with urllib.request.urlopen(request, timeout=1.5) as response:
                 payload = json.loads(response.read().decode("utf-8") or "{}")
             base.connected = bool(payload.get("connected", True))
-            base.healthy = bool(payload.get("healthy", True))
+            base.ready_to_submit = payload.get("ready_to_submit") is True
+            base.healthy = base.ready_to_submit and bool(payload.get("healthy", False))
             base.wallet_public_key = str(payload.get("wallet_public_key") or "")
-            base.can_sign = bool(payload.get("can_sign", False))
-            base.can_unattended_sign = bool(payload.get("can_unattended_sign", False))
-            base.supports_auto_sell = bool(payload.get("supports_auto_sell", False))
-            base.supports_auto_buy = bool(payload.get("supports_auto_buy", False))
+            base.can_sign = base.ready_to_submit and bool(payload.get("can_sign", False))
+            base.can_unattended_sign = base.ready_to_submit and bool(payload.get("can_unattended_sign", False))
+            base.supports_auto_sell = base.ready_to_submit and bool(payload.get("supports_auto_sell", False))
+            base.supports_auto_buy = base.ready_to_submit and bool(payload.get("supports_auto_buy", False))
             base.disabled_reason = str(payload.get("disabled_reason") or "")
             base.message = str(payload.get("message") or "Local signer daemon responded.")
             base.version = str(payload.get("version") or "")
             base.last_heartbeat_at = str(payload.get("last_heartbeat_at") or now.isoformat())
+            if not base.ready_to_submit:
+                base.disabled_reason = base.disabled_reason or "Local signer daemon health response requires ready_to_submit=true."
+                base.message = "Local signer daemon is connected but not ready to submit."
+            if not auth_configured:
+                base.healthy = False
+                base.can_sign = False
+                base.can_unattended_sign = False
+                base.supports_auto_sell = False
+                base.supports_auto_buy = False
+                base.ready_to_submit = False
+                base.disabled_reason = "Local signer daemon auth token is not configured."
+                base.message = "Local signer daemon cannot be armed without authenticated health checks."
         except Exception as exc:
             base.disabled_reason = "Local signer daemon is unavailable."
             base.message = f"Daemon status check failed: {exc.__class__.__name__}"
@@ -4751,9 +4798,18 @@ class BotState:
         self.add_event("warning", "Encrypted local hot wallet cleared from local storage", subsystem="live")
         return status
 
-    def arm_live_backend(self, env_live_enabled: bool, signer_mode: str, wallet_public_key: str = "") -> dict[str, object]:
+    def arm_live_backend(
+        self,
+        env_live_enabled: bool,
+        signer_mode: str,
+        wallet_public_key: str = "",
+        *,
+        local_auth_enabled: bool = False,
+    ) -> dict[str, object]:
+        if not local_auth_enabled:
+            raise ValueError("dashboard password/local auth is required before arming the live backend")
         wallet = self._resolve_backend_wallet(signer_mode, wallet_public_key)
-        status = self.live_status(env_live_enabled, wallet, signer_mode)
+        status = self.live_status(env_live_enabled, wallet, signer_mode, local_auth_enabled=local_auth_enabled)
         blockers = list(status.get("blockers") or [])
         if blockers:
             raise ValueError(", ".join(blockers))
@@ -4773,7 +4829,17 @@ class BotState:
         self.storage.save_live_session(session)
         self.active_live_session_id = session.id
         self.add_event("warning", f"Live backend armed: {signer_mode} / {wallet}", subsystem="live", operator_action="Use the kill switch or disarm control to halt new autonomous entries.")
-        return {"armed": True, "wallet_public_key": wallet, "signer_mode": signer_mode, "live_status": self.live_status(env_live_enabled, wallet, signer_mode)}
+        return {
+            "armed": True,
+            "wallet_public_key": wallet,
+            "signer_mode": signer_mode,
+            "live_status": self.live_status(
+                env_live_enabled,
+                wallet,
+                signer_mode,
+                local_auth_enabled=local_auth_enabled,
+            ),
+        }
 
     def disarm_live_backend(self) -> dict[str, object]:
         mode = self.settings.live_signer_mode
@@ -4784,6 +4850,24 @@ class BotState:
         self.add_event("warning", f"Live backend disarmed: {mode} / {wallet or 'no wallet'}", subsystem="live", operator_action="Protective exits can still be handled manually if needed.")
         self.active_live_session_id = ""
         return {"armed": False, "wallet_public_key": wallet, "signer_mode": mode}
+
+    def enforce_live_auth_startup_policy(self, local_auth_enabled: bool) -> dict[str, object]:
+        if local_auth_enabled or not self.settings.live_active_backend_armed:
+            return {"disarmed": False, "reason": ""}
+        mode = self.settings.live_signer_mode
+        wallet = self.settings.live_active_wallet_public_key
+        self.settings.live_active_backend_armed = False
+        self.settings.live_active_wallet_public_key = ""
+        self.storage.save_settings(self.settings)
+        self.active_live_session_id = ""
+        reason = "Persisted live backend disarmed at startup because dashboard local auth is disabled"
+        self.add_event(
+            "warning",
+            reason,
+            subsystem="live",
+            operator_action="Configure a dashboard password before arming a live backend.",
+        )
+        return {"disarmed": True, "reason": reason, "wallet_public_key": wallet, "signer_mode": mode}
 
     def live_caps_snapshot(self) -> dict[str, object]:
         return {
@@ -4909,6 +4993,8 @@ class BotState:
             blockers.append("Solana RPC URL is not configured")
         if signer_mode != "browser_wallet" and not signer.get("can_sign"):
             blockers.append(str(signer.get("disabled_reason") or f"{signer_mode.replace('_', ' ')} cannot sign transactions right now"))
+        if signer_mode == "local_signer_daemon" and signer.get("ready_to_submit") is not True:
+            blockers.append(str(signer.get("disabled_reason") or "local signer daemon requires ready_to_submit=true"))
 
         wallet_metrics = wallet_metrics if wallet_metrics is not None else self._wallet_live_metrics(wallet_public_key)
         if action == "buy":
@@ -5403,6 +5489,7 @@ class BotState:
             "signer_readiness": {
                 "mode": signer_mode,
                 "healthy": bool(signer.get("healthy")),
+                "ready_to_submit": signer.get("ready_to_submit") is True,
                 "endpoint": str(signer.get("endpoint") or ""),
                 "transport": str(signer.get("transport") or ""),
                 "auth_configured": bool(signer.get("auth_configured")),
@@ -5433,10 +5520,10 @@ class BotState:
             operator_action = "Keep the encrypted hot wallet unlocked only for the local session and use tiny caps."
         elif signer_mode == "local_signer_daemon":
             submit_path = "localhost_signer_daemon"
-            implemented = bool(signer.get("can_sign"))
+            implemented = signer.get("ready_to_submit") is True and bool(signer.get("can_sign"))
             local_only = str(signer.get("transport") or "") == "localhost_http"
             manual_approval_required = False
-            unattended_submit = bool(signer.get("can_unattended_sign"))
+            unattended_submit = signer.get("ready_to_submit") is True and bool(signer.get("can_unattended_sign"))
             operator_action = "Run a localhost-only signer daemon with auth before selecting this backend."
         else:
             submit_path = "unsupported"
@@ -5453,6 +5540,8 @@ class BotState:
             blockers.append(f"{signer_mode} submit path is not implemented or not connected")
         if not bool(signer.get("can_sign")):
             blockers.append(str(signer.get("disabled_reason") or f"{signer_mode.replace('_', ' ')} cannot sign transactions"))
+        if signer_mode == "local_signer_daemon" and signer.get("ready_to_submit") is not True:
+            blockers.append(str(signer.get("disabled_reason") or "local signer daemon requires ready_to_submit=true"))
         if not local_only:
             blockers.append("execution backend must stay localhost/local-file only")
         if signer_mode != "browser_wallet" and not active_backend_matches:
@@ -5673,7 +5762,7 @@ class BotState:
             return False
         if audit.status == "stale" and not audit.transaction_signature:
             return False
-        if audit.status in {"submitted", "needs_review", "failed", "stale"}:
+        if audit.status in {"submitting", "submitted", "needs_review", "failed", "stale"}:
             return True
         if audit.transaction_signature and audit.status not in {"reconciled"} and audit.reconciliation_status != "matched":
             return True
@@ -6260,6 +6349,14 @@ class BotState:
                 raise ValueError("browser wallet submit requires a transaction signature")
             audit.transaction_signature = signature.strip()
         else:
+            audit.status = "submitting"
+            audit.final_status = "submitting"
+            audit.updated_at = utc_now()
+            timing = self._audit_execution_timing(audit)
+            timing["submitting_at"] = audit.updated_at.isoformat()
+            audit.execution_timing = timing
+            self._append_unique(audit.warnings, "backend executor started")
+            self.storage.save_live_execution_audit(audit)
             execution = self._execute_backend_audit(audit)
             audit.transaction_signature = str(execution.get("signature") or execution.get("transaction_signature") or "")
             simulation = execution.get("simulation")
@@ -6350,7 +6447,6 @@ class BotState:
             payload = json.dumps(
                 {
                     "unsigned_transaction_base64": unsigned_transaction_base64,
-                    "rpc_url": self.settings.solana_rpc_url,
                     "mint": audit.mint,
                     "action": audit.action,
                     "amount": audit.amount,
@@ -6442,7 +6538,9 @@ class BotState:
     def _recovery_retry_limit_reached(self, audit: LiveExecutionAudit) -> bool:
         return audit.status == "needs_review" and audit.recovery_attempts >= self.live_recovery_max_attempts
 
-    def run_live_autonomy(self, env_live_enabled: bool) -> dict[str, object]:
+    def run_live_autonomy(self, env_live_enabled: bool, *, local_auth_enabled: bool = False) -> dict[str, object]:
+        if not local_auth_enabled:
+            return {"status": "disabled", "reason": "dashboard password/local auth is required for live autonomy"}
         if not env_live_enabled:
             return {"status": "disabled", "reason": "LIVE_TRADING_ENABLED is false"}
         if not self.settings.live_active_backend_armed:
@@ -7016,12 +7114,36 @@ class BotState:
         transaction = VersionedTransaction.populate(message, [])
         selected_accounts = [eligible_by_account[account] for account in selected]
         recoverable = round(sum(float(item.get("rent_sol") or 0.0) for item in selected_accounts), 9)
+        audit = LiveExecutionAudit(
+            id=f"rent_{uuid.uuid4().hex[:12]}",
+            created_at=utc_now(),
+            updated_at=utc_now(),
+            action="rent_recovery",
+            mint="rent_recovery",
+            amount=str(recoverable),
+            status="ready",
+            signer_mode="browser_wallet",
+            wallet_public_key=wallet,
+            quote={
+                "unsigned_transaction_base64": base64.b64encode(bytes(transaction)).decode("utf-8"),
+                "selected_accounts": selected_accounts,
+                "selected_count": len(selected_accounts),
+                "recoverable_rent_sol": recoverable,
+                "manual_approval_required": True,
+                "created_at": utc_now().isoformat(),
+            },
+            request={"token_accounts": selected},
+            final_status="ready",
+            recommended_action="Review the browser wallet prompt, then submit the returned signature for audit recovery.",
+        )
+        self.storage.save_live_execution_audit(audit)
         return {
+            "audit_id": audit.id,
             "wallet_public_key": wallet,
             "selected_accounts": selected_accounts,
             "selected_count": len(selected_accounts),
             "recoverable_rent_sol": recoverable,
-            "unsigned_transaction_base64": base64.b64encode(bytes(transaction)).decode("utf-8"),
+            "unsigned_transaction_base64": audit.quote["unsigned_transaction_base64"],
             "manual_approval_required": True,
             "status": "ready_for_signature",
             "warnings": [
@@ -7804,7 +7926,7 @@ class BotState:
 
     def _latest_live_mark_price_snapshot(self, mint: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
-        for observation in self.storage.load_price_observations(100, mint=mint):
+        for observation in self.storage.load_price_observations_newest_first(100, mint=mint):
             if observation.accepted:
                 for key, value in (
                     ("selected_price", observation.selected_price),
@@ -9314,6 +9436,7 @@ class BotState:
         manual_live = live.get("manual_live_verification", {}) if isinstance(live.get("manual_live_verification"), dict) else {}
         gates = [
             self._promotion_gate("env_live_enabled", "Live env", bool(live.get("env_live_enabled")), True, bool(live.get("env_live_enabled")), "LIVE_TRADING_ENABLED must be explicitly enabled for a real-money pilot."),
+            self._promotion_gate("local_auth", "Local auth", bool(local_auth_enabled), True, bool(local_auth_enabled), "Configure a dashboard password/local auth before starting a real-money pilot."),
             self._promotion_gate("session_acknowledged", "Session acknowledgement", bool(live.get("session_acknowledged")), True, bool(live.get("session_acknowledged")), "Operator must acknowledge the live session risk state."),
             self._promotion_gate("source_trust", "Source trust", f"{source.get('status', 'unknown')}/{source.get('trust_state', 'unknown')}", "connected, recent, trusted, archived", source_ready_for_live, source_live_blocker or source_archive_blocker or "PumpPortal source must be connected, recent, trusted, and archived before live entries."),
             self._promotion_gate("source_soak", "Hybrid source soak", source_soak.get("status", "unknown"), "ready when direct verifier is configured", (not source_soak_required) or source_soak_ready, "Hybrid direct/PumpPortal source-soak gate must pass before a real-money pilot when direct verification is configured or direct events exist."),
@@ -9401,6 +9524,7 @@ class BotState:
                 "Launch",
                 [
                     "env_live_enabled",
+                    "local_auth",
                     "session_acknowledged",
                     "source_trust",
                     "source_soak",
@@ -9537,8 +9661,19 @@ class BotState:
         return preview
 
     def confirm_restore_artifact(self, artifact: dict[str, object]) -> dict[str, object]:
-        result = self.storage.restore_backup_artifact(artifact)
-        self._reload_from_storage()
+        self._require_destructive_operation_prerequisites()
+        try:
+            result = self.storage.restore_backup_artifact(artifact, post_swap_validator=self._reload_from_storage)
+            self.status = BotStatus.STOPPED
+        except Exception:
+            try:
+                self._reload_from_storage(persist_settings_version=False)
+            except Exception:
+                pass
+            self.status = BotStatus.STOPPED
+            self.settings.live_active_backend_armed = False
+            self.settings.kill_switch_enabled = True
+            raise
         self.add_event(
             "warning",
             "Local database restored from artifact",
@@ -10029,29 +10164,51 @@ class BotState:
         }
 
     def data_summary(self) -> dict[str, int]:
-        return {
-            "tokens": self.storage.count_tokens(),
-            "events": self.storage.count_events(),
-            "source_events": self.storage.count_source_events(),
-            "backtests": self.storage.count_backtest_runs(),
-            "trades": self.storage.count_trades(),
-            "price_observations": self.storage.count_price_observations(),
-            "strategy_decisions": self.storage.count_strategy_decisions(),
-            "trade_sessions": self.storage.count_trade_sessions(),
-            "settings_versions": self.storage.count_settings_versions(),
-            "experiments": self.storage.count_experiment_runs(),
-            "trade_labels": self.storage.count_trade_labels(),
-            "strategy_presets": self.storage.count_strategy_presets(),
-            "live_execution_requests": self.storage.count_live_execution_requests(),
-            "live_sessions": self.storage.count_live_sessions(),
-            "live_execution_audits": self.storage.count_live_execution_audits(),
-            "live_intents": self.storage.count_live_intents(),
-            "live_ledger_positions": self.storage.count_live_ledger_positions(),
-            "backup_restore_history": self.storage.count_backup_restore_history(),
-            "source_soak_history": self.storage.count_source_soak_history(),
-        }
+        return self.storage.data_summary_counts()
+
+    def _require_destructive_operation_prerequisites(self) -> None:
+        blockers: list[str] = []
+        if (
+            self.status != BotStatus.STOPPED
+            or self.source_status.status != "offline"
+            or self.solana_logs_status.status != "offline"
+        ):
+            blockers.append("bot and source tasks must be stopped")
+        if self.settings.live_active_backend_armed:
+            blockers.append("live backend must be disarmed")
+        if not self.settings.kill_switch_enabled:
+            blockers.append("live kill switch must be engaged")
+        try:
+            audit_count = self.storage.count_live_execution_audits()
+            audits = self.storage.load_live_execution_audits(max(1, audit_count + 1))
+            if len(audits) != audit_count:
+                blockers.append("live audit debt could not be verified")
+            elif any(self._is_unresolved_live_audit(audit) for audit in audits):
+                blockers.append("unresolved live audit debt must be zero")
+        except Exception:
+            blockers.append("live audit debt could not be verified")
+        if blockers:
+            raise ValueError(f"Destructive operation blocked; unmet prerequisites: {'; '.join(blockers)}")
 
     def clear_data(self, target: str) -> dict[str, int]:
+        self._require_destructive_operation_prerequisites()
+        if target == "all":
+            reset_version = SettingsVersion(
+                id=new_id("set"),
+                created_at=utc_now(),
+                settings=asdict(self.settings),
+                label="reset",
+                changed_keys=[],
+            )
+            self.storage.clear_all_data(reset_version)
+            self.tokens.clear()
+            self.creator_history.clear()
+            self.events.clear()
+            self.backtest_runs.clear()
+            self.current_settings_version_id = reset_version.id
+            self.add_event("warning", "Data cleared: all")
+            self.recalculate_stats()
+            return self.data_summary()
         if target in {"tokens", "all"}:
             self.storage.clear_tokens()
             self.tokens.clear()
@@ -10175,11 +10332,11 @@ class BotState:
         if changed:
             self.tokens = deque(sorted(self.tokens, key=lambda token: token.detected_at, reverse=True), maxlen=80)
 
-    def snapshot(self) -> BotSnapshot:
+    def snapshot(self, *, include_tokens: bool = True) -> BotSnapshot:
         return BotSnapshot(
             status=self.status,
             settings=self.settings,
-            tokens=self._snapshot_tokens(),
+            tokens=self._snapshot_tokens() if include_tokens else [],
             events=list(self.events),
             stats=self.stats,
             source_status=self.source_status,

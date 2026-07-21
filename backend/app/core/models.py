@@ -349,6 +349,7 @@ class SignerStatus:
     version: str = ""
     last_heartbeat_at: str = ""
     auth_configured: bool = False
+    ready_to_submit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

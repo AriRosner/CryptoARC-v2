@@ -1,9 +1,11 @@
+import ast
 import base64
+import inspect
 import json
 import sqlite3
 import unittest
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch
@@ -14,9 +16,10 @@ from solders.transaction import VersionedTransaction
 from app.core.alerts import AlertRouter
 from app.core.models import BacktestRun, BotMode, BotSettings, BotStats, BotStatus, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
-from app.core.price_pipeline import PricePipeline
+from app.core.price_pipeline import PricePipeline, numeric as price_pipeline_numeric
 from app.core.risk import RiskEngine
 from app.core.scoring import ScoringEngine
+from app.core import sources as sources_module
 from app.core.sources import LaunchEvent, PumpPortalLaunchSource, normalize_pumpportal_new_token, normalize_pumpportal_trade, solana_logs_subscribe_payload
 from app.core.storage import Storage
 from app.core.state import BotState
@@ -580,6 +583,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_token(token)
             artifact = state.storage.create_backup_artifact()
             state.storage.clear_tokens()
+            state.settings.kill_switch_enabled = True
 
             result = state.confirm_restore_artifact(artifact)
 
@@ -716,6 +720,78 @@ class CoreLogicTests(unittest.TestCase):
             self.assertFalse(status["healthy"])
             self.assertFalse(status["auth_configured"])
 
+    def test_local_signer_daemon_status_blocks_readiness_without_auth(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"connected":true,"healthy":true,"can_sign":true,"can_unattended_sign":true,"supports_auto_buy":true,"supports_auto_sell":true,"wallet_public_key":"WalletSigner"}'
+
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"), signer_daemon_auth_token="")
+            with patch("app.core.state.urllib.request.urlopen", return_value=FakeResponse()):
+                status = state.signer_status("local_signer_daemon", "")
+
+            self.assertFalse(status["healthy"])
+            self.assertFalse(status["can_sign"])
+            self.assertFalse(status["auth_configured"])
+            self.assertIn("auth token", status["disabled_reason"].lower())
+
+    def test_local_signer_daemon_rejects_legacy_healthy_payload_without_ready_to_submit(self) -> None:
+        class FakeResponse:
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b'{"connected":true,"healthy":true,"can_sign":true,"can_unattended_sign":true,"supports_auto_buy":true,"supports_auto_sell":true,"wallet_public_key":"WalletSigner"}'
+
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                signer_daemon_auth_token="s" * 32,
+            )
+            with patch("app.core.state.urllib.request.urlopen", return_value=FakeResponse()):
+                status = state.signer_status("local_signer_daemon", "")
+
+            self.assertFalse(status["ready_to_submit"])
+            self.assertFalse(status["healthy"])
+            self.assertFalse(status["can_sign"])
+            self.assertFalse(status["can_unattended_sign"])
+            self.assertIn("ready_to_submit", status["disabled_reason"])
+
+            blockers = state._live_execution_blockers(
+                True,
+                "sell",
+                "WalletSigner",
+                "local_signer_daemon",
+                signer={
+                    "connected": True,
+                    "healthy": True,
+                    "can_sign": True,
+                    "can_unattended_sign": True,
+                    "supports_auto_buy": True,
+                    "supports_auto_sell": True,
+                },
+                caps={
+                    "max_trade_sol": 0.001,
+                    "daily_loss_cap_sol": 0.005,
+                    "wallet_exposure_cap_sol": 0.01,
+                    "max_open_positions": 1,
+                    "max_slippage_pct": 1,
+                    "priority_fee_cap_sol": 0.00001,
+                },
+                wallet_metrics={"cost_basis_sol": 0.0, "realized_pnl_sol": 0.0, "unrealized_pnl_sol": 0.0, "open_positions": 0.0},
+            )
+
+            self.assertTrue(any("ready_to_submit" in blocker for blocker in blockers))
+
     def test_local_signer_daemon_execute_rejects_remote_endpoint_before_network(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"), signer_daemon_url="https://signer.example.invalid")
@@ -775,6 +851,7 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(result["signature"], "sig")
             self.assertEqual(captured["data"]["amount"], "0.001")
             self.assertEqual(captured["data"]["amount_sol"], 0.001)
+            self.assertNotIn("rpc_url", captured["data"])
 
     def test_storage_round_trip_source_event_and_backtest(self) -> None:
         with TemporaryDirectory() as directory:
@@ -881,6 +958,54 @@ class CoreLogicTests(unittest.TestCase):
         self.assertEqual(event.kind, "trade")
         self.assertEqual(event.mint, "Mint111")
         self.assertGreater(event.observed_price or 0, 0)
+
+    def test_price_pipeline_uses_numeric_string_after_invalid_direct_price_alias(self) -> None:
+        candidate = PricePipeline.from_payload({"price": "not-a-number", "priceSol": "0.000042"})
+
+        self.assertEqual(candidate.source, "direct")
+        self.assertAlmostEqual(candidate.price or 0, 0.000042)
+
+    def test_pumpportal_new_token_uses_numeric_string_after_invalid_aliases(self) -> None:
+        token = normalize_pumpportal_new_token(
+            {
+                "txType": "create",
+                "mint": "Mint111",
+                "symbol": "ARC",
+                "name": "Arc Token",
+                "initialBuy": "not-a-number",
+                "initialBuySol": "2.5",
+                "marketCapSol": "not-a-number",
+                "marketCap": "42",
+                "creatorHoldPct": "not-a-number",
+                "creator_hold_pct": "7.5",
+            },
+            utc_now(),
+        )
+
+        self.assertIsNotNone(token)
+        assert token is not None
+        self.assertEqual(token.initial_buy_sol, 2.5)
+        self.assertEqual(token.market_cap_sol, 42.0)
+        self.assertEqual(token.creator_hold_pct, 7.5)
+        self.assertAlmostEqual(token.current_price or 0, 0.000042)
+
+    def test_pumpportal_trade_uses_numeric_string_after_invalid_sol_amount_alias(self) -> None:
+        event = normalize_pumpportal_trade(
+            {"txType": "buy", "mint": "Mint111", "solAmount": "not-a-number", "sol_amount": "0.4"},
+            utc_now(),
+        )
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.sol_amount, 0.4)
+
+    def test_sources_has_no_independent_numeric_parser(self) -> None:
+        sources_path = Path(sources_module.__file__ or "")
+        module = ast.parse(sources_path.read_text(encoding="utf-8"))
+        functions = [node.name for node in module.body if isinstance(node, ast.FunctionDef)]
+
+        self.assertNotIn("numeric", functions)
+        self.assertIs(sources_module.numeric, price_pipeline_numeric)
 
     def test_pumpportal_launch_stream_uses_public_url_without_api_key(self) -> None:
         source = PumpPortalLaunchSource(
@@ -1349,6 +1474,157 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(safety["paper_only"])
             self.assertFalse(safety["manual_live_ready"])
 
+    def test_watchdog_tick_telemetry_defaults_before_first_completed_tick(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            watchdog = state.watchdog_status()
+
+            self.assertEqual(watchdog["last_tick_tokens_seen"], 0)
+            self.assertEqual(watchdog["last_tick_active_tokens"], 0)
+            self.assertEqual(watchdog["last_tick_closed"], 0)
+            self.assertIsNone(watchdog["last_tick_completed_at"])
+
+    def test_tick_publishes_exact_work_telemetry_for_mixed_tokens(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.settings.max_position_ticks = 1
+            inactive = self.make_token()
+            inactive.id = "tok_inactive"
+            inactive.status = TokenStatus.SKIPPED
+            pending = self.make_token()
+            pending.id = "tok_pending"
+            pending.status = TokenStatus.BUYING
+            closing = self.make_token()
+            closing.id = "tok_closing"
+            closing.status = TokenStatus.MONITORING
+            closing.entry_price = 0.00001
+            closing.current_price = 0.00001
+            closing.amount_sol = 0.1
+            closing.opened_at = utc_now()
+            state.tokens.extend((inactive, pending, closing))
+
+            state.tick()
+
+            watchdog = state.watchdog_status()
+            self.assertEqual(watchdog["last_tick_tokens_seen"], 3)
+            self.assertEqual(watchdog["last_tick_active_tokens"], 2)
+            self.assertEqual(watchdog["last_tick_closed"], 1)
+            self.assertEqual(closing.status, TokenStatus.PAPER_SOLD)
+            self.assertEqual(closing.exit_reason, "max position ticks")
+            self.assertIsNotNone(watchdog["last_tick_completed_at"])
+            datetime.fromisoformat(str(watchdog["last_tick_completed_at"]))
+
+    def test_tick_failure_keeps_last_completed_telemetry_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.tick()
+            completed = state.watchdog_status()
+            active = self.make_token()
+            active.status = TokenStatus.BUYING
+            state.tokens.append(active)
+
+            def fail_recalculate() -> None:
+                raise RuntimeError("injected recalculate failure")
+
+            state.recalculate_stats = fail_recalculate  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(RuntimeError, "injected recalculate failure"):
+                state.tick()
+
+            watchdog = state.watchdog_status()
+            self.assertEqual(watchdog["last_tick_tokens_seen"], completed["last_tick_tokens_seen"])
+            self.assertEqual(watchdog["last_tick_active_tokens"], completed["last_tick_active_tokens"])
+            self.assertEqual(watchdog["last_tick_closed"], completed["last_tick_closed"])
+            self.assertEqual(watchdog["last_tick_completed_at"], completed["last_tick_completed_at"])
+
+    def test_snapshot_failure_keeps_last_completed_telemetry_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.tick()
+            completed = state.watchdog_status()
+            active = self.make_token()
+            active.status = TokenStatus.BUYING
+            state.tokens.append(active)
+
+            def fail_snapshot() -> object:
+                raise RuntimeError("injected snapshot failure")
+
+            state.snapshot = fail_snapshot  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(RuntimeError, "injected snapshot failure"):
+                state.tick()
+
+            watchdog = state.watchdog_status()
+            self.assertEqual(watchdog["last_tick_tokens_seen"], completed["last_tick_tokens_seen"])
+            self.assertEqual(watchdog["last_tick_active_tokens"], completed["last_tick_active_tokens"])
+            self.assertEqual(watchdog["last_tick_closed"], completed["last_tick_closed"])
+            self.assertEqual(watchdog["last_tick_completed_at"], completed["last_tick_completed_at"])
+
+    def test_snapshot_default_still_hydrates_tokens(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            state.storage.save_token(token)
+            calls: list[bool] = []
+            original_snapshot_tokens = state._snapshot_tokens
+
+            def record_snapshot_tokens() -> list[TokenSignal]:
+                calls.append(True)
+                return original_snapshot_tokens()
+
+            state._snapshot_tokens = record_snapshot_tokens  # type: ignore[method-assign]
+
+            default_snapshot = state.snapshot()
+            explicit_snapshot = state.snapshot(include_tokens=True)
+
+            self.assertEqual(default_snapshot.to_dict(), explicit_snapshot.to_dict())
+            self.assertEqual(calls, [True, True])
+
+    def test_snapshot_can_skip_token_hydration_without_changing_other_fields(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            state.storage.save_token(token)
+            full_payload = state.snapshot().to_dict()
+
+            def fail_token_hydration(*args: object, **kwargs: object) -> list[TokenSignal]:
+                raise AssertionError("token hydration must be skipped")
+
+            state._snapshot_tokens = fail_token_hydration  # type: ignore[method-assign]
+            state.storage.load_tokens = fail_token_hydration  # type: ignore[method-assign]
+
+            compact_payload = state.snapshot(include_tokens=False).to_dict()
+            expected_payload = dict(full_payload)
+            expected_payload["tokens"] = []
+
+            self.assertEqual(compact_payload, expected_payload)
+
+    def test_tick_can_complete_without_building_a_snapshot(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            state.tokens.append(token)
+            recalculate_calls: list[bool] = []
+            original_recalculate_stats = state.recalculate_stats
+
+            def record_recalculate_stats() -> None:
+                recalculate_calls.append(True)
+                original_recalculate_stats()
+
+            def fail_snapshot() -> object:
+                raise AssertionError("snapshot must not be built")
+
+            state.recalculate_stats = record_recalculate_stats  # type: ignore[method-assign]
+            state.snapshot = fail_snapshot  # type: ignore[method-assign]
+
+            result = state.tick(build_snapshot=False)
+
+            self.assertIsNone(result)
+            self.assertEqual(recalculate_calls, [True])
+            self.assertTrue(any(saved.id == token.id for saved in state.storage.load_all_tokens(20)))
+            self.assertIsNotNone(state.watchdog_status()["last_tick_completed_at"])
+
     def test_manual_live_request_review_remains_audit_only(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
@@ -1710,7 +1986,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             imported = state.import_hot_wallet(str(Keypair()), "password123", "ops")
             state.unlock_hot_wallet("password123")
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             database_path.with_suffix(".hotwallet.json").unlink()
 
             restored = BotState(database_path=str(database_path))
@@ -1731,7 +2007,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             state.unlock_hot_wallet("password123")
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             database_path.with_suffix(".hotwallet.json").unlink()
 
             restored = BotState(database_path=str(database_path))
@@ -1752,10 +2028,11 @@ class CoreLogicTests(unittest.TestCase):
             source.storage.save_settings(source.settings)
             imported = source.import_hot_wallet(str(Keypair()), "password123", "ops")
             source.unlock_hot_wallet("password123")
-            source.arm_live_backend(True, "local_hot_wallet")
+            source.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             artifact = source.storage.create_backup_artifact()
 
             restored = BotState(database_path=str(Path(directory) / "restored.db"))
+            restored.settings.kill_switch_enabled = True
             restored.confirm_restore_artifact(artifact)
             live_status = restored.live_status(True, signer_mode="local_hot_wallet")
 
@@ -1771,10 +2048,11 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
 
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             live_status = state.live_status(True, signer_mode="local_hot_wallet")
 
             self.assertTrue(armed["armed"])
+            self.assertTrue(armed["live_status"]["autonomy"]["override"]["local_auth_enabled"])
             self.assertTrue(live_status["active_backend"]["armed"])
             self.assertEqual(live_status["active_backend"]["mode"], "local_hot_wallet")
             self.assertTrue(live_status["autonomy"]["active_backend_matches"])
@@ -1784,6 +2062,49 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(live_status["execution_backend"]["unattended_submit_available"])
             self.assertTrue(live_status["execution_backend"]["can_submit_now"])
 
+    def test_live_backend_arm_local_auth_is_keyword_only(self) -> None:
+        parameter = inspect.signature(BotState.arm_live_backend).parameters.get("local_auth_enabled")
+
+        self.assertIsNotNone(parameter)
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_live_backend_arm_requires_local_auth_without_mutation(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.import_hot_wallet(str(Keypair()), "password123", "ops")
+            initial_mode = state.settings.live_signer_mode
+
+            with self.assertRaisesRegex(ValueError, "local auth"):
+                state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=False)
+
+            self.assertFalse(state.settings.live_active_backend_armed)
+            self.assertEqual(state.settings.live_active_wallet_public_key, "")
+            self.assertEqual(state.settings.live_signer_mode, initial_mode)
+            self.assertEqual(state.storage.count_live_sessions(), 0)
+
+    def test_startup_live_auth_policy_disarms_persisted_backend(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            state = BotState(database_path=str(database_path))
+            state.settings.live_signer_mode = "browser_wallet"
+            state.settings.live_active_backend_armed = True
+            state.settings.live_active_wallet_public_key = "WalletPersisted"
+            state.storage.save_settings(state.settings)
+            restarted = BotState(database_path=str(database_path))
+            policy = getattr(restarted, "enforce_live_auth_startup_policy", None)
+
+            self.assertIsNotNone(policy)
+            result = policy(False)
+
+            persisted = restarted.storage.load_settings()
+            self.assertTrue(result["disarmed"])
+            self.assertFalse(restarted.settings.live_active_backend_armed)
+            self.assertEqual(restarted.settings.live_active_wallet_public_key, "")
+            self.assertFalse(persisted.live_active_backend_armed)
+            self.assertEqual(persisted.live_active_wallet_public_key, "")
+            self.assertTrue(any(event.level == "warning" and "local auth" in event.message.lower() for event in restarted.events))
+
     def test_stale_balance_verification_blocks_autonomy(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
@@ -1791,7 +2112,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.settings.source_stale_seconds = 30
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.storage.save_live_ledger_position(
                 LiveLedgerPosition(
                     id="livepos_stale_balance",
@@ -1967,6 +2288,12 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(preview["selected_count"], 1)
             self.assertEqual(preview["recoverable_rent_sol"], 0.002)
             self.assertEqual(preview["manual_approval_required"], True)
+            self.assertTrue(preview["audit_id"])
+            stored = state.storage.load_live_execution_audit(preview["audit_id"])
+            self.assertIsNotNone(stored)
+            self.assertEqual(stored.action, "rent_recovery")
+            self.assertEqual(stored.wallet_public_key, wallet)
+            self.assertEqual(stored.status, "ready")
             self.assertEqual(len(transaction.message.instructions), 1)
 
     def test_live_quote_validates_caps_and_disabled_signer(self) -> None:
@@ -2011,6 +2338,49 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("confirmed_at", confirmed["execution_timing"])
             self.assertGreaterEqual(confirmed["execution_timing"]["quote_to_submit_ms"], 0)
             self.assertGreaterEqual(confirmed["execution_timing"]["submit_to_confirm_ms"], 0)
+
+    def test_backend_live_submit_persists_submitting_audit_before_executor(self) -> None:
+        with TemporaryDirectory() as directory:
+            db_path = str(Path(directory) / "test.db")
+            state = BotState(database_path=db_path)
+            self.configure_live_caps(state)
+            state.settings.live_signer_mode = "local_signer_daemon"
+            state.storage.save_settings(state.settings)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            state.signer_status = lambda mode="browser_wallet", wallet_public_key="": {
+                "mode": mode,
+                "connected": True,
+                "ready_to_submit": True,
+                "healthy": True,
+                "can_sign": True,
+                "can_unattended_sign": True,
+                "supports_auto_buy": True,
+                "supports_auto_sell": True,
+                "wallet_public_key": wallet_public_key or "WalletSubmit",
+            }
+
+            def timeout_executor(audit: LiveExecutionAudit) -> dict[str, object]:
+                stored = state.storage.load_live_execution_audit(audit.id)
+                self.assertIsNotNone(stored)
+                self.assertEqual(stored.status, "submitting")
+                self.assertEqual(stored.final_status, "submitting")
+                self.assertIn("backend executor started", stored.warnings)
+                raise TimeoutError("lost response after submit")
+
+            state._execute_backend_audit = timeout_executor  # type: ignore[method-assign]
+            quote = state.live_quote(True, "buy", "MintSubmitting", "0.001", True, 1, 0.00001, "pump", "WalletSubmit", signer_mode="local_signer_daemon")
+
+            with self.assertRaisesRegex(TimeoutError, "lost response"):
+                state.live_submit(quote["id"], "")
+
+            reloaded = BotState(database_path=db_path)
+            self.configure_live_caps(reloaded)
+            reloaded.source_status.status = "connected"
+            reloaded.source_status.last_event_at = utc_now()
+            status = reloaded.live_status(True, "WalletSubmit", "local_signer_daemon")
+
+            self.assertEqual(status["unresolved_audit_count"], 1)
+            self.assertIn("unresolved live audit recovery debt blocks new entries", status["blockers"])
 
     def test_live_submit_rejects_blocked_or_stale_quotes(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2367,7 +2737,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2406,7 +2776,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             wallet = str(armed["wallet_public_key"])
 
             without_manual = state.live_status(True, wallet, "local_hot_wallet")
@@ -2446,7 +2816,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2502,7 +2872,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2537,7 +2907,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet")
+            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2573,7 +2943,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: {  # type: ignore[method-assign]
                 "signature": "sighot111",
@@ -2596,11 +2966,30 @@ class CoreLogicTests(unittest.TestCase):
             token.score = 95
             state.tokens.appendleft(token)
 
-            result = state.run_live_autonomy(True)
+            result = state.run_live_autonomy(True, local_auth_enabled=True)
 
             self.assertEqual(result["status"], "ok")
             self.assertGreaterEqual(len(result["executed"]), 1)
             self.assertGreaterEqual(state.storage.count_live_execution_audits(), 1)
+
+    def test_run_live_autonomy_requires_local_auth_before_intent_generation(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = Path(directory) / "test.db"
+            state = BotState(database_path=str(database_path))
+            state.settings.live_signer_mode = "browser_wallet"
+            state.settings.live_active_backend_armed = True
+            state.settings.live_active_wallet_public_key = "WalletPersisted"
+            state.storage.save_settings(state.settings)
+            restarted = BotState(database_path=str(database_path))
+            generated: list[bool] = []
+            restarted.generate_live_intents = lambda *args, **kwargs: generated.append(True) or []  # type: ignore[method-assign]
+
+            result = restarted.run_live_autonomy(True)
+
+            self.assertEqual(result["status"], "disabled")
+            self.assertIn("local auth", result["reason"].lower())
+            self.assertEqual(generated, [])
+            self.assertEqual(restarted.storage.count_live_intents(), 0)
 
     def test_run_live_autonomy_blocks_failed_quote_preflight(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2608,7 +2997,7 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             submitted: list[str] = []
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: submitted.append(unsigned_transaction_base64) or {  # type: ignore[method-assign]
@@ -2633,7 +3022,7 @@ class CoreLogicTests(unittest.TestCase):
             token.score = 95
             state.tokens.appendleft(token)
 
-            result = state.run_live_autonomy(True)
+            result = state.run_live_autonomy(True, local_auth_enabled=True)
             matching_intents = [intent for intent in state.storage.load_live_intents(20) if intent.mint == "MintAutoPreflight"]
             blocked_intent = next(intent for intent in matching_intents if intent.autonomy_blocked)
 
@@ -2648,7 +3037,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -2695,7 +3084,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -2732,7 +3121,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -2776,7 +3165,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -2822,7 +3211,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet")
+            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -4899,6 +5288,26 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(any("LIVE_TRADING_ENABLED" in blocker for blocker in report["blockers"]))
             self.assertTrue(any("kill switch" in blocker.lower() for blocker in report["blockers"]))
             self.assertIn("privacy_note", report)
+
+    def test_pilot_readiness_requires_local_auth(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            without_auth = state.pilot_readiness_report(local_auth_enabled=False)
+            with_auth = state.pilot_readiness_report(local_auth_enabled=True)
+            without_auth_gates = {gate["id"]: gate for gate in without_auth["gates"]}
+            with_auth_gates = {gate["id"]: gate for gate in with_auth["gates"]}
+
+            self.assertIn("local_auth", without_auth_gates)
+            self.assertIn("local_auth", with_auth_gates)
+            without_auth_gate = without_auth_gates["local_auth"]
+            with_auth_gate = with_auth_gates["local_auth"]
+
+            self.assertEqual(without_auth_gate["status"], "fail")
+            self.assertIn("dashboard password", without_auth_gate["reason"].lower())
+            self.assertIn(without_auth_gate["reason"], without_auth["blockers"])
+            self.assertEqual(with_auth_gate["status"], "pass")
+            self.assertNotIn(with_auth_gate["reason"], with_auth["blockers"])
 
     def test_pilot_readiness_requires_operator_visible_cap_settings_version(self) -> None:
         with TemporaryDirectory() as directory:

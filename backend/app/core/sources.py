@@ -12,7 +12,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import websockets
 
 from app.core.models import SourceStatus, TokenSignal, TokenStatus, new_id, utc_now
-from app.core.price_pipeline import PricePipeline
+from app.core.price_pipeline import PricePipeline, numeric
 from app.core.simulator import LaunchSimulator
 
 
@@ -433,17 +433,4 @@ def first_string(payload: dict[str, Any], *keys: str) -> str | None:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return None
-
-
-def numeric(payload: dict[str, Any], *keys: str) -> float | None:
-    for key in keys:
-        value = payload.get(key)
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                return float(value)
-            except ValueError:
-                continue
     return None

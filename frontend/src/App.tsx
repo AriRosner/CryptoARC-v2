@@ -374,6 +374,35 @@ type LiveWalletMethod = "browser_wallet" | "local_hot_wallet" | "local_signer_da
 type PnlWalletScope = "paper" | string;
 type PnlCurrency = "SOL" | "USD";
 type BotActionStatus = "starting" | "stopping" | "";
+type PendingLiveSignature = {
+  audit_id: string;
+  signature: string;
+  wallet_public_key: string;
+  action: string;
+  mint: string;
+  recorded_at: string;
+};
+
+const pendingLiveSignatureStorageKey = "cryptoarc_pending_live_signature";
+
+function readPendingLiveSignature(): PendingLiveSignature | null {
+  try {
+    const raw = window.localStorage.getItem(pendingLiveSignatureStorageKey);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingLiveSignature>;
+    if (!parsed.audit_id || !parsed.signature) return null;
+    return {
+      audit_id: String(parsed.audit_id),
+      signature: String(parsed.signature),
+      wallet_public_key: String(parsed.wallet_public_key || ""),
+      action: String(parsed.action || ""),
+      mint: String(parsed.mint || ""),
+      recorded_at: String(parsed.recorded_at || new Date().toISOString())
+    };
+  } catch {
+    return null;
+  }
+}
 
 const pnlTimeframes: Array<{ label: string; value: PnlTimeframe; millis: number | null }> = [
   { label: "5m", value: "5m", millis: 5 * 60 * 1000 },
@@ -598,6 +627,7 @@ function App() {
   const [livePool, setLivePool] = React.useState("pump");
   const [activeLiveAudit, setActiveLiveAudit] = React.useState<LiveExecutionAudit | null>(null);
   const [activeLiveIntentId, setActiveLiveIntentId] = React.useState("");
+  const [pendingLiveSignature, setPendingLiveSignature] = React.useState<PendingLiveSignature | null>(() => readPendingLiveSignature());
   const [rentRecoveryScan, setRentRecoveryScan] = React.useState<RentRecoveryScan | null>(null);
   const [rentRecoveryPreview, setRentRecoveryPreview] = React.useState<RentRecoveryPreview | null>(null);
   const [rentRecoverySignature, setRentRecoverySignature] = React.useState("");
@@ -1498,12 +1528,12 @@ function App() {
       }
       if (kind === "configure_caps") {
         patch.manual_live_enabled = overrides.manual_live_enabled ?? true;
-        patch.live_max_trade_sol = overrides.live_max_trade_sol ?? (settings.live_max_trade_sol > 0 ? settings.live_max_trade_sol : 0.01);
-        patch.live_daily_loss_cap_sol = overrides.live_daily_loss_cap_sol ?? (settings.live_daily_loss_cap_sol > 0 ? settings.live_daily_loss_cap_sol : 0.05);
-        patch.live_wallet_exposure_cap_sol = overrides.live_wallet_exposure_cap_sol ?? (settings.live_wallet_exposure_cap_sol > 0 ? settings.live_wallet_exposure_cap_sol : 0.1);
-        patch.live_max_open_positions = overrides.live_max_open_positions ?? (settings.live_max_open_positions > 0 ? settings.live_max_open_positions : 2);
+        patch.live_max_trade_sol = overrides.live_max_trade_sol ?? (settings.live_max_trade_sol > 0 ? settings.live_max_trade_sol : 0.001);
+        patch.live_daily_loss_cap_sol = overrides.live_daily_loss_cap_sol ?? (settings.live_daily_loss_cap_sol > 0 ? settings.live_daily_loss_cap_sol : 0.005);
+        patch.live_wallet_exposure_cap_sol = overrides.live_wallet_exposure_cap_sol ?? (settings.live_wallet_exposure_cap_sol > 0 ? settings.live_wallet_exposure_cap_sol : 0.01);
+        patch.live_max_open_positions = overrides.live_max_open_positions ?? (settings.live_max_open_positions > 0 ? settings.live_max_open_positions : 1);
         patch.live_max_slippage_pct = overrides.live_max_slippage_pct ?? (settings.live_max_slippage_pct > 0 ? settings.live_max_slippage_pct : 5);
-        patch.live_priority_fee_cap_sol = overrides.live_priority_fee_cap_sol ?? (settings.live_priority_fee_cap_sol > 0 ? settings.live_priority_fee_cap_sol : 0.0001);
+        patch.live_priority_fee_cap_sol = overrides.live_priority_fee_cap_sol ?? (settings.live_priority_fee_cap_sol > 0 ? settings.live_priority_fee_cap_sol : 0.00001);
       }
       if (kind === "disable_kill_switch") {
         patch.kill_switch_enabled = overrides.kill_switch_enabled ?? false;
@@ -1731,6 +1761,29 @@ function App() {
     }
   }
 
+  function recordPendingLiveSignature(audit: LiveExecutionAudit, signature: string) {
+    const pending: PendingLiveSignature = {
+      audit_id: audit.id,
+      signature,
+      wallet_public_key: audit.wallet_public_key,
+      action: audit.action,
+      mint: audit.mint,
+      recorded_at: new Date().toISOString()
+    };
+    window.localStorage.setItem(pendingLiveSignatureStorageKey, JSON.stringify(pending));
+    setPendingLiveSignature(pending);
+  }
+
+  function clearPendingLiveSignature(auditId: string, signature: string) {
+    setPendingLiveSignature((current) => {
+      if (current?.audit_id === auditId && current.signature === signature) {
+        window.localStorage.removeItem(pendingLiveSignatureStorageKey);
+        return null;
+      }
+      return current;
+    });
+  }
+
   async function signAndSendLiveAudit() {
     if (!activeLiveAudit) return;
     try {
@@ -1758,7 +1811,9 @@ function App() {
       } else {
         throw new Error("Wallet does not support transaction signing");
       }
+      recordPendingLiveSignature(activeLiveAudit, signature);
       const submitted = await submitLiveAudit(activeLiveAudit.id, signature);
+      clearPendingLiveSignature(activeLiveAudit.id, signature);
       const connection = new Connection(snapshot.settings.solana_rpc_url, "confirmed");
       const confirmation = await connection.confirmTransaction(signature, "confirmed");
       const confirmed = await confirmLiveAudit(submitted.id, confirmation.value.err ? "failed" : "confirmed", confirmation.value.err ? JSON.stringify(confirmation.value.err) : "");
@@ -1825,6 +1880,9 @@ function App() {
         signature = await connection.sendTransaction(signed);
       } else {
         throw new Error("Wallet does not support transaction signing");
+      }
+      if (rentRecoveryPreview.audit_id) {
+        await submitLiveAudit(rentRecoveryPreview.audit_id, signature);
       }
       setRentRecoverySignature(signature);
       await refreshConnectedWalletBalance(rentRecoveryPreview.wallet_public_key);
@@ -2185,6 +2243,7 @@ function App() {
           livePool={livePool}
           activeLiveAudit={activeLiveAudit}
           activeLiveIntentId={activeLiveIntentId}
+          pendingLiveSignature={pendingLiveSignature}
           onClose={() => setLiveWalletOpen(false)}
           onConnectWallet={connectBrowserWallet}
           onAcknowledgeLive={acknowledgeLiveRisk}
@@ -2345,6 +2404,7 @@ function GuidedLiveWalletModal({
   livePool,
   activeLiveAudit,
   activeLiveIntentId,
+  pendingLiveSignature,
   onClose,
   onConnectWallet,
   onAcknowledgeLive,
@@ -2405,6 +2465,7 @@ function GuidedLiveWalletModal({
   livePool: string;
   activeLiveAudit: LiveExecutionAudit | null;
   activeLiveIntentId: string;
+  pendingLiveSignature: PendingLiveSignature | null;
   onClose: () => void;
   onConnectWallet: () => Promise<boolean>;
   onAcknowledgeLive: () => Promise<boolean>;
@@ -2497,7 +2558,7 @@ function GuidedLiveWalletModal({
   const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
   const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
-  const quoteBlocked = !envEnabled;
+  const quoteBlocked = !envEnabled || Boolean(pendingLiveSignature);
   const apiDisconnected = apiState !== "connected";
   const activeAuditWalletMismatch = method === "browser_wallet" && Boolean(activeLiveAudit?.wallet_public_key) && activeLiveAudit?.wallet_public_key !== walletPublicKey;
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
@@ -2513,6 +2574,7 @@ function GuidedLiveWalletModal({
   const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
   const activeBackend = liveStatus?.active_backend;
   const sourceMode = liveStatus?.source_degraded_mode;
+  const runtimeConnectivity = liveStatus?.runtime_connectivity;
   const fullSniper = liveStatus?.full_sniper_gate;
   const connectionReady = method === "browser_wallet"
     ? Boolean(walletPublicKey)
@@ -2713,7 +2775,7 @@ function GuidedLiveWalletModal({
             key: "live_max_trade_sol",
             label: "Max trade SOL",
             kind: "number",
-            recommended: 0.01,
+            recommended: 0.001,
             current: settings.live_max_trade_sol,
             help: "Recommended conservative ceiling for one live trade.",
             min: 0.001,
@@ -2723,7 +2785,7 @@ function GuidedLiveWalletModal({
             key: "live_daily_loss_cap_sol",
             label: "Daily loss cap SOL",
             kind: "number",
-            recommended: 0.05,
+            recommended: 0.005,
             current: settings.live_daily_loss_cap_sol,
             help: "Recommended maximum realized loss before entries halt.",
             min: 0.001,
@@ -2733,7 +2795,7 @@ function GuidedLiveWalletModal({
             key: "live_wallet_exposure_cap_sol",
             label: "Wallet exposure SOL",
             kind: "number",
-            recommended: 0.1,
+            recommended: 0.01,
             current: settings.live_wallet_exposure_cap_sol,
             help: "Recommended total wallet exposure cap across open positions.",
             min: 0.001,
@@ -2743,7 +2805,7 @@ function GuidedLiveWalletModal({
             key: "live_max_open_positions",
             label: "Max open positions",
             kind: "number",
-            recommended: 2,
+            recommended: 1,
             current: settings.live_max_open_positions,
             help: "Recommended compact live position count for safer operation.",
             min: 1,
@@ -2763,7 +2825,7 @@ function GuidedLiveWalletModal({
             key: "live_priority_fee_cap_sol",
             label: "Priority fee cap SOL",
             kind: "number",
-            recommended: 0.0001,
+            recommended: 0.00001,
             current: settings.live_priority_fee_cap_sol,
             help: "Recommended upper bound for priority fee spend per order.",
             min: 0.00001,
@@ -3224,6 +3286,25 @@ function GuidedLiveWalletModal({
                         </div>
                       ))}
                     </div>
+                    {runtimeConnectivity ? (
+                      <div className={`mt-3 rounded-xl border p-3 text-xs ${runtimeConnectivity.safe_for_new_entry ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-100" : "border-rose-500/20 bg-rose-500/10 text-rose-100"}`}>
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="font-black uppercase tracking-widest">Runtime Connectivity</span>
+                          <span className="font-black uppercase tracking-widest">{runtimeConnectivity.safe_for_new_entry ? "entry safe" : "blocked"}</span>
+                        </div>
+                        <p className="mt-2 text-zinc-300">{runtimeConnectivity.operator_action}</p>
+                        <div className="mt-3 grid gap-2 sm:grid-cols-5">
+                          <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Source <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.source_connected ? "connected" : "down"}</strong></span>
+                          <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">RPC <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.rpc_available ? "ready" : "blocked"}</strong></span>
+                          <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Balance <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.rpc_balance_checked ? "checked" : "unknown"}</strong></span>
+                          <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Signer <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.signer_available ? "ready" : "blocked"}</strong></span>
+                          <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Debt <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.recovery_debt_clear ? "clear" : "blocked"}</strong></span>
+                        </div>
+                        {runtimeConnectivity.blockers.length ? (
+                          <p className="mt-2 truncate text-[10px] text-zinc-300">{runtimeConnectivity.blockers[0]}</p>
+                        ) : null}
+                      </div>
+                    ) : null}
                     <div className="mt-4 flex flex-wrap gap-2">
                       {primaryWorkspaceButtons}
                       <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:border-white/20 hover:bg-white/10" onClick={() => { setWorkspaceVisible(false); setStepIndex(0); }}>
@@ -3453,6 +3534,11 @@ function GuidedLiveWalletModal({
                     <button className="h-9 rounded-xl border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
                     <button className="h-9 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-100 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                   </div>
+                  {pendingLiveSignature ? (
+                    <p className="mt-3 rounded-xl border border-rose-500/25 bg-rose-500/10 p-3 text-xs font-bold text-rose-100">
+                      A browser-wallet transaction was signed but is not yet recorded by the backend: {pendingLiveSignature.signature}. Recover or inspect audit {pendingLiveSignature.audit_id} before any new buy.
+                    </p>
+                  ) : null}
                   {!envEnabled ? <p className="mt-3 rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Live env is disabled, so quotes and signing are blocked. Wallet checks and setup still work.</p> : null}
                   {activeLiveAudit ? (
                     <article className="mt-3 rounded-xl border border-white/5 bg-black/25 p-3">
@@ -3637,6 +3723,7 @@ function LegacyLiveWalletModal({
   livePool,
   activeLiveAudit,
   activeLiveIntentId,
+  pendingLiveSignature = null,
   onClose,
   onConnectWallet,
   onAcknowledgeLive,
@@ -3689,6 +3776,7 @@ function LegacyLiveWalletModal({
   livePool: string;
   activeLiveAudit: LiveExecutionAudit | null;
   activeLiveIntentId: string;
+  pendingLiveSignature?: PendingLiveSignature | null;
   onClose: () => void;
   onConnectWallet: () => Promise<void>;
   onAcknowledgeLive: () => Promise<void>;
@@ -3725,7 +3813,7 @@ function LegacyLiveWalletModal({
   const capsSet = settings.live_max_trade_sol > 0 && settings.live_daily_loss_cap_sol > 0 && settings.live_wallet_exposure_cap_sol > 0 && settings.live_max_open_positions > 0 && settings.live_max_slippage_pct > 0 && settings.live_priority_fee_cap_sol > 0;
   const envEnabled = Boolean(liveStatus?.env_live_enabled);
   const walletDisplay = method === "local_hot_wallet" ? hotWalletStatus?.wallet_public_key || settings.live_hot_wallet_public_key : liveStatus?.signer?.wallet_public_key || walletPublicKey;
-  const quoteBlocked = !envEnabled;
+  const quoteBlocked = !envEnabled || Boolean(pendingLiveSignature);
   const apiDisconnected = apiState !== "connected";
   const activeAuditWalletMismatch = method === "browser_wallet" && Boolean(activeLiveAudit?.wallet_public_key) && activeLiveAudit?.wallet_public_key !== walletPublicKey;
   const blockers = liveStatus?.blockers?.length ? liveStatus.blockers : envEnabled ? [] : ["Live environment flag is disabled"];
@@ -3741,6 +3829,7 @@ function LegacyLiveWalletModal({
   const signerSupportsAutoBuy = Boolean(liveStatus?.signer?.supports_auto_buy);
   const activeBackend = liveStatus?.active_backend;
   const sourceMode = liveStatus?.source_degraded_mode;
+  const runtimeConnectivity = liveStatus?.runtime_connectivity;
   const fullSniper = liveStatus?.full_sniper_gate;
 
   return (
@@ -4005,6 +4094,25 @@ function LegacyLiveWalletModal({
                     </div>
                   </div>
                 ) : null}
+                {runtimeConnectivity ? (
+                  <div className={`mt-3 rounded-lg border p-3 text-xs ${runtimeConnectivity.safe_for_new_entry ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-100" : "border-rose-500/20 bg-rose-500/10 text-rose-100"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="font-black uppercase tracking-widest">Runtime Connectivity</span>
+                      <span className="font-black uppercase tracking-widest">{runtimeConnectivity.safe_for_new_entry ? "entry safe" : "blocked"}</span>
+                    </div>
+                    <p className="mt-2 text-zinc-300">{runtimeConnectivity.operator_action}</p>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-5">
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Source <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.source_connected ? "connected" : "down"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">RPC <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.rpc_available ? "ready" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Balance <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.rpc_balance_checked ? "checked" : "unknown"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Signer <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.signer_available ? "ready" : "blocked"}</strong></span>
+                      <span className="rounded-lg border border-white/10 bg-black/20 p-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400">Debt <strong className="block pt-1 text-xs text-white">{runtimeConnectivity.recovery_debt_clear ? "clear" : "blocked"}</strong></span>
+                    </div>
+                    {runtimeConnectivity.blockers.length ? (
+                      <p className="mt-2 truncate text-[10px] text-zinc-300">{runtimeConnectivity.blockers[0]}</p>
+                    ) : null}
+                  </div>
+                ) : null}
                 {fullSniper ? (
                   <div className={`mt-3 rounded-lg border p-3 text-xs ${fullSniper.ready ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-100" : "border-rose-500/20 bg-rose-500/10 text-rose-100"}`}>
                     <div className="flex items-center justify-between gap-3">
@@ -4137,6 +4245,11 @@ function LegacyLiveWalletModal({
                   <button className="h-8 rounded-lg border border-white/10 bg-white/5 px-3 text-[10px] font-bold tracking-wide text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSimulateActiveAudit} disabled={!activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Simulate</button>
                   <button className="h-8 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 text-[10px] font-bold tracking-wide text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50" onClick={onSignAndSendLive} disabled={quoteBlocked || apiDisconnected || activeAuditWalletMismatch || activeQuoteStale || !activeLiveAudit || !activeLiveAudit.quote.unsigned_transaction_base64}>Sign & Send</button>
                 </div>
+                {pendingLiveSignature ? (
+                  <p className="mt-3 rounded-lg border border-rose-500/25 bg-rose-500/10 p-3 text-xs font-bold text-rose-100">
+                    A browser-wallet transaction was signed but is not yet recorded by the backend: {pendingLiveSignature.signature}. Recover or inspect audit {pendingLiveSignature.audit_id} before any new buy.
+                  </p>
+                ) : null}
                 {!envEnabled ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-200">Live env is disabled, so quotes and signing are blocked. Wallet connection and backend status checks still work.</p> : null}
                 {liveStatus?.readiness?.status !== "ready" ? <p className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-xs font-bold text-amber-100">Readiness warnings now hard-block autonomous entries only when the backend gates require it. Manual/assisted flows can still be reviewed here.</p> : null}
                 {activeLiveAudit ? (

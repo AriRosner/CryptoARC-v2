@@ -1,0 +1,122 @@
+name: Update code line badge
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-code-lines:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Count source lines
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $includeExtensions = @(
+            ".py",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".mjs",
+            ".css",
+            ".html",
+            ".md",
+            ".ps1",
+            ".yml",
+            ".yaml",
+            ".json",
+            ".toml",
+            ".ini",
+            ".env",
+            ".txt"
+          )
+          $includeNames = @(
+            "Dockerfile",
+            ".env.example",
+            ".env.production.example"
+          )
+          $excludeDirs = @(
+            ".agents",
+            ".github",
+            ".understand-anything",
+            "badges",
+            "data"
+          )
+          $excludeFiles = @(
+            "package-lock.json",
+            "skills-lock.json",
+            "badges/code-lines.json"
+          )
+
+          $files = git ls-files | ForEach-Object {
+            $relative = $_
+            $item = Get-Item -LiteralPath $relative
+            $parts = $relative -split "/"
+            $isIncluded = $includeExtensions -contains $item.Extension.ToLowerInvariant() -or $includeNames -contains $item.Name
+            $isExcludedDir = $false
+            foreach ($dir in $excludeDirs) {
+              if ($parts -contains $dir) {
+                $isExcludedDir = $true
+                break
+              }
+            }
+            $isExcludedFile = $excludeFiles -contains $relative -or $excludeFiles -contains $item.Name
+            if ($isIncluded -and -not $isExcludedDir -and -not $isExcludedFile) {
+              $item
+            }
+          }
+
+          $lineCount = 0
+          foreach ($file in $files) {
+            $lineCount += (Get-Content -LiteralPath $file.FullName | Measure-Object -Line).Lines
+          }
+
+          if ($lineCount -ge 1000000) {
+            $message = "{0:n1}M" -f ($lineCount / 1000000)
+          } elseif ($lineCount -ge 1000) {
+            $message = "{0:n1}k" -f ($lineCount / 1000)
+          } else {
+            $message = "$lineCount"
+          }
+          $message = $message -replace "\.0([kM])$", '$1'
+
+          $badge = [ordered]@{
+            schemaVersion = 1
+            label = "source lines"
+            message = $message
+            color = "blue"
+          }
+
+          New-Item -ItemType Directory -Force -Path badges | Out-Null
+          $json = $badge | ConvertTo-Json -Depth 3
+          [IO.File]::WriteAllText(
+            (Join-Path (Get-Location).Path "badges/code-lines.json"),
+            $json + [Environment]::NewLine,
+            [Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Commit badge update
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (git status --short -- badges/code-lines.json)) {
+            Write-Host "Code line badge is already current."
+            exit 0
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add badges/code-lines.json
+          git commit -m "Update code line badge"
+          git push origin HEAD:${{ github.ref_name }}

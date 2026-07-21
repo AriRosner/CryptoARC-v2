@@ -2,20 +2,69 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import shutil
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+
+
+DATA_SUMMARY_COUNT_TABLES = (
+    ("tokens", "tokens"),
+    ("events", "events"),
+    ("source_events", "source_events"),
+    ("backtests", "backtest_runs"),
+    ("trades", "trades"),
+    ("price_observations", "price_observations"),
+    ("strategy_decisions", "strategy_decisions"),
+    ("trade_sessions", "trade_sessions"),
+    ("settings_versions", "settings_versions"),
+    ("experiments", "experiment_runs"),
+    ("trade_labels", "trade_labels"),
+    ("strategy_presets", "strategy_presets"),
+    ("live_execution_requests", "live_execution_requests"),
+    ("live_sessions", "live_sessions"),
+    ("live_execution_audits", "live_execution_audits"),
+    ("live_intents", "live_intents"),
+    ("live_ledger_positions", "live_ledger_positions"),
+    ("backup_restore_history", "backup_restore_history"),
+    ("source_soak_history", "source_soak_history"),
+)
+DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
+    f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
+)
 
 
 class Storage:
     SCHEMA_VERSION = 9
     BACKUP_FORMAT_VERSION = 1
+    CLEAR_ALL_TABLES = (
+        "tokens",
+        "events",
+        "source_events",
+        "backtest_runs",
+        "trades",
+        "price_observations",
+        "strategy_decisions",
+        "trade_sessions",
+        "settings_versions",
+        "experiment_runs",
+        "trade_labels",
+        "strategy_presets",
+        "live_execution_requests",
+        "live_sessions",
+        "live_execution_audits",
+        "live_intents",
+        "live_ledger_positions",
+        "source_soak_history",
+    )
     BACKUP_TABLES = (
         "settings",
         "tokens",
@@ -452,7 +501,11 @@ class Storage:
             raise ValueError("Restore artifact was created by a newer schema version")
         metadata_summary = artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}
         actual_summary = inspection.get("table_counts", {})
-        current_summary = self._summary_counts()
+        current_summary = (
+            self._summary_counts()
+            if self.path.exists()
+            else {key: 0 for key in actual_summary}
+        )
         table_deltas = {
             key: {
                 "current": int(current_summary.get(key, 0) or 0),
@@ -500,46 +553,103 @@ class Storage:
             "detected_tables": inspection.get("tables", []),
         }
 
-    def restore_backup_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
+    def restore_backup_artifact(
+        self,
+        artifact: dict[str, Any],
+        post_swap_validator: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        original_exists = self.path.exists()
         preview = self.preview_restore_artifact(artifact)
-        backup_result = self.backup()
         decoded = base64.b64decode(str(artifact["database_base64"]).encode("ascii"))
-        temp_path = self.path.with_suffix(".restore.tmp")
-        temp_path.write_bytes(decoded)
+        original_migration_status = dict(self._migration_status)
+        safety_path: Path | None = None
+        swapped = False
+        with NamedTemporaryFile(
+            prefix=f".{self.path.stem}.restore-",
+            suffix=f"-{uuid.uuid4().hex}{self.path.suffix}",
+            dir=self.path.parent,
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(decoded)
         try:
+            staged_storage = Storage(str(temp_path))
+            staged_settings = staged_storage.load_settings()
+            staged_settings.live_active_backend_armed = False
+            staged_settings.kill_switch_enabled = True
+            staged_storage.save_settings(staged_settings)
+            persisted_settings = staged_storage.load_settings()
+            if persisted_settings.live_active_backend_armed or not persisted_settings.kill_switch_enabled:
+                raise ValueError("Restore staging failed to persist fail-closed live settings")
             self._inspect_sqlite_file(temp_path)
+            staged_schema = staged_storage.schema_status()
+            if not staged_schema.get("ok"):
+                raise ValueError("Restore staging failed schema migration validation")
+
+            safety_path = self._create_restore_safety_backup() if original_exists else None
             temp_path.replace(self.path)
+            swapped = True
             self._ensure_schema()
+            self._inspect_sqlite_file(self.path)
+            restored_settings = self.load_settings()
+            if restored_settings.live_active_backend_armed or not restored_settings.kill_switch_enabled:
+                raise ValueError("Restored database did not retain fail-closed live settings")
+            if post_swap_validator is not None:
+                post_swap_validator()
+
+            backup_path = str(safety_path or "")
+            history_entry = {
+                "id": f"restore_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "action": "restore",
+                "status": "restored",
+                "artifact_created_at": preview.get("created_at"),
+                "artifact_database_name": preview.get("database_name"),
+                "backup_path": backup_path,
+                "operator_action": "Review migration, runtime, and wallet state after restore before trading.",
+            }
+            self.save_backup_restore_history(history_entry)
+            return {**preview, "status": "restored", "backup_path": backup_path}
         except Exception as exc:
-            self.save_backup_restore_history(
-                {
-                    "id": f"restore_failed_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "action": "restore",
-                    "status": "failed",
-                    "artifact_created_at": preview.get("created_at"),
-                    "artifact_database_name": preview.get("database_name"),
-                    "backup_path": backup_result.get("path", ""),
-                    "error": f"{exc.__class__.__name__}: {exc}",
-                    "operator_action": "Keep the safety backup and inspect the artifact before retrying restore.",
-                }
-            )
+            if swapped:
+                try:
+                    if original_exists:
+                        if safety_path is None or not safety_path.exists():
+                            raise FileNotFoundError("Restore safety backup is unavailable")
+                        safety_path.replace(self.path)
+                    else:
+                        self.path.unlink(missing_ok=True)
+                    self._migration_status = original_migration_status
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        f"Restore failed and atomic safety rollback failed: {rollback_exc.__class__.__name__}: {rollback_exc}"
+                    ) from exc
             raise
         finally:
             if temp_path.exists():
                 temp_path.unlink(missing_ok=True)
-        history_entry = {
-            "id": f"restore_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "action": "restore",
-            "status": "restored",
-            "artifact_created_at": preview.get("created_at"),
-            "artifact_database_name": preview.get("database_name"),
-            "backup_path": backup_result.get("path", ""),
-            "operator_action": "Review migration, runtime, and wallet state after restore before trading.",
-        }
-        self.save_backup_restore_history(history_entry)
-        return {**preview, "status": "restored", "backup_path": backup_result.get("path", "")}
+
+    def _create_restore_safety_backup(self) -> Path:
+        backup_path: Path | None = None
+        try:
+            with NamedTemporaryFile(
+                prefix=f"{self.path.stem}.backup-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-",
+                suffix=self.path.suffix,
+                dir=self.path.parent,
+                delete=False,
+            ) as destination:
+                backup_path = Path(destination.name)
+                with self.path.open("rb") as source:
+                    shutil.copyfileobj(source, destination)
+                destination.flush()
+                os.fsync(destination.fileno())
+            if backup_path.read_bytes() != self.path.read_bytes():
+                raise OSError("Restore safety backup does not exactly match the original database")
+            return backup_path
+        except Exception:
+            if backup_path is not None:
+                backup_path.unlink(missing_ok=True)
+            raise
 
     def load_backup_restore_history(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -656,6 +766,25 @@ class Storage:
                 return payload
         return None
 
+    def touch_active_mobile_device_by_token_hash(self, token_hash: str, last_seen_at: str) -> dict[str, Any] | None:
+        """Atomically update the last-seen time for a currently active device."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute("SELECT id, payload, revoked_at FROM mobile_devices").fetchall()
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if str(payload.get("token_hash") or "") != token_hash:
+                    continue
+                if str(row["revoked_at"] or "") or str(payload.get("revoked_at") or ""):
+                    return None
+                payload["last_seen_at"] = last_seen_at
+                connection.execute(
+                    "UPDATE mobile_devices SET payload = ?, last_seen_at = ? WHERE id = ?",
+                    (json.dumps(payload), last_seen_at, row["id"]),
+                )
+                return payload
+        return None
+
     def backup_restore_status(self) -> dict[str, Any]:
         history = self.load_backup_restore_history(10)
         latest_backup = next((item for item in history if str(item.get("action", "")).startswith("backup")), None)
@@ -752,6 +881,11 @@ class Storage:
             "mobile_pairing_requests": self.count_mobile_pairing_requests(),
             "mobile_devices": self.count_mobile_devices(),
         }
+
+    def data_summary_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            row = connection.execute(DATA_SUMMARY_COUNTS_SQL).fetchone()
+        return {key: int(row[key] if row else 0) for key, _ in DATA_SUMMARY_COUNT_TABLES}
 
     def load_settings(self) -> BotSettings:
         with self._connect() as connection:
@@ -1039,6 +1173,20 @@ class Storage:
                 ).fetchall()
         return [self._price_observation_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def load_price_observations_newest_first(self, limit: int = 1000, mint: str | None = None) -> list[PriceObservation]:
+        with self._connect() as connection:
+            if mint:
+                rows = connection.execute(
+                    "SELECT payload FROM price_observations WHERE mint = ? ORDER BY observed_at DESC LIMIT ?",
+                    (mint, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM price_observations ORDER BY observed_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._price_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
     def save_price_observation(self, observation: PriceObservation) -> None:
         payload = json.dumps(observation.to_dict())
         with self._connect() as connection:
@@ -1126,6 +1274,25 @@ class Storage:
     def clear_tokens(self) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM tokens")
+
+    def clear_all_data(self, reset_settings_version: SettingsVersion) -> None:
+        payload = json.dumps(reset_settings_version.to_dict())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for table in self.CLEAR_ALL_TABLES:
+                    connection.execute(f"DELETE FROM {table}")
+                connection.execute(
+                    "INSERT INTO settings_versions (id, payload, created_at) VALUES (?, ?, ?)",
+                    (
+                        reset_settings_version.id,
+                        payload,
+                        reset_settings_version.created_at.isoformat(),
+                    ),
+                )
+            except Exception:
+                connection.rollback()
+                raise
 
     def clear_events(self) -> None:
         with self._connect() as connection:

@@ -408,8 +408,7 @@ latency_status: dict[str, object] = {
 
 
 def websocket_snapshot_payload() -> dict:
-    payload = state.snapshot().to_dict()
-    payload["tokens"] = []
+    payload = state.snapshot(include_tokens=False).to_dict()
     payload["events"] = payload.get("events", [])[:25]
     return payload
 
@@ -460,8 +459,8 @@ async def bot_loop() -> None:
             await ensure_source_task()
             await ensure_solana_logs_task()
             await drain_launch_queue()
-            state.tick()
-            state.run_live_autonomy(config.live_trading_enabled)
+            state.tick(build_snapshot=False)
+            state.run_live_autonomy(config.live_trading_enabled, local_auth_enabled=auth.enabled)
             await broadcast_snapshot()
             await broadcast_mobile_cockpit()
         except Exception as exc:
@@ -700,6 +699,7 @@ async def stop_runtime_tasks() -> dict[str, object]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    state.enforce_live_auth_startup_policy(auth.enabled)
     task = asyncio.create_task(bot_loop())
     live_poll_task = asyncio.create_task(live_audit_poll_loop())
     latency_task = asyncio.create_task(latency_probe_loop())
@@ -1426,7 +1426,12 @@ async def live_session_start(payload: LiveSessionStartPayload) -> dict:
 @app.post("/api/live/backend/arm", dependencies=[Depends(require_auth)])
 async def live_backend_arm(payload: LiveBackendArmPayload) -> dict:
     try:
-        return state.arm_live_backend(config.live_trading_enabled, payload.signer_mode, payload.wallet_public_key)
+        return state.arm_live_backend(
+            config.live_trading_enabled,
+            payload.signer_mode,
+            payload.wallet_public_key,
+            local_auth_enabled=auth.enabled,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1807,7 +1812,10 @@ async def data_summary() -> dict:
 
 @app.post("/api/data/clear/{target}", dependencies=[Depends(require_auth)])
 async def clear_data(target: Literal["tokens", "events", "source_events", "backtests", "trades", "price_observations", "strategy_decisions", "trade_sessions", "settings_versions", "experiments", "trade_labels", "strategy_presets", "live_execution_requests", "live_sessions", "live_execution_audits", "live_intents", "live_ledger_positions", "source_soak_history", "all"]) -> dict:
-    result = state.clear_data(target)
+    try:
+        result = state.clear_data(target)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     await broadcast_snapshot()
     return result
 

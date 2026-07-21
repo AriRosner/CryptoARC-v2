@@ -118,6 +118,9 @@ class HotWalletVault:
         client = SolanaReadOnlyClient(rpc_url)
         signed_transaction_base64 = str(signing["signed_transaction_base64"])
         simulation = self._simulate(client, signed_transaction_base64)
+        if simulation.get("ok") is not True:
+            detail = str(simulation.get("error") or simulation.get("warning") or "simulation failed")
+            raise ValueError(f"transaction simulation failed: {detail}")
         signature = client.rpc(
             "sendTransaction",
             [
@@ -184,7 +187,7 @@ class HotWalletVault:
 
     def _simulate(self, client: SolanaReadOnlyClient, signed_transaction_base64: str) -> dict[str, Any]:
         try:
-            result = client.rpc(
+            response = client.rpc(
                 "simulateTransaction",
                 [
                     signed_transaction_base64,
@@ -194,13 +197,26 @@ class HotWalletVault:
                         "commitment": "processed",
                     },
                 ],
-            ).get("result") or {}
-            value = result.get("value") or {}
-            err = value.get("err")
+            )
+            if not isinstance(response, dict):
+                return self._malformed_simulation_response("response must be an object")
+            if "result" not in response:
+                return self._malformed_simulation_response("missing result")
+            result = response["result"]
+            if not isinstance(result, dict):
+                return self._malformed_simulation_response("result must be an object")
+            if "value" not in result:
+                return self._malformed_simulation_response("missing result.value")
+            value = result["value"]
+            if not isinstance(value, dict):
+                return self._malformed_simulation_response("result.value must be an object")
+            if "err" not in value:
+                return self._malformed_simulation_response("missing result.value.err")
+            err = value["err"]
             return {
-                "ok": err in (None, False),
-                "warning": "" if err in (None, False) else "RPC simulation reported an error.",
-                "error": "" if err in (None, False) else json.dumps(err),
+                "ok": err is None,
+                "warning": "" if err is None else "RPC simulation reported an error.",
+                "error": "" if err is None else json.dumps(err),
                 "result": value,
             }
         except Exception as exc:
@@ -210,6 +226,15 @@ class HotWalletVault:
                 "error": f"{exc.__class__.__name__}: {exc}",
                 "result": {},
             }
+
+    @staticmethod
+    def _malformed_simulation_response(detail: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "warning": "RPC simulation response was malformed.",
+            "error": f"malformed RPC simulation response: {detail}",
+            "result": {},
+        }
 
     def _require_unlocked_keypair(self) -> Keypair:
         if self._keypair is None:

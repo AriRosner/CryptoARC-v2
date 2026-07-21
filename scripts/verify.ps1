@@ -26,6 +26,9 @@ if (-not $SkipBackendTests) {
   Invoke-CryptoArcNative -FilePath $python -Arguments @("-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py", "-q")
 }
 
+Write-Host "Checking backend and frontend settings contract"
+Invoke-CryptoArcNative -FilePath $python -Arguments @("scripts/check_settings_contract.py")
+
 if (-not $SkipFrontendBuild) {
   Assert-CryptoArcFrontendDependencies
   $packageManager = Resolve-CryptoArcPackageManager
