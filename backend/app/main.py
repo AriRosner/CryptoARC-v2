@@ -635,12 +635,15 @@ async def drain_launch_queue() -> None:
         clear_launch_queue()
         return
 
+    active_tokens_loaded = False
     while not launch_queue.empty():
         if state.status.value != "running":
             clear_launch_queue()
             return
         event = await launch_queue.get()
-        state.ingest_source_event(event)
+        state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
+        if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
+            active_tokens_loaded = True
         launch_queue.task_done()
 
 

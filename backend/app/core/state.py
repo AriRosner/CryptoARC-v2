@@ -669,14 +669,14 @@ class BotState:
         )
         self.storage.save_source_event(event)
 
-    def ingest_source_event(self, event: LaunchEvent) -> None:
+    def ingest_source_event(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> None:
         if event.kind == "trade":
             if event.source == "pumpportal" and self.source_status.pumpportal_funding_blocked:
                 self.source_status.pumpportal_funding_blocked = False
                 self.source_status.pumpportal_funding_message = ""
                 self.source_status.pumpportal_funding_blocked_at = None
             self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
-            self.apply_observed_trade(event)
+            self.apply_observed_trade(event, active_tokens_loaded=active_tokens_loaded)
             return
         if event.kind in {"verification", "verification_status"}:
             token = self._direct_solana_token_from_event(event) if event.kind == "verification" else None
@@ -735,10 +735,11 @@ class BotState:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
         return mint in PUMPPORTAL_NON_LAUNCH_MINTS
 
-    def apply_observed_trade(self, event: LaunchEvent) -> None:
+    def apply_observed_trade(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> None:
         if not self.settings.use_observed_prices or not event.mint:
             return
-        self._ensure_active_tokens_loaded()
+        if not active_tokens_loaded:
+            self._ensure_active_tokens_loaded()
         observation = self.price_pipeline.observe(
             event.raw_payload,
             mint=event.mint,
