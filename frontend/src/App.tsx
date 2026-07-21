@@ -1944,11 +1944,10 @@ function App() {
       refreshPnlData().catch(() => undefined);
     }
     refreshSolUsdPrice().catch(() => undefined);
-    refreshStrategyPresetData().catch(() => undefined);
     if (workspacePage !== "monitor") {
       refreshWorkspaceData(workspacePage).catch(() => undefined);
     }
-  }, [liveWalletOpen, pnlTimeframe, refreshPnlData, refreshSolUsdPrice, refreshStrategyPresetData, refreshWorkspaceData, selectedLivePnlWallet, workspacePage]);
+  }, [liveWalletOpen, pnlTimeframe, refreshPnlData, refreshSolUsdPrice, refreshWorkspaceData, selectedLivePnlWallet, workspacePage]);
 
   React.useEffect(() => {
     if (!settingsOpen) return;

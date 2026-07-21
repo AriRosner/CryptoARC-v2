@@ -38,6 +38,17 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertNotIn('payload["tokens"] = []', websocket_payload)
         self.assertIn("state.tick(build_snapshot=False)", bot_loop)
 
+    def test_verify_runs_polling_stability_check_before_frontend_build(self) -> None:
+        script = (ROOT / "scripts" / "verify.ps1").read_text(encoding="utf-8")
+        frontend_block = script[
+            script.index("if (-not $SkipFrontendBuild)") : script.index("if (-not $SkipMobileBuild)")
+        ]
+
+        polling_check = 'Arguments @("run", "check:polling")'
+        frontend_build = 'Arguments @("run", "build")'
+        self.assertIn(polling_check, frontend_block)
+        self.assertLess(frontend_block.index(polling_check), frontend_block.index(frontend_build))
+
     def test_start_dev_records_dynamic_ports_and_frontend_api_base(self) -> None:
         script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
 

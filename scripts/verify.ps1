@@ -32,9 +32,11 @@ Invoke-CryptoArcNative -FilePath $python -Arguments @("scripts/check_settings_co
 if (-not $SkipFrontendBuild) {
   Assert-CryptoArcFrontendDependencies
   $packageManager = Resolve-CryptoArcPackageManager
-  Write-Host "Running frontend build"
   Push-Location $frontendRoot
   try {
+    Write-Host "Checking frontend polling stability"
+    Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "check:polling")
+    Write-Host "Running frontend build"
     Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "build")
   } finally {
     Pop-Location

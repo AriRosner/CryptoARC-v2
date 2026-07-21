@@ -1,6 +1,6 @@
 import * as LocalAuthentication from "expo-local-authentication";
 import * as SecureStore from "expo-secure-store";
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import {
@@ -20,6 +20,19 @@ import type { MobileCockpitPayload, MobileDevice, MobileFeedPayload } from "./ty
 const TOKEN_KEY = "cryptoarc.mobile.token";
 const API_BASE_KEY = "cryptoarc.mobile.apiBaseUrl";
 const DEVICE_KEY = "cryptoarc.mobile.device";
+
+function mobileSessionIdentity(apiBaseUrl: string, token: string): string {
+  return JSON.stringify([apiBaseUrl, token]);
+}
+
+interface ActiveMobileSession {
+  identity: string;
+  epoch: number;
+}
+
+interface CockpitRefreshInFlight extends ActiveMobileSession {
+  promise: Promise<void>;
+}
 
 interface MobileSessionValue {
   apiBaseUrl: string;
@@ -56,18 +69,43 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
   const [locked, setLocked] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const sessionEpochRef = useRef(0);
+  const activeSessionRef = useRef<ActiveMobileSession | null>(null);
+  const cockpitRefreshInFlightRef = useRef<CockpitRefreshInFlight | null>(null);
 
-  const refreshCockpit = useCallback(async () => {
-    if (!token || !apiBaseUrl) return;
-    try {
-      const payload = await fetchMobileCockpit(apiBaseUrl, token);
-      setCockpit(payload);
-      setConnected(true);
-      setError("");
-    } catch (err) {
-      setConnected(false);
-      setError(err instanceof Error ? err.message : "Cockpit refresh failed");
+  const refreshCockpit = useCallback((): Promise<void> => {
+    if (!token || !apiBaseUrl) return Promise.resolve();
+    const identity = mobileSessionIdentity(apiBaseUrl, token);
+    const activeSession = activeSessionRef.current;
+    if (!activeSession || activeSession.identity !== identity) return Promise.resolve();
+    const currentRequest = cockpitRefreshInFlightRef.current;
+    if (currentRequest?.identity === identity && currentRequest.epoch === activeSession.epoch) {
+      return currentRequest.promise;
     }
+    const epoch = activeSession.epoch;
+
+    const request = (async () => {
+      try {
+        const payload = await fetchMobileCockpit(apiBaseUrl, token);
+        if (activeSessionRef.current?.identity !== identity || activeSessionRef.current.epoch !== epoch) return;
+        setCockpit(payload);
+        setConnected(true);
+        setError("");
+      } catch (err) {
+        if (activeSessionRef.current?.identity !== identity || activeSessionRef.current.epoch !== epoch) return;
+        setConnected(false);
+        setError(err instanceof Error ? err.message : "Cockpit refresh failed");
+      }
+    })();
+    cockpitRefreshInFlightRef.current = { identity, epoch, promise: request };
+    const release = () => {
+      const current = cockpitRefreshInFlightRef.current;
+      if (current?.identity === identity && current.epoch === epoch && current.promise === request) {
+        cockpitRefreshInFlightRef.current = null;
+      }
+    };
+    void request.then(release, release);
+    return request;
   }, [apiBaseUrl, token]);
 
   useEffect(() => {
@@ -80,6 +118,13 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
           SecureStore.getItemAsync(DEVICE_KEY),
         ]);
         if (cancelled) return;
+        const epoch = sessionEpochRef.current + 1;
+        sessionEpochRef.current = epoch;
+        activeSessionRef.current =
+          storedToken && storedApiBaseUrl
+            ? { identity: mobileSessionIdentity(storedApiBaseUrl, storedToken), epoch }
+            : null;
+        cockpitRefreshInFlightRef.current = null;
         setToken(storedToken);
         setApiBaseUrl(storedApiBaseUrl ?? "");
         setDevice(storedDevice ? (JSON.parse(storedDevice) as MobileDevice) : null);
@@ -148,9 +193,38 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
   }, [refreshCockpit, token]);
 
   const saveSession = useCallback(async (nextApiBaseUrl: string, nextToken: string, nextDevice: MobileDevice) => {
-    await SecureStore.setItemAsync(API_BASE_KEY, nextApiBaseUrl);
-    await SecureStore.setItemAsync(TOKEN_KEY, nextToken);
-    await SecureStore.setItemAsync(DEVICE_KEY, JSON.stringify(nextDevice));
+    const previousSession = activeSessionRef.current;
+    const epoch = sessionEpochRef.current + 1;
+    sessionEpochRef.current = epoch;
+    activeSessionRef.current = { identity: mobileSessionIdentity(nextApiBaseUrl, nextToken), epoch };
+    cockpitRefreshInFlightRef.current = null;
+    let previousStoredValues: [string | null, string | null, string | null] | null = null;
+    try {
+      previousStoredValues = await Promise.all([
+        SecureStore.getItemAsync(API_BASE_KEY),
+        SecureStore.getItemAsync(TOKEN_KEY),
+        SecureStore.getItemAsync(DEVICE_KEY),
+      ]);
+      await SecureStore.setItemAsync(API_BASE_KEY, nextApiBaseUrl);
+      await SecureStore.setItemAsync(TOKEN_KEY, nextToken);
+      await SecureStore.setItemAsync(DEVICE_KEY, JSON.stringify(nextDevice));
+    } catch (err) {
+      if (previousStoredValues) {
+        const restoreStoredValue = (key: string, value: string | null) =>
+          value === null ? SecureStore.deleteItemAsync(key) : SecureStore.setItemAsync(key, value);
+        // Restore every key independently; rollback failures must not mask the original persistence error.
+        await Promise.allSettled([
+          restoreStoredValue(API_BASE_KEY, previousStoredValues[0]),
+          restoreStoredValue(TOKEN_KEY, previousStoredValues[1]),
+          restoreStoredValue(DEVICE_KEY, previousStoredValues[2]),
+        ]);
+      }
+      const rollbackEpoch = sessionEpochRef.current + 1;
+      sessionEpochRef.current = rollbackEpoch;
+      activeSessionRef.current = previousSession ? { identity: previousSession.identity, epoch: rollbackEpoch } : null;
+      cockpitRefreshInFlightRef.current = null;
+      throw err;
+    }
     setApiBaseUrl(nextApiBaseUrl);
     setToken(nextToken);
     setDevice(nextDevice);
@@ -284,6 +358,9 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
   );
 
   const clearSession = useCallback(async () => {
+    sessionEpochRef.current += 1;
+    activeSessionRef.current = null;
+    cockpitRefreshInFlightRef.current = null;
     await Promise.all([
       SecureStore.deleteItemAsync(TOKEN_KEY),
       SecureStore.deleteItemAsync(API_BASE_KEY),
