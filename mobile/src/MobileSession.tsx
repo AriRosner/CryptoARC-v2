@@ -20,6 +20,22 @@ import type { MobileCockpitPayload, MobileDevice, MobileFeedPayload } from "./ty
 const TOKEN_KEY = "cryptoarc.mobile.token";
 const API_BASE_KEY = "cryptoarc.mobile.apiBaseUrl";
 const DEVICE_KEY = "cryptoarc.mobile.device";
+const DISCONNECT_FAILED_MESSAGE = "Disconnect failed. Session remains active.";
+
+type StoredMobileSessionValues = [string | null, string | null, string | null];
+
+async function restoreStoredSessionValues(values: StoredMobileSessionValues): Promise<void> {
+  const restoreStoredValue = (key: string, value: string | null) =>
+    Promise.resolve().then(() =>
+      value === null ? SecureStore.deleteItemAsync(key) : SecureStore.setItemAsync(key, value),
+    );
+  // Restore every key independently; rollback failures must not mask the operation's original failure.
+  await Promise.allSettled([
+    restoreStoredValue(API_BASE_KEY, values[0]),
+    restoreStoredValue(TOKEN_KEY, values[1]),
+    restoreStoredValue(DEVICE_KEY, values[2]),
+  ]);
+}
 
 function mobileSessionIdentity(apiBaseUrl: string, token: string): string {
   return JSON.stringify([apiBaseUrl, token]);
@@ -198,7 +214,7 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
     sessionEpochRef.current = epoch;
     activeSessionRef.current = { identity: mobileSessionIdentity(nextApiBaseUrl, nextToken), epoch };
     cockpitRefreshInFlightRef.current = null;
-    let previousStoredValues: [string | null, string | null, string | null] | null = null;
+    let previousStoredValues: StoredMobileSessionValues | null = null;
     try {
       previousStoredValues = await Promise.all([
         SecureStore.getItemAsync(API_BASE_KEY),
@@ -210,14 +226,7 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
       await SecureStore.setItemAsync(DEVICE_KEY, JSON.stringify(nextDevice));
     } catch (err) {
       if (previousStoredValues) {
-        const restoreStoredValue = (key: string, value: string | null) =>
-          value === null ? SecureStore.deleteItemAsync(key) : SecureStore.setItemAsync(key, value);
-        // Restore every key independently; rollback failures must not mask the original persistence error.
-        await Promise.allSettled([
-          restoreStoredValue(API_BASE_KEY, previousStoredValues[0]),
-          restoreStoredValue(TOKEN_KEY, previousStoredValues[1]),
-          restoreStoredValue(DEVICE_KEY, previousStoredValues[2]),
-        ]);
+        await restoreStoredSessionValues(previousStoredValues);
       }
       const rollbackEpoch = sessionEpochRef.current + 1;
       sessionEpochRef.current = rollbackEpoch;
@@ -358,14 +367,40 @@ export function MobileSessionProvider({ children }: { children: React.ReactNode 
   );
 
   const clearSession = useCallback(async () => {
+    const previousSession = activeSessionRef.current;
+    const restorePreviousSession = () => {
+      const rollbackEpoch = sessionEpochRef.current + 1;
+      sessionEpochRef.current = rollbackEpoch;
+      activeSessionRef.current = previousSession ? { identity: previousSession.identity, epoch: rollbackEpoch } : null;
+      cockpitRefreshInFlightRef.current = null;
+    };
     sessionEpochRef.current += 1;
     activeSessionRef.current = null;
     cockpitRefreshInFlightRef.current = null;
-    await Promise.all([
-      SecureStore.deleteItemAsync(TOKEN_KEY),
-      SecureStore.deleteItemAsync(API_BASE_KEY),
-      SecureStore.deleteItemAsync(DEVICE_KEY),
+    let previousStoredValues: StoredMobileSessionValues;
+    try {
+      previousStoredValues = await Promise.all([
+        SecureStore.getItemAsync(API_BASE_KEY),
+        SecureStore.getItemAsync(TOKEN_KEY),
+        SecureStore.getItemAsync(DEVICE_KEY),
+      ]);
+    } catch {
+      restorePreviousSession();
+      setError(DISCONNECT_FAILED_MESSAGE);
+      return;
+    }
+    const deleteStoredValue = (key: string) => Promise.resolve().then(() => SecureStore.deleteItemAsync(key));
+    const deleteResults = await Promise.allSettled([
+      deleteStoredValue(API_BASE_KEY),
+      deleteStoredValue(TOKEN_KEY),
+      deleteStoredValue(DEVICE_KEY),
     ]);
+    if (deleteResults.some((result) => result.status === "rejected")) {
+      await restoreStoredSessionValues(previousStoredValues);
+      restorePreviousSession();
+      setError(DISCONNECT_FAILED_MESSAGE);
+      return;
+    }
     setToken(null);
     setApiBaseUrl("");
     setDevice(null);

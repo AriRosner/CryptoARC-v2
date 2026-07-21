@@ -1,5 +1,7 @@
 import type { MobileCockpitPayload, MobileFeedPayload, PairingClaimResponse } from "./types";
 
+const MOBILE_COCKPIT_TIMEOUT_MS = 10000;
+
 export interface PairingClaimInput {
   apiBaseUrl: string;
   pairingId: string;
@@ -59,7 +61,22 @@ export async function claimMobilePairing(input: PairingClaimInput): Promise<Pair
 }
 
 export async function fetchMobileCockpit(apiBaseUrl: string, token: string): Promise<MobileCockpitPayload> {
-  return mobileRequest<MobileCockpitPayload>(apiBaseUrl, "/api/mobile/cockpit", token);
+  const controller = new AbortController();
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error("Cockpit refresh timed out"));
+      controller.abort();
+    }, MOBILE_COCKPIT_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([
+      mobileRequest<MobileCockpitPayload>(apiBaseUrl, "/api/mobile/cockpit", token, { signal: controller.signal }),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 export async function fetchMobileFeed(apiBaseUrl: string, token: string, level = "", subsystem = ""): Promise<MobileFeedPayload> {

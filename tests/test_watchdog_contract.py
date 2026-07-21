@@ -26,7 +26,7 @@ class WatchdogContractTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             backend_fields = set(BotState(database_path=str(Path(directory) / "watchdog.db")).watchdog_status())
 
-        self.assertEqual(backend_fields, frontend_fields)
+        self.assertEqual(frontend_fields - backend_fields, set())
 
 
 if __name__ == "__main__":

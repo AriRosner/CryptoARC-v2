@@ -130,19 +130,22 @@ describe("MobileSessionProvider cockpit refresh", () => {
     });
     const fetchesWhilePending = fetchMobileCockpitMock.mock.calls.length;
 
-    firstRequest.reject(new Error("cockpit offline"));
+    firstRequest.reject(new Error("Cockpit refresh timed out"));
     await act(async () => {
       await overlappingRefresh;
     });
+    expect(session?.error).toBe("Cockpit refresh timed out");
 
     await act(async () => {
       await session!.refreshCockpit();
     });
     const fetchesAfterRelease = fetchMobileCockpitMock.mock.calls.length;
+    const errorAfterRelease = session?.error;
     view.unmount();
 
     expect(fetchesWhilePending).toBe(1);
     expect(fetchesAfterRelease).toBe(2);
+    expect(errorAfterRelease).toBe("");
   });
 
   it.each(["success", "failure"] as const)(
@@ -394,4 +397,130 @@ describe("MobileSessionProvider cockpit refresh", () => {
       expect(remountFetchArgs).toEqual(["https://cryptoarc-old.test", "old-mobile-token"]);
     },
   );
+
+  it("rolls back a partial clear without rejecting and allows a successful retry", async () => {
+    const oldDevice = {
+      id: "mobile-old-clear",
+      name: "Old clear-session cockpit",
+      platform: "android",
+      scopes: ["mobile:read"],
+      created_at: "2026-07-01T20:00:00Z",
+      last_seen_at: "2026-07-01T20:00:00Z",
+      expires_at: "2026-08-01T20:00:00Z",
+      revoked_at: "",
+    };
+    const oldApiBaseUrl = "https://cryptoarc-old-clear.test";
+    const oldToken = "old-clear-token";
+    const oldPayload = { ...sampleCockpit, server_time: "old-clear-session" };
+    const storedValues = new Map<string, string>([
+      ["cryptoarc.mobile.apiBaseUrl", oldApiBaseUrl],
+      ["cryptoarc.mobile.token", oldToken],
+      ["cryptoarc.mobile.device", JSON.stringify(oldDevice)],
+    ]);
+    getItemAsyncMock.mockImplementation(async (key) => storedValues.get(key) ?? null);
+    setItemAsyncMock.mockImplementation(async (key, value) => {
+      storedValues.set(key, value);
+    });
+    let failTokenDelete = true;
+    deleteItemAsyncMock.mockImplementation(async (key) => {
+      if (key === "cryptoarc.mobile.token" && failTokenDelete) {
+        failTokenDelete = false;
+        throw new Error("private delete failure: old-clear-token");
+      }
+      storedValues.delete(key);
+    });
+    fetchMobileCockpitMock.mockResolvedValue(oldPayload);
+    let session: SessionValue | undefined;
+    const onSessionReady = (nextSession: SessionValue) => {
+      session = nextSession;
+    };
+
+    const firstView = await render(
+      <MobileSessionProvider>
+        <SessionProbe onSessionReady={onSessionReady} />
+      </MobileSessionProvider>,
+    );
+    await waitFor(() => expect(fetchMobileCockpitMock).toHaveBeenCalledTimes(1));
+
+    let firstClearOutcome = "pending";
+    await act(async () => {
+      firstClearOutcome = await session!.clearSession().then(
+        () => "resolved",
+        () => "rejected",
+      );
+    });
+    const failedClearSession = {
+      apiBaseUrl: session?.apiBaseUrl,
+      token: session?.token,
+      device: session?.device,
+      error: session?.error,
+    };
+    const durableValuesAfterFailure = new Map(storedValues);
+
+    await act(async () => {
+      await session!.refreshCockpit();
+    });
+    const refreshCallsAfterFailure = fetchMobileCockpitMock.mock.calls.length;
+    const refreshArgsAfterFailure = fetchMobileCockpitMock.mock.lastCall;
+    await firstView.unmount();
+
+    let remountedSession: SessionValue | undefined;
+    const onRemountedSessionReady = (nextSession: SessionValue) => {
+      remountedSession = nextSession;
+    };
+    const secondView = await render(
+      <MobileSessionProvider>
+        <SessionProbe onSessionReady={onRemountedSessionReady} />
+      </MobileSessionProvider>,
+    );
+    await waitFor(() => expect(remountedSession?.loading).toBe(false));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const sessionAfterRemount = {
+      apiBaseUrl: remountedSession?.apiBaseUrl,
+      token: remountedSession?.token,
+      device: remountedSession?.device,
+    };
+    const refreshCallsAfterRemount = fetchMobileCockpitMock.mock.calls.length;
+
+    let retryOutcome = "pending";
+    await act(async () => {
+      retryOutcome = await remountedSession!.clearSession().then(
+        () => "resolved",
+        () => "rejected",
+      );
+    });
+    const sessionAfterRetry = {
+      apiBaseUrl: remountedSession?.apiBaseUrl,
+      token: remountedSession?.token,
+      device: remountedSession?.device,
+      error: remountedSession?.error,
+    };
+    const durableValuesAfterRetry = new Map(storedValues);
+    await secondView.unmount();
+
+    expect(firstClearOutcome).toBe("resolved");
+    expect(failedClearSession).toEqual({
+      apiBaseUrl: oldApiBaseUrl,
+      token: oldToken,
+      device: oldDevice,
+      error: "Disconnect failed. Session remains active.",
+    });
+    expect(failedClearSession.error).not.toContain("old-clear-token");
+    expect(durableValuesAfterFailure).toEqual(
+      new Map([
+        ["cryptoarc.mobile.apiBaseUrl", oldApiBaseUrl],
+        ["cryptoarc.mobile.token", oldToken],
+        ["cryptoarc.mobile.device", JSON.stringify(oldDevice)],
+      ]),
+    );
+    expect(refreshCallsAfterFailure).toBe(2);
+    expect(refreshArgsAfterFailure).toEqual([oldApiBaseUrl, oldToken]);
+    expect(sessionAfterRemount).toEqual({ apiBaseUrl: oldApiBaseUrl, token: oldToken, device: oldDevice });
+    expect(refreshCallsAfterRemount).toBe(3);
+    expect(retryOutcome).toBe("resolved");
+    expect(sessionAfterRetry).toEqual({ apiBaseUrl: "", token: null, device: null, error: "" });
+    expect(durableValuesAfterRetry.size).toBe(0);
+  });
 });
