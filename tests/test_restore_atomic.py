@@ -145,21 +145,68 @@ class AtomicRestoreTests(unittest.TestCase):
             target.settings.watch_wallet_address = "original-target-wallet"
             target.storage.save_settings(target.settings)
             original_bytes = target_path.read_bytes()
+            reload_calls = 0
 
-            def fail_reload() -> None:
+            def fail_reload(persist_settings_version: bool = True) -> None:
+                nonlocal reload_calls
+                reload_calls += 1
                 raise RuntimeError("injected BotState reload failure")
 
             target._reload_from_storage = fail_reload
 
-            with self.assertRaisesRegex(RuntimeError, "injected BotState reload"):
-                target.confirm_restore_artifact(artifact)
+            with self.assertLogs("app.core.state", level="ERROR") as captured:
+                with self.assertRaisesRegex(RuntimeError, "injected BotState reload"):
+                    target.confirm_restore_artifact(artifact)
 
+            self.assertEqual(reload_calls, 2)
+            self.assertIn("recovery_error=RuntimeError", captured.output[0])
             self.assertEqual(target_path.read_bytes(), original_bytes)
             self.assertEqual(target.status, BotStatus.STOPPED)
             self.assertFalse(target.settings.live_active_backend_armed)
             self.assertTrue(target.settings.kill_switch_enabled)
             original = Storage(str(target_path))
             self.assertEqual(original.load_settings().watch_wallet_address, "original-target-wallet")
+
+    def test_secondary_recovery_reload_failure_is_logged_without_exception_details(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = self._unsafe_artifact(root / "source.db")
+            target_path = root / "target.db"
+            target = BotState(database_path=str(target_path))
+            target.settings.live_active_backend_armed = False
+            target.settings.kill_switch_enabled = True
+            target.storage.save_settings(target.settings)
+            reload_calls = 0
+
+            class RecoveryReloadError(RuntimeError):
+                pass
+
+            def fail_both_reloads(persist_settings_version: bool = True) -> None:
+                nonlocal reload_calls
+                reload_calls += 1
+                if reload_calls == 1:
+                    raise ValueError("primary-sensitive-detail")
+                raise RecoveryReloadError("secondary-sensitive-detail")
+
+            target._reload_from_storage = fail_both_reloads
+
+            with self.assertLogs("app.core.state", level="ERROR") as captured:
+                with self.assertRaisesRegex(ValueError, "primary-sensitive-detail"):
+                    target.confirm_restore_artifact(artifact)
+
+            self.assertEqual(reload_calls, 2)
+            self.assertEqual(
+                captured.output,
+                [
+                    "ERROR:app.core.state:Restore recovery reload failed after restore rejection; "
+                    "recovery_error=RecoveryReloadError"
+                ],
+            )
+            self.assertNotIn("primary-sensitive-detail", captured.output[0])
+            self.assertNotIn("secondary-sensitive-detail", captured.output[0])
+            self.assertEqual(target.status, BotStatus.STOPPED)
+            self.assertFalse(target.settings.live_active_backend_armed)
+            self.assertTrue(target.settings.kill_switch_enabled)
 
     def test_fail_once_validator_recovery_reload_does_not_mutate_rolled_back_original(self) -> None:
         with TemporaryDirectory() as directory:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import re
 import secrets
 import time
@@ -73,6 +74,9 @@ LIVE_BUY_PROGRAM_FEE_BUFFER_SOL = 0.00002
 SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 SPL_TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 from app.core.strategy import DecisionPipeline
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BotState:
@@ -9668,8 +9672,11 @@ class BotState:
         except Exception:
             try:
                 self._reload_from_storage(persist_settings_version=False)
-            except Exception:
-                pass
+            except Exception as recovery_error:
+                LOGGER.error(
+                    "Restore recovery reload failed after restore rejection; recovery_error=%s",
+                    recovery_error.__class__.__name__,
+                )
             self.status = BotStatus.STOPPED
             self.settings.live_active_backend_armed = False
             self.settings.kill_switch_enabled = True

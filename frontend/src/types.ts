@@ -1387,8 +1387,6 @@ export interface WatchdogStatus {
   loop_iterations: number;
   last_error: string;
   recommended_action: string;
-  shadow_comparison: Record<string, unknown>;
-  execution_timing: Record<string, unknown>;
 }
 
 export interface SolanaStatus {
