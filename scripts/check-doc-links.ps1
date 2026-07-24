@@ -2,6 +2,16 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $errors = @()
+$readmePath = Join-Path $root "README.md"
+$badgePath = Join-Path $root "badges/code-lines.json"
+$badge = Get-Content -LiteralPath $badgePath -Raw | ConvertFrom-Json
+$badgeMessage = [Uri]::EscapeDataString([string]$badge.message)
+$expectedBadge = "![Source lines](https://img.shields.io/badge/source%20lines-$badgeMessage-blue)"
+$readme = [IO.File]::ReadAllText($readmePath)
+if (-not $readme.Contains($expectedBadge)) {
+  $errors += "README.md -> source-lines badge must match badges/code-lines.json and avoid private raw endpoints."
+}
+
 $markdownFiles = Get-ChildItem -LiteralPath $root -Recurse -Filter "*.md" |
   Where-Object {
     $_.FullName -notmatch "\\node_modules\\" -and
@@ -37,4 +47,3 @@ if ($errors.Count -gt 0) {
 }
 
 Write-Host "All relative Markdown links resolve."
-

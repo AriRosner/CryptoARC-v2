@@ -111,17 +111,35 @@ jobs:
             [Text.UTF8Encoding]::new($false)
           )
 
+          $readmePath = Join-Path (Get-Location).Path "README.md"
+          $readme = [IO.File]::ReadAllText($readmePath)
+          $badgeMessage = [Uri]::EscapeDataString($message)
+          $badgeMarkdown = "![Source lines](https://img.shields.io/badge/source%20lines-$badgeMessage-blue)"
+          $badgePattern = "(?m)^!\[Source lines\]\([^)]+\)\r?$"
+          $badgeRegex = [Text.RegularExpressions.Regex]::new($badgePattern)
+          if (-not $badgeRegex.IsMatch($readme)) {
+            throw "README.md does not contain the source-lines badge."
+          }
+          $updatedReadme = $badgeRegex.Replace($readme, $badgeMarkdown, 1)
+          if ($updatedReadme -ne $readme) {
+            [IO.File]::WriteAllText(
+              $readmePath,
+              $updatedReadme,
+              [Text.UTF8Encoding]::new($false)
+            )
+          }
+
       - name: Commit badge update
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          if (-not (git status --short -- badges/code-lines.json)) {
+          if (-not (git status --short -- badges/code-lines.json README.md)) {
             Write-Host "Code line badge is already current."
             exit 0
           }
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add badges/code-lines.json
+          git add badges/code-lines.json README.md
           git commit -m "Update code line badge"
           git push origin HEAD:${{ github.ref_name }}
