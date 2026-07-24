@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: update-code-line-badge-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   update-code-lines:
     runs-on: ubuntu-latest
@@ -61,9 +65,10 @@ jobs:
 
           $files = git ls-files | ForEach-Object {
             $relative = $_
-            $item = Get-Item -LiteralPath $relative
             $parts = $relative -split "/"
-            $isIncluded = $includeExtensions -contains $item.Extension.ToLowerInvariant() -or $includeNames -contains $item.Name
+            $name = [IO.Path]::GetFileName($relative)
+            $extension = [IO.Path]::GetExtension($relative).ToLowerInvariant()
+            $isIncluded = $includeExtensions -contains $extension -or $includeNames -contains $name
             $isExcludedDir = $false
             foreach ($dir in $excludeDirs) {
               if ($parts -contains $dir) {
@@ -71,9 +76,9 @@ jobs:
                 break
               }
             }
-            $isExcludedFile = $excludeFiles -contains $relative -or $excludeFiles -contains $item.Name
-            if ($isIncluded -and -not $isExcludedDir -and -not $isExcludedFile) {
-              $item
+            $isExcludedFile = $excludeFiles -contains $relative -or $excludeFiles -contains $name
+            if ($isIncluded -and -not $isExcludedDir -and -not $isExcludedFile -and (Test-Path -LiteralPath $relative -PathType Leaf)) {
+              Get-Item -LiteralPath $relative
             }
           }
 
@@ -99,7 +104,7 @@ jobs:
           }
 
           New-Item -ItemType Directory -Force -Path badges | Out-Null
-          $json = $badge | ConvertTo-Json -Depth 3
+          $json = $badge | ConvertTo-Json -Depth 3 -Compress
           [IO.File]::WriteAllText(
             (Join-Path (Get-Location).Path "badges/code-lines.json"),
             $json + [Environment]::NewLine,
