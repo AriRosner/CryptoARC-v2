@@ -7,6 +7,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from weakref import WeakSet
 
 import websockets
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
@@ -541,6 +542,85 @@ def bot_tick_seconds() -> float:
     }.get(state.settings.trading_speed, 2.0)
 
 
+_source_task_callbacks: WeakSet[asyncio.Task] = WeakSet()
+_source_task_failures_reported: WeakSet[asyncio.Task] = WeakSet()
+_source_task_timeouts_reported: WeakSet[asyncio.Task] = WeakSet()
+
+
+def _safe_failure_message(context: str, exc: BaseException) -> str:
+    return f"{context} failure ({exc.__class__.__name__})"
+
+
+def _consume_source_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        if task in _source_task_failures_reported:
+            return
+        _source_task_failures_reported.add(task)
+        state.add_event("warning", _safe_failure_message("Source cleanup", exc), subsystem="source")
+
+
+async def _cancel_and_wait_source_tasks(
+    named_tasks: list[tuple[str, asyncio.Task]],
+    timeout_seconds: float = 1.0,
+) -> list[str]:
+    tracked_tasks = list(named_tasks)
+    active_tasks = [(name, task) for name, task in named_tasks if not task.done()]
+    done: set[asyncio.Task] = {task for _, task in tracked_tasks if task.done()}
+    pending: set[asyncio.Task] = set()
+    if active_tasks:
+        for _, task in active_tasks:
+            task.cancel()
+        completed, pending = await asyncio.wait(
+            {task for _, task in active_tasks},
+            timeout=timeout_seconds,
+        )
+        done.update(completed)
+
+    warnings: list[str] = []
+    for name, task in tracked_tasks:
+        if task in pending and not task.done():
+            if task not in _source_task_timeouts_reported:
+                warnings.append(f"{name} task did not acknowledge cancellation within {timeout_seconds:g} second")
+                _source_task_timeouts_reported.add(task)
+            if task not in _source_task_callbacks:
+                task.add_done_callback(_consume_source_task_result)
+                _source_task_callbacks.add(task)
+            continue
+        if task not in done and not task.done():
+            continue
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            continue
+        except Exception as exc:
+            if task in _source_task_failures_reported:
+                continue
+            _source_task_failures_reported.add(task)
+            warnings.append(_safe_failure_message(f"{name} cleanup", exc))
+    return warnings
+
+
+def _record_source_stop_warnings(warnings: list[str]) -> None:
+    for warning in warnings:
+        state.add_event("warning", warning, subsystem="source")
+
+
+def _record_background_task_failures(
+    named_results: list[tuple[str, object]],
+) -> None:
+    for name, result in named_results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            state.add_event(
+                "warning",
+                _safe_failure_message(f"{name} shutdown", result),
+                subsystem="runtime",
+            )
+
+
 async def ensure_source_task() -> None:
     global source_key, source_task
 
@@ -551,14 +631,20 @@ async def ensure_source_task() -> None:
             error = None
         if error:
             state.source_status.status = "error"
-            state.source_status.message = f"Source task failed: {error.__class__.__name__}: {error}"
+            state.source_status.message = _safe_failure_message("Source task", error)
             state.add_event("danger", state.source_status.message, subsystem="source")
         source_task = None
         source_key = None
 
     if state.status.value != "running" or not state.settings.detect_new_tokens:
         if source_task:
-            source_task.cancel()
+            previous_task = source_task
+            warnings = await _cancel_and_wait_source_tasks([("Source", previous_task)])
+            _record_source_stop_warnings(warnings)
+            if not previous_task.done():
+                state.source_status.status = "error"
+                state.source_status.message = warnings[0] if warnings else "Source cancellation is still pending"
+                return
             source_task = None
             source_key = None
         state.source_status.status = "offline"
@@ -570,7 +656,15 @@ async def ensure_source_task() -> None:
         return
 
     if source_task:
-        source_task.cancel()
+        previous_task = source_task
+        warnings = await _cancel_and_wait_source_tasks([("Source", previous_task)])
+        _record_source_stop_warnings(warnings)
+        if not previous_task.done():
+            state.source_status.status = "error"
+            state.source_status.message = warnings[0] if warnings else "Source cancellation is still pending"
+            return
+        source_task = None
+        source_key = None
 
     state.source_status = SourceStatus(source=state.settings.launch_source, status="connecting", connection_requested_at=utc_now())
     source = make_source(
@@ -593,7 +687,7 @@ async def ensure_solana_logs_task() -> None:
             error = None
         if error:
             state.solana_logs_status.status = "error"
-            state.solana_logs_status.message = f"Solana logs verifier failed: {error.__class__.__name__}: {error}"
+            state.solana_logs_status.message = _safe_failure_message("Solana logs verifier", error)
             state.add_event("warning", state.solana_logs_status.message, subsystem="source")
         solana_logs_task = None
         solana_logs_key = None
@@ -605,7 +699,13 @@ async def ensure_solana_logs_task() -> None:
 
     if state.status.value != "running" or not state.settings.detect_new_tokens or not endpoint or not mentions_address:
         if solana_logs_task:
-            solana_logs_task.cancel()
+            previous_task = solana_logs_task
+            warnings = await _cancel_and_wait_source_tasks([("Solana logs verifier", previous_task)])
+            _record_source_stop_warnings(warnings)
+            if not previous_task.done():
+                state.solana_logs_status.status = "error"
+                state.solana_logs_status.message = warnings[0] if warnings else "Solana logs cancellation is still pending"
+                return
             solana_logs_task = None
             solana_logs_key = None
         state.solana_logs_status.status = "offline"
@@ -622,7 +722,15 @@ async def ensure_solana_logs_task() -> None:
         return
 
     if solana_logs_task:
-        solana_logs_task.cancel()
+        previous_task = solana_logs_task
+        warnings = await _cancel_and_wait_source_tasks([("Solana logs verifier", previous_task)])
+        _record_source_stop_warnings(warnings)
+        if not previous_task.done():
+            state.solana_logs_status.status = "error"
+            state.solana_logs_status.message = warnings[0] if warnings else "Solana logs cancellation is still pending"
+            return
+        solana_logs_task = None
+        solana_logs_key = None
 
     state.solana_logs_status = SourceStatus(source="solana_logs", status="connecting")
     verifier = SolanaLogsSource(wss_endpoint=endpoint, mentions_address=mentions_address)
@@ -662,46 +770,47 @@ def clear_launch_queue() -> int:
 async def stop_runtime_tasks() -> dict[str, object]:
     global source_key, source_task, solana_logs_key, solana_logs_task
 
-    cancelled_source = False
-    cancelled_solana_logs = False
-    source_stop_warning = ""
-    def _consume_source_task_result(task: asyncio.Task) -> None:
-        try:
-            task.exception()
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            state.add_event("warning", f"Source stop warning: {exc.__class__.__name__}: {exc}")
+    source_root = source_task
+    solana_logs_root = solana_logs_task
+    cancelled_source = bool(source_root and not source_root.done())
+    cancelled_solana_logs = bool(solana_logs_root and not solana_logs_root.done())
+    named_tasks = []
+    if source_root:
+        named_tasks.append(("Source", source_root))
+    if solana_logs_root:
+        named_tasks.append(("Solana logs verifier", solana_logs_root))
+    warnings = await _cancel_and_wait_source_tasks(named_tasks)
+    _record_source_stop_warnings(warnings)
 
-    if source_task and not source_task.done():
-        cancelled_source = True
-        source_task.cancel()
-        source_task.add_done_callback(_consume_source_task_result)
-
-    if solana_logs_task and not solana_logs_task.done():
-        cancelled_solana_logs = True
-        solana_logs_task.cancel()
-        solana_logs_task.add_done_callback(_consume_source_task_result)
-
-    source_task = None
-    source_key = None
-    solana_logs_task = None
-    solana_logs_key = None
+    if source_root is None or source_root.done():
+        source_task = None
+        source_key = None
+        state.source_status.status = "offline"
+        state.source_status.message = "Source stopped"
+    else:
+        state.source_status.status = "error"
+        state.source_status.message = warnings[0] if warnings else "Source cancellation is still pending"
+    if solana_logs_root is None or solana_logs_root.done():
+        solana_logs_task = None
+        solana_logs_key = None
+        state.solana_logs_status.status = "offline"
+        state.solana_logs_status.message = "Solana logs verifier stopped"
+    else:
+        state.solana_logs_status.status = "error"
+        state.solana_logs_status.message = warnings[-1] if warnings else "Solana logs cancellation is still pending"
     queued_launches_dropped = clear_launch_queue()
-    state.source_status.status = "offline"
-    state.source_status.message = "Source stopped"
-    state.solana_logs_status.status = "offline"
-    state.solana_logs_status.message = "Solana logs verifier stopped"
     return {
         "source_task_cancelled": cancelled_source,
         "solana_logs_task_cancelled": cancelled_solana_logs,
         "queued_launches_dropped": queued_launches_dropped,
-        "source_stop_warning": source_stop_warning,
+        "source_stop_warning": "; ".join(warnings),
     }
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    global source_key, source_task, solana_logs_key, solana_logs_task
+
     state.enforce_live_auth_startup_policy(auth.enabled)
     task = asyncio.create_task(bot_loop())
     live_poll_task = asyncio.create_task(live_audit_poll_loop())
@@ -709,25 +818,37 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        if source_task:
-            source_task.cancel()
-        if solana_logs_task:
-            solana_logs_task.cancel()
         task.cancel()
         live_poll_task.cancel()
         latency_task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await live_poll_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await latency_task
-        except asyncio.CancelledError:
-            pass
+        named_tasks = []
+        if source_task:
+            named_tasks.append(("Source", source_task))
+        if solana_logs_task:
+            named_tasks.append(("Solana logs verifier", solana_logs_task))
+        warnings = await _cancel_and_wait_source_tasks(named_tasks)
+        _record_source_stop_warnings(warnings)
+        if source_task is None or source_task.done():
+            source_task = None
+            source_key = None
+        if solana_logs_task is None or solana_logs_task.done():
+            solana_logs_task = None
+            solana_logs_key = None
+        background_results = await asyncio.gather(
+            task,
+            live_poll_task,
+            latency_task,
+            return_exceptions=True,
+        )
+        _record_background_task_failures(
+            list(
+                zip(
+                    ("Bot loop", "Live audit poller", "Latency probe"),
+                    background_results,
+                    strict=True,
+                )
+            )
+        )
 
 
 app = FastAPI(title="CryptoARC v2 API", version="0.1.0", lifespan=lifespan)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -16,9 +17,18 @@ from app.core.price_pipeline import PricePipeline, numeric
 from app.core.simulator import LaunchSimulator
 
 
+logger = logging.getLogger(__name__)
+
+
 PUMPPORTAL_NON_LAUNCH_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
 }
+
+
+def _log_cleanup_failures(context: str, results: list[Any]) -> None:
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            logger.warning("%s cleanup failure (%s)", context, result.__class__.__name__)
 
 
 class LaunchSource(ABC):
@@ -95,6 +105,8 @@ class PumpPortalLaunchSource(LaunchSource):
         except asyncio.CancelledError:
             for task in tasks:
                 task.cancel()
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            _log_cleanup_failures("PumpPortal source", results)
             raise
 
     async def _run_launch_stream(
@@ -206,12 +218,22 @@ class PumpPortalLaunchSource(LaunchSource):
                     while True:
                         recv_task = asyncio.create_task(websocket.recv())
                         subscribe_task = asyncio.create_task(subscription_queue.get())
-                        done, pending = await asyncio.wait(
-                            {recv_task, subscribe_task},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
+                        wait_tasks = {recv_task, subscribe_task}
+                        try:
+                            done, pending = await asyncio.wait(
+                                wait_tasks,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                        except asyncio.CancelledError:
+                            for task in wait_tasks:
+                                task.cancel()
+                            results = await asyncio.gather(*wait_tasks, return_exceptions=True)
+                            _log_cleanup_failures("PumpPortal trade stream", results)
+                            raise
                         for task in pending:
                             task.cancel()
+                        results = await asyncio.gather(*pending, return_exceptions=True)
+                        _log_cleanup_failures("PumpPortal trade stream", results)
                         if subscribe_task in done:
                             mint = subscribe_task.result()
                             subscription_queue.task_done()
