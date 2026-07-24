@@ -5553,20 +5553,245 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(gate_status["verify_script"], "pass")
             self.assertEqual(gate_status["bootstrap_script"], "pass")
             self.assertEqual(gate_status["doctor_script"], "pass")
-            self.assertEqual(gate_status["frontend_audit"], "warn")
+            self.assertEqual(gate_status["frontend_audit"], "pass")
             self.assertEqual(gate_status["schema"], "pass")
             self.assertEqual(gate_status["live_disabled"], "fail")
             self.assertEqual(gate_status["recovery_debt"], "fail")
             self.assertEqual(gate_status["manual_verification"], "warn")
-            self.assertTrue(any("solana advisory" in warning.lower() for warning in report["warnings"]))
+            self.assertFalse(any("solana advisory" in warning.lower() for warning in report["warnings"]))
             self.assertTrue(any("live execution disabled" in blocker.lower() for blocker in report["blockers"]))
             self.assertTrue(any("unresolved live audits" in blocker.lower() for blocker in report["blockers"]))
             self.assertTrue(report["evidence"]["scripts"]["doctor_present"])
             self.assertTrue(report["evidence"]["scripts"]["frontend_audit_present"])
-            self.assertTrue(report["evidence"]["dependency_audit"]["known_chain_present"])
-            self.assertEqual(report["evidence"]["dependency_audit"]["status"], "review")
+            self.assertFalse(report["evidence"]["dependency_audit"]["known_chain_present"])
+            self.assertEqual(report["evidence"]["dependency_audit"]["status"], "ready")
+            self.assertIsNone(report["evidence"]["dependency_audit"]["acknowledged_exception"])
             self.assertIn("unresolved_audits", report["evidence"])
             self.assertIn("privacy_note", report)
+
+    def test_frontend_dependency_audit_policy_preserves_vulnerable_uuid_review(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            frontend_root = repo_root / "frontend"
+            scripts_root = repo_root / "scripts"
+            frontend_root.mkdir()
+            scripts_root.mkdir()
+            (frontend_root / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "packages": {
+                            "node_modules/@solana/web3.js": {"version": "1.98.4"},
+                            "node_modules/jayson": {"version": "4.3.0"},
+                            "node_modules/uuid": {"version": "11.1.0"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            audit_script = scripts_root / "audit-frontend.ps1"
+            audit_script.write_text("# fixture", encoding="utf-8")
+            state = BotState(database_path=str(repo_root / "test.db"))
+
+            policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+            self.assertEqual(policy["status"], "review")
+            self.assertTrue(policy["known_chain_present"])
+            self.assertIn("@solana/web3.js -> jayson -> uuid", policy["acknowledged_exception"])
+
+    def test_frontend_dependency_audit_policy_blocks_missing_or_invalid_lockfile(self) -> None:
+        for fixture_name, lock_contents in (("missing", None), ("invalid", "{not-json")):
+            with self.subTest(fixture=fixture_name), TemporaryDirectory() as directory:
+                repo_root = Path(directory)
+                frontend_root = repo_root / "frontend"
+                scripts_root = repo_root / "scripts"
+                frontend_root.mkdir()
+                scripts_root.mkdir()
+                if lock_contents is not None:
+                    (frontend_root / "package-lock.json").write_text(lock_contents, encoding="utf-8")
+                audit_script = scripts_root / "audit-frontend.ps1"
+                audit_script.write_text("# fixture", encoding="utf-8")
+                state = BotState(database_path=str(repo_root / "test.db"))
+
+                policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+                self.assertEqual(policy["status"], "blocked")
+                self.assertIsNone(policy["acknowledged_exception"])
+                self.assertTrue(any("package-lock.json" in blocker for blocker in policy["blockers"]))
+                self.assertIn("package-lock.json", policy["operator_action"])
+
+    def test_frontend_dependency_audit_policy_treats_patched_prereleases_as_affected(self) -> None:
+        for uuid_version in ("11.1.1-beta.1", "12.0.1-rc.1", "13.0.1-beta.2"):
+            with self.subTest(uuid_version=uuid_version), TemporaryDirectory() as directory:
+                repo_root = Path(directory)
+                frontend_root = repo_root / "frontend"
+                scripts_root = repo_root / "scripts"
+                frontend_root.mkdir()
+                scripts_root.mkdir()
+                (frontend_root / "package-lock.json").write_text(
+                    json.dumps(
+                        {
+                            "packages": {
+                                "node_modules/@solana/web3.js": {"version": "1.98.4"},
+                                "node_modules/jayson": {"version": "4.3.0"},
+                                "node_modules/uuid": {"version": uuid_version},
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                audit_script = scripts_root / "audit-frontend.ps1"
+                audit_script.write_text("# fixture", encoding="utf-8")
+                state = BotState(database_path=str(repo_root / "test.db"))
+
+                policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+                self.assertEqual(policy["status"], "review")
+                self.assertTrue(policy["known_chain_present"])
+                self.assertIsNotNone(policy["acknowledged_exception"])
+
+    def test_frontend_dependency_audit_policy_reviews_nested_vulnerable_uuid(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            frontend_root = repo_root / "frontend"
+            scripts_root = repo_root / "scripts"
+            frontend_root.mkdir()
+            scripts_root.mkdir()
+            (frontend_root / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "packages": {
+                            "node_modules/@solana/web3.js": {"version": "1.98.4"},
+                            "node_modules/jayson": {"version": "4.3.0"},
+                            "node_modules/uuid": {"version": "11.1.1"},
+                            "node_modules/rpc-websockets/node_modules/uuid": {"version": "11.1.0"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            audit_script = scripts_root / "audit-frontend.ps1"
+            audit_script.write_text("# fixture", encoding="utf-8")
+            state = BotState(database_path=str(repo_root / "test.db"))
+
+            policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+            self.assertEqual(policy["status"], "review")
+            self.assertTrue(policy["known_chain_present"])
+            self.assertIn("11.1.0", policy["packages"]["uuid_versions"])
+
+    def test_frontend_dependency_audit_policy_blocks_malformed_required_versions(self) -> None:
+        valid_versions = {
+            "node_modules/@solana/web3.js": "1.98.4",
+            "node_modules/jayson": "4.3.0",
+            "node_modules/uuid": "11.1.1",
+        }
+        for dependency_path in valid_versions:
+            with self.subTest(dependency_path=dependency_path), TemporaryDirectory() as directory:
+                repo_root = Path(directory)
+                frontend_root = repo_root / "frontend"
+                scripts_root = repo_root / "scripts"
+                frontend_root.mkdir()
+                scripts_root.mkdir()
+                versions = dict(valid_versions)
+                versions[dependency_path] = "not-semver"
+                (frontend_root / "package-lock.json").write_text(
+                    json.dumps(
+                        {
+                            "packages": {
+                                path: {"version": version}
+                                for path, version in versions.items()
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                audit_script = scripts_root / "audit-frontend.ps1"
+                audit_script.write_text("# fixture", encoding="utf-8")
+                state = BotState(database_path=str(repo_root / "test.db"))
+
+                policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+                self.assertEqual(policy["status"], "blocked")
+                self.assertTrue(any("valid semantic versions" in blocker for blocker in policy["blockers"]))
+                self.assertIn("package-lock.json", policy["operator_action"])
+
+    def test_frontend_dependency_audit_policy_blocks_malformed_nested_uuid_version(self) -> None:
+        fixtures = {
+            "empty_object": {},
+            "empty_version": {"version": ""},
+            "null_entry": None,
+            "malformed_version": {"version": "not-semver"},
+        }
+        for fixture_name, nested_entry in fixtures.items():
+            with self.subTest(fixture=fixture_name), TemporaryDirectory() as directory:
+                repo_root = Path(directory)
+                frontend_root = repo_root / "frontend"
+                scripts_root = repo_root / "scripts"
+                frontend_root.mkdir()
+                scripts_root.mkdir()
+                (frontend_root / "package-lock.json").write_text(
+                    json.dumps(
+                        {
+                            "packages": {
+                                "node_modules/@solana/web3.js": {"version": "1.98.4"},
+                                "node_modules/jayson": {"version": "4.3.0"},
+                                "node_modules/uuid": {"version": "11.1.1"},
+                                "node_modules/rpc-websockets/node_modules/uuid": nested_entry,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                audit_script = scripts_root / "audit-frontend.ps1"
+                audit_script.write_text("# fixture", encoding="utf-8")
+                state = BotState(database_path=str(repo_root / "test.db"))
+
+                policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+                self.assertEqual(policy["status"], "blocked")
+                self.assertTrue(any("installed uuid" in blocker.lower() for blocker in policy["blockers"]))
+                self.assertIn("package-lock.json", policy["operator_action"])
+
+    def test_frontend_dependency_audit_policy_reports_missing_script_action(self) -> None:
+        with TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            frontend_root = repo_root / "frontend"
+            frontend_root.mkdir()
+            (frontend_root / "package-lock.json").write_text(
+                json.dumps(
+                    {
+                        "packages": {
+                            "node_modules/@solana/web3.js": {"version": "1.98.4"},
+                            "node_modules/jayson": {"version": "4.3.0"},
+                            "node_modules/uuid": {"version": "11.1.1"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            audit_script = repo_root / "scripts" / "audit-frontend.ps1"
+            state = BotState(database_path=str(repo_root / "test.db"))
+
+            policy = state._frontend_dependency_audit_policy(repo_root, audit_script)
+
+            self.assertEqual(policy["status"], "blocked")
+            self.assertIn("audit-frontend.ps1", policy["operator_action"])
+            self.assertNotIn("package-lock.json is missing", policy["operator_action"])
+
+    def test_release_next_steps_uses_current_frontend_audit_guidance(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            steps = state._release_next_steps(
+                [{"id": "frontend_audit", "status": "fail"}],
+                "blocked",
+            )
+
+            self.assertEqual(
+                steps,
+                ["Run scripts/audit-frontend.ps1 -Strict and resolve reported blockers or review items before release."],
+            )
+            self.assertNotIn("Solana advisory", steps[0])
 
     def test_release_readiness_accepts_recent_verifier_attestation(self) -> None:
         with TemporaryDirectory() as directory:

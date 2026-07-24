@@ -1,4 +1,9 @@
+import json
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -7,6 +12,244 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptSafetyTests(unittest.TestCase):
+    def run_frontend_audit_fixture(
+        self,
+        audit: dict,
+        *,
+        audit_exit_code: int = 0,
+        strict: bool = False,
+        expected_exit_code: int = 0,
+    ) -> dict:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        self.assertIsNotNone(powershell, "PowerShell is required to exercise audit-frontend.ps1")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            mock_npm = Path(temporary_directory) / "mock-npm.ps1"
+            mock_npm.write_text(
+                "$auditJson = @'\n"
+                f"{json.dumps(audit)}\n"
+                "'@\n"
+                "Write-Output $auditJson\n"
+                f"exit {audit_exit_code}\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment["CRYPTOARC_NPM"] = str(mock_npm)
+            command = [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ROOT / "scripts" / "audit-frontend.ps1"),
+                "-Json",
+            ]
+            if strict:
+                command.append("-Strict")
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, expected_exit_code, completed.stderr or completed.stdout)
+        return json.loads(completed.stdout)
+
+    def test_frontend_audit_omits_acknowledged_exception_when_clear(self) -> None:
+        report = self.run_frontend_audit_fixture(
+            {
+                "auditReportVersion": 2,
+                "vulnerabilities": {},
+                "metadata": {
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 0,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 0,
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(report["status"], "ready")
+        self.assertIsNone(report["acknowledged_exception"])
+
+    def test_frontend_audit_preserves_matching_acknowledged_exception(self) -> None:
+        report = self.run_frontend_audit_fixture(
+            {
+                "auditReportVersion": 2,
+                "vulnerabilities": {
+                    "uuid": {
+                        "name": "uuid",
+                        "severity": "moderate",
+                        "isDirect": False,
+                        "via": ["jayson"],
+                        "effects": [],
+                        "range": "<11.1.1",
+                        "nodes": ["node_modules/uuid"],
+                        "fixAvailable": {
+                            "name": "@solana/web3.js",
+                            "version": "0.0.3",
+                            "isSemVerMajor": True,
+                        },
+                    }
+                },
+                "metadata": {
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 1,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 1,
+                    }
+                },
+            },
+            audit_exit_code=1,
+            strict=True,
+        )
+
+        self.assertEqual(report["status"], "review")
+        self.assertTrue(report["vulnerabilities"][0]["acknowledged_exception"])
+        self.assertIn("@solana/web3.js -> jayson -> uuid", report["acknowledged_exception"])
+        self.assertIsNone(report["tooling_error"])
+
+    def test_frontend_audit_strict_blocks_tooling_exit_with_acknowledged_advisory(self) -> None:
+        report = self.run_frontend_audit_fixture(
+            {
+                "auditReportVersion": 2,
+                "vulnerabilities": {
+                    "uuid": {
+                        "name": "uuid",
+                        "severity": "moderate",
+                        "isDirect": False,
+                        "via": ["jayson"],
+                        "effects": [],
+                        "range": "<11.1.1",
+                        "nodes": ["node_modules/uuid"],
+                        "fixAvailable": {
+                            "name": "@solana/web3.js",
+                            "version": "0.0.3",
+                            "isSemVerMajor": True,
+                        },
+                    }
+                },
+                "metadata": {
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 1,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 1,
+                    }
+                },
+            },
+            audit_exit_code=2,
+            strict=True,
+            expected_exit_code=1,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertTrue(any("npm audit exited with code 2" in blocker for blocker in report["blockers"]))
+        self.assertIn("tooling or registry failure", report["tooling_error"])
+        self.assertIsNotNone(report["acknowledged_exception"])
+
+    def test_frontend_audit_strict_blocks_unexplained_nonzero_npm_exit(self) -> None:
+        report = self.run_frontend_audit_fixture(
+            {
+                "auditReportVersion": 2,
+                "vulnerabilities": {},
+                "metadata": {
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 0,
+                        "high": 0,
+                        "critical": 0,
+                        "total": 0,
+                    }
+                },
+            },
+            audit_exit_code=2,
+            strict=True,
+            expected_exit_code=1,
+        )
+
+        self.assertEqual(report["status"], "blocked")
+        self.assertTrue(any("npm audit exited with code 2" in blocker for blocker in report["blockers"]))
+
+    def test_frontend_audit_strict_blocks_invalid_success_schema(self) -> None:
+        valid_counts = {
+            "info": 0,
+            "low": 0,
+            "moderate": 0,
+            "high": 0,
+            "critical": 0,
+            "total": 0,
+        }
+        fixtures = {
+            "empty": {},
+            "wrong_report_version": {
+                "auditReportVersion": 1,
+                "vulnerabilities": {},
+                "metadata": {"vulnerabilities": valid_counts},
+            },
+            "missing_vulnerabilities": {
+                "auditReportVersion": 2,
+                "metadata": {"vulnerabilities": valid_counts},
+            },
+            "missing_counts": {
+                "auditReportVersion": 2,
+                "vulnerabilities": {},
+                "metadata": {"vulnerabilities": {"total": 0}},
+            },
+            "inconsistent_counts": {
+                "auditReportVersion": 2,
+                "vulnerabilities": {},
+                "metadata": {
+                    "vulnerabilities": {
+                        "info": 0,
+                        "low": 0,
+                        "moderate": 0,
+                        "high": 1,
+                        "critical": 0,
+                        "total": 1,
+                    }
+                },
+            },
+        }
+
+        for fixture_name, audit in fixtures.items():
+            with self.subTest(fixture=fixture_name):
+                report = self.run_frontend_audit_fixture(
+                    audit,
+                    strict=True,
+                    expected_exit_code=1,
+                )
+
+                self.assertEqual(report["status"], "blocked")
+                self.assertIn("invalid npm audit JSON schema", report["tooling_error"])
+                self.assertTrue(report["blockers"])
+
+    def test_frontend_audit_documented_commands_use_strict_mode(self) -> None:
+        quickstart = (ROOT / "docs" / "manual" / "02-quickstart.md").read_text(encoding="utf-8")
+        release_checklist = (ROOT / "docs" / "RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "powershell -ExecutionPolicy Bypass -File scripts\\audit-frontend.ps1 -Strict",
+            quickstart,
+        )
+        self.assertIn(
+            "powershell -ExecutionPolicy Bypass -File scripts\\audit-frontend.ps1 -Strict",
+            release_checklist,
+        )
+
     def test_signer_health_callers_allow_rpc_probe_timeout_margin(self) -> None:
         daemon = (ROOT / "tools" / "local_signer_daemon.py").read_text(encoding="utf-8")
         state = (ROOT / "backend" / "app" / "core" / "state.py").read_text(encoding="utf-8")

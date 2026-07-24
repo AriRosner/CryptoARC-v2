@@ -33,10 +33,10 @@ This is the canonical local health check. It runs setup diagnostics, a backend i
 ### Frontend dependency audit
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1
+powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1 -Strict
 ```
 
-This wraps `npm audit --json` with the project release policy. High, critical, and unacknowledged moderate advisories block release work. The current moderate `@solana/web3.js -> jayson -> uuid` advisory is treated as an acknowledged review item because npm's available fix downgrades `@solana/web3.js` to `0.0.3`.
+This wraps `npm audit --json` with the project release policy. High, critical, and unacknowledged moderate advisories block release work. A clear audit reports `ready` with no acknowledged exception. If the recognized moderate `@solana/web3.js -> jayson -> uuid` advisory signature reappears with npm's breaking `@solana/web3.js@0.0.3` fix, the script reports it as an acknowledged review item instead of claiming the current audit is affected.
 
 ### Setup diagnostics
 

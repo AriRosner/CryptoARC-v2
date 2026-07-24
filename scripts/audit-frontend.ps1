@@ -29,9 +29,45 @@ try {
   throw "npm audit did not return parseable JSON. Raw output: $auditText"
 }
 
+$schemaErrors = @()
+if ($null -eq $audit) {
+  $schemaErrors += "report is null"
+} else {
+  $reportVersionProperty = $audit.PSObject.Properties["auditReportVersion"]
+  if ($null -eq $reportVersionProperty -or [string]$reportVersionProperty.Value -ne "2") {
+    $schemaErrors += "auditReportVersion must be 2"
+  }
+  $vulnerabilitiesProperty = $audit.PSObject.Properties["vulnerabilities"]
+  if ($null -eq $vulnerabilitiesProperty -or $vulnerabilitiesProperty.Value -isnot [pscustomobject]) {
+    $schemaErrors += "vulnerabilities must be an object"
+  }
+  $metadataProperty = $audit.PSObject.Properties["metadata"]
+  $countsProperty = if ($null -ne $metadataProperty -and $metadataProperty.Value -is [pscustomobject]) {
+    $metadataProperty.Value.PSObject.Properties["vulnerabilities"]
+  } else {
+    $null
+  }
+  if ($null -eq $countsProperty -or $countsProperty.Value -isnot [pscustomobject]) {
+    $schemaErrors += "metadata.vulnerabilities must be an object"
+  } else {
+    foreach ($countName in @("info", "low", "moderate", "high", "critical", "total")) {
+      $countProperty = $countsProperty.Value.PSObject.Properties[$countName]
+      [long]$parsedCount = 0
+      if ($null -eq $countProperty -or -not [long]::TryParse([string]$countProperty.Value, [ref]$parsedCount) -or $parsedCount -lt 0) {
+        $schemaErrors += "metadata.vulnerabilities.$countName must be a non-negative integer"
+      }
+    }
+  }
+}
+$schemaToolingError = if ($schemaErrors.Count -gt 0) {
+  "invalid npm audit JSON schema: $($schemaErrors -join '; ')"
+} else {
+  $null
+}
+
 $acknowledgedChain = @("@solana/web3.js", "jayson", "uuid")
 $vulnerabilities = @()
-if ($audit.vulnerabilities) {
+if (-not $schemaToolingError -and $audit.vulnerabilities) {
   foreach ($property in $audit.vulnerabilities.PSObject.Properties) {
     $item = $property.Value
     $fix = $item.fixAvailable
@@ -47,6 +83,26 @@ if ($audit.vulnerabilities) {
       fix_available         = if ($fix -is [bool]) { $fix } else { [ordered]@{ name = $fixName; version = $fixVersion; is_semver_major = $isSemVerMajor } }
       acknowledged_exception = $acknowledged
     }
+  }
+}
+if (-not $schemaToolingError) {
+  $observedCounts = [ordered]@{ info = 0; low = 0; moderate = 0; high = 0; critical = 0; total = $vulnerabilities.Count }
+  foreach ($item in $vulnerabilities) {
+    $severity = ([string]$item.severity).ToLowerInvariant()
+    if ($observedCounts.Contains($severity) -and $severity -ne "total") {
+      $observedCounts[$severity] += 1
+    } else {
+      $schemaErrors += "vulnerability $($item.name) has unsupported severity '$severity'"
+    }
+  }
+  foreach ($countName in @("info", "low", "moderate", "high", "critical", "total")) {
+    $reportedCount = [long]$audit.metadata.vulnerabilities.PSObject.Properties[$countName].Value
+    if ($reportedCount -ne $observedCounts[$countName]) {
+      $schemaErrors += "metadata.vulnerabilities.$countName=$reportedCount does not match parsed entries=$($observedCounts[$countName])"
+    }
+  }
+  if ($schemaErrors.Count -gt 0) {
+    $schemaToolingError = "invalid npm audit JSON schema: $($schemaErrors -join '; ')"
   }
 }
 
@@ -66,9 +122,18 @@ foreach ($item in $vulnerabilities) {
     $warnings += "$($item.name) remains in the acknowledged @solana/web3.js -> jayson -> uuid advisory chain; npm's available fix downgrades @solana/web3.js to 0.0.3."
   }
 }
+$toolingError = $schemaToolingError
+if ($auditExitCode -gt 1) {
+  $toolingError = "npm audit exited with code $auditExitCode; treat this as a tooling or registry failure and rerun the audit."
+} elseif ($auditExitCode -eq 1 -and $vulnerabilities.Count -eq 0) {
+  $toolingError = "npm audit exited with code 1 without parsed vulnerability entries; treat this as a tooling or registry failure and rerun the audit."
+}
+if ($toolingError) {
+  $blockers += $toolingError
+}
 
 $metadata = $audit.metadata
-$counts = if ($metadata -and $metadata.vulnerabilities) { $metadata.vulnerabilities } else { [ordered]@{} }
+$counts = if (-not $schemaToolingError) { $metadata.vulnerabilities } else { [ordered]@{} }
 $status = if ($blockers.Count -gt 0) { "blocked" } elseif ($warnings.Count -gt 0 -or $auditExitCode -ne 0) { "review" } else { "ready" }
 $operatorAction = if ($status -eq "ready") {
   "Frontend dependency audit is clear."
@@ -77,6 +142,11 @@ $operatorAction = if ($status -eq "ready") {
 } else {
   "Resolve high, critical, or unacknowledged advisories before release or live work."
 }
+$acknowledgedException = if ($warnings.Count -gt 0) {
+  "moderate @solana/web3.js -> jayson -> uuid advisory; npm fix suggests @solana/web3.js@0.0.3, which is a breaking downgrade"
+} else {
+  $null
+}
 
 $report = [ordered]@{
   artifact_type          = "cryptoarc_frontend_dependency_audit"
@@ -84,11 +154,12 @@ $report = [ordered]@{
   generated_at           = (Get-Date).ToUniversalTime().ToString("o")
   status                 = $status
   npm_exit_code          = $auditExitCode
+  tooling_error          = $toolingError
   counts                 = $counts
   vulnerabilities        = $vulnerabilities
   blockers               = @($blockers | Select-Object -Unique)
   warnings               = @($warnings | Select-Object -Unique)
-  acknowledged_exception = "moderate @solana/web3.js -> jayson -> uuid advisory; npm fix suggests @solana/web3.js@0.0.3, which is a breaking downgrade"
+  acknowledged_exception = $acknowledgedException
   operator_action        = $operatorAction
 }
 

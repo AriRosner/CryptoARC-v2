@@ -9322,35 +9322,109 @@ class BotState:
 
     def _frontend_dependency_audit_policy(self, repo_root: Path, audit_script_path: Path) -> dict[str, object]:
         package_lock = repo_root / "frontend" / "package-lock.json"
+        package_lock_present = package_lock.exists()
+        try:
+            package_lock_payload = json.loads(package_lock.read_text(encoding="utf-8"))
+            package_lock_valid = isinstance(package_lock_payload, dict) and isinstance(package_lock_payload.get("packages"), dict)
+        except (OSError, json.JSONDecodeError):
+            package_lock_payload = {}
+            package_lock_valid = False
         solana_version = self._package_lock_dependency_version(package_lock, "node_modules/@solana/web3.js")
         jayson_version = self._package_lock_dependency_version(package_lock, "node_modules/jayson")
         uuid_version = self._package_lock_dependency_version(package_lock, "node_modules/uuid")
         script_present = audit_script_path.exists()
-        known_chain_present = bool(solana_version and jayson_version and uuid_version)
+        semver_pattern = r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?"
+        required_versions = (solana_version, jayson_version, uuid_version)
+        required_versions_present = all(required_versions)
+        required_versions_valid = required_versions_present and all(re.fullmatch(semver_pattern, version) for version in required_versions)
+        package_entries = package_lock_payload.get("packages", {}) if package_lock_valid else {}
+        uuid_package_entries = [
+            item
+            for dependency_path, item in package_entries.items()
+            if re.search(r"(?:^|/)node_modules/uuid$", str(dependency_path))
+        ]
+        uuid_versions = [
+            str(item.get("version") or "") if isinstance(item, dict) else ""
+            for item in uuid_package_entries
+        ]
+        uuid_versions_valid = bool(uuid_package_entries) and all(
+            isinstance(item, dict)
+            and bool(item.get("version"))
+            and re.fullmatch(semver_pattern, str(item.get("version")))
+            for item in uuid_package_entries
+        )
+        uuid_advisory_present = False
+        for installed_uuid_version in uuid_versions:
+            uuid_match = re.fullmatch(semver_pattern, installed_uuid_version)
+            uuid_semver = tuple(int(part) for part in uuid_match.groups()[:3]) if uuid_match else ()
+            uuid_prerelease = bool(uuid_match and uuid_match.group(4))
+            if uuid_semver and (
+                uuid_semver < (11, 1, 1)
+                or (12, 0, 0) <= uuid_semver < (12, 0, 1)
+                or (13, 0, 0) <= uuid_semver < (13, 0, 1)
+                or (uuid_prerelease and uuid_semver in {(11, 1, 1), (12, 0, 1), (13, 0, 1)})
+            ):
+                uuid_advisory_present = True
+                break
+        known_chain_present = bool(solana_version and jayson_version and uuid_advisory_present)
         status = "ready"
         blockers: list[str] = []
         warnings: list[str] = []
         if not script_present:
-            status = "blocked"
             blockers.append("scripts/audit-frontend.ps1 is missing.")
+        if not package_lock_present:
+            blockers.append("frontend/package-lock.json is missing.")
+        elif not package_lock_valid:
+            blockers.append("frontend/package-lock.json is invalid.")
+        elif not required_versions_present:
+            blockers.append("frontend/package-lock.json is missing required dependency metadata.")
+        elif not required_versions_valid:
+            blockers.append("frontend/package-lock.json does not contain valid semantic versions for required dependencies.")
+        elif not uuid_versions_valid:
+            blockers.append("frontend/package-lock.json contains invalid semantic version metadata for an installed uuid package.")
+        if blockers:
+            status = "blocked"
         elif known_chain_present:
             status = "review"
             warnings.append("Known moderate @solana/web3.js -> jayson -> uuid advisory remains acknowledged; npm's available fix downgrades @solana/web3.js to 0.0.3.")
+        if status == "ready":
+            operator_action = "Frontend audit policy is present; run scripts/audit-frontend.ps1 -Strict before release."
+        elif status == "review":
+            operator_action = "Run scripts/audit-frontend.ps1 -Strict and review the recognized advisory before release."
+        else:
+            actions: list[str] = []
+            if not script_present:
+                actions.append("Restore scripts/audit-frontend.ps1.")
+            if not package_lock_present:
+                actions.append("Restore frontend/package-lock.json.")
+            elif not package_lock_valid:
+                actions.append("Regenerate a valid frontend/package-lock.json.")
+            elif not required_versions_present:
+                actions.append("Regenerate frontend/package-lock.json with the required dependency metadata.")
+            elif not required_versions_valid:
+                actions.append("Regenerate frontend/package-lock.json with valid semantic versions.")
+            elif not uuid_versions_valid:
+                actions.append("Regenerate frontend/package-lock.json with valid installed uuid versions.")
+            actions.append("Then run scripts/audit-frontend.ps1 -Strict.")
+            operator_action = " ".join(actions)
         return {
             "status": status,
             "script": str(audit_script_path.relative_to(repo_root)),
             "script_present": script_present,
-            "package_lock_present": package_lock.exists(),
+            "package_lock_present": package_lock_present,
+            "package_lock_valid": package_lock_valid,
             "known_chain_present": known_chain_present,
             "packages": {
                 "@solana/web3.js": solana_version,
                 "jayson": jayson_version,
                 "uuid": uuid_version,
+                "uuid_versions": uuid_versions,
+                "uuid_versions_valid": uuid_versions_valid,
             },
-            "acknowledged_exception": "moderate @solana/web3.js -> jayson -> uuid advisory; do not apply npm's breaking @solana/web3.js@0.0.3 audit fix without a compatibility plan" if known_chain_present else "",
+            "acknowledged_exception": "moderate @solana/web3.js -> jayson -> uuid advisory; do not apply npm's breaking @solana/web3.js@0.0.3 audit fix without a compatibility plan" if known_chain_present else None,
             "blockers": blockers,
             "warnings": warnings,
-            "operator_action": "Run scripts/audit-frontend.ps1 before release; review the acknowledged Solana advisory and block high/critical advisories." if status == "review" else ("Restore scripts/audit-frontend.ps1 before release." if status == "blocked" else "Frontend audit policy is present; run it before release."),
+            "operator_action": operator_action,
         }
 
     def _package_lock_dependency_version(self, package_lock_path: Path, dependency_path: str) -> str:
@@ -9379,7 +9453,7 @@ class BotState:
             elif gate_id in {"verify_script", "bootstrap_script", "doctor_script"}:
                 actions.append("Restore the local setup and verification scripts before handoff.")
             elif gate_id == "frontend_audit":
-                actions.append("Run scripts/audit-frontend.ps1 and keep the Solana advisory acknowledged until a compatible fix exists.")
+                actions.append("Run scripts/audit-frontend.ps1 -Strict and resolve reported blockers or review items before release.")
             elif gate_id == "schema":
                 actions.append("Run bootstrap or startup migrations until schema status is current.")
             elif gate_id == "frontend_version":

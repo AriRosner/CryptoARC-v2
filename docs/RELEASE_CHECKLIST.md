@@ -8,7 +8,7 @@ Use this checklist before tagging a local release, starting a live-testing sessi
 - Run `powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1` on fresh or changed environments.
 - Run `powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Strict`.
 - Run `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
-- Run `powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1`.
+- Run `powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1 -Strict`.
 - Record `/api/reports/release-readiness/verification` after verification, git diff review, and release-doc review so the release-readiness manual gate has local evidence.
 - Confirm GitHub Actions CI is green for backend tests, frontend build, frontend dependency audit policy, and docs links.
 - Confirm backend tests pass.
@@ -86,5 +86,5 @@ Use this concise checklist for the first local full autonomous sniper pilot.
 
 - Update `docs/roadmap/01-launch-critical-path.md` if setup, verification, source health, or live-safety assumptions changed.
 - Update `docs/AI_HANDOFF.md` when new major subsystems, commands, or safety boundaries are added.
-- Track the current acknowledged frontend advisory chain through `scripts\audit-frontend.ps1`: `@solana/web3.js -> jayson -> uuid`. Do not apply npm's breaking `@solana/web3.js@0.0.3` audit fix without a separate compatibility plan.
+- Confirm `scripts\audit-frontend.ps1` reports `ready` with no acknowledged exception when the audit is clear. If the recognized `@solana/web3.js -> jayson -> uuid` advisory signature reappears with npm's breaking `@solana/web3.js@0.0.3` fix, keep it as an explicit review item until a compatible remediation is verified.
 - Preserve the no-seed-phrase and localhost-only live-execution boundaries.
