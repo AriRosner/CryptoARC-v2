@@ -73,6 +73,7 @@ class CoreLogicTests(unittest.TestCase):
                     opened_at=now,
                     closed_at=now,
                     source_price_confidence=0.9,
+                    settings_version_id=state.current_settings_version_id,
                 )
             )
             state.storage.save_strategy_decision(

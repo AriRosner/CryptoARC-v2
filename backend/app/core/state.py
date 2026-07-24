@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from collections import Counter, deque
 from dataclasses import asdict, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -88,6 +88,8 @@ class BotState:
     MOBILE_TOKEN_TTL_DAYS = 30
     READINESS_CACHE_TTL_SECONDS = 5.0
     live_recovery_max_attempts = 3
+    PAPER_STRATEGY_FINGERPRINT_SCHEMA = "paper-strategy-v1"
+    STRATEGY_PROMOTION_EVIDENCE_WINDOW_HOURS = 168
     LIVE_CAP_SETTING_KEYS = (
         "live_max_trade_sol",
         "live_daily_loss_cap_sol",
@@ -95,6 +97,48 @@ class BotState:
         "live_max_open_positions",
         "live_max_slippage_pct",
         "live_priority_fee_cap_sol",
+    )
+    PAPER_STRATEGY_IGNORED_SETTING_KEYS = frozenset(
+        {
+            "mode",
+            "require_live_confirmation",
+            "detect_new_tokens",
+            "auto_refresh",
+            "backtest_replay_limit",
+            "raw_replay_limit",
+            "enable_trade_toasts",
+            "compact_table_mode",
+            "kill_switch_enabled",
+            "solana_rpc_url",
+            "watch_wallet_address",
+            "manual_live_enabled",
+            "manual_live_max_sol",
+            "autonomous_live_enabled",
+            "live_trading_enabled",
+            "live_max_trade_sol",
+            "live_daily_loss_cap_sol",
+            "live_wallet_exposure_cap_sol",
+            "live_max_open_positions",
+            "live_max_slippage_pct",
+            "live_priority_fee_cap_sol",
+            "live_session_acknowledged",
+            "live_signer_mode",
+            "live_active_backend_armed",
+            "live_active_wallet_public_key",
+            "live_hot_wallet_enabled",
+            "live_hot_wallet_public_key",
+            "live_hot_wallet_label",
+            "profit_sweep_enabled",
+            "profit_sweep_mode",
+            "profit_sweep_threshold_sol",
+            "profit_sweep_amount_sol",
+            "profit_sweep_percentage",
+            "profit_sweep_min_profit_sol",
+            "profit_sweep_destination_wallet",
+            "profit_sweep_min_reserve_sol",
+            "profit_sweep_cooldown_seconds",
+            "profit_sweep_max_per_day",
+        }
     )
 
     def __init__(
@@ -1069,7 +1113,7 @@ class BotState:
             quote_adjusted_pnl_sol=quote_adjusted_pnl,
             simulation_accuracy_status=accuracy_status,
             source_price_confidence=token.price_confidence,
-            settings_version_id=token.settings_version_id or self.current_settings_version_id,
+            settings_version_id=token.settings_version_id,
         )
 
     def _paper_model_cost_sol(self, token: TokenSignal) -> float:
@@ -1169,7 +1213,6 @@ class BotState:
         gross_win = 0.0
         gross_loss = 0.0
         pnl_curve = [0.0]
-        trough = 0.0
         trades: list[dict[str, object]] = []
         for token in candidates:
             replay_token = self._replay_launch_candidate(token)
@@ -1179,7 +1222,6 @@ class BotState:
                 pnl = replay_token.pnl_sol if replay_token.pnl_sol is not None else self._observed_replay_pnl(replay_token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
-                trough = min(trough, simulated_pnl)
                 outcome = self._classify_pnl(pnl)
                 if pnl > 0:
                     gross_wins += 1
@@ -1229,7 +1271,9 @@ class BotState:
             gross_win_rate_pct=int((gross_wins / buys) * 100) if buys else 0,
             scratch_rate_pct=int((scratches / buys) * 100) if buys else 0,
             estimated_pnl_sol=round(simulated_pnl, 6),
-            max_drawdown_sol=round(trough, 6),
+            max_drawdown_sol=self._peak_to_trough_drawdown_sol(
+                [float(item.get("pnl_sol", 0.0) or 0.0) for item in trades if item.get("decision") == "buy"]
+            ),
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
             avg_hold_seconds=int(sum((token.hold_duration_seconds or 0) for token in candidates) / max(1, len(candidates))),
             best_trade_sol=round(max([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
@@ -1943,19 +1987,19 @@ class BotState:
             losses = 0
             scratches = 0
             gross_wins = 0
-            drawdown = 0.0
+            profile_pnls: list[float] = []
             for token in candidates:
                 decision = self.risk.evaluate(token, settings, BotStats(), open_positions=0)
                 if decision.allowed:
                     buys += 1
                     trade_pnl = token.pnl_sol if token.pnl_sol is not None else self._observed_replay_pnl(token, settings) + abs(offset) / 2000
                     pnl += trade_pnl
+                    profile_pnls.append(trade_pnl)
                     gross_wins += 1 if trade_pnl > 0 else 0
                     outcome = self._classify_pnl(trade_pnl)
                     wins += 1 if outcome == "win" else 0
                     losses += 1 if outcome == "loss" else 0
                     scratches += 1 if outcome == "scratch" else 0
-                    drawdown = min(drawdown, pnl)
                 else:
                     skips += 1
             comparison.append({
@@ -1967,7 +2011,7 @@ class BotState:
                 "scratches": scratches,
                 "win_rate_pct": int((wins / buys) * 100) if buys else 0,
                 "gross_win_rate_pct": int((gross_wins / buys) * 100) if buys else 0,
-                "max_drawdown_sol": round(drawdown, 6),
+                "max_drawdown_sol": self._peak_to_trough_drawdown_sol(profile_pnls),
                 "estimated_pnl_sol": round(pnl, 6),
             })
         run.comparison = comparison
@@ -1988,7 +2032,6 @@ class BotState:
         gross_win = 0.0
         gross_loss = 0.0
         pnl_curve = [0.0]
-        trough = 0.0
         trades: list[dict[str, object]] = []
         for token in candidates:
             replay_token = self._replay_launch_candidate(token)
@@ -2004,7 +2047,6 @@ class BotState:
                 pnl = replay_token.pnl_sol if replay_token.pnl_sol is not None else self._observed_replay_pnl(replay_token, settings)
                 simulated_pnl = round(simulated_pnl + pnl, 6)
                 pnl_curve.append(simulated_pnl)
-                trough = min(trough, simulated_pnl)
                 outcome = self._classify_pnl(pnl)
                 if pnl > 0:
                     gross_wins += 1
@@ -2035,7 +2077,9 @@ class BotState:
             gross_win_rate_pct=int((gross_wins / buys) * 100) if buys else 0,
             scratch_rate_pct=int((scratches / buys) * 100) if buys else 0,
             estimated_pnl_sol=round(simulated_pnl, 6),
-            max_drawdown_sol=round(trough, 6),
+            max_drawdown_sol=self._peak_to_trough_drawdown_sol(
+                [float(item.get("pnl_sol", 0.0) or 0.0) for item in trades if item.get("decision") == "buy"]
+            ),
             profit_factor=round(gross_win / gross_loss, 2) if gross_loss else 0.0,
             avg_hold_seconds=int(sum((token.hold_duration_seconds or 0) for token in candidates) / max(1, len(candidates))),
             best_trade_sol=round(max([float(item.get("pnl_sol", 0) or 0) for item in trades if item.get("decision") == "buy"], default=0.0), 6),
@@ -4345,9 +4389,44 @@ class BotState:
         out_of_sample: dict[str, object] | None = None,
         source_soak: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        closed_count = len(closed)
-        pnl_sol = float(performance.get("pnl_sol", 0.0))
-        max_drawdown = self._max_drawdown_sol(closed)
+        strategy_fingerprint = self._paper_strategy_fingerprint(self.settings)
+        matching_settings_version_ids = sorted(
+            version.id
+            for version in self.storage.load_settings_versions(5000)
+            if self._paper_strategy_fingerprint(version.settings) == strategy_fingerprint
+        )
+        matching_ids = set(matching_settings_version_ids)
+        matching_closed = [
+            trade
+            for trade in closed
+            if trade.mode == "paper" and trade.settings_version_id in matching_ids
+        ]
+        evidence_now = utc_now()
+        evidence_cutoff = evidence_now - timedelta(hours=self.STRATEGY_PROMOTION_EVIDENCE_WINDOW_HOURS)
+        recent_matching_closed: list[TradeRecord] = []
+        excluded_ambiguous_timestamp_trades = 0
+        excluded_future_timestamp_trades = 0
+        for trade in matching_closed:
+            closed_at = trade.closed_at
+            if closed_at is None or closed_at.tzinfo is None or closed_at.utcoffset() is None:
+                excluded_ambiguous_timestamp_trades += 1
+                continue
+            if closed_at > evidence_now:
+                excluded_future_timestamp_trades += 1
+                continue
+            if closed_at >= evidence_cutoff:
+                recent_matching_closed.append(trade)
+        recent_matching_closed.sort(key=self._trade_timestamp_sort_key)
+        closed_count = len(recent_matching_closed)
+        cohort_performance = self._performance_group("current paper strategy (recent)", recent_matching_closed)
+        all_matching_strategy_performance = self._performance_group("current paper strategy (all time)", matching_closed)
+        pnl_sol = float(cohort_performance.get("pnl_sol", 0.0))
+        cohort_wins = int(cohort_performance.get("wins", 0) or 0)
+        cohort_losses = int(cohort_performance.get("losses", 0) or 0)
+        cohort_profit_factor = 99.0 if cohort_wins > 0 and cohort_losses == 0 else float(cohort_performance.get("profit_factor", 0.0))
+        max_drawdown = self._max_drawdown_sol(recent_matching_closed)
+        all_matching_strategy_drawdown = self._max_drawdown_sol(matching_closed)
+        all_history_drawdown = self._max_drawdown_sol(closed)
         out_of_sample = out_of_sample or self._out_of_sample_strategy_evidence(self.settings.strategy_profile)
         source_soak = source_soak or self.source_soak_acceptance_report()
         source_soak_required = bool(source_soak.get("hard_required"))
@@ -4358,13 +4437,13 @@ class BotState:
         validate_profit_factor = float(validate.get("profit_factor", 0.0) or 0.0)
         collapse = bool(out_of_sample.get("collapse_warning"))
         gates = [
-            self._promotion_gate("closed_trades", "Closed paper trades", closed_count, ">= 30", closed_count >= 30, "Collect enough closed paper trades to reduce sample noise."),
+            self._promotion_gate("closed_trades", "Recent closed paper trades (current strategy)", closed_count, ">= 30 within 168h", closed_count >= 30, "Collect at least 30 closed paper trades under the current strategy within the fixed seven-day evidence window."),
             self._promotion_gate("source_events", "Source event sample", source_events, ">= 100", source_events >= 100, "Collect enough source events for replay and parser confidence."),
             self._promotion_gate("replay_confidence", "Replay confidence", replay_confidence, ">= 70", replay_confidence >= 70, "Replay confidence needs accepted price and normalized event coverage."),
             self._promotion_gate("source_trust", "Source trust", str(source.get("trust_state", "unknown")), "trusted", source.get("trust_state") == "trusted", "Source trust must be trusted before strategy promotion."),
             self._promotion_gate("source_soak", "Hybrid source soak", source_soak.get("status", "unknown"), "ready when direct verifier is configured", (not source_soak_required) or source_soak_ready, "Direct/PumpPortal soak must pass once the direct verifier is configured or direct events are collected."),
             self._promotion_gate("price_acceptance", "Price acceptance", round(float(price.get("acceptance_rate", 0.0)), 3), ">= 0.70", float(price.get("acceptance_rate", 0.0)) >= 0.70, "Accepted prices should dominate rejected marks."),
-            self._promotion_gate("paper_profitability", "Paper profitability", f"{round(pnl_sol, 6)} SOL / PF {round(profit_factor, 2)}", "PnL > 0 and PF > 1.1", pnl_sol > 0 and profit_factor > 1.1, "Paper performance must be positive with profit factor above 1.1."),
+            self._promotion_gate("paper_profitability", "Paper profitability (current strategy)", f"{round(pnl_sol, 6)} SOL / PF {round(cohort_profit_factor, 2)}", "PnL > 0 and PF > 1.1", pnl_sol > 0 and cohort_profit_factor > 1.1, "Paper performance under the current strategy must be positive with profit factor above 1.1."),
             self._promotion_gate("drawdown", "Max drawdown", round(max_drawdown, 6), "<= 0.05 SOL", max_drawdown <= 0.05, "Drawdown must fit the tiny-pilot risk envelope."),
             self._promotion_gate("out_of_sample", "Out-of-sample replay", f"{round(validate_pnl, 6)} SOL / PF {round(validate_profit_factor, 2)} / {validate_tokens} tokens", "validate PnL > 0, PF > 1.0, >= 10 tokens", validate_tokens >= 10 and validate_pnl > 0 and validate_profit_factor > 1.0, "Validation replay must stay profitable on held-out tokens."),
             self._promotion_gate("strategy_drift", "Strategy drift", "collapse" if collapse else "stable", "stable", not collapse, "Validation performance must not collapse versus training performance."),
@@ -4382,7 +4461,24 @@ class BotState:
             "requires_operator_review": True,
             "out_of_sample": out_of_sample,
             "source_soak": source_soak,
-            "generated_at": utc_now().isoformat(),
+            "strategy_fingerprint_schema": self.PAPER_STRATEGY_FINGERPRINT_SCHEMA,
+            "strategy_fingerprint": strategy_fingerprint,
+            "matching_settings_version_ids": matching_settings_version_ids,
+            "strategy_evidence_window_hours": self.STRATEGY_PROMOTION_EVIDENCE_WINDOW_HOURS,
+            "matching_closed_trades": len(matching_closed),
+            "recent_matching_closed_trades": closed_count,
+            "recent_oldest_closed_at": self._timestamp_for_deterministic_ordering(recent_matching_closed[0].closed_at).isoformat() if recent_matching_closed else None,
+            "recent_newest_closed_at": self._timestamp_for_deterministic_ordering(recent_matching_closed[-1].closed_at).isoformat() if recent_matching_closed else None,
+            "excluded_ambiguous_timestamp_trades": excluded_ambiguous_timestamp_trades,
+            "excluded_future_timestamp_trades": excluded_future_timestamp_trades,
+            "all_matching_strategy_closed_trades": len(matching_closed),
+            "all_matching_strategy_performance": all_matching_strategy_performance,
+            "all_matching_strategy_drawdown_sol": all_matching_strategy_drawdown,
+            "all_history_closed_trades": len(closed),
+            "cohort_performance": cohort_performance,
+            "all_history_performance": {**performance, "profit_factor": profit_factor},
+            "all_history_drawdown_sol": all_history_drawdown,
+            "generated_at": evidence_now.isoformat(),
         }
 
     def _out_of_sample_strategy_evidence(self, profile: str | None = None, limit: int | None = None) -> dict[str, object]:
@@ -4436,15 +4532,52 @@ class BotState:
             "reason": reason,
         }
 
-    def _max_drawdown_sol(self, trades: list[TradeRecord]) -> float:
+    def _paper_strategy_fingerprint(self, settings: BotSettings | dict[str, object]) -> str:
+        recorded = asdict(settings) if isinstance(settings, BotSettings) else dict(settings)
+        normalized = asdict(BotSettings())
+        normalized.update({key: value for key, value in recorded.items() if key in normalized})
+        strategy_settings = {
+            key: value
+            for key, value in normalized.items()
+            if key not in self.PAPER_STRATEGY_IGNORED_SETTING_KEYS
+            and not key.startswith(("live_", "manual_live_", "profit_sweep_"))
+        }
+        encoded = json.dumps(
+            {
+                "schema": self.PAPER_STRATEGY_FINGERPRINT_SCHEMA,
+                "settings": strategy_settings,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    def _peak_to_trough_drawdown_sol(self, pnls: list[float]) -> float:
         running = 0.0
         peak = 0.0
         drawdown = 0.0
-        for trade in sorted(trades, key=lambda item: item.closed_at or item.opened_at or utc_now()):
-            running = round(running + (trade.pnl_sol or 0.0), 6)
+        for pnl in pnls:
+            running = round(running + pnl, 6)
             peak = max(peak, running)
             drawdown = max(drawdown, peak - running)
         return round(drawdown, 6)
+
+    def _max_drawdown_sol(self, trades: list[TradeRecord]) -> float:
+        ordered = sorted(trades, key=self._trade_timestamp_sort_key)
+        return self._peak_to_trough_drawdown_sol([float(trade.pnl_sol or 0.0) for trade in ordered])
+
+    def _trade_timestamp_sort_key(self, trade: TradeRecord) -> tuple[datetime, str]:
+        timestamp = trade.closed_at or trade.opened_at
+        return self._timestamp_for_deterministic_ordering(timestamp), trade.id
+
+    def _timestamp_for_deterministic_ordering(self, timestamp: datetime | None) -> datetime:
+        """Normalize only for reporting order; naive legacy values assume UTC but never pass freshness gates."""
+        if timestamp is None:
+            return datetime.min.replace(tzinfo=timezone.utc)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            return timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.astimezone(timezone.utc)
 
     def readiness_halt_reason(self, readiness: dict[str, object] | None = None) -> str | None:
         if not self.settings.halt_on_low_readiness:
