@@ -78,13 +78,13 @@ jobs:
             }
             $isExcludedFile = $excludeFiles -contains $relative -or $excludeFiles -contains $name
             if ($isIncluded -and -not $isExcludedDir -and -not $isExcludedFile -and (Test-Path -LiteralPath $relative -PathType Leaf)) {
-              Get-Item -LiteralPath $relative
+              $relative
             }
           }
 
           $lineCount = 0
           foreach ($file in $files) {
-            $lineCount += (Get-Content -LiteralPath $file.FullName | Measure-Object -Line).Lines
+            $lineCount += (Get-Content -LiteralPath $file | Measure-Object -Line).Lines
           }
 
           if ($lineCount -ge 1000000) {
