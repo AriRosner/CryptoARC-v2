@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, Field, SecretStr
+from starlette.responses import JSONResponse
 
 from app.mobile.contracts import MobileScope
 from app.mobile.service import (
@@ -33,8 +36,24 @@ class MobileKillSwitchPayload(BaseModel):
 
 
 class MobilePushRegistrationRequest(BaseModel):
-    token: str = Field(min_length=1, max_length=4096)
+    token: SecretStr = Field(min_length=1, max_length=4096)
     platform: str = Field(default="android", max_length=40)
+
+
+class MobilePushRegistrationRoute(APIRoute):
+    def get_route_handler(self):
+        route_handler = super().get_route_handler()
+
+        async def redacted_route_handler(request: Request):
+            try:
+                return await route_handler(request)
+            except RequestValidationError:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": "Invalid mobile push registration request"},
+                )
+
+        return redacted_route_handler
 
 
 def create_mobile_router(
@@ -153,7 +172,6 @@ def create_mobile_router(
             detail=f"Mobile trade approval is not implemented for {intent_id}",
         )
 
-    @router.post("/notifications/register")
     async def mobile_notifications_register(
         payload: MobilePushRegistrationRequest,
         device: dict[str, object] = Depends(require_scope(MobileScope.ALERTS)),
@@ -161,10 +179,17 @@ def create_mobile_router(
         try:
             return service.register_push_token(
                 device=device,
-                token=payload.token,
+                token=payload.token.get_secret_value(),
                 platform=payload.platform,
             )
         except MobilePushTokenEncryptionUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    router.add_api_route(
+        "/notifications/register",
+        mobile_notifications_register,
+        methods=["POST"],
+        route_class_override=MobilePushRegistrationRoute,
+    )
 
     return router

@@ -839,7 +839,44 @@ class Storage:
                 return payload
         return None
 
-    def save_mobile_push_registration(self, registration: MobilePushRegistration) -> None:
+    def revoke_mobile_device_and_push_registrations(
+        self,
+        device_id: str,
+        revoked_at: str,
+    ) -> tuple[dict[str, Any], bool] | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload, revoked_at FROM mobile_devices WHERE id = ?",
+                (device_id,),
+            ).fetchone()
+            if not row:
+                return None
+            payload = json.loads(row["payload"])
+            existing_revoked_at = str(
+                row["revoked_at"] or payload.get("revoked_at") or ""
+            )
+            newly_revoked = not existing_revoked_at
+            effective_revoked_at = existing_revoked_at or revoked_at
+            payload["revoked_at"] = effective_revoked_at
+            connection.execute(
+                "UPDATE mobile_devices SET payload = ?, revoked_at = ? WHERE id = ?",
+                (json.dumps(payload), effective_revoked_at, device_id),
+            )
+            connection.execute(
+                """
+                UPDATE mobile_push_registrations
+                SET revoked_at = ?, updated_at = ?
+                WHERE device_id = ? AND (revoked_at IS NULL OR revoked_at = '')
+                """,
+                (revoked_at, revoked_at, device_id),
+            )
+            return payload, newly_revoked
+
+    def save_mobile_push_registration(
+        self,
+        registration: MobilePushRegistration,
+    ) -> MobilePushRegistration:
         payload = registration.to_dict()
         with self._connect() as connection:
             connection.execute(
@@ -867,6 +904,31 @@ class Storage:
                     payload["revoked_at"],
                 ),
             )
+            row = connection.execute(
+                """
+                SELECT id, device_id, token_ciphertext, token_fingerprint, platform,
+                       created_at, updated_at, revoked_at
+                FROM mobile_push_registrations
+                WHERE token_fingerprint = ?
+                """,
+                (payload["token_fingerprint"],),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Mobile push registration persistence failed")
+        return MobilePushRegistration(
+            id=str(row["id"]),
+            device_id=str(row["device_id"]),
+            token_ciphertext=str(row["token_ciphertext"]),
+            token_fingerprint=str(row["token_fingerprint"]),
+            platform=str(row["platform"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            revoked_at=(
+                datetime.fromisoformat(str(row["revoked_at"]))
+                if str(row["revoked_at"] or "")
+                else None
+            ),
+        )
 
     def load_mobile_push_registrations(self, include_revoked: bool = False, limit: int = 200) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(1000, int(limit or 200)))

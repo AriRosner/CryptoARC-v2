@@ -364,12 +364,14 @@ class BotState:
         return self._public_mobile_device(device)
 
     def revoke_mobile_device(self, device_id: str) -> dict[str, object]:
-        device = self.storage.load_mobile_device(device_id.strip())
-        if not device:
+        result = self.storage.revoke_mobile_device_and_push_registrations(
+            device_id.strip(),
+            utc_now().isoformat(),
+        )
+        if not result:
             raise ValueError("Mobile device was not found")
-        if not str(device.get("revoked_at") or ""):
-            device["revoked_at"] = utc_now().isoformat()
-            self.storage.save_mobile_device(device)
+        device, newly_revoked = result
+        if newly_revoked:
             self.add_event(
                 "warning",
                 f"Mobile device revoked: {device.get('name') or device_id}",

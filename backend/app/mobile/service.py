@@ -200,8 +200,8 @@ class MobileCommandCenterService:
             created_at=now,
             updated_at=now,
         )
-        self.state.storage.save_mobile_push_registration(registration)
-        return {"registered": True, "registration": registration.to_public_dict()}
+        persisted = self.state.storage.save_mobile_push_registration(registration)
+        return {"registered": True, "registration": persisted.to_public_dict()}
 
     def _push_token_fernet(self) -> Fernet:
         key = str(self.config.mobile_push_token_encryption_key or "").strip()
