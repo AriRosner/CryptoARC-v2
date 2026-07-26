@@ -66,6 +66,7 @@ from app.core.simulator import LaunchSimulator
 from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, normalize_pumpportal_new_token
+from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
 SOLANA_SIGNATURE_BASE_FEE_LAMPORTS = 5_000
@@ -80,9 +81,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BotState:
-    MOBILE_MONITOR_SCOPE = "mobile:monitor"
-    MOBILE_CONTROL_SCOPE = "mobile:control"
+    MOBILE_MONITOR_SCOPE = MobileScope.MONITOR
+    MOBILE_CONTROL_SCOPE = MobileScope.CONTROL
     MOBILE_DEFAULT_SCOPES = (MOBILE_MONITOR_SCOPE, MOBILE_CONTROL_SCOPE)
+    MOBILE_ALLOWED_SCOPES = frozenset(
+        {
+            MobileScope.MONITOR,
+            MobileScope.CONTROL,
+            MobileScope.PORTFOLIO_READ,
+            MobileScope.TRADE_REVIEW,
+            MobileScope.TRADE_EXECUTE,
+            MobileScope.WALLET_READ,
+            MobileScope.TREASURY_REQUEST,
+            MobileScope.ALERTS,
+            MobileScope.DIAGNOSTICS,
+        }
+    )
     MOBILE_PAIRING_TTL_SECONDS = 300
     MOBILE_PAIRING_MAX_FAILED_ATTEMPTS = 5
     MOBILE_TOKEN_TTL_DAYS = 30
@@ -530,8 +544,7 @@ class BotState:
 
     def _normalize_mobile_scopes(self, scopes: list[str] | None) -> list[str]:
         requested = scopes or list(self.MOBILE_DEFAULT_SCOPES)
-        allowed = {self.MOBILE_MONITOR_SCOPE, self.MOBILE_CONTROL_SCOPE}
-        clean = [scope for scope in requested if scope in allowed]
+        clean = [scope for scope in requested if scope in self.MOBILE_ALLOWED_SCOPES]
         if self.MOBILE_MONITOR_SCOPE not in clean:
             clean.insert(0, self.MOBILE_MONITOR_SCOPE)
         return list(dict.fromkeys(clean))

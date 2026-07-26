@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.auth import AuthManager
 from app.core.models import BotStatus
 from app.core.state import BotState
+from app.mobile.contracts import MobileScope
 
 
 class MobileApiTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class MobileApiTests(unittest.TestCase):
 
             pairing = state.create_mobile_pairing(
                 api_base_url="https://cryptoarc-node.tailnet.ts.net",
-                scopes=["mobile:monitor", "mobile:control"],
+                scopes=[MobileScope.MONITOR, MobileScope.CONTROL],
             )
             pairing_rows = state.storage.load_mobile_pairing_requests(include_claimed=True)
 
@@ -40,6 +41,8 @@ class MobileApiTests(unittest.TestCase):
 
             self.assertEqual(claimed["device"]["name"], "Pixel 9")
             self.assertEqual(device["id"], claimed["device"]["id"])
+            self.assertNotIn(MobileScope.TRADE_EXECUTE, claimed["scopes"])
+            self.assertNotIn(MobileScope.TREASURY_REQUEST, claimed["scopes"])
             self.assertNotIn(claimed["token"], json.dumps(device_rows))
             self.assertIn("token_hash", device_rows[0])
 

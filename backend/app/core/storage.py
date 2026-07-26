@@ -13,7 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -43,7 +43,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -204,6 +204,7 @@ class Storage:
             (7, "007_foundation_indexes", "foundation release supporting indexes", self._migration_007_foundation_indexes),
             (8, "008_source_soak_history", "durable hybrid source soak snapshots", self._migration_008_source_soak_history),
             (9, "009_mobile_companion", "mobile companion pairing and devices", self._migration_009_mobile_companion),
+            (10, "010_mobile_command_center", "scoped mobile command center persistence", self._migration_010_mobile_command_center),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -413,6 +414,59 @@ class Storage:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_mobile_devices_revoked_at ON mobile_devices(revoked_at, created_at DESC)"
+        )
+
+    def _migration_010_mobile_command_center(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_action_receipts (
+                id TEXT PRIMARY KEY,
+                idempotency_key_hash TEXT NOT NULL UNIQUE,
+                device_id TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_destination_authorizations (
+                id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_push_registrations (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                token_ciphertext TEXT NOT NULL,
+                token_fingerprint TEXT NOT NULL UNIQUE,
+                platform TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                revoked_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_alert_acknowledgements (
+                id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                acknowledged_at TEXT NOT NULL,
+                UNIQUE(device_id, event_id)
+            )
+            """
         )
 
     def schema_status(self) -> dict[str, Any]:
@@ -785,6 +839,52 @@ class Storage:
                 return payload
         return None
 
+    def save_mobile_push_registration(self, registration: MobilePushRegistration) -> None:
+        payload = registration.to_dict()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO mobile_push_registrations (
+                    id, device_id, token_ciphertext, token_fingerprint, platform,
+                    created_at, updated_at, revoked_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token_fingerprint) DO UPDATE SET
+                    device_id = excluded.device_id,
+                    token_ciphertext = excluded.token_ciphertext,
+                    platform = excluded.platform,
+                    updated_at = excluded.updated_at,
+                    revoked_at = excluded.revoked_at
+                """,
+                (
+                    payload["id"],
+                    payload["device_id"],
+                    payload["token_ciphertext"],
+                    payload["token_fingerprint"],
+                    payload["platform"],
+                    payload["created_at"],
+                    payload["updated_at"],
+                    payload["revoked_at"],
+                ),
+            )
+
+    def load_mobile_push_registrations(self, include_revoked: bool = False, limit: int = 200) -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit or 200)))
+        where_clause = "" if include_revoked else "WHERE revoked_at IS NULL OR revoked_at = ''"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT id, device_id, token_ciphertext, token_fingerprint, platform,
+                       created_at, updated_at, revoked_at
+                FROM mobile_push_registrations
+                {where_clause}
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def backup_restore_status(self) -> dict[str, Any]:
         history = self.load_backup_restore_history(10)
         latest_backup = next((item for item in history if str(item.get("action", "")).startswith("backup")), None)
@@ -962,6 +1062,9 @@ class Storage:
 
     def count_mobile_devices(self) -> int:
         return self._count_table("mobile_devices")
+
+    def count_mobile_push_registrations(self) -> int:
+        return self._count_table("mobile_push_registrations")
 
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:

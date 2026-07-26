@@ -834,6 +834,83 @@ class StrategyPreset:
 
 
 @dataclass(slots=True)
+class MobileActionReceipt:
+    id: str
+    idempotency_key_hash: str
+    device_id: str
+    action_type: str
+    entity_id: str
+    payload: dict[str, Any]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class MobileDestinationAuthorization:
+    id: str
+    payload: dict[str, Any]
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat()
+        payload["used_at"] = self.used_at.isoformat() if self.used_at else None
+        return payload
+
+
+@dataclass(slots=True)
+class MobilePushRegistration:
+    id: str
+    device_id: str
+    token_ciphertext: str
+    token_fingerprint: str
+    platform: str
+    created_at: datetime
+    updated_at: datetime
+    revoked_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        payload["revoked_at"] = self.revoked_at.isoformat() if self.revoked_at else None
+        return payload
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "device_id": self.device_id,
+            "platform": self.platform,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+        }
+
+
+@dataclass(slots=True)
+class MobileAlertAcknowledgement:
+    id: str
+    device_id: str
+    event_id: str
+    acknowledged_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["acknowledged_at"] = self.acknowledged_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
 class BotSnapshot:
     status: BotStatus
     settings: BotSettings
