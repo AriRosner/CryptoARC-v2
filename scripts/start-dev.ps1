@@ -12,6 +12,18 @@ $logsRoot = Join-Path $root "data\logs"
 $portsPath = Join-Path $logsRoot "dev-ports.json"
 $processesPath = Join-Path $logsRoot "dev-processes.json"
 $python = Resolve-CryptoArcPython
+$backendExecutable = [System.IO.Path]::GetFullPath($python).TrimEnd("\", "/")
+$backendBaseExecutableOutput = @(& $python -c "import sys; print(sys._base_executable)")
+if (
+  $LASTEXITCODE -ne 0 -or
+  $backendBaseExecutableOutput.Count -ne 1 -or
+  [string]::IsNullOrWhiteSpace([string]$backendBaseExecutableOutput[0])
+) {
+  throw "Could not resolve the selected Python runtime base executable."
+}
+$backendBaseExecutable = [System.IO.Path]::GetFullPath(
+  [string]$backendBaseExecutableOutput[0]
+).TrimEnd("\", "/")
 $packageManager = Resolve-CryptoArcPackageManager
 $packageManagerPath = $packageManager.FilePath
 Assert-CryptoArcFrontendDependencies
@@ -119,6 +131,8 @@ function Write-CryptoArcProcessManifest {
     backend_child_pids = @($backendChildPids)
     backend_port_owner_pids = @($backendPortOwnerPids)
     frontend_port_owner_pids = @($frontendPortOwnerPids)
+    backend_executable = $backendExecutable
+    backend_base_executable = $backendBaseExecutable
     backend_port = $backendPort
     frontend_port = $frontendPort
     backend_url = $backendUrl
@@ -180,6 +194,7 @@ try {
   Wait-HttpReady -Url $frontendUrl -Name "Frontend"
   Write-CryptoArcProcessManifest -BackendLauncherPid $backendProcess.Id -FrontendLauncherPid $frontendProcess.Id
 } catch {
+  Write-CryptoArcProcessManifest -BackendLauncherPid $backendProcess.Id -FrontendLauncherPid $frontendProcess.Id
   if (-not $VerboseMode) {
     if (Test-Path $backendLog) {
       Write-Host ""
