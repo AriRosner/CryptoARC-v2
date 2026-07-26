@@ -8,7 +8,10 @@
     "scheme": "cryptoarc",
     "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Unlock CryptoARC monitoring and guarded controls."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -33,10 +36,24 @@
         {
           "image": "./assets/images/splash-icon.png",
           "resizeMode": "contain",
-          "backgroundColor": "#ffffff"
+          "backgroundColor": "#08090F"
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/images/android-icon-monochrome.png",
+          "color": "#E89A4A",
+          "defaultChannel": "critical"
+        }
+      ],
+      [
+        "expo-sqlite",
+        {
+          "useSQLCipher": true
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true

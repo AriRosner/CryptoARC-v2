@@ -34,6 +34,9 @@ try {
   Write-Host "Running mobile unit/component tests"
   Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("test")
 
+  Write-Host "Running mobile production dependency audit"
+  Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("audit", "--omit=dev", "--audit-level=high")
+
   if (-not $SkipDiagnostics) {
     Write-Host "Running Expo diagnostics"
     Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "diagnostics")
