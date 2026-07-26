@@ -36,6 +36,8 @@ if (-not $SkipFrontendBuild) {
   try {
     Write-Host "Checking frontend polling stability"
     Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "check:polling")
+    Write-Host "Checking frontend execution-readiness contract"
+    Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "check:execution-readiness")
     Write-Host "Running frontend build"
     Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("run", "build")
   } finally {

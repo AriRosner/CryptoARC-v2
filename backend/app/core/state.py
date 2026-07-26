@@ -3271,18 +3271,49 @@ class BotState:
         source = source or self.source_health()
         signer_mode = signer_mode or self.settings.live_signer_mode
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
-        normalized_audits = self._normalize_live_audits(self.storage.load_live_execution_audits(500))
+        now = utc_now()
+        quote_evidence_window_hours = 24.0
+        quote_evidence_cutoff = now - timedelta(hours=quote_evidence_window_hours)
+        audit_history_limit = 500
+        loaded_audit_rows = self.storage.load_live_execution_audits(audit_history_limit + 1)
+        audit_history_truncated = len(loaded_audit_rows) > audit_history_limit
+        audit_history_complete = not audit_history_truncated
+        normalized_audits = self._normalize_live_audits(loaded_audit_rows[:audit_history_limit])
         calibration = self._live_landing_calibration(normalized_audits)
         audits = self._refresh_shadow_comparisons(normalized_audits)
         pipeline_latency = self._execution_pipeline_latency(audits)
         latency_summary = self._execution_latency_summary(pipeline_latency, calibration)
-        now = utc_now()
-        quote_audits = [audit for audit in audits if isinstance(audit.quote, dict) and audit.quote.get("id")]
-        shadow_audits = [audit for audit in quote_audits if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison]
+        all_history_quote_audits = [audit for audit in audits if isinstance(audit.quote, dict) and audit.quote.get("id")]
+        current_quote_audits: list[LiveExecutionAudit] = []
+        excluded_ambiguous_timestamp_quote_audits = 0
+        excluded_future_timestamp_quote_audits = 0
+        for audit in all_history_quote_audits:
+            created_at = audit.created_at
+            if created_at.tzinfo is None or created_at.utcoffset() is None:
+                excluded_ambiguous_timestamp_quote_audits += 1
+                continue
+            if created_at > now:
+                excluded_future_timestamp_quote_audits += 1
+                continue
+            if created_at >= quote_evidence_cutoff:
+                current_quote_audits.append(audit)
+        current_calibration = self._live_landing_calibration(current_quote_audits)
+        current_pipeline_latency = self._execution_pipeline_latency(current_quote_audits)
+        current_latency_summary = self._execution_latency_summary(current_pipeline_latency, current_calibration)
+        shadow_audits = [
+            audit
+            for audit in all_history_quote_audits
+            if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison
+        ]
+        current_shadow_audits = [
+            audit
+            for audit in current_quote_audits
+            if isinstance(audit.shadow_comparison, dict) and audit.shadow_comparison
+        ]
         shadow_evaluated = [audit for audit in shadow_audits if audit.shadow_comparison.get("status") == "evaluated"]
-        recent_shadow_window_hours = 24.0
-        recent_shadow_cutoff = now - timedelta(hours=recent_shadow_window_hours)
-        recent_shadow_evaluated = [audit for audit in shadow_evaluated if audit.created_at >= recent_shadow_cutoff]
+        current_shadow_evaluated = [audit for audit in current_shadow_audits if audit.shadow_comparison.get("status") == "evaluated"]
+        recent_shadow_window_hours = quote_evidence_window_hours
+        recent_shadow_evaluated = current_shadow_evaluated
         shadow_winners = [audit for audit in shadow_evaluated if str(audit.shadow_comparison.get("outcome", "")) == "win"]
         recent_shadow_winners = [audit for audit in recent_shadow_evaluated if str(audit.shadow_comparison.get("outcome", "")) == "win"]
         shadow_pnls = [float(audit.shadow_comparison.get("estimated_pnl_sol", 0.0) or 0.0) for audit in shadow_evaluated]
@@ -3293,45 +3324,153 @@ class BotState:
             for window in audit.shadow_comparison.get("landing_windows", [])
             if isinstance(window, dict)
         ]
+        current_shadow_windows = [
+            window
+            for audit in current_shadow_audits
+            for window in audit.shadow_comparison.get("landing_windows", [])
+            if isinstance(window, dict)
+        ]
         shadow_window_evaluated = [window for window in shadow_windows if window.get("status") == "evaluated"]
         shadow_window_winners = [window for window in shadow_window_evaluated if str(window.get("outcome", "")) == "win"]
         shadow_window_pnls = [float(window.get("estimated_pnl_sol", 0.0) or 0.0) for window in shadow_window_evaluated]
-        submittable_quote_audits = [audit for audit in quote_audits if not bool(audit.quote.get("shadow_only"))]
-        stale_quotes = [audit for audit in submittable_quote_audits if audit.status == "stale" or bool(audit.quote.get("stale"))]
+        submittable_quote_audits = [audit for audit in all_history_quote_audits if not bool(audit.quote.get("shadow_only"))]
+        stale_quotes = [
+            audit
+            for audit in submittable_quote_audits
+            if audit.status == "stale" or bool(audit.quote.get("stale"))
+        ]
         blocked_quotes = [audit for audit in submittable_quote_audits if audit.status == "blocked"]
-        ready_quotes = [audit for audit in submittable_quote_audits if audit.status in {"ready", "simulated", "simulation_warning"}]
-        submitted = [audit for audit in quote_audits if audit.transaction_signature or audit.status in {"submitted", "confirmed", "reconciled", "needs_review", "failed"}]
-        unresolved = [audit for audit in audits if self._is_unresolved_live_audit(audit)]
-        quote_issues = self._quote_issue_taxonomy(quote_audits)
-        failure_stages = self._execution_failure_stage_taxonomy(quote_audits)
-        latest_quote_at = max((audit.created_at for audit in quote_audits), default=None)
-        latest_quote_age_seconds = round((now - latest_quote_at).total_seconds(), 3) if latest_quote_at else None
-        quote_health_sample = submittable_quote_audits or quote_audits
+        ready_quotes = [
+            audit
+            for audit in submittable_quote_audits
+            if audit.status in {"ready", "simulated", "simulation_warning"}
+        ]
+        submitted = [
+            audit
+            for audit in all_history_quote_audits
+            if audit.transaction_signature or audit.status in {"submitted", "confirmed", "reconciled", "needs_review", "failed"}
+        ]
+        quote_health_sample = submittable_quote_audits or all_history_quote_audits
         stale_rate = round(len(stale_quotes) / len(quote_health_sample), 3) if quote_health_sample else 0.0
         blocked_rate = round(len(blocked_quotes) / len(quote_health_sample), 3) if quote_health_sample else 0.0
+        current_submittable_quote_audits = [
+            audit for audit in current_quote_audits if not bool(audit.quote.get("shadow_only"))
+        ]
+        current_quote_health_sample = current_quote_audits
+        current_quote_health_sample_kind = "current_quote_audits"
+        current_health = {
+            audit.id: self._current_quote_health_flags(audit)
+            for audit in current_quote_health_sample
+        }
+        current_stale_quotes = [audit for audit in current_quote_health_sample if current_health[audit.id][1]]
+        current_blocked_quotes = [audit for audit in current_quote_health_sample if current_health[audit.id][2]]
+        current_ready_quotes = [audit for audit in current_quote_health_sample if current_health[audit.id][3]]
+        current_failed_quotes = [audit for audit in current_quote_health_sample if current_health[audit.id][4]]
+        current_unhealthy_quotes = [
+            audit
+            for audit in current_quote_health_sample
+            if current_health[audit.id][2] or current_health[audit.id][4]
+        ]
+        current_submittable_health = {
+            audit.id: self._current_quote_health_flags(audit)
+            for audit in current_submittable_quote_audits
+        }
+        current_submittable_stale_quotes = [
+            audit
+            for audit in current_submittable_quote_audits
+            if current_submittable_health[audit.id][1]
+        ]
+        current_submittable_ready_quotes = [
+            audit
+            for audit in current_submittable_quote_audits
+            if current_submittable_health[audit.id][3]
+        ]
+        current_submittable_unhealthy_quotes = [
+            audit
+            for audit in current_submittable_quote_audits
+            if current_submittable_health[audit.id][2] or current_submittable_health[audit.id][4]
+        ]
+        current_submitted = [
+            audit
+            for audit in current_quote_audits
+            if audit.transaction_signature or audit.status in {"submitted", "confirmed", "reconciled", "needs_review", "failed"}
+        ]
+        unresolved = [audit for audit in audits if self._is_unresolved_live_audit(audit)]
+        quote_issues = self._quote_issue_taxonomy(all_history_quote_audits)
+        failure_stages = self._execution_failure_stage_taxonomy(all_history_quote_audits)
+        current_quote_issues = self._quote_issue_taxonomy(current_quote_health_sample, current_health=True)
+        current_failure_stages = self._execution_failure_stage_taxonomy(
+            current_quote_health_sample,
+            current_health=True,
+        )
+        aware_quote_audits = [
+            audit
+            for audit in all_history_quote_audits
+            if audit.created_at.tzinfo is not None and audit.created_at.utcoffset() is not None
+        ]
+        latest_quote_at = max((audit.created_at for audit in aware_quote_audits), default=None)
+        latest_quote_age_seconds = round((now - latest_quote_at).total_seconds(), 3) if latest_quote_at else None
+        current_latest_quote_at = max((audit.created_at for audit in current_quote_audits), default=None)
+        current_latest_quote_age_seconds = (
+            round((now - current_latest_quote_at).total_seconds(), 3)
+            if current_latest_quote_at
+            else None
+        )
+        current_stale_rate = (
+            round(len(current_stale_quotes) / len(current_quote_health_sample), 3)
+            if current_quote_health_sample
+            else 0.0
+        )
+        current_blocked_rate = (
+            round(len(current_blocked_quotes) / len(current_quote_health_sample), 3)
+            if current_quote_health_sample
+            else 0.0
+        )
+        current_unhealthy_rate = (
+            round(len(current_unhealthy_quotes) / len(current_quote_health_sample), 3)
+            if current_quote_health_sample
+            else 0.0
+        )
+        current_submittable_stale_rate = (
+            round(len(current_submittable_stale_quotes) / len(current_submittable_quote_audits), 3)
+            if current_submittable_quote_audits
+            else 0.0
+        )
+        current_submittable_unhealthy_rate = (
+            round(len(current_submittable_unhealthy_quotes) / len(current_submittable_quote_audits), 3)
+            if current_submittable_quote_audits
+            else 0.0
+        )
+        live_submit_quote_evidence_ready = bool(
+            len(current_submittable_ready_quotes) >= 5
+            and current_submittable_stale_rate <= 0.25
+            and current_submittable_unhealthy_rate <= 0.25
+        )
         policy_blockers = self._execution_policy_blockers()
         signer = self.signer_status(signer_mode, wallet_public_key)
         strategy_can_shadow = bool(strategy_promotion.get("can_promote")) if isinstance(strategy_promotion, dict) else False
         shadow_price_observations_blocked = bool(source.get("shadow_price_observations_blocked"))
         live_blockers = self._live_execution_blockers(bool(env_live_enabled), "buy", wallet_public_key, signer_mode, autonomous=False) if env_live_enabled is not None else []
         policy_recommendation = self._execution_policy_recommendation(
-            stale_rate=stale_rate,
-            blocked_rate=blocked_rate,
-            quote_issues=quote_issues,
-            calibration=calibration,
-            shadow_windows=shadow_windows,
+            stale_rate=current_stale_rate,
+            blocked_rate=current_blocked_rate,
+            unhealthy_rate=current_unhealthy_rate,
+            quote_issues=current_quote_issues,
+            calibration=current_calibration,
+            shadow_windows=current_shadow_windows,
             policy_blockers=policy_blockers,
         )
         gates = [
             self._promotion_gate("dry_run_quote_path", "Dry-run quote path", "available", "quote without submit", True, "PumpPortal local transaction quotes are stored as audits before signing or submit."),
-            self._promotion_gate("quote_audit_sample", "Quote audit sample", len(quote_audits), ">= 5", len(quote_audits) >= 5, "Collect at least five quote attempts before speed tuning."),
-            self._promotion_gate("quote_freshness", "Quote freshness", f"{round(stale_rate * 100, 1)}% stale", "<= 25%", len(quote_audits) > 0 and stale_rate <= 0.25, "Stale quote frequency must be low enough for fast entries."),
-            self._promotion_gate("failed_quote_rate", "Failed quote rate", f"{round(blocked_rate * 100, 1)}% blocked", "<= 25%", len(quote_audits) > 0 and blocked_rate <= 0.25, "Policy and provider blocks should be rare before live shadow runs."),
+            self._promotion_gate("quote_audit_sample", "Quote audit sample", len(current_quote_audits), ">= 5 within 24h", len(current_quote_audits) >= 5, "Collect at least five current quote attempts before speed tuning."),
+            self._promotion_gate("quote_freshness", "Quote freshness", f"{round(current_stale_rate * 100, 1)}% stale", "<= 25%", bool(current_quote_health_sample) and current_stale_rate <= 0.25, "Current stale quote frequency must be low enough for fast entries."),
+            self._promotion_gate("failed_quote_rate", "Failed quote rate", f"{round(current_unhealthy_rate * 100, 1)}% unhealthy", "<= 25%", bool(current_quote_health_sample) and current_unhealthy_rate <= 0.25, "Current blocked, failed, review-required, and quote-error outcomes should be rare before live shadow runs."),
             self._promotion_gate("execution_policy_caps", "Execution policy caps", "configured" if not policy_blockers else "incomplete", "caps set", not policy_blockers, "Trade size, slippage, priority fee, loss, exposure, and position caps must be explicit."),
             self._promotion_gate("source_trust", "Source trust", str(source.get("trust_state", "unknown")), "trusted", not bool(source.get("live_entry_blocked")), "Live entries need trusted or explicitly non-blocking source state."),
             self._promotion_gate("shadow_price_observations", "Shadow price observations", "blocked" if shadow_price_observations_blocked else "available", "available", not shadow_price_observations_blocked, "PumpPortal trade subscriptions require a funded API key before shadow price observations can evaluate."),
             self._promotion_gate("strategy_shadow_gate", "Strategy shadow gate", "eligible" if strategy_can_shadow else "blocked", "eligible", strategy_can_shadow, "Strategy promotion gates should pass before comparing fast live-entry shadows."),
             self._promotion_gate("signer_boundary", "Signer boundary", signer_mode, "local signer known", bool(signer.get("connected")) if wallet_public_key else True, "Execution keeps local signing boundaries visible before any submit path."),
+            self._promotion_gate("audit_history_complete", "Audit history completeness", "complete" if audit_history_complete else f"truncated at {audit_history_limit}", "complete", audit_history_complete, "Audit history truncation may hide current quote failures or recovery debt, so readiness fails closed."),
             self._promotion_gate("recovery_queue", "Recovery queue", len(unresolved), "0 unresolved", len(unresolved) == 0, "Unresolved live audits must be cleared before speed tuning."),
         ]
         blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail"]
@@ -3340,14 +3479,26 @@ class BotState:
             blockers.extend([f"Live blocker: {blocker}" for blocker in live_blockers])
         can_shadow = not blockers
         return {
-            "status": "shadow_ready" if can_shadow else "not_enough_quote_data" if not quote_audits else "blocked",
+            "status": "shadow_ready" if can_shadow else "not_enough_quote_data" if not current_quote_audits else "blocked",
             "can_shadow": can_shadow,
-            "can_live_submit": bool(env_live_enabled) and can_shadow and bool(signer.get("connected")) and not live_blockers,
+            "can_live_submit": (
+                bool(env_live_enabled)
+                and can_shadow
+                and live_submit_quote_evidence_ready
+                and bool(signer.get("connected"))
+                and not live_blockers
+            ),
+            "live_submit_quote_evidence_ready": live_submit_quote_evidence_ready,
             "mode": "dry_run_to_shadow",
             "quote_ttl_seconds": 30,
+            "quote_evidence_window_hours": quote_evidence_window_hours,
+            "audit_history_limit": audit_history_limit,
+            "audit_history_truncated": audit_history_truncated,
+            "audit_history_complete": audit_history_complete,
             "latest_quote_age_seconds": latest_quote_age_seconds,
+            "current_latest_quote_age_seconds": current_latest_quote_age_seconds,
             "metrics": {
-                "quote_attempts": len(quote_audits),
+                "quote_attempts": len(all_history_quote_audits),
                 "ready_quotes": len(ready_quotes),
                 "blocked_quotes": len(blocked_quotes),
                 "stale_quotes": len(stale_quotes),
@@ -3356,6 +3507,46 @@ class BotState:
                 "stale_quote_rate": stale_rate,
                 "blocked_quote_rate": blocked_rate,
                 "shadow_samples": len(shadow_audits),
+                "current_quote_attempts": len(current_quote_audits),
+                "recent_submittable_quote_attempts": len(current_submittable_quote_audits),
+                "current_quote_health_sample": len(current_quote_health_sample),
+                "current_quote_health_sample_kind": current_quote_health_sample_kind,
+                "current_ready_quotes": len(current_ready_quotes),
+                "current_blocked_quotes": len(current_blocked_quotes),
+                "current_failed_quotes": len(current_failed_quotes),
+                "current_unhealthy_quotes": len(current_unhealthy_quotes),
+                "current_stale_quotes": len(current_stale_quotes),
+                "current_submitted_audits": len(current_submitted),
+                "current_stale_quote_rate": current_stale_rate,
+                "current_blocked_quote_rate": current_blocked_rate,
+                "current_unhealthy_quote_rate": current_unhealthy_rate,
+                "current_live_submit_quote_evidence_ready": live_submit_quote_evidence_ready,
+                "current_shadow_samples": len(current_shadow_audits),
+                "current_submittable_quote_health_sample": len(current_submittable_quote_audits),
+                "current_submittable_ready_quotes": len(current_submittable_ready_quotes),
+                "current_submittable_stale_quotes": len(current_submittable_stale_quotes),
+                "current_submittable_unhealthy_quotes": len(current_submittable_unhealthy_quotes),
+                "current_submittable_stale_quote_rate": current_submittable_stale_rate,
+                "current_submittable_unhealthy_quote_rate": current_submittable_unhealthy_rate,
+                "excluded_ambiguous_timestamp_quote_audits": excluded_ambiguous_timestamp_quote_audits,
+                "excluded_future_timestamp_quote_audits": excluded_future_timestamp_quote_audits,
+                "loaded_history_quote_attempts": len(all_history_quote_audits),
+                "loaded_history_submittable_quote_attempts": len(submittable_quote_audits),
+                "loaded_history_ready_quotes": len(ready_quotes),
+                "loaded_history_blocked_quotes": len(blocked_quotes),
+                "loaded_history_stale_quotes": len(stale_quotes),
+                "loaded_history_submitted_audits": len(submitted),
+                "loaded_history_stale_quote_rate": stale_rate,
+                "loaded_history_blocked_quote_rate": blocked_rate,
+                "loaded_history_shadow_samples": len(shadow_audits),
+                "loaded_history_shadow_evaluated": len(shadow_evaluated),
+                "loaded_history_shadow_win_rate_pct": int((len(shadow_winners) / len(shadow_evaluated)) * 100) if shadow_evaluated else 0,
+                "loaded_history_shadow_estimated_pnl_sol": round(sum(shadow_pnls), 6),
+                "loaded_history_shadow_landing_windows": len(shadow_windows),
+                "loaded_history_shadow_landing_evaluated": len(shadow_window_evaluated),
+                "loaded_history_shadow_landing_win_rate_pct": int((len(shadow_window_winners) / len(shadow_window_evaluated)) * 100) if shadow_window_evaluated else 0,
+                "loaded_history_shadow_landing_best_pnl_sol": round(max(shadow_window_pnls), 6) if shadow_window_pnls else 0.0,
+                "loaded_history_shadow_landing_worst_pnl_sol": round(min(shadow_window_pnls), 6) if shadow_window_pnls else 0.0,
                 "shadow_evaluated": len(shadow_evaluated),
                 "recent_shadow_evaluated": len(recent_shadow_evaluated),
                 "recent_shadow_window_hours": recent_shadow_window_hours,
@@ -3380,6 +3571,18 @@ class BotState:
                 "signal_to_quote_p90_ms": int(pipeline_latency["totals"]["signal_to_quote_ms"]["p90_ms"]),
                 "intent_to_quote_p50_ms": int(pipeline_latency["totals"]["intent_to_quote_ms"]["p50_ms"]),
                 "intent_to_quote_p90_ms": int(pipeline_latency["totals"]["intent_to_quote_ms"]["p90_ms"]),
+                "current_live_landing_samples": int(current_calibration["samples"]),
+                "current_live_quote_to_submit_p50_ms": int(current_calibration["quote_to_submit_p50_ms"]),
+                "current_live_quote_to_submit_p90_ms": int(current_calibration["quote_to_submit_p90_ms"]),
+                "current_live_quote_to_submit_p99_ms": int(current_calibration["quote_to_submit_p99_ms"]),
+                "current_live_submit_to_confirm_p50_ms": int(current_calibration["submit_to_confirm_p50_ms"]),
+                "current_live_submit_to_confirm_p90_ms": int(current_calibration["submit_to_confirm_p90_ms"]),
+                "current_live_submit_to_confirm_p99_ms": int(current_calibration["submit_to_confirm_p99_ms"]),
+                "current_pipeline_samples": int(current_pipeline_latency["samples"]),
+                "current_signal_to_quote_p50_ms": int(current_pipeline_latency["totals"]["signal_to_quote_ms"]["p50_ms"]),
+                "current_signal_to_quote_p90_ms": int(current_pipeline_latency["totals"]["signal_to_quote_ms"]["p90_ms"]),
+                "current_intent_to_quote_p50_ms": int(current_pipeline_latency["totals"]["intent_to_quote_ms"]["p50_ms"]),
+                "current_intent_to_quote_p90_ms": int(current_pipeline_latency["totals"]["intent_to_quote_ms"]["p90_ms"]),
             },
             "policy": {
                 "max_trade_sol": self.settings.live_max_trade_sol,
@@ -3398,8 +3601,14 @@ class BotState:
             "quote_issues": quote_issues,
             "failure_stages": failure_stages,
             "landing_calibration": calibration,
+            "current_latency_summary": current_latency_summary,
+            "current_pipeline_latency": current_pipeline_latency,
+            "current_quote_issues": current_quote_issues,
+            "current_failure_stages": current_failure_stages,
+            "current_landing_calibration": current_calibration,
             "gates": gates,
             "shadow_comparisons": [audit.shadow_comparison for audit in shadow_audits[:10]],
+            "current_shadow_comparisons": [audit.shadow_comparison for audit in current_shadow_audits[:10]],
             "blockers": list(dict.fromkeys(blockers)),
             "operator_action": "Run dry-run quotes until the quote sample, freshness, policy, source, and recovery gates pass.",
             "generated_at": now.isoformat(),
@@ -3443,7 +3652,88 @@ class BotState:
             "operator_action": "Collect linked source, decision, intent, quote, and submit evidence until the latency summary is fast or watch.",
         }
 
-    def _quote_issue_taxonomy(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+    def _current_quote_health_flags(self, audit: LiveExecutionAudit) -> tuple[str, bool, bool, bool, bool]:
+        quote = audit.quote if isinstance(audit.quote, dict) else {}
+        audit_status = str(audit.status or "").lower()
+        final_status = str(audit.final_status or "").lower()
+        quote_status = str(quote.get("status") or "").lower()
+        audit_statuses = {
+            audit_status,
+            final_status,
+            quote_status,
+        }
+        lifecycle_statuses = {
+            audit_status,
+            final_status,
+        }
+        terminal_success = bool(
+            lifecycle_statuses.intersection({"confirmed", "reconciled"})
+            or audit.reconciliation_status == "matched"
+        )
+        explicit_ready = bool(
+            {audit_status, final_status}.intersection({"ready", "simulated", "simulation_warning"})
+        )
+        shadow_ttl_stale = bool(
+            quote.get("shadow_only")
+            and ("stale" in audit_statuses or bool(quote.get("stale")))
+        )
+        if terminal_success:
+            status = "reconciled" if "reconciled" in audit_statuses or audit.reconciliation_status == "matched" else "confirmed"
+        elif audit_statuses.intersection({"failed", "needs_review"}):
+            status = "needs_review" if "needs_review" in audit_statuses else "failed"
+        elif "blocked" in audit_statuses:
+            status = "blocked"
+        elif "stale" in audit_statuses or bool(quote.get("stale")):
+            status = "stale"
+        else:
+            status = next(
+                (
+                    candidate
+                    for candidate in (final_status, audit_status, quote_status)
+                    if candidate and candidate != "pending"
+                ),
+                final_status or audit_status or quote_status,
+            )
+        is_stale = bool(
+            not terminal_success
+            and not bool(quote.get("shadow_only"))
+            and ("stale" in audit_statuses or bool(quote.get("stale")))
+        )
+        is_blocked = bool(
+            not terminal_success
+            and "blocked" in audit_statuses
+        )
+        quote_error = str(quote.get("error") or "").strip()
+        is_failed = bool(
+            not terminal_success
+            and (
+                audit_statuses.intersection({"failed", "needs_review"})
+                or quote_error
+                or (
+                    not explicit_ready
+                    and not is_stale
+                    and not is_blocked
+                    and not shadow_ttl_stale
+                )
+            )
+        )
+        is_ready = bool(
+            not is_stale
+            and not is_blocked
+            and not is_failed
+            and (
+                explicit_ready
+                or terminal_success
+            )
+        )
+        return status, is_stale, is_blocked, is_ready, is_failed
+
+    def _quote_issue_taxonomy(
+        self,
+        audits: list[LiveExecutionAudit],
+        *,
+        current_health: bool = False,
+    ) -> dict[str, object]:
         categories: dict[str, dict[str, object]] = {}
         recent: list[dict[str, object]] = []
         stale_count = 0
@@ -3451,7 +3741,13 @@ class BotState:
         failed_count = 0
         for audit in audits:
             quote = audit.quote if isinstance(audit.quote, dict) else {}
-            status = str(audit.status or quote.get("status") or "")
+            if current_health:
+                status, is_stale, is_blocked, _, is_failed = self._current_quote_health_flags(audit)
+            else:
+                status = str(audit.status or quote.get("status") or "")
+                is_stale = status == "stale" or bool(quote.get("stale"))
+                is_blocked = status == "blocked" or str(quote.get("status", "")) == "blocked"
+                is_failed = status in {"failed", "needs_review"}
             quote_error = str(quote.get("error") or "").strip()
             reasons = [str(error).strip() for error in audit.errors if str(error).strip()]
             if quote_error:
@@ -3459,14 +3755,13 @@ class BotState:
             if audit.last_recovery_error:
                 reasons.append(audit.last_recovery_error)
             reasons = list(dict.fromkeys(reasons))
-            is_stale = status == "stale" or bool(quote.get("stale"))
-            is_blocked = status == "blocked" or str(quote.get("status", "")) == "blocked"
-            is_failed = status in {"failed", "needs_review"} or bool(
-                quote_error
-                and not is_stale
-                and not is_blocked
-                and status not in {"ready", "simulated", "simulation_warning", "submitted", "confirmed", "reconciled"}
-            )
+            if not current_health:
+                is_failed = is_failed or bool(
+                    quote_error
+                    and not is_stale
+                    and not is_blocked
+                    and status not in {"ready", "simulated", "simulation_warning", "submitted", "confirmed", "reconciled"}
+                )
             if not (is_stale or is_blocked or is_failed):
                 continue
             if is_stale:
@@ -3519,7 +3814,12 @@ class BotState:
             "operator_action": "Review the top quote issue category before raising caps, slippage, priority fees, or signer automation.",
         }
 
-    def _execution_failure_stage_taxonomy(self, audits: list[LiveExecutionAudit]) -> dict[str, object]:
+    def _execution_failure_stage_taxonomy(
+        self,
+        audits: list[LiveExecutionAudit],
+        *,
+        current_health: bool = False,
+    ) -> dict[str, object]:
         stage_order = ["quote", "simulation", "submit", "confirmation", "reconciliation"]
         stages: dict[str, dict[str, object]] = {
             stage: {"stage": stage, "count": 0, "latest_at": "", "categories": {}, "audit_ids": [], "reasons": []}
@@ -3527,6 +3827,10 @@ class BotState:
         }
         recent: list[dict[str, object]] = []
         for audit in audits:
+            if current_health:
+                status, _, _, is_ready, _ = self._current_quote_health_flags(audit)
+                if is_ready and status in {"confirmed", "reconciled"}:
+                    continue
             stage, reason = self._execution_failure_stage(audit)
             if not stage:
                 continue
@@ -4298,6 +4602,7 @@ class BotState:
         *,
         stale_rate: float,
         blocked_rate: float,
+        unhealthy_rate: float,
         quote_issues: dict[str, object],
         calibration: dict[str, object],
         shadow_windows: list[dict[str, object]],
@@ -4322,7 +4627,7 @@ class BotState:
             slippage_delta += 0.5
         if stale_pressure or missed_rate > 0.25:
             slippage_delta += 0.25
-        if blocked_rate > 0.25 and not cap_pressure:
+        if unhealthy_rate > 0.25 and not cap_pressure:
             slippage_delta += 0.25
         suggested_slippage = base_slippage + slippage_delta
         if slippage_cap > 0:
@@ -4367,6 +4672,7 @@ class BotState:
             "inputs": {
                 "stale_quote_rate": stale_rate,
                 "blocked_quote_rate": blocked_rate,
+                "unhealthy_quote_rate": unhealthy_rate,
                 "missed_landing_rate": missed_rate,
                 "landing_windows": len(shadow_windows),
                 "evaluated_landing_windows": len(evaluated_windows),

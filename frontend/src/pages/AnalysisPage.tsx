@@ -98,6 +98,7 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   const promotionTone = promotion?.can_promote ? "success" : promotion?.status === "not_enough_data" ? "warning" : "danger";
   const execution = readinessStatus?.execution_readiness;
   const executionTone = execution?.can_shadow ? "success" : execution?.status === "not_enough_quote_data" ? "warning" : "danger";
+  const quoteEvidenceWindowLabel = execution ? `${execution.quote_evidence_window_hours}h` : "24h";
 
   return (
     <div className="space-y-6">
@@ -294,25 +295,49 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
               <div className="space-y-4">
                 <div className="grid grid-cols-3 gap-2">
                   <div className="rounded-xl bg-white/[0.02] p-3">
-                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Quotes</div>
-                    <div className="mt-1 text-lg font-black text-white">{execution.metrics.quote_attempts}</div>
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Quotes ({quoteEvidenceWindowLabel})</div>
+                    <div className="mt-1 text-lg font-black text-white">{execution.metrics.current_quote_attempts}</div>
                   </div>
                   <div className="rounded-xl bg-white/[0.02] p-3">
-                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Stale</div>
-                    <div className="mt-1 text-lg font-black text-amber-400">{Math.round(execution.metrics.stale_quote_rate * 100)}%</div>
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Stale ({quoteEvidenceWindowLabel})</div>
+                    <div className="mt-1 text-lg font-black text-amber-400">{Math.round(execution.metrics.current_stale_quote_rate * 100)}%</div>
                   </div>
                   <div className="rounded-xl bg-white/[0.02] p-3">
-                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Blocked</div>
-                    <div className="mt-1 text-lg font-black text-rose-400">{Math.round(execution.metrics.blocked_quote_rate * 100)}%</div>
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Unhealthy ({quoteEvidenceWindowLabel})</div>
+                    <div className="mt-1 text-lg font-black text-rose-400">{Math.round(execution.metrics.current_unhealthy_quote_rate * 100)}%</div>
+                    <div className="mt-1 text-[9px] font-bold text-zinc-600">
+                      {execution.metrics.current_failed_quotes} failed / {execution.metrics.current_blocked_quotes} blocked
+                    </div>
                   </div>
                 </div>
-                {execution.quote_issues?.total_issues ? (
+                <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[10px] text-zinc-500">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="font-black uppercase tracking-widest text-zinc-600">Loaded history</span>
+                    <span className="font-bold text-zinc-400">
+                      {execution.metrics.loaded_history_quote_attempts ?? execution.metrics.quote_attempts} quotes
+                    </span>
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-3">
+                    <span>
+                      {Math.round((execution.metrics.loaded_history_stale_quote_rate ?? execution.metrics.stale_quote_rate) * 100)}% stale /{" "}
+                      {Math.round((execution.metrics.loaded_history_blocked_quote_rate ?? execution.metrics.blocked_quote_rate) * 100)}% blocked
+                    </span>
+                    {execution.audit_history_truncated ? (
+                      <span className="font-bold text-amber-400">
+                        latest {execution.audit_history_limit} records
+                      </span>
+                    ) : (
+                      <span>{execution.audit_history_complete ? "complete" : "partial"}</span>
+                    )}
+                  </div>
+                </div>
+                {execution.current_quote_issues?.total_issues ? (
                   <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
                     <div className="mb-2 flex items-center justify-between gap-3">
-                      <span className="font-black uppercase tracking-widest text-zinc-500">Quote Issues</span>
-                      <span className="font-black text-white">{execution.quote_issues.total_issues}</span>
+                      <span className="font-black uppercase tracking-widest text-zinc-500">Quote Issues ({quoteEvidenceWindowLabel})</span>
+                      <span className="font-black text-white">{execution.current_quote_issues.total_issues}</span>
                     </div>
-                    {execution.quote_issues.categories.slice(0, 4).map((issue) => (
+                    {execution.current_quote_issues.categories.slice(0, 4).map((issue) => (
                       <div key={issue.category} className="mt-2 flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="font-bold text-zinc-400">{issue.category.replace(/_/g, " ")}</div>
@@ -321,7 +346,7 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                         <span className="shrink-0 font-black text-white">{issue.count}</span>
                       </div>
                     ))}
-                    {execution.quote_issues.recent.slice(0, 2).map((issue) => (
+                    {execution.current_quote_issues.recent.slice(0, 2).map((issue) => (
                       <div key={issue.audit_id} className="mt-2 flex items-center justify-between gap-3 border-t border-white/5 pt-2 text-[10px] text-zinc-600">
                         <span className="truncate">{issue.mint}</span>
                         <span className="shrink-0 font-bold text-zinc-400">{issue.status.replace(/_/g, " ")}</span>
@@ -329,13 +354,13 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                     ))}
                   </div>
                 ) : null}
-                {execution.failure_stages?.total_failures ? (
+                {execution.current_failure_stages?.total_failures ? (
                   <div className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px] text-zinc-300">
                     <div className="mb-2 flex items-center justify-between gap-3">
-                      <span className="font-black uppercase tracking-widest text-zinc-500">Failure Stages</span>
-                      <span className="font-black text-white">{execution.failure_stages.total_failures}</span>
+                      <span className="font-black uppercase tracking-widest text-zinc-500">Failure Stages ({quoteEvidenceWindowLabel})</span>
+                      <span className="font-black text-white">{execution.current_failure_stages.total_failures}</span>
                     </div>
-                    {execution.failure_stages.stages.filter((stage) => stage.count > 0).slice(0, 5).map((stage) => (
+                    {execution.current_failure_stages.stages.filter((stage) => stage.count > 0).slice(0, 5).map((stage) => (
                       <div key={stage.stage} className="mt-2 flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="font-bold text-zinc-400">{stage.stage.replace(/_/g, " ")}</div>
@@ -344,12 +369,12 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
                         <span className="shrink-0 font-black text-white">{stage.count}</span>
                       </div>
                     ))}
-                    <p className="mt-2 border-t border-white/5 pt-2 text-[10px] text-zinc-500">{execution.failure_stages.operator_action}</p>
+                    <p className="mt-2 border-t border-white/5 pt-2 text-[10px] text-zinc-500">{execution.current_failure_stages.operator_action}</p>
                   </div>
                 ) : null}
                 <div className="grid grid-cols-3 gap-2">
                   <div className="rounded-xl bg-white/[0.02] p-3">
-                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Shadow</div>
+                    <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">Loaded history shadow</div>
                     <div className="mt-1 text-lg font-black text-white">{execution.metrics.shadow_evaluated}/{execution.metrics.shadow_samples}</div>
                   </div>
                   <div className="rounded-xl bg-white/[0.02] p-3">

@@ -1693,6 +1693,17 @@ class CoreLogicTests(unittest.TestCase):
         if include_backup:
             state.storage.create_backup_artifact()
 
+    def stub_wallet_sol_balance(self, state: BotState, balance_sol: float = 1.0) -> None:
+        state._wallet_sol_balance = lambda wallet_public_key: {  # type: ignore[method-assign]
+            "wallet_public_key": wallet_public_key,
+            "balance_sol": balance_sol,
+            "error": "",
+        }
+
+    def arm_local_hot_wallet_backend(self, state: BotState) -> dict[str, object]:
+        self.stub_wallet_sol_balance(state)
+        return state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+
     def seed_ready_source_soak_events(self, state: BotState) -> None:
         now = utc_now()
         state.source_status.status = "connected"
@@ -1987,7 +1998,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             imported = state.import_hot_wallet(str(Keypair()), "password123", "ops")
             state.unlock_hot_wallet("password123")
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             database_path.with_suffix(".hotwallet.json").unlink()
 
             restored = BotState(database_path=str(database_path))
@@ -2008,7 +2019,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             state.unlock_hot_wallet("password123")
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             database_path.with_suffix(".hotwallet.json").unlink()
 
             restored = BotState(database_path=str(database_path))
@@ -2029,7 +2040,7 @@ class CoreLogicTests(unittest.TestCase):
             source.storage.save_settings(source.settings)
             imported = source.import_hot_wallet(str(Keypair()), "password123", "ops")
             source.unlock_hot_wallet("password123")
-            source.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(source)
             artifact = source.storage.create_backup_artifact()
 
             restored = BotState(database_path=str(Path(directory) / "restored.db"))
@@ -2049,7 +2060,7 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
 
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             live_status = state.live_status(True, signer_mode="local_hot_wallet")
 
             self.assertTrue(armed["armed"])
@@ -2113,7 +2124,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.settings.source_stale_seconds = 30
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.storage.save_live_ledger_position(
                 LiveLedgerPosition(
                     id="livepos_stale_balance",
@@ -2738,7 +2749,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2777,7 +2788,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             wallet = str(armed["wallet_public_key"])
 
             without_manual = state.live_status(True, wallet, "local_hot_wallet")
@@ -2817,7 +2828,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2873,7 +2884,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2908,7 +2919,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.storage.save_settings(state.settings)
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            armed = state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            armed = self.arm_local_hot_wallet_backend(state)
             wallet = str(armed["wallet_public_key"])
             now = utc_now()
             state.storage.save_live_execution_audit(
@@ -2944,7 +2955,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_settings(state.settings)
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: {  # type: ignore[method-assign]
                 "signature": "sighot111",
@@ -2998,7 +3009,7 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             submitted: list[str] = []
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: submitted.append(unsigned_transaction_base64) or {  # type: ignore[method-assign]
@@ -3038,7 +3049,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -3085,7 +3096,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -3122,7 +3133,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -3166,7 +3177,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -3212,7 +3223,7 @@ class CoreLogicTests(unittest.TestCase):
             state = BotState(database_path=str(Path(directory) / "test.db"))
             wallet = state.import_hot_wallet(str(Keypair()), "password123", "ops")["wallet_public_key"]
             self.configure_live_caps(state)
-            state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
+            self.arm_local_hot_wallet_backend(state)
             state.update_settings(
                 {
                     "profit_sweep_enabled": True,
@@ -3766,7 +3777,7 @@ class CoreLogicTests(unittest.TestCase):
     def test_execution_readiness_reports_stage_failure_taxonomy(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
-            now = utc_now()
+            now = utc_now() - timedelta(seconds=4)
             for audit in [
                 LiveExecutionAudit(
                     id="liveaudit_quote_stage",

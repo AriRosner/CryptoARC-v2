@@ -288,8 +288,12 @@ class ScriptSafetyTests(unittest.TestCase):
         ]
 
         polling_check = 'Arguments @("run", "check:polling")'
+        execution_readiness_check = 'Arguments @("run", "check:execution-readiness")'
         frontend_build = 'Arguments @("run", "build")'
         self.assertIn(polling_check, frontend_block)
+        self.assertIn(execution_readiness_check, frontend_block)
+        self.assertLess(frontend_block.index(polling_check), frontend_block.index(execution_readiness_check))
+        self.assertLess(frontend_block.index(execution_readiness_check), frontend_block.index(frontend_build))
         self.assertLess(frontend_block.index(polling_check), frontend_block.index(frontend_build))
 
     def test_start_dev_records_dynamic_ports_and_frontend_api_base(self) -> None:

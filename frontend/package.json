@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "check:polling": "node scripts/check-polling-stability.mjs",
+    "check:execution-readiness": "node scripts/check-execution-readiness-ui.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
