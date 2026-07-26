@@ -12,7 +12,7 @@
 
 - Work only in `C:\Users\Ari Rosner\Projects\CryptoARC\.worktrees\mobile-operator-command-center` on branch `mobile/operator-command-center`.
 - Do not stage, move, revert, or clean changes in the main checkout.
-- The other active task owns `scripts/stop-dev.ps1`, `tests/test_scripts.py`, and shared runtime start/stop operations until its final handoff.
+- The other active task owns `scripts/start-dev.ps1`, `scripts/stop-dev.ps1`, `tests/test_scripts.py`, and shared runtime start/stop operations until its final handoff.
 - Do not run `scripts/start-dev.ps1`, `scripts/stop-dev.ps1`, or the full repository verifier concurrently with another task.
 - Rebase or merge the shutdown task's final commit before the first shared-runtime integration test and before final verification.
 - Preserve Android package `com.cryptoarc.cockpit`; bump version and `android.versionCode` only in Task 10.
