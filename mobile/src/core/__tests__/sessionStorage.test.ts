@@ -66,10 +66,17 @@ describe("atomic secure session storage", () => {
 
     const writeIndex = fixture.operations.indexOf(`set:${SESSION_STORAGE_KEY}`);
     const verifyIndex = fixture.operations.indexOf(`get:${SESSION_STORAGE_KEY}`, writeIndex + 1);
+    const controlWriteIndex = fixture.operations.indexOf(`set:${SESSION_CONTROL_KEY}`);
+    const controlVerifyIndex = fixture.operations.indexOf(
+      `get:${SESSION_CONTROL_KEY}`,
+      controlWriteIndex + 1,
+    );
     const firstDeleteIndex = fixture.operations.findIndex((operation) => operation.startsWith("delete:"));
     expect(writeIndex).toBeGreaterThan(-1);
     expect(verifyIndex).toBeGreaterThan(writeIndex);
-    expect(firstDeleteIndex).toBeGreaterThan(verifyIndex);
+    expect(controlWriteIndex).toBeGreaterThan(verifyIndex);
+    expect(controlVerifyIndex).toBeGreaterThan(controlWriteIndex);
+    expect(firstDeleteIndex).toBeGreaterThan(controlVerifyIndex);
     expect(fixture.values.has(LEGACY_API_BASE_KEY)).toBe(false);
     expect(fixture.values.has(LEGACY_TOKEN_KEY)).toBe(false);
     expect(fixture.values.has(LEGACY_DEVICE_KEY)).toBe(false);
@@ -99,6 +106,123 @@ describe("atomic secure session storage", () => {
     expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalledWith(LEGACY_API_BASE_KEY);
     expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalledWith(LEGACY_TOKEN_KEY);
     expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalledWith(LEGACY_DEVICE_KEY);
+  });
+
+  it("recovers legacy authority when migration stops before the credential slot completes", async () => {
+    const fixture = secureStoreFixture({
+      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+      [LEGACY_TOKEN_KEY]: record.token,
+      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
+    });
+    let slotWriteStarted = false;
+    const interruptedWrite = new Promise<void>(() => undefined);
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      if (key === SESSION_SLOT_A_KEY) {
+        slotWriteStarted = true;
+        await interruptedWrite;
+        return;
+      }
+      fixture.values.set(key, value);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+    void storage.loadOrMigrate().catch(() => undefined);
+
+    for (let attempt = 0; attempt < 50 && !slotWriteStarted; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(slotWriteStarted).toBe(true);
+    expect(fixture.values.has(SESSION_CONTROL_KEY)).toBe(false);
+    expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
+  });
+
+  it("recovers a verified standalone migration slot when stopped before active control", async () => {
+    const fixture = secureStoreFixture({
+      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+      [LEGACY_TOKEN_KEY]: record.token,
+      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
+    });
+    let activeControlWriteStarted = false;
+    const interruptedWrite = new Promise<void>(() => undefined);
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      if (key === SESSION_CONTROL_KEY && JSON.parse(value).status === "active") {
+        activeControlWriteStarted = true;
+        await interruptedWrite;
+        return;
+      }
+      fixture.values.set(key, value);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+    void storage.loadOrMigrate().catch(() => undefined);
+
+    for (let attempt = 0; attempt < 50 && !activeControlWriteStarted; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(activeControlWriteStarted).toBe(true);
+    expect(fixture.values.has(SESSION_CONTROL_KEY)).toBe(false);
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify(record));
+    expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
+  });
+
+  it("retains a recoverable verified slot when legacy migration control write fails", async () => {
+    const fixture = secureStoreFixture({
+      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+      [LEGACY_TOKEN_KEY]: record.token,
+      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
+    });
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      if (key === SESSION_CONTROL_KEY && JSON.parse(value).status === "active") {
+        throw new Error("active control write failed");
+      }
+      fixture.values.set(key, value);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+
+    await expect(storage.loadOrMigrate()).rejects.toThrow("active control write failed");
+    expect(fixture.values.has(SESSION_CONTROL_KEY)).toBe(false);
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify(record));
+    expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
   });
 
   it("does not bootstrap an uncommitted first-save slot after verification fails", async () => {
@@ -254,6 +378,9 @@ describe("atomic secure session storage", () => {
 
     await expect(storage.loadOrMigrate()).resolves.toEqual(record);
     expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+    await expect(
+      createSecureSessionStorage(fixture.secureStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
 
     await expect(storage.clear()).resolves.toBeUndefined();
 

@@ -191,6 +191,68 @@ export function createSecureSessionStorage(
     return { control, raw };
   };
 
+  const migrateLegacyRecord = async (record: SecureSessionRecord): Promise<void> => {
+    try {
+      await writeSlot("a", record);
+    } catch (error) {
+      await cleanupKeys(secureStore, [SESSION_SLOT_A_KEY]);
+      throw error;
+    }
+
+    const control: ActiveSessionControl = {
+      version: 1,
+      status: "active",
+      generation: 1,
+      slot: "a",
+      savedAt: record.savedAt,
+    };
+    const serializedControl = JSON.stringify(control);
+    try {
+      await writeControl(control);
+    } catch (error) {
+      try {
+        const persisted = await secureStore.getItemAsync(SESSION_CONTROL_KEY);
+        if (persisted === serializedControl) {
+          parseSessionControl(persisted);
+          await cleanupKeys(secureStore, [
+            LEGACY_API_BASE_KEY,
+            LEGACY_TOKEN_KEY,
+            LEGACY_DEVICE_KEY,
+          ]);
+          return;
+        }
+      } catch {
+        // Fall through to restoring the verified standalone-slot recovery path.
+      }
+
+      try {
+        await secureStore.deleteItemAsync(SESSION_CONTROL_KEY);
+        if ((await secureStore.getItemAsync(SESSION_CONTROL_KEY)) !== null) {
+          throw new Error("Legacy migration control rollback verification failed");
+        }
+      } catch {
+        try {
+          await writeControl(control);
+          await cleanupKeys(secureStore, [
+            LEGACY_API_BASE_KEY,
+            LEGACY_TOKEN_KEY,
+            LEGACY_DEVICE_KEY,
+          ]);
+          return;
+        } catch {
+          throw new SecureSessionRollbackError();
+        }
+      }
+      throw error;
+    }
+
+    await cleanupKeys(secureStore, [
+      LEGACY_API_BASE_KEY,
+      LEGACY_TOKEN_KEY,
+      LEGACY_DEVICE_KEY,
+    ]);
+  };
+
   const save = async (record: SecureSessionRecord): Promise<void> => {
     parseSecureSessionRecord(JSON.stringify(record));
     let previousRaw = await secureStore.getItemAsync(SESSION_CONTROL_KEY);
@@ -344,12 +406,7 @@ export function createSecureSessionStorage(
       device,
       savedAt: now(),
     };
-    await save(migrated);
-    await cleanupKeys(secureStore, [
-      LEGACY_API_BASE_KEY,
-      LEGACY_TOKEN_KEY,
-      LEGACY_DEVICE_KEY,
-    ]);
+    await migrateLegacyRecord(migrated);
     return migrated;
   };
 
