@@ -395,6 +395,7 @@ class LiveExecutionIntent:
     operator_recommendation: str = ""
     priority_reason: str = ""
     generated_from_position: bool = False
+    version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -543,6 +544,9 @@ class LiveLedgerPosition:
     realized_pnl_confidence: str = "unknown"
     unrealized_pnl_confidence: str = "unknown"
     pnl_confidence_notes: list[str] = field(default_factory=list)
+    stop_pct: float | None = None
+    target_pct: float | None = None
+    version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

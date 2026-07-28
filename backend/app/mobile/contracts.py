@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MobileScope:
@@ -36,6 +37,53 @@ class MobileActionStatus(str, Enum):
     CANCELLED = "cancelled"
     EXPIRED = "expired"
     REVIEW_REQUIRED = "review_required"
+
+
+class MobileTradeDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    amount: Decimal = Field(gt=0)
+    slippage_pct: Decimal = Field(gt=0)
+    stop_pct: Decimal | None = Field(default=None, gt=0)
+    target_pct: Decimal | None = Field(default=None, gt=0)
+
+
+class MobileGuardedActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    draft: MobileTradeDraft
+    escalation_acknowledged: bool = False
+
+
+class MobileRejectTradeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class MobileAdjustExitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    stop_pct: Decimal = Field(gt=0, le=100)
+    target_pct: Decimal = Field(gt=0, le=100)
+    escalation_acknowledged: bool = False
+
+
+class MobilePositionCloseRequest(MobileGuardedActionRequest):
+    intent_id: str = Field(min_length=1, max_length=120)
+    position_version: int = Field(ge=1)
+
+
+class MobileActionReceipt(BaseModel):
+    action_id: str
+    status: MobileActionStatus
+    submitted_at: datetime
+    updated_at: datetime
+    operator_message: str
+    reconcile_after_ms: int = Field(ge=250, le=30000)
 
 
 class MobileFreshness(BaseModel):

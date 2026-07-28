@@ -654,6 +654,61 @@ class BotState:
         self.storage.save_live_ledger_position(position)
         return self._mobile_live_position_detail(position, now)
 
+    def mobile_adjust_position_exit(
+        self,
+        *,
+        position_id: str,
+        expected_version: int,
+        stop_pct: float,
+        target_pct: float,
+    ) -> dict[str, object]:
+        position = self.storage.load_live_ledger_position(position_id)
+        if position is None:
+            raise LookupError("Mobile live position not found")
+        if int(position.version) != int(expected_version):
+            raise ValueError("Position version conflict")
+        if position.status != "open" or position.token_balance <= 0:
+            raise ValueError("Only an open live position can change exit controls")
+        if not (0 < float(stop_pct) <= 100) or not (0 < float(target_pct) <= 100):
+            raise ValueError("Exit controls are outside backend bounds")
+        position.stop_pct = round(float(stop_pct), 4)
+        position.target_pct = round(float(target_pct), 4)
+        position.version += 1
+        position.updated_at = utc_now()
+        self.storage.save_live_ledger_position(position)
+        self.add_event(
+            "warning",
+            f"Mobile exit controls updated for {position.symbol or position.mint[:8]}",
+            subsystem="mobile",
+            operator_action="Review the position and live exit signals after changing its bounds.",
+        )
+        return self._mobile_live_position_detail(position, utc_now())
+
+    def mobile_live_execution_blockers(
+        self,
+        intent: LiveExecutionIntent,
+    ) -> list[str]:
+        blockers = self._live_execution_blockers(
+            True,
+            intent.action,
+            intent.wallet_public_key,
+            intent.signer_mode,
+            autonomous=False,
+        )
+        readiness_halt = self.readiness_halt_reason()
+        if readiness_halt:
+            blockers.append(readiness_halt)
+        if intent.action == "buy":
+            backup = self._pre_run_backup_status()
+            if backup.get("blocks_live_entries"):
+                blockers.append(
+                    str(
+                        backup.get("blocker")
+                        or "pre-run backup is required before live entries"
+                    )
+                )
+        return list(dict.fromkeys(blockers))
+
     def _mobile_position_summaries(
         self,
         now: datetime,
@@ -796,6 +851,23 @@ class BotState:
         total = float(position.realized_pnl_sol + position.unrealized_pnl_sol)
         wallet = position.wallet_public_key
         wallet_label = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 12 else wallet or "Unknown wallet"
+        prepared_close = next(
+            (
+                intent
+                for intent in self.storage.load_live_intents(200)
+                if intent.action == "sell"
+                and intent.mint == position.mint
+                and intent.wallet_public_key == position.wallet_public_key
+                and intent.status == "simulated"
+                and not intent.stale
+            ),
+            None,
+        )
+        controls_available = (
+            position.status == "open"
+            and position.token_balance > 0
+            and position.reconciliation_status != "needs_review"
+        )
         return {
             **summary,
             "wallet_label": wallet_label,
@@ -819,9 +891,15 @@ class BotState:
             },
             "reconciliation_status": position.reconciliation_status,
             "allowed_actions": {
-                "adjust_exit": False,
-                "close": False,
-                "reason": "Guarded position actions are available in the review flow.",
+                "adjust_exit": controls_available,
+                "close": controls_available and prepared_close is not None,
+                "reason": (
+                    "A simulated sell intent is ready for guarded close review."
+                    if controls_available and prepared_close is not None
+                    else "Prepare and simulate a matching sell intent before closing from mobile."
+                    if controls_available
+                    else "Resolve position reconciliation before changing live controls."
+                ),
             },
         }
 
@@ -6845,6 +6923,7 @@ class BotState:
         intent = self._require_live_intent(intent_id)
         intent.status = "cancelled"
         intent.updated_at = utc_now()
+        intent.version += 1
         self.storage.save_live_intent(intent)
         return intent.to_dict()
 
@@ -7081,6 +7160,7 @@ class BotState:
         intent.updated_at = utc_now()
         intent.expires_at = utc_now() + timedelta(seconds=30)
         intent.stale = False
+        intent.version += 1
         self.storage.save_live_intent(intent)
         if shadow_only and intent.source == "paper_promoted":
             stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
@@ -7162,6 +7242,7 @@ class BotState:
             if intent:
                 intent.status = audit.status
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         return audit.to_dict()
 
@@ -7236,6 +7317,7 @@ class BotState:
             if intent:
                 intent.status = "submitted"
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         self.add_event("warning", f"Live {audit.action} submitted: {audit.transaction_signature[:10]}")
         if audit.signer_mode != "browser_wallet":
@@ -7267,6 +7349,7 @@ class BotState:
             if intent:
                 intent.status = "executed" if audit.status == "confirmed" else "needs_review"
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         if audit.status == "confirmed":
             position = self._record_live_fill(audit)
@@ -8191,14 +8274,34 @@ class BotState:
         if price > 0 and entry_price > 0:
             current_pct = ((price - entry_price) / entry_price) * 100
         signals: list[dict[str, object]] = []
-        if self.settings.stop_loss_pct > 0 and current_pct <= -abs(self.settings.stop_loss_pct):
+        stop_pct = (
+            float(position.stop_pct)
+            if position.stop_pct is not None
+            else float(self.settings.stop_loss_pct)
+        )
+        if stop_pct > 0 and current_pct <= -abs(stop_pct):
             signals.append(
                 {
                     "signal": "stop_loss",
-                    "reason": f"Stop-loss triggered at {current_pct:.2f}% versus -{abs(self.settings.stop_loss_pct):.2f}%",
+                    "reason": f"Stop-loss triggered at {current_pct:.2f}% versus -{abs(stop_pct):.2f}%",
                     "priority_reason": f"Risk exit: stop-loss breach {current_pct:.2f}%",
                     "priority": 1000 + abs(current_pct),
                     "score": 100,
+                }
+            )
+        target_pct = (
+            float(position.target_pct)
+            if position.target_pct is not None
+            else float(self.settings.take_profit_pct)
+        )
+        if target_pct > 0 and current_pct >= target_pct:
+            signals.append(
+                {
+                    "signal": "take_profit",
+                    "reason": f"Take-profit triggered at {current_pct:.2f}% versus {target_pct:.2f}%",
+                    "priority_reason": f"Profit exit: target reached at {current_pct:.2f}%",
+                    "priority": 980 + current_pct,
+                    "score": 98,
                 }
             )
         if self.settings.break_even_stop_enabled and token.highest_unrealized_pct >= self.settings.break_even_after_profit_pct and current_pct <= 0:

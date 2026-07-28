@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, SecretStr
 from starlette.responses import JSONResponse
 
 from app.mobile.contracts import (
+    MobileActionReceipt,
+    MobileAdjustExitRequest,
+    MobileGuardedActionRequest,
     MobilePortfolioPayload,
+    MobilePositionCloseRequest,
     MobilePositionDetail,
     MobilePositionsPayload,
+    MobileRejectTradeRequest,
     MobileScope,
 )
 from app.mobile.service import (
@@ -66,6 +71,14 @@ def create_mobile_router(
     require_scope: Callable[[str], Callable[..., dict[str, object]]],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/mobile", tags=["mobile"])
+
+    def guarded_error(exc: Exception) -> HTTPException:
+        if isinstance(exc, LookupError):
+            return HTTPException(status_code=404, detail=str(exc))
+        message = str(exc)
+        if "version conflict" in message.lower() or "idempotency key" in message.lower():
+            return HTTPException(status_code=409, detail=message)
+        return HTTPException(status_code=422, detail=message)
 
     @router.get("/health")
     async def mobile_health() -> dict[str, object]:
@@ -199,15 +212,170 @@ def create_mobile_router(
     ) -> dict[str, object]:
         raise HTTPException(status_code=501, detail="Mobile wallet read is not implemented")
 
-    @router.post("/trades/{intent_id}/approve")
+    @router.get("/trades")
+    async def mobile_trades(
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_REVIEW)
+        ),
+    ) -> dict[str, object]:
+        return service.trades(device=device)
+
+    @router.get("/trades/{intent_id}")
+    async def mobile_trade(
+        intent_id: str,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_REVIEW)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.trade(device=device, intent_id=intent_id)
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post("/trades/{intent_id}/validate")
+    async def mobile_trade_validate(
+        intent_id: str,
+        payload: MobileGuardedActionRequest,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_REVIEW)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.validate_trade(
+                device=device,
+                intent_id=intent_id,
+                expected_version=payload.expected_version,
+                draft=payload.draft,
+                escalation_acknowledged=payload.escalation_acknowledged,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/trades/{intent_id}/approve",
+        response_model=MobileActionReceipt,
+    )
     async def mobile_trade_approve(
         intent_id: str,
-        _: dict[str, object] = Depends(require_scope(MobileScope.TRADE_EXECUTE)),
+        payload: MobileGuardedActionRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_EXECUTE)
+        ),
     ) -> dict[str, object]:
-        raise HTTPException(
-            status_code=501,
-            detail=f"Mobile trade approval is not implemented for {intent_id}",
-        )
+        try:
+            return service.approve_trade(
+                device=device,
+                intent_id=intent_id,
+                expected_version=payload.expected_version,
+                draft=payload.draft,
+                escalation_acknowledged=payload.escalation_acknowledged,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/trades/{intent_id}/reject",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_trade_reject(
+        intent_id: str,
+        payload: MobileRejectTradeRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_REVIEW)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.reject_trade(
+                device=device,
+                intent_id=intent_id,
+                expected_version=payload.expected_version,
+                reason=payload.reason,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/positions/{position_id}/adjust-exit",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_position_adjust_exit(
+        position_id: str,
+        payload: MobileAdjustExitRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_EXECUTE)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.adjust_position_exit(
+                device=device,
+                position_id=position_id,
+                expected_version=payload.expected_version,
+                stop_pct=payload.stop_pct,
+                target_pct=payload.target_pct,
+                escalation_acknowledged=payload.escalation_acknowledged,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/positions/{position_id}/close",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_position_close(
+        position_id: str,
+        payload: MobilePositionCloseRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_EXECUTE)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.close_position(
+                device=device,
+                position_id=position_id,
+                position_version=payload.position_version,
+                intent_id=payload.intent_id,
+                expected_version=payload.expected_version,
+                draft=payload.draft,
+                escalation_acknowledged=payload.escalation_acknowledged,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.get("/actions/{action_id}", response_model=MobileActionReceipt)
+    async def mobile_action(
+        action_id: str,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TRADE_REVIEW)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.action(device=device, action_id=action_id)
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
 
     async def mobile_notifications_register(
         payload: MobilePushRegistrationRequest,

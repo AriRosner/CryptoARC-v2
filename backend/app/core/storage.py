@@ -13,7 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -946,6 +946,116 @@ class Storage:
                 (bounded_limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def reserve_mobile_action_receipt(
+        self,
+        receipt: MobileActionReceipt,
+    ) -> tuple[MobileActionReceipt, bool]:
+        """Atomically reserve an idempotency key before a financial side effect."""
+        payload = receipt.to_dict()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at
+                FROM mobile_action_receipts
+                WHERE idempotency_key_hash = ?
+                """,
+                (receipt.idempotency_key_hash,),
+            ).fetchone()
+            if existing:
+                return self._mobile_action_receipt_from_row(existing), False
+            connection.execute(
+                """
+                INSERT INTO mobile_action_receipts (
+                    id, idempotency_key_hash, device_id, action_type, entity_id,
+                    payload, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    receipt.id,
+                    receipt.idempotency_key_hash,
+                    receipt.device_id,
+                    receipt.action_type,
+                    receipt.entity_id,
+                    json.dumps(payload["payload"]),
+                    receipt.status,
+                    payload["created_at"],
+                    payload["updated_at"],
+                ),
+            )
+        return receipt, True
+
+    def save_mobile_action_receipt(
+        self,
+        receipt: MobileActionReceipt,
+    ) -> MobileActionReceipt:
+        payload = receipt.to_dict()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mobile_action_receipts
+                SET payload = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(payload["payload"]),
+                    receipt.status,
+                    payload["updated_at"],
+                    receipt.id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError(f"Mobile action receipt not found: {receipt.id}")
+        return receipt
+
+    def load_mobile_action_receipt(
+        self,
+        action_id: str,
+    ) -> MobileActionReceipt | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at
+                FROM mobile_action_receipts
+                WHERE id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+        return self._mobile_action_receipt_from_row(row) if row else None
+
+    def load_mobile_action_receipt_by_key_hash(
+        self,
+        idempotency_key_hash: str,
+    ) -> MobileActionReceipt | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at
+                FROM mobile_action_receipts
+                WHERE idempotency_key_hash = ?
+                """,
+                (idempotency_key_hash,),
+            ).fetchone()
+        return self._mobile_action_receipt_from_row(row) if row else None
+
+    @staticmethod
+    def _mobile_action_receipt_from_row(row: sqlite3.Row) -> MobileActionReceipt:
+        return MobileActionReceipt(
+            id=str(row["id"]),
+            idempotency_key_hash=str(row["idempotency_key_hash"]),
+            device_id=str(row["device_id"]),
+            action_type=str(row["action_type"]),
+            entity_id=str(row["entity_id"]),
+            payload=json.loads(str(row["payload"]) or "{}"),
+            status=str(row["status"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
 
     def backup_restore_status(self) -> dict[str, Any]:
         history = self.load_backup_restore_history(10)

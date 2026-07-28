@@ -863,7 +863,7 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             main_app.state = previous_state
             main_app.auth = previous_auth
 
-    def test_explicitly_scoped_wallet_and_trade_requests_stop_at_501(self) -> None:
+    def test_scoped_wallet_stub_and_incomplete_guarded_trade_request_are_inert(self) -> None:
         with self.mobile_client() as (client, desktop_headers):
             claim = self.claim_device(
                 client,
@@ -889,7 +889,7 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             )
 
             self.assertEqual(wallet_response.status_code, 501)
-            self.assertEqual(trade_response.status_code, 501)
+            self.assertEqual(trade_response.status_code, 422)
             self.assertEqual(
                 (
                     self.state.storage.count_trades(),
