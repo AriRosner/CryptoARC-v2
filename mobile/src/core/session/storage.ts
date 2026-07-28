@@ -253,6 +253,32 @@ export function createSecureSessionStorage(
     ]);
   };
 
+  const readLegacyRecord = async (): Promise<SecureSessionRecord | null> => {
+    const [apiBaseUrl, token, rawDevice] = await Promise.all([
+      secureStore.getItemAsync(LEGACY_API_BASE_KEY),
+      secureStore.getItemAsync(LEGACY_TOKEN_KEY),
+      secureStore.getItemAsync(LEGACY_DEVICE_KEY),
+    ]);
+    if (apiBaseUrl === null && token === null && rawDevice === null) return null;
+    if (!apiBaseUrl || !token || !rawDevice) throw new Error("Legacy secure session is incomplete");
+
+    let device: unknown;
+    try {
+      device = JSON.parse(rawDevice);
+    } catch {
+      throw new Error("Legacy secure session is invalid");
+    }
+    if (!validDevice(device)) throw new Error("Legacy secure session is invalid");
+
+    return {
+      version: 2,
+      apiBaseUrl,
+      token,
+      device,
+      savedAt: now(),
+    };
+  };
+
   const save = async (record: SecureSessionRecord): Promise<void> => {
     parseSecureSessionRecord(JSON.stringify(record));
     let previousRaw = await secureStore.getItemAsync(SESSION_CONTROL_KEY);
@@ -371,6 +397,12 @@ export function createSecureSessionStorage(
       return loadControlled(parseSessionControl(controlRaw));
     }
 
+    const legacyRecord = await readLegacyRecord();
+    if (legacyRecord !== null) {
+      await migrateLegacyRecord(legacyRecord);
+      return legacyRecord;
+    }
+
     const standalone = await secureStore.getItemAsync(SESSION_SLOT_A_KEY);
     if (standalone !== null) {
       const record = parseSecureSessionRecord(standalone);
@@ -382,32 +414,7 @@ export function createSecureSessionStorage(
       ]);
       return loadControlled(bootstrapped.control);
     }
-
-    const [apiBaseUrl, token, rawDevice] = await Promise.all([
-      secureStore.getItemAsync(LEGACY_API_BASE_KEY),
-      secureStore.getItemAsync(LEGACY_TOKEN_KEY),
-      secureStore.getItemAsync(LEGACY_DEVICE_KEY),
-    ]);
-    if (apiBaseUrl === null && token === null && rawDevice === null) return null;
-    if (!apiBaseUrl || !token || !rawDevice) throw new Error("Legacy secure session is incomplete");
-
-    let device: unknown;
-    try {
-      device = JSON.parse(rawDevice);
-    } catch {
-      throw new Error("Legacy secure session is invalid");
-    }
-    if (!validDevice(device)) throw new Error("Legacy secure session is invalid");
-
-    const migrated: SecureSessionRecord = {
-      version: 2,
-      apiBaseUrl,
-      token,
-      device,
-      savedAt: now(),
-    };
-    await migrateLegacyRecord(migrated);
-    return migrated;
+    return null;
   };
 
   const clear = async (): Promise<void> => {

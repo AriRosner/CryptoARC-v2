@@ -108,6 +108,89 @@ describe("atomic secure session storage", () => {
     expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalledWith(LEGACY_DEVICE_KEY);
   });
 
+  it("recovers complete legacy authority over a corrupt leftover migration slot", async () => {
+    const fixture = secureStoreFixture({
+      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+      [LEGACY_TOKEN_KEY]: record.token,
+      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
+    });
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      fixture.values.set(
+        key,
+        key === SESSION_SLOT_A_KEY ? JSON.stringify({ version: 1 }) : value,
+      );
+    });
+    fixture.secureStore.deleteItemAsync.mockImplementation(async (key: string) => {
+      fixture.operations.push(`delete:${key}`);
+      if (key === SESSION_SLOT_A_KEY) throw new Error("slot cleanup failed");
+      fixture.values.delete(key);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+
+    await expect(storage.loadOrMigrate()).rejects.toThrow("Secure session verification failed");
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify({ version: 1 }));
+    expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify(record));
+  });
+
+  it("does not promote a valid unexpected leftover slot over complete legacy authority", async () => {
+    const unexpectedRecord: SecureSessionRecord = {
+      ...record,
+      apiBaseUrl: "https://unexpected.test",
+      token: "unexpected-token",
+      savedAt: "2026-07-28T09:00:00.000Z",
+    };
+    const fixture = secureStoreFixture({
+      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+      [LEGACY_TOKEN_KEY]: record.token,
+      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
+    });
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      fixture.values.set(
+        key,
+        key === SESSION_SLOT_A_KEY ? JSON.stringify(unexpectedRecord) : value,
+      );
+    });
+    fixture.secureStore.deleteItemAsync.mockImplementation(async (key: string) => {
+      fixture.operations.push(`delete:${key}`);
+      if (key === SESSION_SLOT_A_KEY) throw new Error("slot cleanup failed");
+      fixture.values.delete(key);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+
+    await expect(storage.loadOrMigrate()).rejects.toThrow("Secure session verification failed");
+    expect(fixture.values.get(LEGACY_TOKEN_KEY)).toBe(record.token);
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toEqual(record);
+    expect(JSON.stringify([...fixture.values.values()])).not.toContain("unexpected-token");
+  });
+
   it("recovers legacy authority when migration stops before the credential slot completes", async () => {
     const fixture = secureStoreFixture({
       [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
@@ -350,9 +433,6 @@ describe("atomic secure session storage", () => {
   it("fails closed on a malformed v2 record instead of recovering from legacy tokens", async () => {
     const fixture = secureStoreFixture({
       [SESSION_STORAGE_KEY]: JSON.stringify({ ...record, version: 1 }),
-      [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
-      [LEGACY_TOKEN_KEY]: record.token,
-      [LEGACY_DEVICE_KEY]: JSON.stringify(record.device),
     });
     const storage = createSecureSessionStorage(fixture.secureStore);
 
@@ -360,6 +440,39 @@ describe("atomic secure session storage", () => {
     expect(fixture.secureStore.setItemAsync).not.toHaveBeenCalled();
     expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalled();
   });
+
+  it.each([
+    {
+      label: "incomplete",
+      legacy: {
+        [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+        [LEGACY_TOKEN_KEY]: record.token,
+      },
+      message: "Legacy secure session is incomplete",
+    },
+    {
+      label: "invalid",
+      legacy: {
+        [LEGACY_API_BASE_KEY]: record.apiBaseUrl,
+        [LEGACY_TOKEN_KEY]: record.token,
+        [LEGACY_DEVICE_KEY]: JSON.stringify({ id: "" }),
+      },
+      message: "Legacy secure session is invalid",
+    },
+  ] as Array<{ label: string; legacy: Record<string, string>; message: string }>)(
+    "fails closed on $label legacy authority instead of bootstrapping standalone v2",
+    async ({ legacy, message }) => {
+      const fixture = secureStoreFixture({
+        [SESSION_STORAGE_KEY]: JSON.stringify(record),
+        ...legacy,
+      });
+      const storage = createSecureSessionStorage(fixture.secureStore);
+
+      await expect(storage.loadOrMigrate()).rejects.toThrow(message);
+      expect(fixture.secureStore.setItemAsync).not.toHaveBeenCalled();
+      expect(fixture.secureStore.deleteItemAsync).not.toHaveBeenCalled();
+    },
+  );
 
   it("commits a credential-free tombstone before cleanup so failed legacy deletes cannot resurrect a session", async () => {
     const fixture = secureStoreFixture({
