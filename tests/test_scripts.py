@@ -522,6 +522,78 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("Where-Object { [int]$_.LocalPort -eq $BackendPort }", stop_script)
         self.assertNotIn("defaultBackendPorts", stop_script)
 
+    def test_stop_dev_manifest_timestamp_parser_is_strict_across_powershell_versions(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        self.assertIsNotNone(powershell, "PowerShell is required to test manifest timestamp parsing")
+        stop_script = (ROOT / "scripts" / "stop-dev.ps1").read_text(encoding="utf-8")
+        function_start = stop_script.index("function ConvertTo-CryptoArcManifestTimestamp")
+        function_end = stop_script.index(
+            "\nfunction Test-CryptoArcManifestProcessFreshness",
+            function_start,
+        )
+        function_source = stop_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            wrapper_path = Path(temporary_directory) / "test-manifest-timestamp.ps1"
+            wrapper_path.write_text(
+                function_source
+                + """
+$pastUtc = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Utc)
+$pastLocal = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Local)
+$pastUnspecified = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Unspecified)
+$cases = [ordered]@{
+  native_datetime_utc = $pastUtc
+  native_datetime_local = $pastLocal
+  native_datetime_unspecified = $pastUnspecified
+  native_datetimeoffset_utc = [DateTimeOffset]::new(2020, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+  native_datetimeoffset_nonzero = [DateTimeOffset]::new(
+    2020, 1, 1, 0, 0, 0, [TimeSpan]::FromHours(1)
+  )
+  native_future_utc = [DateTime]::UtcNow.AddMinutes(5)
+  strict_utc_string = "2020-01-01T00:00:00.0000000Z"
+}
+$results = [ordered]@{}
+foreach ($case in $cases.GetEnumerator()) {
+  try {
+    ConvertTo-CryptoArcManifestTimestamp -Value $case.Value -Name $case.Key | Out-Null
+    $results[$case.Key] = $true
+  } catch {
+    $results[$case.Key] = $false
+  }
+}
+$results | ConvertTo-Json -Compress
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(wrapper_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "native_datetime_utc": True,
+                "native_datetime_local": False,
+                "native_datetime_unspecified": False,
+                "native_datetimeoffset_utc": True,
+                "native_datetimeoffset_nonzero": False,
+                "native_future_utc": False,
+                "strict_utc_string": True,
+            },
+        )
+
     def test_start_dev_records_process_manifest(self) -> None:
         script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
 

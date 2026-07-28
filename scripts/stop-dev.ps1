@@ -32,7 +32,19 @@ function ConvertTo-CryptoArcManifestTimestamp {
   )
 
   $timestamp = [DateTimeOffset]::MinValue
-  if (
+  if ($Value -is [DateTime]) {
+    $dateTime = [DateTime]$Value
+    if ($dateTime.Kind -ne [DateTimeKind]::Utc) {
+      throw "Invalid $Name in CryptoARC process manifest."
+    }
+    $timestamp = [DateTimeOffset]::new($dateTime)
+  } elseif ($Value -is [DateTimeOffset]) {
+    $timestamp = [DateTimeOffset]$Value
+    if ($timestamp.Offset -ne [TimeSpan]::Zero) {
+      throw "Invalid $Name in CryptoARC process manifest."
+    }
+    $timestamp = $timestamp.ToUniversalTime()
+  } elseif (
     -not $Value -or
     -not [DateTimeOffset]::TryParseExact(
       [string]$Value,
@@ -41,9 +53,11 @@ function ConvertTo-CryptoArcManifestTimestamp {
       [System.Globalization.DateTimeStyles]::RoundtripKind,
       [ref]$timestamp
     ) -or
-    $timestamp.Offset -ne [TimeSpan]::Zero -or
-    $timestamp -gt [DateTimeOffset]::UtcNow
+    $timestamp.Offset -ne [TimeSpan]::Zero
   ) {
+    throw "Invalid $Name in CryptoARC process manifest."
+  }
+  if ($timestamp -gt [DateTimeOffset]::UtcNow) {
     throw "Invalid $Name in CryptoARC process manifest."
   }
   return $timestamp
