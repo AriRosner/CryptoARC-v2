@@ -1,5 +1,6 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
+import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { useOptionalSession } from "../../core/session/SessionProvider";
 import { fetchPortfolio } from "./api";
 import type { PortfolioTimeframe } from "./types";
@@ -10,12 +11,14 @@ export function usePortfolioQuery(timeframe: PortfolioTimeframe) {
   return useQuery({
     queryKey: ["mobile", "portfolio", timeframe, session?.generation ?? "test"],
     queryFn: () =>
-      session
-        ? fetchPortfolio(timeframe, {
-            apiBaseUrl: session.apiBaseUrl,
-            token: session.token,
-          })
-        : fetchPortfolio(timeframe),
+      authenticatedRead(session, () =>
+        session
+          ? fetchPortfolio(timeframe, {
+              apiBaseUrl: session.apiBaseUrl,
+              token: session.token,
+            })
+          : fetchPortfolio(timeframe),
+      ),
     enabled,
     placeholderData: keepPreviousData,
   });

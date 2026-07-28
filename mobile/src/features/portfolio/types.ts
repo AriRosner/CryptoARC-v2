@@ -16,11 +16,25 @@ export interface PortfolioSummary {
   cost_basis_sol: number;
   net_pnl_sol: number;
   realized_pnl_sol: number;
+  selected_period_realized_pnl_sol: number;
   unrealized_pnl_sol: number;
   win_rate_pct: number;
   health_score: number;
   open_positions: number;
   closed_trades: number;
+}
+
+export interface CurrentPortfolioSnapshot {
+  generated_at: string;
+  tracked_value_sol: number;
+  cost_basis_sol: number;
+  realized_pnl_sol: number;
+  unrealized_pnl_sol: number;
+  net_pnl_sol: number;
+  paper_pnl_sol: number;
+  live_pnl_sol: number;
+  open_positions: number;
+  approximate: boolean;
 }
 
 export interface PortfolioPoint {
@@ -47,6 +61,7 @@ export interface PortfolioPayload {
   timeframe: PortfolioTimeframe;
   freshness: MobileFreshness;
   summary: PortfolioSummary;
+  current_snapshot: CurrentPortfolioSnapshot;
   series: PortfolioPoint[];
   allocation: PortfolioAllocation[];
   positions: PositionSummary[];

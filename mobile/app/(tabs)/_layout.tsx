@@ -1,5 +1,12 @@
 import { Tabs } from "expo-router";
-import { Bell, Gauge, Link2, ShieldAlert, Smartphone } from "lucide-react-native";
+import {
+  Bell,
+  ChartNoAxesCombined,
+  Gauge,
+  Link2,
+  ShieldAlert,
+  Smartphone,
+} from "lucide-react-native";
 
 import { colors } from "@/src/theme";
 
@@ -21,6 +28,10 @@ export default function TabLayout() {
           fontSize: 10,
           fontWeight: "800",
         },
+        tabBarItemStyle: {
+          minHeight: 48,
+          minWidth: 52,
+        },
       }}>
       <Tabs.Screen
         name="pairing"
@@ -31,6 +42,13 @@ export default function TabLayout() {
       />
       <Tabs.Screen
         name="index"
+        options={{
+          title: "Portfolio",
+          tabBarIcon: ({ color }) => <ChartNoAxesCombined size={22} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="cockpit"
         options={{
           title: "Cockpit",
           tabBarIcon: ({ color }) => <Gauge size={22} color={color} />,

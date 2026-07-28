@@ -73,7 +73,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       },
       isAuthenticationError: (error) =>
         error instanceof MobileApiError &&
-        (error.status === 401 || error.status === 403),
+        error.status === 401,
       onStateChange: setRealtime,
       onRevoked: () => {
         void session.revokeSession();

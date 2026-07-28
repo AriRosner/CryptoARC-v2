@@ -1,14 +1,24 @@
 import {
+  BottomSheetBackdrop,
   BottomSheetModal,
-  BottomSheetView,
+  BottomSheetScrollView,
+  type BottomSheetBackdropProps,
   type BottomSheetModal as BottomSheetModalType,
 } from "@gorhom/bottom-sheet";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLink, ShieldAlert, SlidersHorizontal, X } from "lucide-react-native";
-import React, { useEffect, useMemo, useRef } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef } from "react";
+import {
+  AccessibilityInfo,
+  findNodeHandle,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 
 import { ActionButton, DetailRow, StatusBadge } from "../../components/ui";
+import { authenticatedRead, mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
 import { colors, radius, spacing } from "../../theme";
@@ -30,17 +40,20 @@ export function PositionSheet({
   onClose,
 }: PositionSheetProps) {
   const modalRef = useRef<BottomSheetModalType>(null);
+  const titleRef = useRef<Text>(null);
   const session = useOptionalSession();
   const snapPoints = useMemo(() => ["60%", "88%"], []);
   const query = useQuery({
     queryKey: ["mobile", "position", positionId, session?.generation ?? "test"],
     queryFn: () =>
-      session
-        ? fetchPositionDetail(positionId!, {
-            apiBaseUrl: session.apiBaseUrl,
-            token: session.token,
-          })
-        : fetchPositionDetail(positionId!),
+      authenticatedRead(session, () =>
+        session
+          ? fetchPositionDetail(positionId!, {
+              apiBaseUrl: session.apiBaseUrl,
+              token: session.token,
+            })
+          : fetchPositionDetail(positionId!),
+      ),
     enabled: Boolean(positionId) && (session === null || Boolean(session.token)),
   });
 
@@ -49,28 +62,59 @@ export function PositionSheet({
     else modalRef.current?.dismiss();
   }, [positionId]);
 
-  const position = query.data;
+  const accessDenied =
+    query.error instanceof MobileApiError &&
+    (query.error.status === 401 || query.error.status === 403);
+  const position = accessDenied ? undefined : query.data;
   const totalPnl = position?.pnl.total_sol ?? 0;
   const notFound = query.error instanceof MobileApiError && query.error.status === 404;
+  const renderBackdrop = useCallback(
+    (props: BottomSheetBackdropProps) => (
+      <BottomSheetBackdrop
+        {...props}
+        accessibilityLabel="Dismiss position sheet"
+        accessibilityRole="button"
+        appearsOnIndex={0}
+        disappearsOnIndex={-1}
+        pressBehavior="close"
+      />
+    ),
+    [],
+  );
+  const focusSheet = useCallback((index: number) => {
+    if (index < 0) return;
+    const node = findNodeHandle(titleRef.current);
+    if (node) AccessibilityInfo.setAccessibilityFocus(node);
+  }, []);
+  useEffect(() => {
+    if (positionId && !query.isLoading) focusSheet(0);
+  }, [focusSheet, positionId, query.isLoading]);
 
   return (
     <BottomSheetModal
       ref={modalRef}
       snapPoints={snapPoints}
       enablePanDownToClose
+      backdropComponent={renderBackdrop}
+      onChange={focusSheet}
       onDismiss={onDismiss}
       backgroundStyle={styles.sheet}
       handleIndicatorStyle={styles.handle}>
-      <BottomSheetView style={styles.content}>
+      <BottomSheetScrollView
+        accessibilityViewIsModal
+        importantForAccessibility="yes"
+        contentContainerStyle={styles.content}>
         {query.isLoading ? (
           <PositionSheetSkeleton />
         ) : !position ? (
           <View style={styles.message}>
-            <Text style={styles.messageTitle}>{notFound ? "Position not found" : "Position unavailable"}</Text>
+            <Text ref={titleRef} accessibilityRole="header" style={styles.messageTitle}>
+              {notFound ? "Position not found" : "Position unavailable"}
+            </Text>
             <Text style={styles.messageBody}>
               {notFound
                 ? "This stable position ID is no longer present in the local ledger."
-                : "The private tunnel or mobile API is unavailable."}
+                : mobileReadErrorMessage(query.error, "positions")}
             </Text>
             {!notFound ? <ActionButton label="Retry" onPress={() => void query.refetch()} /> : null}
           </View>
@@ -79,7 +123,7 @@ export function PositionSheet({
             <View style={styles.header}>
               <View style={styles.headerCopy}>
                 <View style={styles.titleLine}>
-                  <Text style={styles.title}>{position.symbol}</Text>
+                  <Text ref={titleRef} accessibilityRole="header" style={styles.title}>{position.symbol}</Text>
                   <StatusBadge label={position.mode} tone={position.mode === "live" ? "warning" : "neutral"} />
                 </View>
                 <Text style={styles.mint} numberOfLines={1}>{position.mint}</Text>
@@ -141,7 +185,7 @@ export function PositionSheet({
             />
           </>
         )}
-      </BottomSheetView>
+      </BottomSheetScrollView>
     </BottomSheetModal>
   );
 }

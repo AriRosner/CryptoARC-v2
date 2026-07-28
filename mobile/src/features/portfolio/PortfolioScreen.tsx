@@ -1,10 +1,12 @@
 import { router } from "expo-router";
 import { RefreshCw } from "lucide-react-native";
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ActionButton, ErrorBanner, PageHeader, Section, SegmentedControl, StatusBadge } from "../../components/ui";
+import { mobileReadErrorMessage } from "../../core/api/authenticatedRead";
+import { MobileApiError } from "../../core/api/errors";
 import { colors, radius, spacing } from "../../theme";
 import { PositionList } from "../positions/PositionList";
 import { PositionSheet } from "../positions/PositionSheet";
@@ -13,6 +15,7 @@ import { PerformanceChart } from "./PerformanceChart";
 import { PortfolioMetrics } from "./PortfolioMetrics";
 import { usePortfolioQuery } from "./queries";
 import type { PortfolioTimeframe } from "./types";
+import type { PortfolioPayload } from "./types";
 
 const timeframes = [
   { label: "1D", value: "1d" },
@@ -25,7 +28,18 @@ export function PortfolioScreen() {
   const [timeframe, setTimeframe] = useState<PortfolioTimeframe>("1d");
   const [selectedPositionId, setSelectedPositionId] = useState<string | null>(null);
   const query = usePortfolioQuery(timeframe);
-  const payload = query.data;
+  const lastPayloadRef = useRef<PortfolioPayload | undefined>(undefined);
+  useEffect(() => {
+    if (query.data) lastPayloadRef.current = query.data;
+  }, [query.data]);
+  const accessDenied =
+    query.error instanceof MobileApiError &&
+    (query.error.status === 401 || query.error.status === 403);
+  const payload = accessDenied ? undefined : query.data ?? lastPayloadRef.current;
+  const displayedTimeframe = payload?.timeframe;
+  const timeframeMismatch = Boolean(
+    displayedTimeframe && displayedTimeframe !== timeframe,
+  );
 
   const setSelectedTimeframe = (value: string) => {
     setTimeframe(value as PortfolioTimeframe);
@@ -56,7 +70,17 @@ export function PortfolioScreen() {
           }
         />
         <SegmentedControl options={timeframes} value={timeframe} onChange={setSelectedTimeframe} />
-        <ErrorBanner message={query.isError ? "Portfolio data is unavailable. Pull to retry over the private tunnel." : ""} />
+        <ErrorBanner
+          message={
+            timeframeMismatch
+              ? query.isError
+                ? `Showing cached ${displayedTimeframe!.toUpperCase()} data; ${timeframe.toUpperCase()} is unavailable.`
+                : `Showing ${displayedTimeframe!.toUpperCase()} data while ${timeframe.toUpperCase()} loads.`
+              : query.isError
+                ? mobileReadErrorMessage(query.error, "Portfolio")
+                : ""
+          }
+        />
         {query.isError ? (
           <ActionButton
             label="Retry"
@@ -69,16 +93,23 @@ export function PortfolioScreen() {
           <PortfolioSkeleton />
         ) : payload ? (
           <>
-            <PortfolioMetrics summary={payload.summary} />
+            <PortfolioMetrics
+              currentSnapshot={payload.current_snapshot}
+              summary={payload.summary}
+              timeframe={payload.timeframe}
+            />
             <Section
-              title="Performance"
+              title={`${payload.timeframe.toUpperCase()} realized performance`}
               right={
                 <StatusBadge
-                  label={payload.freshness.approximate_pnl ? "Approximate" : "Reconciled"}
-                  tone={payload.freshness.approximate_pnl ? "warning" : "success"}
+                  label="Period exact"
+                  tone="success"
                 />
               }>
-              <PerformanceChart series={payload.series} />
+              <PerformanceChart
+                currentSnapshot={payload.current_snapshot}
+                series={payload.series}
+              />
             </Section>
             <Section title="Positions" right={<StatusBadge label={`${payload.summary.open_positions} open`} />}>
               <PositionList positions={payload.positions} onPress={setSelectedPositionId} />
@@ -107,8 +138,13 @@ function PortfolioSkeleton() {
   return (
     <View accessibilityLabel="Loading portfolio" style={styles.skeletonStack}>
       <View style={styles.skeletonMetrics}>
-        <View style={[styles.skeleton, styles.skeletonMetric]} />
-        <View style={[styles.skeleton, styles.skeletonMetric]} />
+        {Array.from({ length: 4 }, (_, index) => (
+          <View
+            key={index}
+            testID="portfolio-metric-skeleton"
+            style={[styles.skeleton, styles.skeletonMetric]}
+          />
+        ))}
       </View>
       <View style={[styles.skeleton, styles.skeletonChart]} />
       <View style={[styles.skeleton, styles.skeletonRow]} />
@@ -148,6 +184,7 @@ const styles = StyleSheet.create({
   },
   skeletonMetrics: {
     flexDirection: "row",
+    flexWrap: "wrap",
     gap: spacing.sm,
   },
   skeleton: {
@@ -155,7 +192,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
   },
   skeletonMetric: {
-    flex: 1,
+    flexBasis: "47%",
+    flexGrow: 1,
     height: 92,
   },
   skeletonChart: {

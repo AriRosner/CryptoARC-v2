@@ -5,16 +5,38 @@ import React from "react";
 import { fetchPositionDetail } from "../api";
 import { PositionSheet } from "../PositionSheet";
 import type { PositionDetail } from "../types";
+import { MobileApiError } from "../../../core/api/errors";
 
+const mockBackdrop = jest.fn();
+const mockModal = jest.fn();
 jest.mock("@gorhom/bottom-sheet", () => {
   const ReactModule = jest.requireActual("react");
   const { View: MockView } = jest.requireActual("react-native");
   return {
-    BottomSheetBackdrop: () => null,
+    BottomSheetBackdrop: (props: unknown) => {
+      mockBackdrop(props);
+      return <MockView testID="position-sheet-backdrop" />;
+    },
     BottomSheetModal: ReactModule.forwardRef(
-      ({ children }: { children?: React.ReactNode }, _ref: React.ForwardedRef<unknown>) => (
-        <MockView>{children}</MockView>
-      ),
+      (props: {
+        backdropComponent?: (props: Record<string, unknown>) => React.ReactNode;
+        children?: React.ReactNode;
+      }, ref: React.ForwardedRef<unknown>) => {
+        mockModal(props);
+        ReactModule.useImperativeHandle(ref, () => ({
+          dismiss: jest.fn(),
+          present: jest.fn(),
+        }));
+        return (
+          <MockView>
+            {props.backdropComponent?.({ animatedIndex: {}, animatedPosition: {}, style: {} })}
+            {props.children}
+          </MockView>
+        );
+      },
+    ),
+    BottomSheetScrollView: ({ children, ...props }: { children?: React.ReactNode }) => (
+      <MockView testID="position-sheet-scroll" {...props}>{children}</MockView>
     ),
     BottomSheetView: ({ children }: { children?: React.ReactNode }) => <MockView>{children}</MockView>,
   };
@@ -22,6 +44,16 @@ jest.mock("@gorhom/bottom-sheet", () => {
 
 jest.mock("../api", () => ({
   fetchPositionDetail: jest.fn(),
+}));
+
+const mockRevokeSession = jest.fn(async () => undefined);
+jest.mock("../../../core/session/SessionProvider", () => ({
+  useOptionalSession: () => ({
+    apiBaseUrl: "https://cryptoarc.test",
+    token: "mobile-token",
+    generation: 3,
+    revokeSession: mockRevokeSession,
+  }),
 }));
 
 const detail: PositionDetail = {
@@ -102,6 +134,79 @@ describe("PositionSheet", () => {
 
     fireEvent.press(view.getByText("Full details"));
     expect(onOpenDetails).toHaveBeenCalledWith("live-position-1");
+    client.clear();
+  });
+
+  it("uses a closing backdrop and scrollable modal accessibility boundary", async () => {
+    const onDismiss = jest.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0, retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={client}>
+        <PositionSheet
+          positionId="live-position-1"
+          onDismiss={onDismiss}
+          onOpenDetails={jest.fn()}
+          onAdjustExit={jest.fn()}
+          onClose={jest.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await view.findByText("Full details")).toBeTruthy();
+    expect(view.getByTestId("position-sheet-scroll")).toHaveProp("accessibilityViewIsModal", true);
+    expect(mockBackdrop).toHaveBeenCalledWith(
+      expect.objectContaining({
+        appearsOnIndex: 0,
+        disappearsOnIndex: -1,
+        pressBehavior: "close",
+      }),
+    );
+    fireEvent.press(view.getByLabelText("Close position sheet"));
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+    client.clear();
+  });
+
+  it("quarantines the session when position detail returns 401", async () => {
+    fetchPositionDetailMock.mockRejectedValueOnce(
+      new MobileApiError("session expired", "authentication", 401, false),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0, retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={client}>
+        <PositionSheet
+          positionId="live-position-1"
+          onDismiss={jest.fn()}
+          onOpenDetails={jest.fn()}
+          onAdjustExit={jest.fn()}
+          onClose={jest.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    await view.findByText("Pair this device again to view positions.");
+    expect(mockRevokeSession).toHaveBeenCalledTimes(1);
+    client.clear();
+  });
+
+  it("shows a scope denial without quarantining a valid session", async () => {
+    fetchPositionDetailMock.mockRejectedValueOnce(
+      new MobileApiError("portfolio scope required", "authorization", 403, false),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { gcTime: 0, retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={client}>
+        <PositionSheet
+          positionId="live-position-1"
+          onDismiss={jest.fn()}
+          onOpenDetails={jest.fn()}
+          onAdjustExit={jest.fn()}
+          onClose={jest.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(await view.findByText("This device does not have positions access.")).toBeTruthy();
+    expect(mockRevokeSession).not.toHaveBeenCalled();
     client.clear();
   });
 });

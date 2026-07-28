@@ -323,6 +323,21 @@ describe("modern provider lifecycle guards", () => {
     view.unmount();
   });
 
+  it("keeps the session mounted when ticket acquisition returns a 403 scope denial", async () => {
+    ticketMock.mockRejectedValue(
+      new MobileApiError("monitor scope required", "authorization", 403, false),
+    );
+    let session: SessionValue | undefined;
+    const view = await render(<ProviderStack onValue={(value) => (session = value)} />);
+
+    await waitFor(() => expect(ticketMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(session?.token).toBe("old-long-lived-token"));
+
+    expect(sockets).toHaveLength(0);
+    expect(values.get(SESSION_CONTROL_KEY)).not.toContain('"status":"cleared"');
+    view.unmount();
+  });
+
   it("does not install a pairing claim that resolves after clear", async () => {
     const claim = deferred<Awaited<ReturnType<typeof claimMobilePairing>>>();
     claimMock.mockReturnValue(claim.promise);

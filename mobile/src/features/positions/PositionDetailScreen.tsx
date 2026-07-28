@@ -5,6 +5,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ActionButton, DetailRow, EmptyState, PageHeader, Section, StatusBadge } from "../../components/ui";
+import { authenticatedRead, mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
 import { colors, radius, spacing } from "../../theme";
@@ -21,15 +22,20 @@ export function PositionDetailScreen({
   const query = useQuery({
     queryKey: ["mobile", "position", positionId, session?.generation ?? "test"],
     queryFn: () =>
-      session
-        ? fetchPositionDetail(positionId, {
-            apiBaseUrl: session.apiBaseUrl,
-            token: session.token,
-          })
-        : fetchPositionDetail(positionId),
+      authenticatedRead(session, () =>
+        session
+          ? fetchPositionDetail(positionId, {
+              apiBaseUrl: session.apiBaseUrl,
+              token: session.token,
+            })
+          : fetchPositionDetail(positionId),
+      ),
     enabled: Boolean(positionId) && (session === null || Boolean(session.token)),
   });
-  const position = query.data;
+  const accessDenied =
+    query.error instanceof MobileApiError &&
+    (query.error.status === 401 || query.error.status === 403);
+  const position = accessDenied ? undefined : query.data;
   const notFound = query.error instanceof MobileApiError && query.error.status === 404;
 
   return (
@@ -51,7 +57,7 @@ export function PositionDetailScreen({
               body={
                 notFound
                   ? "This stable position ID is no longer present in the local ledger."
-                  : "The private tunnel or mobile API is unavailable."
+                  : mobileReadErrorMessage(query.error, "positions")
               }
             />
             {!notFound ? <ActionButton label="Retry" onPress={() => void query.refetch()} /> : null}
