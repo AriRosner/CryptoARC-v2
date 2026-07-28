@@ -13,6 +13,7 @@ import urllib.request
 from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -566,8 +567,11 @@ class BotState:
         )
         open_positions = [position for position in positions if position["status"] == "open"]
         cost_basis = round(sum(float(position["cost_basis_sol"]) for position in open_positions), 9)
-        tracked_value = round(sum(float(position["value_sol"]) for position in open_positions), 9)
-        allocation = self._mobile_allocation(open_positions, tracked_value)
+        allocation = self._mobile_allocation(open_positions)
+        tracked_value = round(
+            sum(float(item["value_sol"]) for item in allocation),
+            9,
+        )
         live_net = round(live_realized + live_unrealized, 9)
         paper_net = round(current_paper_realized + paper_unrealized, 9)
         current_net = round(paper_net + live_net, 9)
@@ -865,23 +869,42 @@ class BotState:
     @staticmethod
     def _mobile_allocation(
         positions: list[dict[str, object]],
-        total_value: float,
     ) -> list[dict[str, object]]:
+        included = [
+            (position, Decimal(str(float(position["value_sol"]))))
+            for position in positions
+            if float(position["value_sol"]) > 0
+        ]
+        total_value = sum((value for _, value in included), Decimal("0"))
         if total_value <= 0:
             return []
+        exact_basis_points = [
+            (value / total_value) * Decimal("10000")
+            for _, value in included
+        ]
+        basis_points = [
+            int(value.quantize(Decimal("1"), rounding=ROUND_DOWN))
+            for value in exact_basis_points
+        ]
+        remainder = 10000 - sum(basis_points)
+        remainder_order = sorted(
+            range(len(included)),
+            key=lambda index: (
+                -(exact_basis_points[index] - Decimal(basis_points[index])),
+                str(included[index][0]["id"]),
+            ),
+        )
+        for index in remainder_order[:remainder]:
+            basis_points[index] += 1
         return [
             {
                 "key": str(position["id"]),
                 "label": str(position["symbol"]),
-                "value_sol": float(position["value_sol"]),
-                "percentage": round(
-                    max(0.0, float(position["value_sol"])) / total_value * 100,
-                    2,
-                ),
+                "value_sol": float(value),
+                "percentage": basis_points[index] / 100,
                 "mode": str(position["mode"]),
             }
-            for position in positions
-            if float(position["value_sol"]) > 0
+            for index, (position, value) in enumerate(included)
         ]
 
     def mobile_start_bot(self, live_trading_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:

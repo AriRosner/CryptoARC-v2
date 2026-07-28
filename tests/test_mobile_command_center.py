@@ -542,6 +542,106 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             )
         self.assertEqual(response.status_code, 422)
 
+    def test_portfolio_allocation_uses_only_positive_values_and_route_validates(self) -> None:
+        self.seed_portfolio()
+        now = datetime.now(timezone.utc)
+        for token_id, symbol, pnl in (
+            ("token-negative-value", "NEG", -0.2),
+            ("token-zero-value", "ZERO", -0.1),
+        ):
+            self.state.storage.save_token(
+                TokenSignal(
+                    id=token_id,
+                    symbol=symbol,
+                    name=symbol,
+                    mint=f"mint-{symbol.lower()}",
+                    creator="creator",
+                    detected_at=now,
+                    status=TokenStatus.MONITORING,
+                    amount_sol=0.1,
+                    pnl_sol=pnl,
+                    opened_at=now,
+                    last_observed_trade_at=now,
+                    price_source="test",
+                    price_confidence=1.0,
+                )
+            )
+
+        with self.mobile_client() as (client, desktop_headers):
+            allowed = self.claim_device(
+                client,
+                desktop_headers,
+                name="Allocation reader",
+                scopes=[MobileScope.PORTFOLIO_READ],
+            )
+            response = client.get(
+                "/api/mobile/portfolio?timeframe=all",
+                headers={"Authorization": f"Bearer {allowed['token']}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        allocation = payload["allocation"]
+        self.assertTrue(all(row["value_sol"] > 0 for row in allocation))
+        self.assertNotIn(
+            "paper:token-negative-value",
+            {row["key"] for row in allocation},
+        )
+        self.assertNotIn(
+            "paper:token-zero-value",
+            {row["key"] for row in allocation},
+        )
+        self.assertAlmostEqual(
+            payload["summary"]["tracked_value_sol"],
+            sum(row["value_sol"] for row in allocation),
+        )
+        self.assertTrue(
+            all(0.0 <= row["percentage"] <= 100.0 for row in allocation)
+        )
+        self.assertEqual(
+            round(sum(row["percentage"] for row in allocation), 2),
+            100.0,
+        )
+
+    def test_portfolio_allocation_distributes_rounding_remainder_deterministically(
+        self,
+    ) -> None:
+        allocation = self.state._mobile_allocation(
+            [
+                {
+                    "id": "position-z",
+                    "symbol": "Z",
+                    "value_sol": 1.0,
+                    "mode": "paper",
+                },
+                {
+                    "id": "position-a",
+                    "symbol": "A",
+                    "value_sol": 1.0,
+                    "mode": "paper",
+                },
+                {
+                    "id": "position-m",
+                    "symbol": "M",
+                    "value_sol": 1.0,
+                    "mode": "paper",
+                },
+            ]
+        )
+
+        self.assertEqual(
+            [(row["key"], row["percentage"]) for row in allocation],
+            [
+                ("position-z", 33.33),
+                ("position-a", 33.34),
+                ("position-m", 33.33),
+            ],
+        )
+        self.assertEqual(
+            round(sum(row["percentage"] for row in allocation), 2),
+            100.0,
+        )
+
     def test_new_scopes_are_not_granted_by_legacy_control(self) -> None:
         pairing = self.state.create_mobile_pairing(
             api_base_url="https://node.tailnet.ts.net",
