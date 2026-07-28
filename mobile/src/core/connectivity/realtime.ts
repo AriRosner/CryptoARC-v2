@@ -97,8 +97,9 @@ interface QueryInvalidator {
 }
 
 interface MobileRealtimeClientOptions {
-  url: string;
+  urlFactory: () => Promise<string>;
   initialState?: MobileRealtimeState;
+  isAuthenticationError?: (error: unknown) => boolean;
   now?: () => number;
   onRevoked?: () => void;
   onStateChange?: (state: MobileRealtimeState) => void;
@@ -147,9 +148,11 @@ export class MobileRealtimeClient {
   private readonly webSocketFactory: (url: string) => RealtimeSocket;
   private reconnectAttempt = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private requestPending = false;
   private socket: RealtimeSocket | null = null;
   private stopped = true;
   private state: MobileRealtimeState;
+  private lifecycleGeneration = 0;
 
   constructor(private readonly options: MobileRealtimeClientOptions) {
     this.state = options.initialState ?? initialRealtimeState;
@@ -168,9 +171,33 @@ export class MobileRealtimeClient {
   connect(): void {
     if (this.state.revoked) return;
     this.stopped = false;
-    if (this.socket !== null || this.reconnectTimer !== null) return;
+    if (this.socket !== null || this.reconnectTimer !== null || this.requestPending) return;
     this.updateState({ ...this.state, status: "connecting", reason: "" });
-    const socket = this.webSocketFactory(this.options.url);
+    const generation = this.lifecycleGeneration;
+    this.requestPending = true;
+    void this.openSocket(generation);
+  }
+
+  private async openSocket(generation: number): Promise<void> {
+    try {
+      const url = await this.options.urlFactory();
+      if (this.stopped || generation !== this.lifecycleGeneration) return;
+      this.requestPending = false;
+      const socket = this.webSocketFactory(url);
+      this.attachSocket(socket);
+    } catch (error) {
+      if (this.stopped || generation !== this.lifecycleGeneration) return;
+      this.requestPending = false;
+      if (this.options.isAuthenticationError?.(error)) {
+        this.revoke();
+        return;
+      }
+      this.updateState({ ...this.state, status: "offline", reason: "ticket_request_failed" });
+      this.scheduleReconnect();
+    }
+  }
+
+  private attachSocket(socket: RealtimeSocket): void {
     this.socket = socket;
     socket.onopen = () => {
       if (this.socket !== socket || this.stopped) return;
@@ -192,10 +219,6 @@ export class MobileRealtimeClient {
       if (this.socket !== socket) return;
       this.socket = null;
       if (this.stopped) return;
-      if (event.code === 1008) {
-        this.revoke();
-        return;
-      }
       this.updateState({ ...this.state, status: "offline", reason: "connection_closed" });
       this.scheduleReconnect();
     };
@@ -203,6 +226,8 @@ export class MobileRealtimeClient {
 
   disconnect(): void {
     this.stopped = true;
+    this.lifecycleGeneration += 1;
+    this.requestPending = false;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -277,6 +302,8 @@ export class MobileRealtimeClient {
       );
     }
     this.stopped = true;
+    this.lifecycleGeneration += 1;
+    this.requestPending = false;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

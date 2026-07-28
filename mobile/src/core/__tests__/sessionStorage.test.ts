@@ -125,6 +125,88 @@ describe("atomic secure session storage", () => {
     ).resolves.toBeNull();
   });
 
+  it("persists cleared authority before a first-save slot can survive process interruption", async () => {
+    const fixture = secureStoreFixture();
+    let activeControlWriteStarted = false;
+    const interruptedWrite = new Promise<void>(() => undefined);
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      if (key === SESSION_CONTROL_KEY && JSON.parse(value).status === "active") {
+        activeControlWriteStarted = true;
+        await interruptedWrite;
+        return;
+      }
+      fixture.values.set(key, value);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+    void storage.save(record).catch(() => undefined);
+
+    for (let attempt = 0; attempt < 10 && !activeControlWriteStarted; attempt += 1) {
+      await Promise.resolve();
+    }
+    expect(activeControlWriteStarted).toBe(true);
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify(record));
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toBeNull();
+    expect(fixture.values.get(SESSION_CONTROL_KEY)).toContain('"status":"cleared"');
+  });
+
+  it("keeps cleared authority when first-save control commit fails and slot cleanup is interrupted", async () => {
+    const fixture = secureStoreFixture();
+    let corruptNextControlRead = false;
+    fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
+      fixture.operations.push(`set:${key}`);
+      fixture.values.set(key, value);
+      if (key === SESSION_CONTROL_KEY && JSON.parse(value).status === "active") {
+        corruptNextControlRead = true;
+      }
+    });
+    fixture.secureStore.getItemAsync.mockImplementation(async (key: string) => {
+      fixture.operations.push(`get:${key}`);
+      if (key === SESSION_CONTROL_KEY && corruptNextControlRead) {
+        corruptNextControlRead = false;
+        return JSON.stringify({ version: 999 });
+      }
+      return fixture.values.get(key) ?? null;
+    });
+    fixture.secureStore.deleteItemAsync.mockImplementation(async (key: string) => {
+      fixture.operations.push(`delete:${key}`);
+      if (key === SESSION_SLOT_A_KEY) throw new Error("slot cleanup interrupted");
+      fixture.values.delete(key);
+    });
+    const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
+
+    await expect(storage.save(record)).rejects.toThrow(
+      "Secure session control verification failed",
+    );
+    expect(fixture.values.get(SESSION_SLOT_A_KEY)).toBe(JSON.stringify(record));
+
+    const remountedStore = {
+      getItemAsync: async (key: string) => fixture.values.get(key) ?? null,
+      setItemAsync: async (key: string, value: string) => {
+        fixture.values.set(key, value);
+      },
+      deleteItemAsync: async (key: string) => {
+        fixture.values.delete(key);
+      },
+    };
+    await expect(
+      createSecureSessionStorage(remountedStore, () => record.savedAt).loadOrMigrate(),
+    ).resolves.toBeNull();
+    expect(fixture.values.get(SESSION_CONTROL_KEY)).toContain('"status":"cleared"');
+  });
+
   it("restores the previous v2 record when a replacement write cannot be verified", async () => {
     const fixture = secureStoreFixture({ [SESSION_STORAGE_KEY]: JSON.stringify(record) });
     const replacement = { ...record, token: "replacement-token", savedAt: "2026-07-28T11:00:00.000Z" };
@@ -247,29 +329,31 @@ describe("atomic secure session storage", () => {
     await expect(createSecureSessionStorage(fixture.secureStore).loadOrMigrate()).resolves.toBeNull();
   });
 
-  it("fails closed behind a tombstone when first-save rollback delete fails", async () => {
+  it("fails closed behind a tombstone when first-save cleared-authority restore fails", async () => {
     const fixture = secureStoreFixture();
     const storage = createSecureSessionStorage(fixture.secureStore, () => record.savedAt);
     let corruptNextControlRead = false;
+    let failNextClearedRestore = false;
     fixture.secureStore.getItemAsync.mockImplementation(async (key: string) => {
       fixture.operations.push(`get:${key}`);
       if (key === SESSION_CONTROL_KEY && corruptNextControlRead) {
         corruptNextControlRead = false;
+        failNextClearedRestore = true;
         return JSON.stringify({ version: 999 });
       }
       return fixture.values.get(key) ?? null;
     });
     fixture.secureStore.setItemAsync.mockImplementation(async (key: string, value: string) => {
       fixture.operations.push(`set:${key}`);
+      const control = key === SESSION_CONTROL_KEY ? JSON.parse(value) : null;
+      if (control?.status === "cleared" && failNextClearedRestore) {
+        failNextClearedRestore = false;
+        throw new Error("cleared authority restore failed");
+      }
       fixture.values.set(key, value);
-      if (key === SESSION_CONTROL_KEY && JSON.parse(value).status === "active") {
+      if (control?.status === "active") {
         corruptNextControlRead = true;
       }
-    });
-    fixture.secureStore.deleteItemAsync.mockImplementation(async (key: string) => {
-      fixture.operations.push(`delete:${key}`);
-      if (key === SESSION_CONTROL_KEY) throw new Error("rollback delete failed");
-      fixture.values.delete(key);
     });
 
     await expect(storage.save(record)).rejects.toThrow("Secure session rollback failed");

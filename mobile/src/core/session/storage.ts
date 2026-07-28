@@ -204,6 +204,15 @@ export function createSecureSessionStorage(
         const bootstrapped = await bootstrapStandaloneRecord(parseSecureSessionRecord(standalone));
         previousControl = bootstrapped.control;
         previousRaw = bootstrapped.raw;
+      } else {
+        const initialAuthority: ClearedSessionControl = {
+          version: 1,
+          status: "cleared",
+          generation: 1,
+          savedAt: now(),
+        };
+        previousRaw = await writeControl(initialAuthority);
+        previousControl = initialAuthority;
       }
     }
 

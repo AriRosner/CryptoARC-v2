@@ -8,6 +8,7 @@ import {
   claimMobilePairing,
   fetchMobileCockpit,
   fetchMobileFeed,
+  MobileApiError,
   requestMobileWebSocketTicket,
   startMobileBot,
 } from "../../api";
@@ -15,8 +16,14 @@ import { MobileSessionProvider, useMobileSession } from "../../MobileSession";
 import { sampleCockpit } from "../../testPayloads";
 import type { MobileDevice, MobileFeedPayload } from "../../types";
 import { ConnectionProvider } from "../connectivity/ConnectionProvider";
-import { SESSION_CONTROL_KEY } from "../session/storage";
-import { SessionProvider } from "../session/SessionProvider";
+import {
+  LEGACY_DEVICE_KEY,
+  SESSION_CONTROL_KEY,
+} from "../session/storage";
+import {
+  SessionProvider,
+  useSession,
+} from "../session/SessionProvider";
 
 jest.mock("../../api", () => ({
   ...jest.requireActual("../../api"),
@@ -61,6 +68,7 @@ const newDevice: MobileDevice = {
 };
 
 type SessionValue = ReturnType<typeof useMobileSession>;
+type CoreSessionValue = ReturnType<typeof useSession>;
 
 function Probe({ onValue }: { onValue(value: SessionValue): void }) {
   const value = useMobileSession();
@@ -82,6 +90,24 @@ function ProviderStack({ onValue }: { onValue(value: SessionValue): void }) {
   );
 }
 
+function CoreProbe({ onValue }: { onValue(value: CoreSessionValue): void }) {
+  const value = useSession();
+  useEffect(() => {
+    onValue(value);
+  }, [onValue, value]);
+  return null;
+}
+
+function CoreProviderStack({ onValue }: { onValue(value: CoreSessionValue): void }) {
+  return (
+    <SessionProvider>
+      <ConnectionProvider>
+        <CoreProbe onValue={onValue} />
+      </ConnectionProvider>
+    </SessionProvider>
+  );
+}
+
 class FakeSocket {
   readyState = 0;
   onopen: (() => void) | null = null;
@@ -94,6 +120,11 @@ class FakeSocket {
 
   emitMessage(value: unknown) {
     this.onmessage?.({ data: JSON.stringify(value) });
+  }
+
+  emitClose(code: number) {
+    this.readyState = 3;
+    this.onclose?.({ code });
   }
 }
 
@@ -164,6 +195,133 @@ describe("modern provider lifecycle guards", () => {
     await waitFor(() => expect(ticketMock).toHaveBeenCalledTimes(1));
     return { get session() { return session!; }, view };
   }
+
+  it("does not publish or reconnect a stale initial session after clear begins", async () => {
+    const initialDeviceRead = deferred<string | null>();
+    let initialDeviceReadStarted = false;
+    jest.mocked(SecureStore.getItemAsync).mockImplementation(async (key) => {
+      if (key === LEGACY_DEVICE_KEY && !initialDeviceReadStarted) {
+        initialDeviceReadStarted = true;
+        return initialDeviceRead.promise;
+      }
+      return values.get(key) ?? null;
+    });
+    let session: CoreSessionValue | undefined;
+    const view = await render(
+      <CoreProviderStack onValue={(value) => (session = value)} />,
+    );
+    await waitFor(() => expect(initialDeviceReadStarted).toBe(true));
+    await waitFor(() => expect(session).toBeDefined());
+
+    let clearing!: Promise<boolean>;
+    await act(async () => {
+      clearing = session!.clearSession();
+      await Promise.resolve();
+    });
+    initialDeviceRead.resolve(JSON.stringify(oldDevice));
+    await act(async () => {
+      await clearing;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(session?.loading).toBe(false));
+
+    expect(session?.token).toBeNull();
+    expect(ticketMock).not.toHaveBeenCalled();
+    expect(values.get(SESSION_CONTROL_KEY)).toContain('"status":"cleared"');
+    view.unmount();
+  });
+
+  it("does not let a stale initial load replace a newer session or acquire its ticket", async () => {
+    const initialDeviceRead = deferred<string | null>();
+    let initialDeviceReadStarted = false;
+    jest.mocked(SecureStore.getItemAsync).mockImplementation(async (key) => {
+      if (key === LEGACY_DEVICE_KEY && !initialDeviceReadStarted) {
+        initialDeviceReadStarted = true;
+        return initialDeviceRead.promise;
+      }
+      return values.get(key) ?? null;
+    });
+    let session: CoreSessionValue | undefined;
+    const view = await render(
+      <CoreProviderStack onValue={(value) => (session = value)} />,
+    );
+    await waitFor(() => expect(initialDeviceReadStarted).toBe(true));
+    await waitFor(() => expect(session).toBeDefined());
+
+    let replacing!: Promise<boolean>;
+    await act(async () => {
+      replacing = session!.replaceSession(
+        "https://cryptoarc-new.test",
+        "new-long-lived-token",
+        newDevice,
+      );
+      await Promise.resolve();
+    });
+    initialDeviceRead.resolve(JSON.stringify(oldDevice));
+    await act(async () => {
+      await replacing;
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(session?.loading).toBe(false));
+    await waitFor(() => expect(ticketMock).toHaveBeenCalled());
+
+    expect(session?.token).toBe("new-long-lived-token");
+    expect(ticketMock).toHaveBeenCalledTimes(1);
+    expect(ticketMock).toHaveBeenCalledWith(
+      "https://cryptoarc-new.test",
+      "new-long-lived-token",
+    );
+    view.unmount();
+  });
+
+  it("acquires a fresh ticket after socket close without clearing the active session", async () => {
+    const randomSpy = jest.spyOn(Math, "random").mockReturnValue(0);
+    ticketMock
+      .mockResolvedValueOnce({
+        ticket: "ticket-A",
+        scope: "mobile:monitor",
+        ttl_seconds: 30,
+      })
+      .mockResolvedValueOnce({
+        ticket: "ticket-B",
+        scope: "mobile:monitor",
+        ttl_seconds: 30,
+      });
+    const mounted = await mountStack();
+    await waitFor(() => expect(sockets).toHaveLength(1));
+
+    await act(async () => {
+      sockets[0].emitClose(1006);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(ticketMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(sockets).toHaveLength(2));
+
+    expect(sockets.map((socket) => socket.url)).toEqual([
+      "wss://cryptoarc-old.test/ws/mobile?ticket=ticket-A",
+      "wss://cryptoarc-old.test/ws/mobile?ticket=ticket-B",
+    ]);
+    expect(mounted.session.token).toBe("old-long-lived-token");
+    randomSpy.mockRestore();
+    mounted.view.unmount();
+  });
+
+  it("quarantines the session when authenticated ticket acquisition returns 401", async () => {
+    ticketMock.mockRejectedValue(
+      new MobileApiError("session denied", "authentication", 401, false),
+    );
+    let session: SessionValue | undefined;
+    const view = await render(<ProviderStack onValue={(value) => (session = value)} />);
+
+    await waitFor(() => expect(ticketMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(session?.token).toBeNull());
+
+    expect(sockets).toHaveLength(0);
+    expect(values.get(SESSION_CONTROL_KEY)).toContain('"status":"cleared"');
+    view.unmount();
+  });
 
   it("does not install a pairing claim that resolves after clear", async () => {
     const claim = deferred<Awaited<ReturnType<typeof claimMobilePairing>>>();

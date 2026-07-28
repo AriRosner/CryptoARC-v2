@@ -32,6 +32,8 @@ class FakeSocket {
     this.readyState = FakeSocket.CLOSED;
   });
 
+  constructor(readonly url = "") {}
+
   emitOpen() {
     this.readyState = FakeSocket.OPEN;
     this.onopen?.();
@@ -165,11 +167,11 @@ describe("MobileRealtimeClient", () => {
     jest.useRealTimers();
   });
 
-  it("does not create duplicate sockets and invalidates affected queries", () => {
+  it("does not create duplicate sockets and invalidates affected queries", async () => {
     const sockets: FakeSocket[] = [];
     const invalidateQueries = jest.fn(async () => undefined);
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       initialState: { ...initialRealtimeState, lastSequence: 8 },
       webSocketFactory: () => {
         const socket = new FakeSocket();
@@ -182,6 +184,8 @@ describe("MobileRealtimeClient", () => {
 
     client.connect();
     client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
     expect(sockets).toHaveLength(1);
 
     sockets[0].emitOpen();
@@ -194,11 +198,11 @@ describe("MobileRealtimeClient", () => {
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile"] });
   });
 
-  it("does not invalidate queries for duplicate or out-of-order envelopes", () => {
+  it("does not invalidate queries for duplicate or out-of-order envelopes", async () => {
     const socket = new FakeSocket();
     const invalidateQueries = jest.fn(async () => undefined);
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       initialState: { ...initialRealtimeState, lastSequence: 8 },
       webSocketFactory: () => socket,
       queryClient: { invalidateQueries },
@@ -206,6 +210,8 @@ describe("MobileRealtimeClient", () => {
     });
 
     client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
     socket.emitMessage(envelope({ sequence: 9 }));
     invalidateQueries.mockClear();
 
@@ -220,7 +226,7 @@ describe("MobileRealtimeClient", () => {
     const sockets: FakeSocket[] = [];
     const onRevoked = jest.fn();
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       webSocketFactory: () => {
         const socket = new FakeSocket();
         sockets.push(socket);
@@ -231,6 +237,8 @@ describe("MobileRealtimeClient", () => {
     });
 
     client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
     sockets[0].emitMessage(
       envelope({
         event_type: "invalidate",
@@ -246,37 +254,137 @@ describe("MobileRealtimeClient", () => {
     expect(client.getState()).toMatchObject({ revoked: true, status: "revoked" });
   });
 
-  it("treats policy-close as revocation and does not reconnect", async () => {
+  it("requests a fresh one-time ticket after an ordinary socket close", async () => {
     const sockets: FakeSocket[] = [];
-    const invalidateQueries = jest.fn(async () => undefined);
+    const onRevoked = jest.fn();
+    const urlFactory = jest
+      .fn<Promise<string>, []>()
+      .mockResolvedValueOnce("wss://cryptoarc.test/ws/mobile?ticket=A")
+      .mockResolvedValueOnce("wss://cryptoarc.test/ws/mobile?ticket=B");
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
-      webSocketFactory: () => {
-        const socket = new FakeSocket();
+      urlFactory,
+      random: () => 1,
+      webSocketFactory: (url) => {
+        const socket = new FakeSocket(url);
         sockets.push(socket);
         return socket;
       },
-      queryClient: { invalidateQueries },
+      onRevoked,
     });
 
     client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(sockets.map((socket) => socket.url)).toEqual([
+      "wss://cryptoarc.test/ws/mobile?ticket=A",
+    ]);
+
+    sockets[0].emitClose(1006);
+    await jest.advanceTimersByTimeAsync(1000);
+
+    expect(urlFactory).toHaveBeenCalledTimes(2);
+    expect(sockets.map((socket) => socket.url)).toEqual([
+      "wss://cryptoarc.test/ws/mobile?ticket=A",
+      "wss://cryptoarc.test/ws/mobile?ticket=B",
+    ]);
+    expect(onRevoked).not.toHaveBeenCalled();
+    expect(client.getState().revoked).toBe(false);
+  });
+
+  it("does not treat a generic policy close for a spent ticket as device revocation", async () => {
+    const sockets: FakeSocket[] = [];
+    const onRevoked = jest.fn();
+    const urlFactory = jest
+      .fn<Promise<string>, []>()
+      .mockResolvedValueOnce("wss://cryptoarc.test/ws/mobile?ticket=spent")
+      .mockResolvedValueOnce("wss://cryptoarc.test/ws/mobile?ticket=fresh");
+    const client = new MobileRealtimeClient({
+      urlFactory,
+      random: () => 1,
+      webSocketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      onRevoked,
+    });
+
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
     sockets[0].emitClose(1008);
-    await jest.runOnlyPendingTimersAsync();
+    await jest.advanceTimersByTimeAsync(1000);
+
+    expect(urlFactory).toHaveBeenCalledTimes(2);
+    expect(sockets).toHaveLength(2);
+    expect(onRevoked).not.toHaveBeenCalled();
+    expect(client.getState().revoked).toBe(false);
+  });
+
+  it("retries transient ticket acquisition failures with capped backoff", async () => {
+    const sockets: FakeSocket[] = [];
+    const urlFactory = jest
+      .fn<Promise<string>, []>()
+      .mockRejectedValueOnce(new Error("temporary tunnel failure"))
+      .mockResolvedValueOnce("wss://cryptoarc.test/ws/mobile?ticket=recovered");
+    const client = new MobileRealtimeClient({
+      urlFactory,
+      random: () => 1,
+      webSocketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
 
     expect(client.getState()).toMatchObject({
+      status: "offline",
+      reason: "ticket_request_failed",
+    });
+    expect(jest.getTimerCount()).toBe(1);
+
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(urlFactory).toHaveBeenCalledTimes(2);
+    expect(sockets.map((socket) => socket.url)).toEqual([
+      "wss://cryptoarc.test/ws/mobile?ticket=recovered",
+    ]);
+  });
+
+  it("quarantines the session when authenticated ticket acquisition is denied", async () => {
+    const authenticationFailure = Object.assign(new Error("session denied"), { status: 401 });
+    const onRevoked = jest.fn();
+    const client = new MobileRealtimeClient({
+      urlFactory: jest.fn(async () => {
+        throw authenticationFailure;
+      }),
+      isAuthenticationError: (error) =>
+        typeof error === "object" &&
+        error !== null &&
+        "status" in error &&
+        (error.status === 401 || error.status === 403),
+      onRevoked,
+    });
+
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(onRevoked).toHaveBeenCalledTimes(1);
+    expect(client.getState()).toMatchObject({
       revoked: true,
-      requiresSnapshot: true,
       status: "revoked",
       reason: "token_revoked",
     });
-    expect(sockets).toHaveLength(1);
-    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile"] });
   });
 
   it("cleans up the socket and pending reconnect timer", async () => {
     const sockets: FakeSocket[] = [];
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       random: () => 1,
       webSocketFactory: () => {
         const socket = new FakeSocket();
@@ -286,6 +394,8 @@ describe("MobileRealtimeClient", () => {
     });
 
     client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
     sockets[0].emitClose(1006);
     expect(jest.getTimerCount()).toBe(1);
 

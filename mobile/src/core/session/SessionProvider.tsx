@@ -81,9 +81,10 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let active = true;
-    void secureSessionStorage.loadOrMigrate().then(
+    const initializationGeneration = generationRef.current;
+    void enqueueMutation(() => secureSessionStorage.loadOrMigrate()).then(
       (record) => {
-        if (active) {
+        if (active && isCurrentGeneration(initializationGeneration)) {
           const generation = nextGeneration();
           updateState(() => ({
             record,
@@ -95,7 +96,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         }
       },
       () => {
-        if (active) {
+        if (active && isCurrentGeneration(initializationGeneration)) {
           const generation = nextGeneration();
           updateState(() => ({
             record: null,
@@ -110,7 +111,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     return () => {
       active = false;
     };
-  }, [nextGeneration, updateState]);
+  }, [enqueueMutation, isCurrentGeneration, nextGeneration, updateState]);
 
   useEffect(() => {
     const onAppStateChange = (nextState: AppStateStatus) => {

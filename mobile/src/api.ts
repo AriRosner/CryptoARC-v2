@@ -1,4 +1,5 @@
 import type { MobileCockpitPayload, MobileFeedPayload, PairingClaimResponse } from "./types";
+import { mobileHttpError } from "./core/api/errors";
 
 export { mobileAction, mobileGet } from "./core/api/client";
 export { MobileApiError } from "./core/api/errors";
@@ -41,14 +42,16 @@ async function mobileRequest<T>(apiBaseUrl: string, path: string, token?: string
   }
   const response = await fetch(`${base}${path}`, { ...init, headers });
   if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
+    let body: { action_id?: unknown; detail?: unknown; message?: unknown } = {};
     try {
-      const body = await response.json();
-      detail = typeof body.detail === "string" ? body.detail : detail;
+      const value = await response.json();
+      if (value && typeof value === "object") {
+        body = value as typeof body;
+      }
     } catch {
       // Response body is optional for health and auth failures.
     }
-    throw new Error(detail);
+    throw mobileHttpError(response.status, response.statusText, body);
   }
   return response.json() as Promise<T>;
 }

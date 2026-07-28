@@ -1,5 +1,6 @@
 import {
   fetchMobileCockpit,
+  MobileApiError,
   mobileWebSocketTicketUrl,
   requestMobileWebSocketTicket,
 } from "../api";
@@ -80,5 +81,27 @@ describe("mobile WebSocket tickets", () => {
     expect(headers.get("Authorization")).toBe("Bearer long-lived-bearer-secret");
     expect(websocketUrl).toBe("wss://cryptoarc.test/ws/mobile?ticket=one-time-ticket");
     expect(websocketUrl).not.toContain("long-lived-bearer-secret");
+  });
+
+  it("preserves authenticated ticket denial as a typed non-retryable error", async () => {
+    const fetchMock = jest.fn(async () => ({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      json: async () => ({ detail: "session denied" }),
+    })) as unknown as typeof fetch;
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: fetchMock });
+
+    const outcome = requestMobileWebSocketTicket(
+      "https://cryptoarc.test",
+      "long-lived-bearer-secret",
+    );
+
+    await expect(outcome).rejects.toBeInstanceOf(MobileApiError);
+    await expect(outcome).rejects.toMatchObject({
+      category: "authentication",
+      retryable: false,
+      status: 401,
+    });
   });
 });

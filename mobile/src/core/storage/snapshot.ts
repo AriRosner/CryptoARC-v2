@@ -129,6 +129,47 @@ function readModelError(): never {
   throw new Error("Snapshot read model is invalid");
 }
 
+function assertPlainJsonValue(value: unknown, seen = new Set<object>()): void {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  ) {
+    return;
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return readModelError();
+  seen.add(value);
+  try {
+    if (Array.isArray(value)) {
+      if (Object.getPrototypeOf(value) !== Array.prototype) return readModelError();
+      const descriptors = Object.getOwnPropertyDescriptors(value);
+      const expectedKeys = new Set(["length"]);
+      for (let index = 0; index < value.length; index += 1) {
+        expectedKeys.add(String(index));
+      }
+      if (Reflect.ownKeys(descriptors).some((key) => typeof key !== "string" || !expectedKeys.has(key))) {
+        return readModelError();
+      }
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = descriptors[String(index)];
+        if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) return readModelError();
+        assertPlainJsonValue(descriptor.value, seen);
+      }
+      return;
+    }
+    if (Object.getPrototypeOf(value) !== Object.prototype) return readModelError();
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") return readModelError();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !("value" in descriptor)) return readModelError();
+      assertPlainJsonValue(descriptor.value, seen);
+    }
+  } finally {
+    seen.delete(value);
+  }
+}
+
 function plainObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return readModelError();
   return value as Record<string, unknown>;
@@ -327,8 +368,15 @@ export function createSnapshotStorage(dependencies: SnapshotDependencies = {
   };
 
   const saveVerifiedSnapshot = async (snapshot: VerifiedSnapshot): Promise<void> => {
-    assertSnapshot(snapshot);
+    assertPlainJsonValue(snapshot);
     const serialized = JSON.stringify(snapshot);
+    let serializedSnapshot: VerifiedSnapshot;
+    try {
+      serializedSnapshot = JSON.parse(serialized) as VerifiedSnapshot;
+    } catch {
+      throw new Error("Snapshot read model is invalid");
+    }
+    assertSnapshot(serializedSnapshot);
     const database = await getDatabase();
     await database.runAsync(
       "INSERT INTO verified_snapshot (id, value) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value",

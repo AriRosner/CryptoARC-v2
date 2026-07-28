@@ -10,6 +10,7 @@ import React, {
 import { AppState, type AppStateStatus } from "react-native";
 
 import {
+  MobileApiError,
   mobileWebSocketTicketUrl,
   requestMobileWebSocketTicket,
 } from "../../api";
@@ -60,40 +61,30 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       return;
     }
 
-    let disposed = false;
     const record = session.record;
-    void requestMobileWebSocketTicket(record.apiBaseUrl, record.token).then(
-      (issued) => {
-        if (disposed) return;
-        const client = new MobileRealtimeClient({
-          url: mobileWebSocketTicketUrl(record.apiBaseUrl, issued.ticket),
-          initialState: {
-            ...realtime,
-            status: realtime.requiresSnapshot ? realtime.status : "offline",
-          },
-          onStateChange: setRealtime,
-          onRevoked: () => {
-            void session.revokeSession();
-          },
-          queryClient: mobileQueryClient,
-        });
-        clientRef.current = client;
-        client.connect();
+    const client = new MobileRealtimeClient({
+      urlFactory: async () => {
+        const issued = await requestMobileWebSocketTicket(record.apiBaseUrl, record.token);
+        return mobileWebSocketTicketUrl(record.apiBaseUrl, issued.ticket);
       },
-      () => {
-        if (!disposed) {
-          setRealtime((current) => ({
-            ...current,
-            reason: "ticket_request_failed",
-            status: "offline",
-          }));
-        }
+      initialState: {
+        ...realtime,
+        status: realtime.requiresSnapshot ? realtime.status : "offline",
       },
-    );
+      isAuthenticationError: (error) =>
+        error instanceof MobileApiError &&
+        (error.status === 401 || error.status === 403),
+      onStateChange: setRealtime,
+      onRevoked: () => {
+        void session.revokeSession();
+      },
+      queryClient: mobileQueryClient,
+    });
+    clientRef.current = client;
+    client.connect();
     return () => {
-      disposed = true;
-      clientRef.current?.disconnect();
-      clientRef.current = null;
+      client.disconnect();
+      if (clientRef.current === client) clientRef.current = null;
     };
   }, [appActive, online, session.record?.apiBaseUrl, session.record?.token]);
 

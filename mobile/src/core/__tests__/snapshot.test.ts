@@ -152,6 +152,74 @@ describe("SQLCipher verified snapshots", () => {
     expect(fixture.database.runAsync).not.toHaveBeenCalled();
   });
 
+  it("rejects a toJSON transformation before credential or action material reaches SQLite", async () => {
+    const fixture = snapshotFixture();
+    const storage = createSnapshotStorage({
+      crypto: fixture.crypto,
+      secureStore: fixture.secureStore,
+      sqlite: fixture.sqlite,
+    });
+    const payload = {
+      kind: "portfolio" as const,
+      version: 1 as const,
+      data: { totalValueSol: 12.5, assets: [] },
+    };
+    Object.defineProperty(payload, "toJSON", {
+      enumerable: false,
+      value: () => ({
+        token: "must-not-persist",
+        actions: [{ command: "stop" }],
+      }),
+    });
+
+    await expect(
+      storage.saveVerifiedSnapshot({
+        ...verifiedSnapshot,
+        payload,
+      }),
+    ).rejects.toThrow("Snapshot read model is invalid");
+    expect(fixture.database.runAsync).not.toHaveBeenCalled();
+    expect(JSON.stringify(fixture.calls)).not.toContain("must-not-persist");
+  });
+
+  it("rejects custom prototypes and accessors before evaluating them", async () => {
+    const fixture = snapshotFixture();
+    const storage = createSnapshotStorage({
+      crypto: fixture.crypto,
+      secureStore: fixture.secureStore,
+      sqlite: fixture.sqlite,
+    });
+    const getter = jest.fn(() => 12.5);
+    const data = { assets: [] as [] };
+    Object.defineProperty(data, "totalValueSol", {
+      enumerable: true,
+      get: getter,
+    });
+    const customPayload = Object.assign(
+      Object.create({ inherited: true }),
+      verifiedSnapshot.payload,
+    ) as SnapshotReadModel;
+
+    await expect(
+      storage.saveVerifiedSnapshot({
+        ...verifiedSnapshot,
+        payload: {
+          kind: "portfolio",
+          version: 1,
+          data,
+        } as unknown as SnapshotReadModel,
+      }),
+    ).rejects.toThrow("Snapshot read model is invalid");
+    await expect(
+      storage.saveVerifiedSnapshot({
+        ...verifiedSnapshot,
+        payload: customPayload,
+      }),
+    ).rejects.toThrow("Snapshot read model is invalid");
+    expect(getter).not.toHaveBeenCalled();
+    expect(fixture.database.runAsync).not.toHaveBeenCalled();
+  });
+
   it("allows explicitly typed public asset identifiers and metadata", async () => {
     const fixture = snapshotFixture();
     const storage = createSnapshotStorage({
