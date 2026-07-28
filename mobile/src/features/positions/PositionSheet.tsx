@@ -6,6 +6,7 @@ import {
   type BottomSheetModal as BottomSheetModalType,
 } from "@gorhom/bottom-sheet";
 import { useQuery } from "@tanstack/react-query";
+import { router } from "expo-router";
 import { ExternalLink, ShieldAlert, SlidersHorizontal, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef } from "react";
 import {
@@ -54,7 +55,9 @@ export function PositionSheet({
             })
           : fetchPositionDetail(positionId!),
       ),
-    enabled: Boolean(positionId) && (session === null || Boolean(session.token)),
+    enabled:
+      Boolean(positionId) &&
+      (session === null || (!session.loading && Boolean(session.token))),
   });
 
   useEffect(() => {
@@ -66,6 +69,8 @@ export function PositionSheet({
     query.error instanceof MobileApiError &&
     (query.error.status === 401 || query.error.status === 403);
   const position = accessDenied ? undefined : query.data;
+  const needsPairing =
+    session !== null && !session.loading && !session.token;
   const totalPnl = position?.pnl.total_sol ?? 0;
   const notFound = query.error instanceof MobileApiError && query.error.status === 404;
   const renderBackdrop = useCallback(
@@ -104,7 +109,26 @@ export function PositionSheet({
         accessibilityViewIsModal
         importantForAccessibility="yes"
         contentContainerStyle={styles.content}>
-        {query.isLoading ? (
+        {session?.loading ? (
+          <PositionSheetSkeleton />
+        ) : needsPairing ? (
+          <View style={styles.message}>
+            <Text
+              ref={titleRef}
+              accessibilityRole="header"
+              style={styles.messageTitle}>
+              Pair this device
+            </Text>
+            <Text style={styles.messageBody}>
+              Pair again before loading position details.
+            </Text>
+            <ActionButton
+              label="Go to Pairing"
+              tone="primary"
+              onPress={() => router.push("/pairing")}
+            />
+          </View>
+        ) : query.isLoading ? (
           <PositionSheetSkeleton />
         ) : !position ? (
           <View style={styles.message}>
@@ -116,7 +140,9 @@ export function PositionSheet({
                 ? "This stable position ID is no longer present in the local ledger."
                 : mobileReadErrorMessage(query.error, "positions")}
             </Text>
-            {!notFound ? <ActionButton label="Retry" onPress={() => void query.refetch()} /> : null}
+            {!notFound && !accessDenied ? (
+              <ActionButton label="Retry" onPress={() => void query.refetch()} />
+            ) : null}
           </View>
         ) : (
           <>

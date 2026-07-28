@@ -1,17 +1,29 @@
 import type { SessionContextValue } from "../session/SessionProvider";
 import { MobileApiError } from "./errors";
 
-type RevocableSession = Pick<SessionContextValue, "revokeSession">;
+type RevocableSession = Pick<
+  SessionContextValue,
+  "generation" | "revokeSession" | "token"
+>;
 
 export async function authenticatedRead<T>(
   session: RevocableSession | null,
   operation: () => Promise<T>,
 ): Promise<T> {
+  const expectedGeneration = session?.generation;
+  if (session && !session.token) {
+    throw new MobileApiError(
+      "Pair this device again",
+      "authentication",
+      401,
+      false,
+    );
+  }
   try {
     return await operation();
   } catch (error) {
     if (session && error instanceof MobileApiError && error.status === 401) {
-      await session.revokeSession();
+      await session.revokeSession(expectedGeneration);
     }
     throw error;
   }

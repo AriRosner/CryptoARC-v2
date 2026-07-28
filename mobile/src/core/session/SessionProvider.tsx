@@ -11,6 +11,7 @@ import React, {
 import { AppState, type AppStateStatus } from "react-native";
 
 import type { MobileDevice } from "../../types";
+import { mobileQueryClient } from "../api/queryClient";
 import {
   SecureSessionRollbackError,
   secureSessionStorage,
@@ -32,7 +33,7 @@ export interface SessionContextValue extends SessionState {
     expectedGeneration?: number,
   ): Promise<boolean>;
   clearSession(): Promise<boolean>;
-  revokeSession(): Promise<void>;
+  revokeSession(expectedGeneration?: number): Promise<boolean>;
   isCurrentGeneration(generation: number): boolean;
   lock(): void;
   unlockControls(): Promise<boolean>;
@@ -226,7 +227,15 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     updateState,
   ]);
 
-  const revokeSession = useCallback(async (): Promise<void> => {
+  const revokeSession = useCallback(async (
+    expectedGeneration?: number,
+  ): Promise<boolean> => {
+    if (
+      expectedGeneration !== undefined &&
+      !isCurrentGeneration(expectedGeneration)
+    ) {
+      return false;
+    }
     const generation = nextGeneration();
     updateState(() => ({
       record: null,
@@ -235,6 +244,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       locked: true,
       error: "Mobile session was revoked. Pair this device again.",
     }));
+    mobileQueryClient.removeQueries({ queryKey: ["mobile"] });
     try {
       await enqueueMutation(() => secureSessionStorage.clear());
     } catch {
@@ -245,6 +255,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         }));
       }
     }
+    return true;
   }, [
     enqueueMutation,
     isCurrentGeneration,

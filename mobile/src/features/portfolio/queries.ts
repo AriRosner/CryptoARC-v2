@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -7,9 +7,11 @@ import type { PortfolioTimeframe } from "./types";
 
 export function usePortfolioQuery(timeframe: PortfolioTimeframe) {
   const session = useOptionalSession();
-  const enabled = session === null || Boolean(session.token);
+  const sessionGeneration = session?.generation ?? "test";
+  const enabled =
+    session === null || (!session.loading && Boolean(session.token));
   return useQuery({
-    queryKey: ["mobile", "portfolio", timeframe, session?.generation ?? "test"],
+    queryKey: ["mobile", "portfolio", timeframe, sessionGeneration],
     queryFn: () =>
       authenticatedRead(session, () =>
         session
@@ -20,6 +22,9 @@ export function usePortfolioQuery(timeframe: PortfolioTimeframe) {
           : fetchPortfolio(timeframe),
       ),
     enabled,
-    placeholderData: keepPreviousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey.at(-1) === sessionGeneration
+        ? previousData
+        : undefined,
   });
 }

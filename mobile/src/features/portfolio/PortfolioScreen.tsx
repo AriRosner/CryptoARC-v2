@@ -1,12 +1,21 @@
 import { router } from "expo-router";
 import { RefreshCw } from "lucide-react-native";
-import React, { useEffect, useRef, useState } from "react";
+import React, { useRef, useState } from "react";
 import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-import { ActionButton, ErrorBanner, PageHeader, Section, SegmentedControl, StatusBadge } from "../../components/ui";
+import {
+  ActionButton,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Section,
+  SegmentedControl,
+  StatusBadge,
+} from "../../components/ui";
 import { mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
+import { useOptionalSession } from "../../core/session/SessionProvider";
 import { colors, radius, spacing } from "../../theme";
 import { PositionList } from "../positions/PositionList";
 import { PositionSheet } from "../positions/PositionSheet";
@@ -28,14 +37,33 @@ export function PortfolioScreen() {
   const [timeframe, setTimeframe] = useState<PortfolioTimeframe>("1d");
   const [selectedPositionId, setSelectedPositionId] = useState<string | null>(null);
   const query = usePortfolioQuery(timeframe);
-  const lastPayloadRef = useRef<PortfolioPayload | undefined>(undefined);
-  useEffect(() => {
-    if (query.data) lastPayloadRef.current = query.data;
-  }, [query.data]);
+  const session = useOptionalSession();
+  const canRead = session === null || Boolean(session.token);
+  const needsPairing =
+    session !== null && !session.loading && !session.token;
+  const sessionKey =
+    session === null
+      ? "test"
+      : `${session.generation}:${session.device?.id ?? "no-device"}`;
+  const lastPayloadRef = useRef<
+    { payload: PortfolioPayload; sessionKey: string } | undefined
+  >(undefined);
   const accessDenied =
     query.error instanceof MobileApiError &&
     (query.error.status === 401 || query.error.status === 403);
-  const payload = accessDenied ? undefined : query.data ?? lastPayloadRef.current;
+  if (
+    !canRead ||
+    (lastPayloadRef.current &&
+      lastPayloadRef.current.sessionKey !== sessionKey)
+  ) {
+    lastPayloadRef.current = undefined;
+  }
+  if (query.data && canRead && !accessDenied) {
+    lastPayloadRef.current = { payload: query.data, sessionKey };
+  }
+  const payload = accessDenied
+    ? undefined
+    : query.data ?? lastPayloadRef.current?.payload;
   const displayedTimeframe = payload?.timeframe;
   const timeframeMismatch = Boolean(
     displayedTimeframe && displayedTimeframe !== timeframe,
@@ -81,7 +109,7 @@ export function PortfolioScreen() {
                 : ""
           }
         />
-        {query.isError ? (
+        {query.isError && !accessDenied && !needsPairing ? (
           <ActionButton
             label="Retry"
             onPress={() => void query.refetch()}
@@ -89,7 +117,21 @@ export function PortfolioScreen() {
           />
         ) : null}
 
-        {query.isLoading && !payload ? (
+        {session?.loading ? (
+          <PortfolioSkeleton />
+        ) : needsPairing ? (
+          <View style={styles.pairing}>
+            <EmptyState
+              title="Pair this device"
+              body="This mobile session is no longer available. Pair again before loading financial data."
+            />
+            <ActionButton
+              label="Go to Pairing"
+              tone="primary"
+              onPress={() => router.push("/pairing")}
+            />
+          </View>
+        ) : query.isLoading && !payload ? (
           <PortfolioSkeleton />
         ) : payload ? (
           <>
@@ -180,6 +222,9 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   skeletonStack: {
+    gap: spacing.md,
+  },
+  pairing: {
     gap: spacing.md,
   },
   skeletonMetrics: {

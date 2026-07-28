@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { router } from "expo-router";
 import { ArrowLeft, ShieldAlert } from "lucide-react-native";
 import React from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
@@ -30,12 +31,16 @@ export function PositionDetailScreen({
             })
           : fetchPositionDetail(positionId),
       ),
-    enabled: Boolean(positionId) && (session === null || Boolean(session.token)),
+    enabled:
+      Boolean(positionId) &&
+      (session === null || (!session.loading && Boolean(session.token))),
   });
   const accessDenied =
     query.error instanceof MobileApiError &&
     (query.error.status === 401 || query.error.status === 403);
   const position = accessDenied ? undefined : query.data;
+  const needsPairing =
+    session !== null && !session.loading && !session.token;
   const notFound = query.error instanceof MobileApiError && query.error.status === 404;
 
   return (
@@ -44,7 +49,25 @@ export function PositionDetailScreen({
         <Pressable accessibilityLabel="Back to portfolio" onPress={onBack} style={styles.back}>
           <ArrowLeft size={20} color={colors.text} />
         </Pressable>
-        {query.isLoading ? (
+        {session?.loading ? (
+          <View accessibilityLabel="Loading position details" style={styles.skeletonStack}>
+            <View style={[styles.skeleton, { height: 36, width: "48%" }]} />
+            <View style={[styles.skeleton, { height: 128 }]} />
+            <View style={[styles.skeleton, { height: 220 }]} />
+          </View>
+        ) : needsPairing ? (
+          <>
+            <EmptyState
+              title="Pair this device"
+              body="Pair again before loading position details."
+            />
+            <ActionButton
+              label="Go to Pairing"
+              tone="primary"
+              onPress={() => router.push("/pairing")}
+            />
+          </>
+        ) : query.isLoading ? (
           <View accessibilityLabel="Loading position details" style={styles.skeletonStack}>
             <View style={[styles.skeleton, { height: 36, width: "48%" }]} />
             <View style={[styles.skeleton, { height: 128 }]} />
@@ -60,7 +83,9 @@ export function PositionDetailScreen({
                   : mobileReadErrorMessage(query.error, "positions")
               }
             />
-            {!notFound ? <ActionButton label="Retry" onPress={() => void query.refetch()} /> : null}
+            {!notFound && !accessDenied ? (
+              <ActionButton label="Retry" onPress={() => void query.refetch()} />
+            ) : null}
           </>
         ) : (
           <>
