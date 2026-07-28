@@ -518,6 +518,334 @@ class BotState:
             "next_operator_action": next_operator_action,
         }
 
+    def mobile_portfolio(self, timeframe: str) -> dict[str, object]:
+        timeframe_windows = {
+            "1d": timedelta(days=1),
+            "1w": timedelta(weeks=1),
+            "1m": timedelta(days=30),
+            "all": None,
+        }
+        if timeframe not in timeframe_windows:
+            raise ValueError("Unsupported portfolio timeframe")
+        now = utc_now()
+        cutoff = now - timeframe_windows[timeframe] if timeframe_windows[timeframe] else None
+        closed = [
+            trade
+            for trade in self.storage.load_trades(5000)
+            if trade.closed_at
+            and trade.pnl_sol is not None
+            and (cutoff is None or trade.closed_at >= cutoff)
+        ]
+        paper_performance = self._performance_group(timeframe, closed)
+        paper_curve = self._pnl_curve(closed)
+        live_positions = self._live_ledger_positions("")
+        positions = self._mobile_position_summaries(now, live_positions=live_positions)
+        live_realized = round(sum(position.realized_pnl_sol for position in live_positions), 9)
+        live_unrealized = round(sum(position.unrealized_pnl_sol for position in live_positions), 9)
+        paper_positions = [position for position in positions if position["mode"] == "paper"]
+        paper_realized = round(
+            float(paper_performance["pnl_sol"])
+            + sum(float(position["realized_pnl_sol"]) for position in paper_positions),
+            9,
+        )
+        paper_unrealized = round(
+            sum(float(position["unrealized_pnl_sol"]) for position in paper_positions),
+            9,
+        )
+        realized = round(paper_realized + live_realized, 9)
+        unrealized = round(paper_unrealized + live_unrealized, 9)
+        net_pnl = round(realized + unrealized, 9)
+        open_positions = [position for position in positions if position["status"] == "open"]
+        cost_basis = round(sum(float(position["cost_basis_sol"]) for position in open_positions), 9)
+        tracked_value = round(sum(float(position["value_sol"]) for position in open_positions), 9)
+        allocation = self._mobile_allocation(open_positions, tracked_value)
+        live_net = round(live_realized + live_unrealized, 9)
+        series = [
+            {
+                "at": point["at"],
+                "paper_pnl_sol": float(point["pnl_sol"]),
+                "live_pnl_sol": 0.0,
+                "net_pnl_sol": float(point["pnl_sol"]),
+                "current_snapshot": False,
+                "approximate": False,
+            }
+            for point in paper_curve
+        ]
+        series.append(
+            {
+                "at": now.isoformat(),
+                "paper_pnl_sol": round(paper_realized + paper_unrealized, 9),
+                "live_pnl_sol": live_net,
+                "net_pnl_sol": net_pnl,
+                "current_snapshot": True,
+                "approximate": True,
+            }
+        )
+        freshness = self._mobile_positions_freshness(positions, now)
+        source = self.source_health()
+        return {
+            "artifact_type": "cryptoarc_mobile_portfolio",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "timeframe": timeframe,
+            "freshness": freshness,
+            "summary": {
+                "equity_sol": None,
+                "tracked_value_sol": tracked_value,
+                "cost_basis_sol": cost_basis,
+                "net_pnl_sol": net_pnl,
+                "realized_pnl_sol": realized,
+                "unrealized_pnl_sol": unrealized,
+                "win_rate_pct": int(paper_performance["win_rate_pct"]),
+                "health_score": int(source.get("health_score", 0) or 0),
+                "open_positions": len(open_positions),
+                "closed_trades": len(closed),
+            },
+            "series": series,
+            "allocation": allocation,
+            "positions": positions,
+        }
+
+    def mobile_positions(self) -> dict[str, object]:
+        now = utc_now()
+        positions = self._mobile_position_summaries(now)
+        return {
+            "artifact_type": "cryptoarc_mobile_positions",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "freshness": self._mobile_positions_freshness(positions, now),
+            "positions": positions,
+        }
+
+    def mobile_position(self, position_id: str) -> dict[str, object] | None:
+        now = utc_now()
+        if position_id.startswith("paper:"):
+            token_id = position_id.removeprefix("paper:")
+            token = next(
+                (item for item in self.storage.load_all_tokens(5000) if item.id == token_id),
+                None,
+            )
+            return self._mobile_paper_position_detail(token, now) if token else None
+        position = self.storage.load_live_ledger_position(position_id)
+        if position is None:
+            return None
+        self._normalize_live_position_status(position)
+        self._refresh_live_position_estimate(position)
+        self.storage.save_live_ledger_position(position)
+        return self._mobile_live_position_detail(position, now)
+
+    def _mobile_position_summaries(
+        self,
+        now: datetime,
+        *,
+        live_positions: list[LiveLedgerPosition] | None = None,
+    ) -> list[dict[str, object]]:
+        paper = [
+            self._mobile_paper_position_summary(token, now)
+            for token in self.storage.load_all_tokens(5000)
+            if token.status == TokenStatus.PAPER_BOUGHT
+        ]
+        live = [
+            self._mobile_live_position_summary(position, now)
+            for position in (
+                live_positions
+                if live_positions is not None
+                else self._live_ledger_positions("")
+            )
+        ]
+        return sorted(
+            [*paper, *live],
+            key=lambda position: str(position["updated_at"]),
+            reverse=True,
+        )
+
+    def _mobile_paper_position_summary(
+        self,
+        token: TokenSignal,
+        now: datetime,
+    ) -> dict[str, object]:
+        observed_at = token.last_observed_trade_at or token.detected_at
+        age = max(0, int((now - observed_at).total_seconds()))
+        cost_basis = float(token.amount_sol or 0.0) * float(token.remaining_fraction)
+        realized = float(token.realized_pnl_sol or 0.0)
+        unrealized = float(token.pnl_sol or 0.0) - realized
+        return {
+            "id": f"paper:{token.id}",
+            "mode": "paper",
+            "symbol": token.symbol or token.name or "Unknown",
+            "mint": token.mint,
+            "status": "open",
+            "opened_at": (token.opened_at or token.detected_at).isoformat(),
+            "updated_at": observed_at.isoformat(),
+            "cost_basis_sol": cost_basis,
+            "value_sol": round(cost_basis + unrealized, 9),
+            "realized_pnl_sol": realized,
+            "unrealized_pnl_sol": unrealized,
+            "pnl_pct": float(token.unrealized_pct or 0.0),
+            "pnl_approximate": True,
+            "mark_fresh": age <= self.settings.source_stale_seconds,
+            "mark_age_seconds": age,
+            "mark_source": token.price_source or "paper_model",
+        }
+
+    def _mobile_live_position_summary(
+        self,
+        position: LiveLedgerPosition,
+        now: datetime,
+    ) -> dict[str, object]:
+        age = (
+            max(0, int((now - position.mark_price_at).total_seconds()))
+            if position.mark_price_at
+            else None
+        )
+        total_pnl = float(position.realized_pnl_sol + position.unrealized_pnl_sol)
+        cost_basis = float(position.cost_basis_sol)
+        return {
+            "id": position.id,
+            "mode": "live",
+            "symbol": position.symbol or "Unknown",
+            "mint": position.mint,
+            "status": position.status,
+            "opened_at": position.created_at.isoformat(),
+            "updated_at": position.updated_at.isoformat(),
+            "cost_basis_sol": cost_basis,
+            "value_sol": round(cost_basis + float(position.unrealized_pnl_sol), 9),
+            "realized_pnl_sol": float(position.realized_pnl_sol),
+            "unrealized_pnl_sol": float(position.unrealized_pnl_sol),
+            "pnl_pct": round((total_pnl / cost_basis) * 100, 2) if cost_basis else 0.0,
+            "pnl_approximate": position.realized_pnl_confidence != "audited"
+            or position.unrealized_pnl_confidence not in {"none", "audited"},
+            "mark_fresh": age is not None and age <= self.settings.source_stale_seconds,
+            "mark_age_seconds": age,
+            "mark_source": position.mark_price_source,
+        }
+
+    def _mobile_paper_position_detail(
+        self,
+        token: TokenSignal,
+        now: datetime,
+    ) -> dict[str, object]:
+        summary = self._mobile_paper_position_summary(token, now)
+        observed_at = token.last_observed_trade_at or token.detected_at
+        realized = float(token.realized_pnl_sol or 0.0)
+        unrealized = float(token.pnl_sol or 0.0) - realized
+        total = realized + unrealized
+        return {
+            **summary,
+            "wallet_label": "Paper model",
+            "token_balance": 0.0,
+            "mark": {
+                "price_sol": float(token.current_price or token.entry_price or 0.0),
+                "source": token.price_source or "paper_model",
+                "confidence": float(token.price_confidence or 0.0),
+                "observed_at": observed_at.isoformat(),
+                "age_seconds": summary["mark_age_seconds"],
+                "fresh": summary["mark_fresh"],
+            },
+            "pnl": {
+                "realized_sol": realized,
+                "unrealized_sol": unrealized,
+                "total_sol": total,
+                "percentage": float(token.unrealized_pct or 0.0),
+                "approximate": True,
+                "confidence": "paper_model",
+                "notes": ["Paper PnL is simulated and is not account equity."],
+            },
+            "reconciliation_status": "paper_model",
+            "allowed_actions": {
+                "adjust_exit": False,
+                "close": False,
+                "reason": "Guarded position actions are available in the review flow.",
+            },
+        }
+
+    def _mobile_live_position_detail(
+        self,
+        position: LiveLedgerPosition,
+        now: datetime,
+    ) -> dict[str, object]:
+        summary = self._mobile_live_position_summary(position, now)
+        total = float(position.realized_pnl_sol + position.unrealized_pnl_sol)
+        wallet = position.wallet_public_key
+        wallet_label = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 12 else wallet or "Unknown wallet"
+        return {
+            **summary,
+            "wallet_label": wallet_label,
+            "token_balance": float(position.token_balance),
+            "mark": {
+                "price_sol": float(position.mark_price_sol),
+                "source": position.mark_price_source,
+                "confidence": float(position.mark_price_confidence),
+                "observed_at": position.mark_price_at.isoformat() if position.mark_price_at else None,
+                "age_seconds": summary["mark_age_seconds"],
+                "fresh": summary["mark_fresh"],
+            },
+            "pnl": {
+                "realized_sol": float(position.realized_pnl_sol),
+                "unrealized_sol": float(position.unrealized_pnl_sol),
+                "total_sol": total,
+                "percentage": summary["pnl_pct"],
+                "approximate": summary["pnl_approximate"],
+                "confidence": position.unrealized_pnl_confidence,
+                "notes": list(position.pnl_confidence_notes),
+            },
+            "reconciliation_status": position.reconciliation_status,
+            "allowed_actions": {
+                "adjust_exit": False,
+                "close": False,
+                "reason": "Guarded position actions are available in the review flow.",
+            },
+        }
+
+    def _mobile_positions_freshness(
+        self,
+        positions: list[dict[str, object]],
+        now: datetime,
+    ) -> dict[str, object]:
+        ages = [
+            int(position["mark_age_seconds"])
+            for position in positions
+            if position.get("mark_age_seconds") is not None
+        ]
+        age = max(ages, default=0)
+        if not positions or not ages:
+            status = "unavailable"
+        elif any(not bool(position["mark_fresh"]) for position in positions):
+            status = "stale"
+        else:
+            status = "fresh"
+        return {
+            "status": status,
+            "generated_at": now.isoformat(),
+            "age_seconds": age,
+            "stale_after_seconds": self.settings.source_stale_seconds,
+            "approximate_pnl": any(
+                bool(position["pnl_approximate"]) for position in positions
+            ),
+        }
+
+    @staticmethod
+    def _mobile_allocation(
+        positions: list[dict[str, object]],
+        total_value: float,
+    ) -> list[dict[str, object]]:
+        if total_value <= 0:
+            return []
+        return [
+            {
+                "key": str(position["id"]),
+                "label": str(position["symbol"]),
+                "value_sol": float(position["value_sol"]),
+                "percentage": round(
+                    max(0.0, float(position["value_sol"])) / total_value * 100,
+                    2,
+                ),
+                "mode": str(position["mode"]),
+            }
+            for position in positions
+            if float(position["value_sol"]) > 0
+        ]
+
     def mobile_start_bot(self, live_trading_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:
         self.start()
         self.add_event("info", "Mobile cockpit started bot", subsystem="mobile")

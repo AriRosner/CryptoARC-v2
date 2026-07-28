@@ -128,6 +128,31 @@ class MobileCommandCenterService:
             device=device,
         )
 
+    def portfolio(
+        self,
+        *,
+        device: dict[str, object],
+        timeframe: str,
+    ) -> dict[str, object]:
+        del device
+        return self.state.mobile_portfolio(timeframe)
+
+    def positions(self, *, device: dict[str, object]) -> dict[str, object]:
+        del device
+        return self.state.mobile_positions()
+
+    def position(
+        self,
+        *,
+        device: dict[str, object],
+        position_id: str,
+    ) -> dict[str, object]:
+        del device
+        payload = self.state.mobile_position(position_id)
+        if payload is None:
+            raise LookupError("Mobile position not found")
+        return payload
+
     def issue_websocket_ticket(self, device: dict[str, object]) -> dict[str, object]:
         raw_ticket = secrets.token_urlsafe(32)
         ticket_hash = self._hash_websocket_ticket(raw_ticket)

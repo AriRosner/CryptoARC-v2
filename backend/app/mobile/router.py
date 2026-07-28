@@ -8,7 +8,12 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, SecretStr
 from starlette.responses import JSONResponse
 
-from app.mobile.contracts import MobileScope
+from app.mobile.contracts import (
+    MobilePortfolioPayload,
+    MobilePositionDetail,
+    MobilePositionsPayload,
+    MobileScope,
+)
 from app.mobile.service import (
     MobileCommandCenterService,
     MobilePushTokenEncryptionUnavailable,
@@ -112,6 +117,32 @@ def create_mobile_router(
         device: dict[str, object] = Depends(require_scope(MobileScope.MONITOR)),
     ) -> dict[str, object]:
         return service.cockpit(device)
+
+    @router.get("/portfolio", response_model=MobilePortfolioPayload)
+    async def mobile_portfolio(
+        timeframe: str = "1d",
+        device: dict[str, object] = Depends(require_scope(MobileScope.PORTFOLIO_READ)),
+    ) -> dict[str, object]:
+        try:
+            return service.portfolio(device=device, timeframe=timeframe)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @router.get("/positions", response_model=MobilePositionsPayload)
+    async def mobile_positions(
+        device: dict[str, object] = Depends(require_scope(MobileScope.PORTFOLIO_READ)),
+    ) -> dict[str, object]:
+        return service.positions(device=device)
+
+    @router.get("/positions/{position_id}", response_model=MobilePositionDetail)
+    async def mobile_position(
+        position_id: str,
+        device: dict[str, object] = Depends(require_scope(MobileScope.PORTFOLIO_READ)),
+    ) -> dict[str, object]:
+        try:
+            return service.position(device=device, position_id=position_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @router.post("/ws-ticket")
     async def mobile_websocket_ticket(
