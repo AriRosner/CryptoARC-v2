@@ -169,7 +169,7 @@ describe("MobileRealtimeClient", () => {
     const sockets: FakeSocket[] = [];
     const invalidateQueries = jest.fn(async () => undefined);
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?token=redacted",
+      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       initialState: { ...initialRealtimeState, lastSequence: 8 },
       webSocketFactory: () => {
         const socket = new FakeSocket();
@@ -194,11 +194,63 @@ describe("MobileRealtimeClient", () => {
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile"] });
   });
 
+  it("does not invalidate queries for duplicate or out-of-order envelopes", () => {
+    const socket = new FakeSocket();
+    const invalidateQueries = jest.fn(async () => undefined);
+    const client = new MobileRealtimeClient({
+      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      initialState: { ...initialRealtimeState, lastSequence: 8 },
+      webSocketFactory: () => socket,
+      queryClient: { invalidateQueries },
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    });
+
+    client.connect();
+    socket.emitMessage(envelope({ sequence: 9 }));
+    invalidateQueries.mockClear();
+
+    socket.emitMessage(envelope({ sequence: 9 }));
+    socket.emitMessage(envelope({ sequence: 8 }));
+
+    expect(client.getState().lastSequence).toBe(9);
+    expect(invalidateQueries).not.toHaveBeenCalled();
+  });
+
+  it("closes and permanently stops after an envelope revokes the session", async () => {
+    const sockets: FakeSocket[] = [];
+    const onRevoked = jest.fn();
+    const client = new MobileRealtimeClient({
+      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
+      webSocketFactory: () => {
+        const socket = new FakeSocket();
+        sockets.push(socket);
+        return socket;
+      },
+      onRevoked,
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    });
+
+    client.connect();
+    sockets[0].emitMessage(
+      envelope({
+        event_type: "invalidate",
+        payload: { reason: "token_revoked" },
+      }),
+    );
+    client.connect();
+    await jest.runOnlyPendingTimersAsync();
+
+    expect(sockets[0].close).toHaveBeenCalledTimes(1);
+    expect(sockets).toHaveLength(1);
+    expect(onRevoked).toHaveBeenCalledTimes(1);
+    expect(client.getState()).toMatchObject({ revoked: true, status: "revoked" });
+  });
+
   it("treats policy-close as revocation and does not reconnect", async () => {
     const sockets: FakeSocket[] = [];
     const invalidateQueries = jest.fn(async () => undefined);
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?token=redacted",
+      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       webSocketFactory: () => {
         const socket = new FakeSocket();
         sockets.push(socket);
@@ -224,7 +276,7 @@ describe("MobileRealtimeClient", () => {
   it("cleans up the socket and pending reconnect timer", async () => {
     const sockets: FakeSocket[] = [];
     const client = new MobileRealtimeClient({
-      url: "wss://cryptoarc.test/ws/mobile?token=redacted",
+      url: "wss://cryptoarc.test/ws/mobile?ticket=one-time",
       random: () => 1,
       webSocketFactory: () => {
         const socket = new FakeSocket();

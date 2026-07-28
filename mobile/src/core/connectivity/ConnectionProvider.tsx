@@ -9,6 +9,10 @@ import React, {
 } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
+import {
+  mobileWebSocketTicketUrl,
+  requestMobileWebSocketTicket,
+} from "../../api";
 import { mobileQueryClient } from "../api/queryClient";
 import { useSession } from "../session/SessionProvider";
 import { useSettingsStore } from "../settings/settingsStore";
@@ -21,11 +25,6 @@ interface ConnectionContextValue {
 }
 
 const ConnectionContext = createContext<ConnectionContextValue | null>(null);
-
-function websocketUrl(apiBaseUrl: string, token: string): string {
-  const wsBase = apiBaseUrl.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:").replace(/\/+$/, "");
-  return `${wsBase}/ws/mobile?token=${encodeURIComponent(token)}`;
-}
 
 export function ConnectionProvider({ children }: { children: React.ReactNode }) {
   const session = useSession();
@@ -61,20 +60,40 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       return;
     }
 
-    const client = new MobileRealtimeClient({
-      url: websocketUrl(session.record.apiBaseUrl, session.record.token),
-      initialState: {
-        ...realtime,
-        status: realtime.requiresSnapshot ? realtime.status : "offline",
+    let disposed = false;
+    const record = session.record;
+    void requestMobileWebSocketTicket(record.apiBaseUrl, record.token).then(
+      (issued) => {
+        if (disposed) return;
+        const client = new MobileRealtimeClient({
+          url: mobileWebSocketTicketUrl(record.apiBaseUrl, issued.ticket),
+          initialState: {
+            ...realtime,
+            status: realtime.requiresSnapshot ? realtime.status : "offline",
+          },
+          onStateChange: setRealtime,
+          onRevoked: () => {
+            void session.revokeSession();
+          },
+          queryClient: mobileQueryClient,
+        });
+        clientRef.current = client;
+        client.connect();
       },
-      onStateChange: setRealtime,
-      queryClient: mobileQueryClient,
-    });
-    clientRef.current = client;
-    client.connect();
+      () => {
+        if (!disposed) {
+          setRealtime((current) => ({
+            ...current,
+            reason: "ticket_request_failed",
+            status: "offline",
+          }));
+        }
+      },
+    );
     return () => {
-      client.disconnect();
-      if (clientRef.current === client) clientRef.current = null;
+      disposed = true;
+      clientRef.current?.disconnect();
+      clientRef.current = null;
     };
   }, [appActive, online, session.record?.apiBaseUrl, session.record?.token]);
 

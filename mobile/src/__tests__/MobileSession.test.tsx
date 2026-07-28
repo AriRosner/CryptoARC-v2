@@ -10,7 +10,6 @@ jest.mock("../api", () => ({
   ...jest.requireActual("../api"),
   claimMobilePairing: jest.fn(),
   fetchMobileCockpit: jest.fn(),
-  mobileWebSocketUrl: jest.fn(() => "ws://localhost/mobile"),
 }));
 
 type Deferred<T> = {

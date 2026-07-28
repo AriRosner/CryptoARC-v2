@@ -1,5 +1,8 @@
 import { createSnapshotStorage } from "../storage/snapshot";
-import type { VerifiedSnapshot } from "../storage/snapshot";
+import type {
+  SnapshotReadModel,
+  VerifiedSnapshot,
+} from "../storage/snapshot";
 
 interface FakeRow {
   value: string;
@@ -46,12 +49,19 @@ function snapshotFixture() {
   return { calls, crypto, database, secureStore, secureValues, sqlite };
 }
 
-const verifiedSnapshot: VerifiedSnapshot<{ balance: number }> = {
+const verifiedSnapshot: VerifiedSnapshot = {
   schemaVersion: 1,
   verifiedAt: "2026-07-28T12:00:00.000Z",
   serverTime: "2026-07-28T12:00:00.000Z",
   sequence: 42,
-  payload: { balance: 12.5 },
+  payload: {
+    kind: "portfolio",
+    version: 1,
+    data: {
+      totalValueSol: 12.5,
+      assets: [],
+    },
+  },
 };
 
 describe("SQLCipher verified snapshots", () => {
@@ -90,7 +100,7 @@ describe("SQLCipher verified snapshots", () => {
 
     await storage.saveVerifiedSnapshot(verifiedSnapshot);
 
-    await expect(storage.loadVerifiedSnapshot<{ balance: number }>()).resolves.toEqual(verifiedSnapshot);
+    await expect(storage.loadVerifiedSnapshot()).resolves.toEqual(verifiedSnapshot);
   });
 
   it("rejects secret-bearing or non-read-model payloads", async () => {
@@ -104,13 +114,24 @@ describe("SQLCipher verified snapshots", () => {
     await expect(
       storage.saveVerifiedSnapshot({
         ...verifiedSnapshot,
-        payload: { balance: 12.5, access_token: "must-not-persist" },
+        payload: {
+          kind: "portfolio",
+          version: 1,
+          data: { totalValueSol: 12.5, assets: [], access_token: "must-not-persist" },
+        } as unknown as SnapshotReadModel,
       }),
-    ).rejects.toThrow("Snapshot payload contains prohibited field: access_token");
+    ).rejects.toThrow("Snapshot read model is invalid");
     expect(fixture.database.runAsync).not.toHaveBeenCalled();
   });
 
-  it("allows public crypto-asset token fields in read models", async () => {
+  it.each([
+    { actions: [] },
+    { command: "stop" },
+    { queue: [] },
+    { idempotencyKey: "action-1" },
+    { token: "ambiguous-session-or-asset-token" },
+    { credential: "secret" },
+  ])("rejects non-allowlisted action or credential material: %j", async (extra) => {
     const fixture = snapshotFixture();
     const storage = createSnapshotStorage({
       crypto: fixture.crypto,
@@ -121,7 +142,46 @@ describe("SQLCipher verified snapshots", () => {
     await expect(
       storage.saveVerifiedSnapshot({
         ...verifiedSnapshot,
-        payload: { token: { symbol: "SOL", balance: 12.5 } },
+        payload: {
+          kind: "portfolio",
+          version: 1,
+          data: { totalValueSol: 12.5, assets: [], ...extra },
+        },
+      }),
+    ).rejects.toThrow("Snapshot read model is invalid");
+    expect(fixture.database.runAsync).not.toHaveBeenCalled();
+  });
+
+  it("allows explicitly typed public asset identifiers and metadata", async () => {
+    const fixture = snapshotFixture();
+    const storage = createSnapshotStorage({
+      crypto: fixture.crypto,
+      secureStore: fixture.secureStore,
+      sqlite: fixture.sqlite,
+    });
+
+    await expect(
+      storage.saveVerifiedSnapshot({
+        ...verifiedSnapshot,
+        payload: {
+          kind: "portfolio",
+          version: 1,
+          data: {
+            totalValueSol: 12.5,
+            assets: [
+              {
+                assetIdentifier: {
+                  kind: "public_asset",
+                  chain: "solana",
+                  value: "So11111111111111111111111111111111111111112",
+                },
+                assetMetadata: { symbol: "SOL", name: "Wrapped SOL" },
+                balance: 12.5,
+                valueSol: 12.5,
+              },
+            ],
+          },
+        },
       }),
     ).resolves.toBeUndefined();
   });

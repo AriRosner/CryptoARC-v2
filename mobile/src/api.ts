@@ -13,6 +13,12 @@ export interface PairingClaimInput {
   platform?: string;
 }
 
+export interface MobileWebSocketTicketResponse {
+  ticket: string;
+  scope: "mobile:monitor";
+  ttl_seconds: number;
+}
+
 export function normalizeApiBaseUrl(value: string): string {
   const trimmed = value.trim().replace(/\/+$/, "");
   if (!trimmed) return "";
@@ -110,8 +116,20 @@ export async function setMobileKillSwitch(
   });
 }
 
-export function mobileWebSocketUrl(apiBaseUrl: string, token: string): string {
+export async function requestMobileWebSocketTicket(
+  apiBaseUrl: string,
+  token: string,
+): Promise<MobileWebSocketTicketResponse> {
+  return mobileRequest<MobileWebSocketTicketResponse>(
+    apiBaseUrl,
+    "/api/mobile/ws-ticket",
+    token,
+    { method: "POST" },
+  );
+}
+
+export function mobileWebSocketTicketUrl(apiBaseUrl: string, ticket: string): string {
   const base = normalizeApiBaseUrl(apiBaseUrl);
   const wsBase = base.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
-  return `${wsBase}/ws/mobile?token=${encodeURIComponent(token)}`;
+  return `${wsBase}/ws/mobile?ticket=${encodeURIComponent(ticket)}`;
 }

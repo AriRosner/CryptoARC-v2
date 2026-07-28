@@ -7,7 +7,6 @@ import {
   claimMobilePairing,
   fetchMobileCockpit,
   fetchMobileFeed,
-  mobileWebSocketUrl,
   normalizeApiBaseUrl,
   probeMobileHealth,
   setMobileKillSwitch,
@@ -170,37 +169,6 @@ function LegacyMobileSessionProvider({ children }: { children: React.ReactNode }
     }, 12000);
     return () => clearInterval(interval);
   }, [apiBaseUrl, refreshCockpit, token]);
-
-  useEffect(() => {
-    if (!token || !apiBaseUrl) return;
-    let active = true;
-    const ws = new WebSocket(mobileWebSocketUrl(apiBaseUrl, token));
-    ws.onopen = () => {
-      if (active) setConnected(true);
-    };
-    ws.onmessage = (event) => {
-      try {
-        const payload = JSON.parse(String(event.data)) as MobileCockpitPayload;
-        if (active) {
-          setCockpit(payload);
-          setConnected(true);
-          setError("");
-        }
-      } catch {
-        if (active) setError("WebSocket payload could not be parsed");
-      }
-    };
-    ws.onerror = () => {
-      if (active) setConnected(false);
-    };
-    ws.onclose = () => {
-      if (active) setConnected(false);
-    };
-    return () => {
-      active = false;
-      ws.close();
-    };
-  }, [apiBaseUrl, token]);
 
   useEffect(() => {
     const onChange = (nextState: AppStateStatus) => {
@@ -486,13 +454,11 @@ function ModernCockpitCompatibilityProvider({
   const [connected, setConnected] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const sessionEpochRef = useRef(0);
   const activeSessionRef = useRef<ActiveMobileSession | null>(null);
   const cockpitRefreshInFlightRef = useRef<CockpitRefreshInFlight | null>(null);
 
   useEffect(() => {
-    sessionEpochRef.current += 1;
-    const epoch = sessionEpochRef.current;
+    const epoch = session.generation;
     activeSessionRef.current =
       session.token && session.apiBaseUrl
         ? {
@@ -501,12 +467,13 @@ function ModernCockpitCompatibilityProvider({
           }
         : null;
     cockpitRefreshInFlightRef.current = null;
+    setLoading(false);
     if (!session.token) {
       setCockpit(null);
       setFeed(null);
       setConnected(false);
     }
-  }, [session.apiBaseUrl, session.token]);
+  }, [session.apiBaseUrl, session.generation, session.token]);
 
   const refreshCockpit = useCallback((): Promise<void> => {
     if (!session.token || !session.apiBaseUrl) return Promise.resolve();
@@ -521,12 +488,24 @@ function ModernCockpitCompatibilityProvider({
     const request = (async () => {
       try {
         const payload = await fetchMobileCockpit(session.apiBaseUrl, session.token!);
-        if (activeSessionRef.current?.identity !== identity || activeSessionRef.current.epoch !== epoch) return;
+        if (
+          !session.isCurrentGeneration(epoch) ||
+          activeSessionRef.current?.identity !== identity ||
+          activeSessionRef.current.epoch !== epoch
+        ) {
+          return;
+        }
         setCockpit(payload);
         setConnected(true);
         setError("");
       } catch (cause) {
-        if (activeSessionRef.current?.identity !== identity || activeSessionRef.current.epoch !== epoch) return;
+        if (
+          !session.isCurrentGeneration(epoch) ||
+          activeSessionRef.current?.identity !== identity ||
+          activeSessionRef.current.epoch !== epoch
+        ) {
+          return;
+        }
         setConnected(false);
         setError(cause instanceof Error ? cause.message : "Cockpit refresh failed");
       }
@@ -540,7 +519,7 @@ function ModernCockpitCompatibilityProvider({
     };
     void request.then(release, release);
     return request;
-  }, [session.apiBaseUrl, session.token]);
+  }, [session]);
 
   useEffect(() => {
     if (!session.token || !session.apiBaseUrl) return;
@@ -562,6 +541,8 @@ function ModernCockpitCompatibilityProvider({
 
   const pairWithManualCode = useCallback(
     async (input: { apiBaseUrl: string; pairingId: string; code: string; deviceName: string }) => {
+      const generation = session.generation;
+      let replacementCompleted = false;
       setLoading(true);
       try {
         const apiBaseUrl = normalizeApiBaseUrl(input.apiBaseUrl);
@@ -572,13 +553,23 @@ function ModernCockpitCompatibilityProvider({
           deviceName: input.deviceName || "Android cockpit",
           platform: "android",
         });
-        await session.replaceSession(apiBaseUrl, claimed.token, claimed.device);
-        setError("");
+        if (!session.isCurrentGeneration(generation)) return;
+        replacementCompleted = await session.replaceSession(
+          apiBaseUrl,
+          claimed.token,
+          claimed.device,
+          generation,
+        );
+        if (replacementCompleted) setError("");
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Pairing failed");
+        if (session.isCurrentGeneration(generation)) {
+          setError(cause instanceof Error ? cause.message : "Pairing failed");
+        }
         throw cause;
       } finally {
-        setLoading(false);
+        if (replacementCompleted || session.isCurrentGeneration(generation)) {
+          setLoading(false);
+        }
       }
     },
     [session],
@@ -613,26 +604,42 @@ function ModernCockpitCompatibilityProvider({
   const loadFeed = useCallback(
     async (level = "", subsystem = "") => {
       if (!session.token || !session.apiBaseUrl) return;
+      const generation = session.generation;
       try {
-        setFeed(await fetchMobileFeed(session.apiBaseUrl, session.token, level, subsystem));
+        const payload = await fetchMobileFeed(
+          session.apiBaseUrl,
+          session.token,
+          level,
+          subsystem,
+        );
+        if (!session.isCurrentGeneration(generation)) return;
+        setFeed(payload);
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Feed load failed");
+        if (session.isCurrentGeneration(generation)) {
+          setError(cause instanceof Error ? cause.message : "Feed load failed");
+        }
       }
     },
-    [session.apiBaseUrl, session.token],
+    [session],
   );
 
   const runGuardedAction = useCallback(
     async (action: () => Promise<MobileCockpitPayload>) => {
+      const generation = session.generation;
       if (session.locked && !(await session.unlockControls())) return;
+      if (!session.isCurrentGeneration(generation)) return;
       setLoading(true);
       try {
-        setCockpit(await action());
+        const payload = await action();
+        if (!session.isCurrentGeneration(generation)) return;
+        setCockpit(payload);
         setError("");
       } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "Action failed");
+        if (session.isCurrentGeneration(generation)) {
+          setError(cause instanceof Error ? cause.message : "Action failed");
+        }
       } finally {
-        setLoading(false);
+        if (session.isCurrentGeneration(generation)) setLoading(false);
       }
     },
     [session],

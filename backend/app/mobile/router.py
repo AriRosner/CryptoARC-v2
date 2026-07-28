@@ -113,6 +113,12 @@ def create_mobile_router(
     ) -> dict[str, object]:
         return service.cockpit(device)
 
+    @router.post("/ws-ticket")
+    async def mobile_websocket_ticket(
+        device: dict[str, object] = Depends(require_scope(MobileScope.MONITOR)),
+    ) -> dict[str, object]:
+        return service.issue_websocket_ticket(device)
+
     @router.get("/feed")
     async def mobile_feed(
         level: str = "",

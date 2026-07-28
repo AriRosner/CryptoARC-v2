@@ -100,6 +100,7 @@ interface MobileRealtimeClientOptions {
   url: string;
   initialState?: MobileRealtimeState;
   now?: () => number;
+  onRevoked?: () => void;
   onStateChange?: (state: MobileRealtimeState) => void;
   queryClient?: QueryInvalidator;
   random?: () => number;
@@ -165,6 +166,7 @@ export class MobileRealtimeClient {
   }
 
   connect(): void {
+    if (this.state.revoked) return;
     this.stopped = false;
     if (this.socket !== null || this.reconnectTimer !== null) return;
     this.updateState({ ...this.state, status: "connecting", reason: "" });
@@ -191,12 +193,7 @@ export class MobileRealtimeClient {
       this.socket = null;
       if (this.stopped) return;
       if (event.code === 1008) {
-        this.updateState(
-          invalidState(this.state, "revoked", "token_revoked", {
-            revoked: true,
-          }),
-        );
-        this.invalidateAll();
+        this.revoke();
         return;
       }
       this.updateState({ ...this.state, status: "offline", reason: "connection_closed" });
@@ -239,10 +236,15 @@ export class MobileRealtimeClient {
       return;
     }
     const next = reduceRealtime(this.state, value, this.now());
+    const stateAdvanced = next !== this.state;
     this.updateState(next);
+    if (next.revoked) {
+      this.revoke();
+      return;
+    }
     if (next.requiresSnapshot) {
       this.invalidateAll();
-    } else if (value.event_type !== "invalidate") {
+    } else if (stateAdvanced && value.event_type !== "invalidate") {
       void this.queryClient?.invalidateQueries({ queryKey: eventQueryKeys[value.event_type] });
     }
   }
@@ -252,7 +254,7 @@ export class MobileRealtimeClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.stopped || this.reconnectTimer !== null) return;
+    if (this.stopped || this.state.revoked || this.reconnectTimer !== null) return;
     const delay = fullJitterReconnectDelay(this.reconnectAttempt, this.random);
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
@@ -264,5 +266,31 @@ export class MobileRealtimeClient {
   private updateState(state: MobileRealtimeState): void {
     this.state = state;
     this.onStateChange?.(state);
+  }
+
+  private revoke(): void {
+    if (!this.state.revoked) {
+      this.updateState(
+        invalidState(this.state, "revoked", "token_revoked", {
+          revoked: true,
+        }),
+      );
+    }
+    this.stopped = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.socket;
+    this.socket = null;
+    if (socket !== null) {
+      socket.onopen = null;
+      socket.onmessage = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.close();
+    }
+    this.invalidateAll();
+    this.options.onRevoked?.();
   }
 }

@@ -10,6 +10,7 @@ export interface SecureSessionRecord {
 
 export interface SessionState {
   record: SecureSessionRecord | null;
+  generation: number;
   loading: boolean;
   locked: boolean;
   error: string;

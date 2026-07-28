@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app.auth import AuthManager
 from app.core.models import BotStatus
@@ -190,6 +191,77 @@ class MobileApiTests(unittest.TestCase):
             finally:
                 main_app.state = previous_state
                 main_app.auth = previous_auth
+
+    def test_websocket_tickets_are_scoped_hashed_single_use_and_fail_closed(self) -> None:
+        from app import main as main_app
+
+        with TemporaryDirectory() as directory:
+            previous_state = main_app.state
+            previous_auth = main_app.auth
+            previous_monotonic = getattr(main_app.mobile_service, "_monotonic", None)
+            now = [1000.0]
+            main_app.state = self.make_state(directory)
+            main_app.auth = AuthManager(password="desktop-pass")
+            main_app.mobile_service._monotonic = lambda: now[0]
+
+            try:
+                client = TestClient(main_app.app)
+                pairing = main_app.state.create_mobile_pairing(
+                    api_base_url="https://cryptoarc-node.tailnet.ts.net",
+                    scopes=[MobileScope.MONITOR],
+                )
+                claimed = main_app.state.claim_mobile_pairing(
+                    pairing["id"],
+                    pairing["code"],
+                    "Pixel 9",
+                    "android",
+                )
+                token = claimed["token"]
+                headers = {"Authorization": f"Bearer {token}"}
+
+                denied_query_auth = client.post(f"/api/mobile/ws-ticket?token={token}")
+                self.assertEqual(denied_query_auth.status_code, 401)
+
+                issued = client.post("/api/mobile/ws-ticket", headers=headers)
+                self.assertEqual(issued.status_code, 200)
+                ticket_payload = issued.json()
+                ticket = ticket_payload["ticket"]
+                self.assertEqual(ticket_payload["scope"], MobileScope.MONITOR)
+                self.assertLessEqual(ticket_payload["ttl_seconds"], 30)
+                self.assertNotEqual(ticket, token)
+                self.assertNotIn(ticket, repr(main_app.mobile_service._ws_tickets))
+
+                with client.websocket_connect(f"/ws/mobile?ticket={ticket}") as websocket:
+                    self.assertEqual(
+                        websocket.receive_json()["device"]["id"],
+                        claimed["device"]["id"],
+                    )
+
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect(f"/ws/mobile?ticket={ticket}"):
+                        pass
+
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect(f"/ws/mobile?token={token}"):
+                        pass
+
+                expiring = client.post("/api/mobile/ws-ticket", headers=headers).json()["ticket"]
+                now[0] += 31.0
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect(f"/ws/mobile?ticket={expiring}"):
+                        pass
+
+                now[0] += 1.0
+                revocable = client.post("/api/mobile/ws-ticket", headers=headers).json()["ticket"]
+                main_app.state.revoke_mobile_device(claimed["device"]["id"])
+                with self.assertRaises(WebSocketDisconnect):
+                    with client.websocket_connect(f"/ws/mobile?ticket={revocable}"):
+                        pass
+            finally:
+                main_app.state = previous_state
+                main_app.auth = previous_auth
+                if previous_monotonic is not None:
+                    main_app.mobile_service._monotonic = previous_monotonic
 
 
 if __name__ == "__main__":

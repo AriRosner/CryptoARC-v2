@@ -1,20 +1,35 @@
 from __future__ import annotations
 
 import hashlib
+import secrets
+import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from cryptography.fernet import Fernet
 
 from app.core.models import MobilePushRegistration, new_id, utc_now
+from app.mobile.contracts import MobileScope
 
 
 class MobilePushTokenEncryptionUnavailable(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class _MobileWebSocketTicket:
+    device_id: str
+    scope: str
+    expires_at: float
+
+
 class MobileCommandCenterService:
+    WEBSOCKET_TICKET_TTL_SECONDS = 30
+    MAX_WEBSOCKET_TICKETS = 512
+
     def __init__(
         self,
         *,
@@ -33,6 +48,9 @@ class MobileCommandCenterService:
         self._broadcast_snapshot = broadcast_snapshot
         self._broadcast_mobile_cockpit = broadcast_mobile_cockpit
         self._stop_runtime_tasks = stop_runtime_tasks
+        self._monotonic = time.monotonic
+        self._ws_ticket_lock = threading.Lock()
+        self._ws_tickets: dict[str, _MobileWebSocketTicket] = {}
 
     @property
     def state(self) -> Any:
@@ -55,7 +73,7 @@ class MobileCommandCenterService:
             "dashboard_auth_enabled": self.auth.enabled,
             "dashboard_totp_enabled": self.auth.totp_enabled,
             "mobile_pairing_available": True,
-            "websocket_path": "/ws/mobile?token=...",
+            "websocket_path": "/ws/mobile?ticket=...",
             "private_tunnel_required": True,
         }
 
@@ -109,6 +127,88 @@ class MobileCommandCenterService:
             local_auth_enabled=self.auth.enabled,
             device=device,
         )
+
+    def issue_websocket_ticket(self, device: dict[str, object]) -> dict[str, object]:
+        raw_ticket = secrets.token_urlsafe(32)
+        ticket_hash = self._hash_websocket_ticket(raw_ticket)
+        now = self._monotonic()
+        ticket = _MobileWebSocketTicket(
+            device_id=str(device.get("id") or ""),
+            scope=MobileScope.MONITOR,
+            expires_at=now + self.WEBSOCKET_TICKET_TTL_SECONDS,
+        )
+        if not ticket.device_id:
+            raise ValueError("Mobile device identity is required")
+        with self._ws_ticket_lock:
+            self._cleanup_websocket_tickets_locked(now)
+            if len(self._ws_tickets) >= self.MAX_WEBSOCKET_TICKETS:
+                oldest_hash = min(
+                    self._ws_tickets,
+                    key=lambda digest: self._ws_tickets[digest].expires_at,
+                )
+                self._ws_tickets.pop(oldest_hash, None)
+            self._ws_tickets[ticket_hash] = ticket
+        return {
+            "ticket": raw_ticket,
+            "scope": ticket.scope,
+            "ttl_seconds": self.WEBSOCKET_TICKET_TTL_SECONDS,
+        }
+
+    def consume_websocket_ticket(self, raw_ticket: str) -> dict[str, object] | None:
+        candidate = raw_ticket.strip()
+        if not candidate:
+            return None
+        ticket_hash = self._hash_websocket_ticket(candidate)
+        now = self._monotonic()
+        with self._ws_ticket_lock:
+            self._cleanup_websocket_tickets_locked(now)
+            ticket = self._ws_tickets.pop(ticket_hash, None)
+        if (
+            ticket is None
+            or ticket.expires_at <= now
+            or ticket.scope != MobileScope.MONITOR
+        ):
+            return None
+        return self._current_mobile_device(ticket.device_id, ticket.scope)
+
+    @staticmethod
+    def _hash_websocket_ticket(raw_ticket: str) -> str:
+        return hashlib.sha256(
+            f"cryptoarc-mobile-ws-ticket-v1:{raw_ticket}".encode("utf-8")
+        ).hexdigest()
+
+    def _cleanup_websocket_tickets_locked(self, now: float) -> None:
+        expired = [
+            digest
+            for digest, ticket in self._ws_tickets.items()
+            if ticket.expires_at <= now
+        ]
+        for digest in expired:
+            self._ws_tickets.pop(digest, None)
+
+    def _current_mobile_device(
+        self,
+        device_id: str,
+        required_scope: str,
+    ) -> dict[str, object] | None:
+        for device in self.state.mobile_devices(include_revoked=True):
+            if str(device.get("id") or "") != device_id:
+                continue
+            if str(device.get("revoked_at") or ""):
+                return None
+            if required_scope not in [str(scope) for scope in device.get("scopes") or []]:
+                return None
+            expires_at = str(device.get("expires_at") or "")
+            try:
+                parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed_expiry.tzinfo is None:
+                parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+            if parsed_expiry <= datetime.now(timezone.utc):
+                return None
+            return device
+        return None
 
     def feed(
         self,

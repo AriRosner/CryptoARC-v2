@@ -1824,8 +1824,8 @@ async def export_data(target: Literal["tokens", "source_events", "backtests", "t
 
 @app.websocket("/ws/mobile")
 async def mobile_websocket_endpoint(websocket: WebSocket) -> None:
-    token = websocket.query_params.get("token", "")
-    device = state.validate_mobile_token(token, required_scope=BotState.MOBILE_MONITOR_SCOPE)
+    ticket = websocket.query_params.get("ticket", "")
+    device = mobile_service.consume_websocket_ticket(ticket)
     if not device:
         await websocket.close(code=1008)
         return

@@ -5,12 +5,16 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import { AppState, type AppStateStatus } from "react-native";
 
 import type { MobileDevice } from "../../types";
-import { secureSessionStorage } from "./storage";
+import {
+  SecureSessionRollbackError,
+  secureSessionStorage,
+} from "./storage";
 import type { SecureSessionRecord, SessionState } from "./types";
 
 const SESSION_LOAD_FAILED = "Secure session could not be loaded. Pair this device again.";
@@ -21,8 +25,15 @@ export interface SessionContextValue extends SessionState {
   apiBaseUrl: string;
   token: string | null;
   device: MobileDevice | null;
-  replaceSession(apiBaseUrl: string, token: string, device: MobileDevice): Promise<void>;
+  replaceSession(
+    apiBaseUrl: string,
+    token: string,
+    device: MobileDevice,
+    expectedGeneration?: number,
+  ): Promise<boolean>;
   clearSession(): Promise<boolean>;
+  revokeSession(): Promise<void>;
+  isCurrentGeneration(generation: number): boolean;
   lock(): void;
   unlockControls(): Promise<boolean>;
   setError(value: string): void;
@@ -31,54 +42,99 @@ export interface SessionContextValue extends SessionState {
 const SessionContext = createContext<SessionContextValue | null>(null);
 
 export function SessionProvider({ children }: { children: React.ReactNode }) {
-  const [state, setState] = useState<SessionState>({
+  const initialState: SessionState = {
     record: null,
+    generation: 0,
     loading: true,
     locked: true,
     error: "",
-  });
+  };
+  const [state, setState] = useState<SessionState>(initialState);
+  const stateRef = useRef(initialState);
+  const generationRef = useRef(0);
+  const mutationQueueRef = useRef<Promise<void>>(Promise.resolve());
+
+  const updateState = useCallback((update: (current: SessionState) => SessionState) => {
+    const next = update(stateRef.current);
+    stateRef.current = next;
+    setState(next);
+  }, []);
+
+  const nextGeneration = useCallback((): number => {
+    generationRef.current += 1;
+    return generationRef.current;
+  }, []);
+
+  const isCurrentGeneration = useCallback(
+    (generation: number): boolean => generationRef.current === generation,
+    [],
+  );
+
+  const enqueueMutation = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const result = mutationQueueRef.current.then(operation, operation);
+    mutationQueueRef.current = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }, []);
 
   useEffect(() => {
     let active = true;
     void secureSessionStorage.loadOrMigrate().then(
       (record) => {
         if (active) {
-          setState({
+          const generation = nextGeneration();
+          updateState(() => ({
             record,
+            generation,
             loading: false,
             locked: Boolean(record),
             error: "",
-          });
+          }));
         }
       },
       () => {
         if (active) {
-          setState({
+          const generation = nextGeneration();
+          updateState(() => ({
             record: null,
+            generation,
             loading: false,
             locked: true,
             error: SESSION_LOAD_FAILED,
-          });
+          }));
         }
       },
     );
     return () => {
       active = false;
     };
-  }, []);
+  }, [nextGeneration, updateState]);
 
   useEffect(() => {
     const onAppStateChange = (nextState: AppStateStatus) => {
       if (nextState !== "active") {
-        setState((current) => ({ ...current, locked: Boolean(current.record) }));
+        updateState((current) => ({ ...current, locked: Boolean(current.record) }));
       }
     };
     const subscription = AppState.addEventListener("change", onAppStateChange);
     return () => subscription.remove();
-  }, []);
+  }, [updateState]);
 
   const replaceSession = useCallback(
-    async (apiBaseUrl: string, token: string, device: MobileDevice): Promise<void> => {
+    async (
+      apiBaseUrl: string,
+      token: string,
+      device: MobileDevice,
+      expectedGeneration?: number,
+    ): Promise<boolean> => {
+      if (
+        expectedGeneration !== undefined &&
+        !isCurrentGeneration(expectedGeneration)
+      ) {
+        return false;
+      }
       const record: SecureSessionRecord = {
         version: 2,
         apiBaseUrl,
@@ -86,42 +142,130 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         device,
         savedAt: new Date().toISOString(),
       };
-      setState((current) => ({ ...current, loading: true, error: "" }));
+      const generation = nextGeneration();
+      updateState((current) => ({
+        ...current,
+        generation,
+        loading: true,
+        error: "",
+      }));
       try {
-        await secureSessionStorage.save(record);
-        setState({ record, loading: false, locked: true, error: "" });
+        await enqueueMutation(() => secureSessionStorage.save(record));
+        if (!isCurrentGeneration(generation)) return false;
+        updateState(() => ({
+          record,
+          generation,
+          loading: false,
+          locked: true,
+          error: "",
+        }));
+        return true;
       } catch (error) {
-        setState((current) => ({ ...current, loading: false, error: SESSION_SAVE_FAILED }));
+        if (isCurrentGeneration(generation)) {
+          updateState((current) =>
+            error instanceof SecureSessionRollbackError
+              ? {
+                  record: null,
+                  generation,
+                  loading: false,
+                  locked: true,
+                  error: SESSION_SAVE_FAILED,
+                }
+              : {
+                  ...current,
+                  loading: false,
+                  error: SESSION_SAVE_FAILED,
+                },
+          );
+        }
         throw error;
       }
     },
-    [],
+    [
+      enqueueMutation,
+      isCurrentGeneration,
+      nextGeneration,
+      updateState,
+    ],
   );
 
   const clearSession = useCallback(async (): Promise<boolean> => {
+    const generation = nextGeneration();
+    updateState((current) => ({
+      ...current,
+      generation,
+      loading: true,
+    }));
     try {
-      await secureSessionStorage.clear();
-      setState({ record: null, loading: false, locked: true, error: "" });
+      await enqueueMutation(() => secureSessionStorage.clear());
+      if (isCurrentGeneration(generation)) {
+        updateState(() => ({
+          record: null,
+          generation,
+          loading: false,
+          locked: true,
+          error: "",
+        }));
+      }
       return true;
     } catch {
-      setState((current) => ({ ...current, error: SESSION_CLEAR_FAILED }));
+      if (isCurrentGeneration(generation)) {
+        updateState((current) => ({
+          ...current,
+          loading: false,
+          error: SESSION_CLEAR_FAILED,
+        }));
+      }
       return false;
     }
-  }, []);
+  }, [
+    enqueueMutation,
+    isCurrentGeneration,
+    nextGeneration,
+    updateState,
+  ]);
+
+  const revokeSession = useCallback(async (): Promise<void> => {
+    const generation = nextGeneration();
+    updateState(() => ({
+      record: null,
+      generation,
+      loading: false,
+      locked: true,
+      error: "Mobile session was revoked. Pair this device again.",
+    }));
+    try {
+      await enqueueMutation(() => secureSessionStorage.clear());
+    } catch {
+      if (isCurrentGeneration(generation)) {
+        updateState((current) => ({
+          ...current,
+          error: "Revoked mobile credentials could not be removed from secure storage.",
+        }));
+      }
+    }
+  }, [
+    enqueueMutation,
+    isCurrentGeneration,
+    nextGeneration,
+    updateState,
+  ]);
 
   const lock = useCallback(() => {
-    setState((current) => ({ ...current, locked: Boolean(current.record) }));
-  }, []);
+    updateState((current) => ({ ...current, locked: Boolean(current.record) }));
+  }, [updateState]);
 
   const unlockControls = useCallback(async (): Promise<boolean> => {
-    if (!state.record) return false;
+    const generation = generationRef.current;
+    if (!stateRef.current.record) return false;
     try {
       const [hasHardware, enrolled] = await Promise.all([
         LocalAuthentication.hasHardwareAsync(),
         LocalAuthentication.isEnrolledAsync(),
       ]);
+      if (!isCurrentGeneration(generation)) return false;
       if (!hasHardware || !enrolled) {
-        setState((current) => ({
+        updateState((current) => ({
           ...current,
           error: "Device unlock is not configured for guarded controls.",
         }));
@@ -132,21 +276,24 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         cancelLabel: "Cancel",
         disableDeviceFallback: false,
       });
+      if (!isCurrentGeneration(generation)) return false;
       if (!result.success) {
-        setState((current) => ({ ...current, error: "Controls remain locked." }));
+        updateState((current) => ({ ...current, error: "Controls remain locked." }));
         return false;
       }
-      setState((current) => ({ ...current, locked: false, error: "" }));
+      updateState((current) => ({ ...current, locked: false, error: "" }));
       return true;
     } catch {
-      setState((current) => ({ ...current, error: "Local unlock failed." }));
+      if (isCurrentGeneration(generation)) {
+        updateState((current) => ({ ...current, error: "Local unlock failed." }));
+      }
       return false;
     }
-  }, [state.record]);
+  }, [isCurrentGeneration, updateState]);
 
   const setError = useCallback((error: string) => {
-    setState((current) => ({ ...current, error }));
-  }, []);
+    updateState((current) => ({ ...current, error }));
+  }, [updateState]);
 
   const value = useMemo<SessionContextValue>(
     () => ({
@@ -155,12 +302,23 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       token: state.record?.token ?? null,
       device: state.record?.device ?? null,
       clearSession,
+      isCurrentGeneration,
       lock,
       replaceSession,
+      revokeSession,
       setError,
       unlockControls,
     }),
-    [clearSession, lock, replaceSession, setError, state, unlockControls],
+    [
+      clearSession,
+      isCurrentGeneration,
+      lock,
+      replaceSession,
+      revokeSession,
+      setError,
+      state,
+      unlockControls,
+    ],
   );
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
