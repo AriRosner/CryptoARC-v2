@@ -102,7 +102,9 @@ class ScriptSafetyTests(unittest.TestCase):
                     "  throw 'Get-NetTCPConnection unavailable'\n"
                     if not port_owner_lookup_available
                     else (
-                        f"  if ($global:syntheticProcesses.ProcessId -contains {port_owner_pid}) {{\n"
+                        "  $matchingOwners = @($global:syntheticProcesses | "
+                        f"Where-Object {{ [int]$_.ProcessId -eq {port_owner_pid} }})\n"
+                        "  if ($matchingOwners.Count -gt 0) {\n"
                         f"    [pscustomobject]@{{ OwningProcess = {port_owner_pid}; "
                         f"State = 'Listen'; LocalPort = {port_owner_local_port} }}\n"
                         "  } elseif ($PSBoundParameters.ContainsKey('LocalPort')) {\n"
