@@ -44,7 +44,32 @@ class ScriptSafetyTests(unittest.TestCase):
             scripts_root.mkdir(parents=True)
             logs_root.mkdir(parents=True)
             shutil.copy2(ROOT / "scripts" / "stop-dev.ps1", scripts_root / "stop-dev.ps1")
-            escaped_root = str(temporary_root).replace("\\", "\\\\")
+
+            def normalize_fixture_value(value: object) -> object:
+                if isinstance(value, dict):
+                    return {key: normalize_fixture_value(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [normalize_fixture_value(item) for item in value]
+                if not isinstance(value, str):
+                    return value
+                normalized = value.replace("__ROOT__", str(temporary_root))
+                if os.name != "nt":
+                    normalized = normalized.replace("\\", "/")
+                    normalized = re.sub(
+                        r"(?<![A-Za-z0-9_])([A-Za-z]):/",
+                        lambda match: f"/synthetic-drive-{match.group(1).upper()}/",
+                        normalized,
+                    )
+                return normalized
+
+            def serialize_fixture_manifest(value: dict | str) -> str:
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        return value.replace("__ROOT__", str(temporary_root))
+                return json.dumps(normalize_fixture_value(value))
+
             ports_path = logs_root / "dev-ports.json"
             processes_path = logs_root / "dev-processes.json"
             manifest_generated_at = "2026-01-01T00:00:00.0000000Z"
@@ -55,11 +80,7 @@ class ScriptSafetyTests(unittest.TestCase):
             elif isinstance(processes_manifest, dict):
                 port_owner_local_port = int(processes_manifest.get("backend_port", 0))
             if ports_manifest is not None:
-                ports_content = (
-                    ports_manifest
-                    if isinstance(ports_manifest, str)
-                    else json.dumps(ports_manifest).replace("__ROOT__", escaped_root)
-                )
+                ports_content = serialize_fixture_manifest(ports_manifest)
                 ports_path.write_text(ports_content, encoding="utf-8")
             if processes_manifest is not None:
                 if isinstance(processes_manifest, dict):
@@ -69,11 +90,7 @@ class ScriptSafetyTests(unittest.TestCase):
                         "backend_base_executable": "__ROOT__\\.venv\\Scripts\\python.exe",
                         **processes_manifest,
                     }
-                processes_content = (
-                    processes_manifest.replace("__ROOT__", escaped_root)
-                    if isinstance(processes_manifest, str)
-                    else json.dumps(processes_manifest).replace("__ROOT__", escaped_root)
-                )
+                processes_content = serialize_fixture_manifest(processes_manifest)
                 processes_path.write_text(processes_content, encoding="utf-8")
             action_path = temporary_root / "actions.log"
             processes = [
@@ -85,8 +102,8 @@ class ScriptSafetyTests(unittest.TestCase):
                     "CreationDate": process_creation_date,
                     **respawn_process,
                 }
-            process_json = json.dumps(processes).replace("__ROOT__", escaped_root)
-            respawn_json = json.dumps(respawn_process).replace("__ROOT__", escaped_root)
+            process_json = json.dumps(normalize_fixture_value(processes))
+            respawn_json = json.dumps(normalize_fixture_value(respawn_process))
             wrapper_path = temporary_root / "run-stop-dev.ps1"
             wrapper_path.write_text(
                 f"$actionPath = '{action_path}'\n"
