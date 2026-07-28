@@ -53,10 +53,24 @@ class MobilePortfolioSummary(BaseModel):
     net_pnl_sol: float
     realized_pnl_sol: float
     unrealized_pnl_sol: float
+    selected_period_realized_pnl_sol: float
     win_rate_pct: int = Field(ge=0, le=100)
     health_score: int = Field(ge=0, le=100)
     open_positions: int = Field(ge=0)
     closed_trades: int = Field(ge=0)
+
+
+class MobilePortfolioCurrentSnapshot(BaseModel):
+    generated_at: datetime
+    tracked_value_sol: float
+    cost_basis_sol: float
+    realized_pnl_sol: float
+    unrealized_pnl_sol: float
+    net_pnl_sol: float
+    paper_pnl_sol: float
+    live_pnl_sol: float
+    open_positions: int = Field(ge=0)
+    approximate: bool
 
 
 class MobilePortfolioPoint(BaseModel):
@@ -153,6 +167,7 @@ class MobilePortfolioPayload(BaseModel):
     timeframe: Literal["1d", "1w", "1m", "all"]
     freshness: MobileFreshness
     summary: MobilePortfolioSummary
+    current_snapshot: MobilePortfolioCurrentSnapshot
     series: list[MobilePortfolioPoint]
     allocation: list[MobileAllocation]
     positions: list[MobilePositionSummary]

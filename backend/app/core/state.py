@@ -540,26 +540,37 @@ class BotState:
         paper_curve = self._pnl_curve(closed)
         live_positions = self._live_ledger_positions("")
         positions = self._mobile_position_summaries(now, live_positions=live_positions)
-        live_realized = round(sum(position.realized_pnl_sol for position in live_positions), 9)
-        live_unrealized = round(sum(position.unrealized_pnl_sol for position in live_positions), 9)
+        open_live_positions = [
+            position for position in live_positions if position.status == "open"
+        ]
+        live_realized = round(
+            sum(position.realized_pnl_sol for position in open_live_positions),
+            9,
+        )
+        live_unrealized = round(
+            sum(position.unrealized_pnl_sol for position in open_live_positions),
+            9,
+        )
         paper_positions = [position for position in positions if position["mode"] == "paper"]
-        paper_realized = round(
-            float(paper_performance["pnl_sol"])
-            + sum(float(position["realized_pnl_sol"]) for position in paper_positions),
+        selected_period_realized = round(
+            float(paper_performance["pnl_sol"]),
+            9,
+        )
+        current_paper_realized = round(
+            sum(float(position["realized_pnl_sol"]) for position in paper_positions),
             9,
         )
         paper_unrealized = round(
             sum(float(position["unrealized_pnl_sol"]) for position in paper_positions),
             9,
         )
-        realized = round(paper_realized + live_realized, 9)
-        unrealized = round(paper_unrealized + live_unrealized, 9)
-        net_pnl = round(realized + unrealized, 9)
         open_positions = [position for position in positions if position["status"] == "open"]
         cost_basis = round(sum(float(position["cost_basis_sol"]) for position in open_positions), 9)
         tracked_value = round(sum(float(position["value_sol"]) for position in open_positions), 9)
         allocation = self._mobile_allocation(open_positions, tracked_value)
         live_net = round(live_realized + live_unrealized, 9)
+        paper_net = round(current_paper_realized + paper_unrealized, 9)
+        current_net = round(paper_net + live_net, 9)
         series = [
             {
                 "at": point["at"],
@@ -571,16 +582,6 @@ class BotState:
             }
             for point in paper_curve
         ]
-        series.append(
-            {
-                "at": now.isoformat(),
-                "paper_pnl_sol": round(paper_realized + paper_unrealized, 9),
-                "live_pnl_sol": live_net,
-                "net_pnl_sol": net_pnl,
-                "current_snapshot": True,
-                "approximate": True,
-            }
-        )
         freshness = self._mobile_positions_freshness(positions, now)
         source = self.source_health()
         return {
@@ -593,13 +594,28 @@ class BotState:
                 "equity_sol": None,
                 "tracked_value_sol": tracked_value,
                 "cost_basis_sol": cost_basis,
-                "net_pnl_sol": net_pnl,
-                "realized_pnl_sol": realized,
-                "unrealized_pnl_sol": unrealized,
+                "net_pnl_sol": selected_period_realized,
+                "realized_pnl_sol": selected_period_realized,
+                "unrealized_pnl_sol": 0.0,
+                "selected_period_realized_pnl_sol": selected_period_realized,
                 "win_rate_pct": int(paper_performance["win_rate_pct"]),
                 "health_score": int(source.get("health_score", 0) or 0),
                 "open_positions": len(open_positions),
                 "closed_trades": len(closed),
+            },
+            "current_snapshot": {
+                "generated_at": now.isoformat(),
+                "tracked_value_sol": tracked_value,
+                "cost_basis_sol": cost_basis,
+                "realized_pnl_sol": round(current_paper_realized + live_realized, 9),
+                "unrealized_pnl_sol": round(paper_unrealized + live_unrealized, 9),
+                "net_pnl_sol": current_net,
+                "paper_pnl_sol": paper_net,
+                "live_pnl_sol": live_net,
+                "open_positions": len(open_positions),
+                "approximate": any(
+                    bool(position["pnl_approximate"]) for position in open_positions
+                ),
             },
             "series": series,
             "allocation": allocation,
@@ -643,7 +659,11 @@ class BotState:
         paper = [
             self._mobile_paper_position_summary(token, now)
             for token in self.storage.load_all_tokens(5000)
-            if token.status == TokenStatus.PAPER_BOUGHT
+            if token.status
+            in {
+                TokenStatus.PAPER_BOUGHT,
+                TokenStatus.MONITORING,
+            }
         ]
         live = [
             self._mobile_live_position_summary(position, now)
@@ -665,7 +685,7 @@ class BotState:
         now: datetime,
     ) -> dict[str, object]:
         observed_at = token.last_observed_trade_at or token.detected_at
-        age = max(0, int((now - observed_at).total_seconds()))
+        age = self._mobile_mark_age(observed_at, now)
         cost_basis = float(token.amount_sol or 0.0) * float(token.remaining_fraction)
         realized = float(token.realized_pnl_sol or 0.0)
         unrealized = float(token.pnl_sol or 0.0) - realized
@@ -681,9 +701,12 @@ class BotState:
             "value_sol": round(cost_basis + unrealized, 9),
             "realized_pnl_sol": realized,
             "unrealized_pnl_sol": unrealized,
-            "pnl_pct": float(token.unrealized_pct or 0.0),
+            "pnl_pct": round((unrealized / cost_basis) * 100, 2)
+            if cost_basis
+            else 0.0,
             "pnl_approximate": True,
-            "mark_fresh": age <= self.settings.source_stale_seconds,
+            "mark_fresh": age is not None
+            and age <= self.settings.source_stale_seconds,
             "mark_age_seconds": age,
             "mark_source": token.price_source or "paper_model",
         }
@@ -693,12 +716,7 @@ class BotState:
         position: LiveLedgerPosition,
         now: datetime,
     ) -> dict[str, object]:
-        age = (
-            max(0, int((now - position.mark_price_at).total_seconds()))
-            if position.mark_price_at
-            else None
-        )
-        total_pnl = float(position.realized_pnl_sol + position.unrealized_pnl_sol)
+        age = self._mobile_mark_age(position.mark_price_at, now)
         cost_basis = float(position.cost_basis_sol)
         return {
             "id": position.id,
@@ -712,10 +730,16 @@ class BotState:
             "value_sol": round(cost_basis + float(position.unrealized_pnl_sol), 9),
             "realized_pnl_sol": float(position.realized_pnl_sol),
             "unrealized_pnl_sol": float(position.unrealized_pnl_sol),
-            "pnl_pct": round((total_pnl / cost_basis) * 100, 2) if cost_basis else 0.0,
+            "pnl_pct": round(
+                (float(position.unrealized_pnl_sol) / cost_basis) * 100,
+                2,
+            )
+            if cost_basis
+            else 0.0,
             "pnl_approximate": position.realized_pnl_confidence != "audited"
             or position.unrealized_pnl_confidence not in {"none", "audited"},
-            "mark_fresh": age is not None and age <= self.settings.source_stale_seconds,
+            "mark_fresh": age is not None
+            and age <= self.settings.source_stale_seconds,
             "mark_age_seconds": age,
             "mark_source": position.mark_price_source,
         }
@@ -746,7 +770,7 @@ class BotState:
                 "realized_sol": realized,
                 "unrealized_sol": unrealized,
                 "total_sol": total,
-                "percentage": float(token.unrealized_pct or 0.0),
+                "percentage": summary["pnl_pct"],
                 "approximate": True,
                 "confidence": "paper_model",
                 "notes": ["Paper PnL is simulated and is not account equity."],
@@ -823,6 +847,20 @@ class BotState:
                 bool(position["pnl_approximate"]) for position in positions
             ),
         }
+
+    @staticmethod
+    def _mobile_mark_age(
+        observed_at: datetime | None,
+        now: datetime,
+    ) -> int | None:
+        if (
+            observed_at is None
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or observed_at > now
+        ):
+            return None
+        return int((now - observed_at).total_seconds())
 
     @staticmethod
     def _mobile_allocation(
@@ -8587,16 +8625,27 @@ class BotState:
 
     def _refresh_live_position_estimate(self, position: LiveLedgerPosition) -> None:
         mark = self._latest_live_mark_price_snapshot(position.mint)
-        price = float(mark.get("price", 0.0) or 0.0)
-        position.mark_price_sol = price
-        position.mark_price_source = str(mark.get("source", ""))
-        position.mark_price_confidence = float(mark.get("confidence", 0.0) or 0.0)
-        position.mark_price_at = mark.get("observed_at") if isinstance(mark.get("observed_at"), datetime) else None
-        position.mark_price_age_seconds = (
-            max(0, int((utc_now() - position.mark_price_at).total_seconds()))
-            if position.mark_price_at
+        observed_at = (
+            mark.get("observed_at")
+            if isinstance(mark.get("observed_at"), datetime)
             else None
         )
+        now = utc_now()
+        mark_age = self._mobile_mark_age(observed_at, now)
+        price = (
+            float(mark.get("price", 0.0) or 0.0)
+            if mark_age is not None
+            else 0.0
+        )
+        position.mark_price_sol = price
+        position.mark_price_source = str(mark.get("source", ""))
+        position.mark_price_confidence = (
+            float(mark.get("confidence", 0.0) or 0.0)
+            if mark_age is not None
+            else 0.0
+        )
+        position.mark_price_at = observed_at if mark_age is not None else None
+        position.mark_price_age_seconds = mark_age
         if price > 0 and position.token_balance > 0:
             estimated_value = position.token_balance * price
             position.unrealized_pnl_sol = round(estimated_value - position.cost_basis_sol, 9)
@@ -8713,8 +8762,12 @@ class BotState:
 
     def _latest_live_mark_price_snapshot(self, mint: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
+        now = utc_now()
         for observation in self.storage.load_price_observations_newest_first(100, mint=mint):
-            if observation.accepted:
+            if (
+                observation.accepted
+                and self._mobile_mark_age(observation.observed_at, now) is not None
+            ):
                 for key, value in (
                     ("selected_price", observation.selected_price),
                     ("price", observation.price),
@@ -8729,7 +8782,7 @@ class BotState:
                             "confidence": float(observation.confidence or 0.0),
                             "observed_at": observation.observed_at,
                         }
-        if token:
+        if token and self._mobile_mark_age(token.detected_at, now) is not None:
             for source, value in (("token_current_price", token.current_price), ("token_exit_price", token.exit_price), ("token_entry_price", token.entry_price)):
                 price = float(value or 0.0)
                 if price > 0:

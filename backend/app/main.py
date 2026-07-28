@@ -338,17 +338,17 @@ def require_mobile_scope(
     def dependency(
         authorization: str | None = Header(default=None),
     ) -> dict[str, object]:
+        token = _mobile_bearer_token(authorization)
         device = state.validate_mobile_token(
-            _mobile_bearer_token(authorization),
-            required_scope=required_scope,
+            token,
+            required_scope="",
         )
-        if device:
-            return device
-        if required_scope == MobileScope.MONITOR:
+        if not device:
             raise HTTPException(status_code=401, detail="Mobile authentication required")
-        if required_scope == MobileScope.CONTROL:
-            raise HTTPException(status_code=403, detail="Mobile control scope required")
-        raise HTTPException(status_code=403, detail=f"{required_scope} scope required")
+        scopes = [str(scope) for scope in device.get("scopes") or []]
+        if required_scope and required_scope not in scopes:
+            raise HTTPException(status_code=403, detail="Mobile scope required")
+        return device
 
     return dependency
 

@@ -214,9 +214,12 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             self.assertAlmostEqual(paper["value_sol"], 0.26)
             self.assertAlmostEqual(payload["summary"]["cost_basis_sol"], 0.4)
             self.assertAlmostEqual(payload["summary"]["tracked_value_sol"], 0.51)
-            self.assertAlmostEqual(payload["summary"]["realized_pnl_sol"], 0.08)
-            self.assertAlmostEqual(payload["summary"]["unrealized_pnl_sol"], 0.11)
-            self.assertAlmostEqual(payload["summary"]["net_pnl_sol"], 0.19)
+            self.assertAlmostEqual(payload["summary"]["realized_pnl_sol"], 0.05)
+            self.assertAlmostEqual(payload["summary"]["unrealized_pnl_sol"], 0.0)
+            self.assertAlmostEqual(payload["summary"]["net_pnl_sol"], 0.05)
+            self.assertAlmostEqual(payload["current_snapshot"]["realized_pnl_sol"], 0.03)
+            self.assertAlmostEqual(payload["current_snapshot"]["unrealized_pnl_sol"], 0.11)
+            self.assertAlmostEqual(payload["current_snapshot"]["net_pnl_sol"], 0.14)
 
     def test_portfolio_series_does_not_backfill_current_live_pnl_into_paper_history(self) -> None:
         from app import main as main_app
@@ -228,13 +231,180 @@ class MobileCommandCenterContractTests(unittest.TestCase):
                 timeframe="all",
             )
 
-            historical = payload["series"][:-1]
-            current = payload["series"][-1]
-            self.assertTrue(historical)
-            self.assertTrue(all(point["live_pnl_sol"] == 0.0 for point in historical))
-            self.assertTrue(all(point["current_snapshot"] is False for point in historical))
-            self.assertAlmostEqual(current["live_pnl_sol"], 0.06)
-            self.assertTrue(current["current_snapshot"])
+            self.assertTrue(payload["series"])
+            self.assertTrue(
+                all(point["live_pnl_sol"] == 0.0 for point in payload["series"])
+            )
+            self.assertTrue(
+                all(point["current_snapshot"] is False for point in payload["series"])
+            )
+            self.assertAlmostEqual(
+                payload["current_snapshot"]["live_pnl_sol"],
+                0.06,
+            )
+
+    def test_monitoring_paper_position_remains_visible_after_tick(self) -> None:
+        from app import main as main_app
+
+        now = datetime.now(timezone.utc)
+        token = TokenSignal(
+            id="token-after-tick",
+            symbol="TICK",
+            name="Ticked position",
+            mint="mint-tick",
+            creator="creator",
+            detected_at=now - timedelta(minutes=2),
+            status=TokenStatus.PAPER_BOUGHT,
+            amount_sol=0.2,
+            entry_price=0.00001,
+            current_price=0.00001,
+            opened_at=now - timedelta(minutes=1),
+            last_observed_trade_at=now,
+        )
+        self.assertFalse(self.state.paper.tick(token, self.state.settings, 1.0))
+        self.assertEqual(token.status, TokenStatus.MONITORING)
+        self.state.storage.save_token(token)
+
+        with self.mobile_client():
+            payload = main_app.mobile_service.positions(
+                device={"id": "mobile-portfolio"},
+            )
+
+        self.assertIn(
+            "paper:token-after-tick",
+            {position["id"] for position in payload["positions"]},
+        )
+
+    def test_position_percentage_is_unrealized_return_on_remaining_basis(self) -> None:
+        from app import main as main_app
+
+        now = datetime.now(timezone.utc)
+        self.state.storage.save_live_ledger_position(
+            LiveLedgerPosition(
+                id="live-partial",
+                created_at=now - timedelta(days=2),
+                updated_at=now,
+                mint="mint-partial",
+                wallet_public_key="wallet-public",
+                symbol="PART",
+                token_balance=1000.0,
+                cost_basis_sol=0.1,
+                realized_pnl_sol=0.09,
+                unrealized_pnl_sol=0.01,
+                mark_price_sol=0.00011,
+                mark_price_source="test",
+                mark_price_confidence=1.0,
+                mark_price_at=now,
+                reconciliation_status="matched",
+            )
+        )
+        with patch.object(self.state, "_refresh_live_position_estimate", return_value=None):
+            with self.mobile_client():
+                detail = main_app.mobile_service.position(
+                    device={"id": "mobile-portfolio"},
+                    position_id="live-partial",
+                )
+
+        self.assertEqual(detail["pnl_pct"], 10.0)
+        self.assertEqual(detail["pnl"]["percentage"], 10.0)
+
+    def test_selected_period_performance_is_separate_from_current_position_snapshot(self) -> None:
+        from app import main as main_app
+
+        self.seed_portfolio()
+        old = datetime.now(timezone.utc) - timedelta(days=10)
+        self.state.storage.save_trade(
+            TradeRecord(
+                id="trade-old",
+                token_id="old-token",
+                mode="paper",
+                strategy_profile="balanced",
+                entry_price=1.0,
+                exit_price=2.0,
+                amount_sol=1.0,
+                pnl_sol=0.5,
+                entry_reason="test",
+                exit_reason="test",
+                opened_at=old - timedelta(hours=1),
+                closed_at=old,
+            )
+        )
+        with self.mobile_client():
+            one_day = main_app.mobile_service.portfolio(
+                device={"id": "mobile-portfolio"},
+                timeframe="1d",
+            )
+            all_time = main_app.mobile_service.portfolio(
+                device={"id": "mobile-portfolio"},
+                timeframe="all",
+            )
+
+        self.assertAlmostEqual(one_day["summary"]["selected_period_realized_pnl_sol"], 0.05)
+        self.assertAlmostEqual(one_day["summary"]["net_pnl_sol"], 0.05)
+        self.assertAlmostEqual(all_time["summary"]["selected_period_realized_pnl_sol"], 0.55)
+        self.assertAlmostEqual(all_time["summary"]["net_pnl_sol"], 0.55)
+        for key in (
+            "tracked_value_sol",
+            "cost_basis_sol",
+            "realized_pnl_sol",
+            "unrealized_pnl_sol",
+            "net_pnl_sol",
+            "paper_pnl_sol",
+            "live_pnl_sol",
+            "open_positions",
+            "approximate",
+        ):
+            self.assertEqual(
+                one_day["current_snapshot"][key],
+                all_time["current_snapshot"][key],
+            )
+        self.assertAlmostEqual(one_day["current_snapshot"]["net_pnl_sol"], 0.14)
+
+    def test_future_and_naive_marks_fail_closed_without_crashing(self) -> None:
+        from app import main as main_app
+
+        self.seed_portfolio()
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+        paper = next(
+            token
+            for token in self.state.storage.load_all_tokens(50)
+            if token.id == "token-paper-open"
+        )
+        paper.last_observed_trade_at = future
+        self.state.storage.save_token(paper)
+        self.state.storage.save_price_observation(
+            PriceObservation(
+                id="price-live-naive",
+                source="pumpportal",
+                mint="mint-live",
+                observed_at=datetime(2099, 1, 1),
+                price=0.00025,
+                price_source="direct",
+                confidence=0.95,
+                accepted=True,
+                selected_price=0.00025,
+            )
+        )
+
+        with self.mobile_client():
+            payload = main_app.mobile_service.positions(
+                device={"id": "mobile-portfolio"},
+            )
+            live_detail = main_app.mobile_service.position(
+                device={"id": "mobile-portfolio"},
+                position_id="live-position-1",
+            )
+
+        positions = {position["id"]: position for position in payload["positions"]}
+        self.assertFalse(positions["paper:token-paper-open"]["mark_fresh"])
+        self.assertIsNone(positions["paper:token-paper-open"]["mark_age_seconds"])
+        self.assertFalse(positions["live-position-1"]["mark_fresh"])
+        self.assertGreater(positions["live-position-1"]["mark_age_seconds"], 0)
+        self.assertAlmostEqual(live_detail["mark"]["price_sol"], 0.00025)
+        self.assertAlmostEqual(live_detail["value_sol"], 0.25)
+        self.assertAlmostEqual(live_detail["pnl"]["unrealized_sol"], 0.05)
+        self.assertGreater(live_detail["mark"]["confidence"], 0)
+        self.assertIn(payload["freshness"]["status"], {"stale", "unavailable"})
 
     def test_portfolio_routes_require_scope_and_unknown_position_is_404(self) -> None:
         self.seed_portfolio()
@@ -275,6 +445,102 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             self.assertEqual(portfolio_response.json()["timeframe"], "1w")
             self.assertEqual(positions_response.status_code, 200)
             self.assertEqual(unknown_response.status_code, 404)
+
+    def test_portfolio_routes_distinguish_authentication_from_scope_and_revocation(self) -> None:
+        routes = (
+            "/api/mobile/portfolio?timeframe=1d",
+            "/api/mobile/positions",
+            "/api/mobile/positions/paper:token-paper-open",
+        )
+        self.seed_portfolio()
+        with self.mobile_client() as (client, desktop_headers):
+            monitor = self.claim_device(
+                client,
+                desktop_headers,
+                name="Monitor",
+                scopes=[MobileScope.MONITOR],
+            )
+            allowed = self.claim_device(
+                client,
+                desktop_headers,
+                name="Allowed",
+                scopes=[MobileScope.PORTFOLIO_READ],
+            )
+            expired = self.claim_device(
+                client,
+                desktop_headers,
+                name="Expired",
+                scopes=[MobileScope.PORTFOLIO_READ],
+            )
+            expired_device = self.state.storage.load_mobile_device(
+                str(expired["device"]["id"])
+            )
+            self.assertIsNotNone(expired_device)
+            expired_device["expires_at"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=1)
+            ).isoformat()
+            self.state.storage.save_mobile_device(expired_device)
+
+            for route in routes:
+                with self.subTest(route=route, credential="missing"):
+                    self.assertEqual(client.get(route).status_code, 401)
+                with self.subTest(route=route, credential="invalid"):
+                    self.assertEqual(
+                        client.get(
+                            route,
+                            headers={"Authorization": "Bearer invalid-mobile-token"},
+                        ).status_code,
+                        401,
+                    )
+                with self.subTest(route=route, credential="expired"):
+                    self.assertEqual(
+                        client.get(
+                            route,
+                            headers={"Authorization": f"Bearer {expired['token']}"},
+                        ).status_code,
+                        401,
+                    )
+                with self.subTest(route=route, credential="missing_scope"):
+                    self.assertEqual(
+                        client.get(
+                            route,
+                            headers={"Authorization": f"Bearer {monitor['token']}"},
+                        ).status_code,
+                        403,
+                    )
+                with self.subTest(route=route, credential="allowed"):
+                    self.assertEqual(
+                        client.get(
+                            route,
+                            headers={"Authorization": f"Bearer {allowed['token']}"},
+                        ).status_code,
+                        200,
+                    )
+
+            self.state.revoke_mobile_device(str(allowed["device"]["id"]))
+            for route in routes:
+                with self.subTest(route=route, credential="revoked"):
+                    response = client.get(
+                        route,
+                        headers={"Authorization": f"Bearer {allowed['token']}"},
+                    )
+                    self.assertEqual(response.status_code, 401)
+                    self.assertNotIn("revoked", response.text.lower())
+
+    def test_portfolio_route_rejects_invalid_timeframe(self) -> None:
+        self.seed_portfolio()
+        with self.mobile_client() as (client, desktop_headers):
+            allowed = self.claim_device(
+                client,
+                desktop_headers,
+                name="Portfolio",
+                scopes=[MobileScope.PORTFOLIO_READ],
+            )
+            response = client.get(
+                "/api/mobile/portfolio?timeframe=quarter",
+                headers={"Authorization": f"Bearer {allowed['token']}"},
+            )
+        self.assertEqual(response.status_code, 422)
 
     def test_new_scopes_are_not_granted_by_legacy_control(self) -> None:
         pairing = self.state.create_mobile_pairing(
