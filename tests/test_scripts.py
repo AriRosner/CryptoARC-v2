@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,220 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ScriptSafetyTests(unittest.TestCase):
+    @staticmethod
+    def unused_local_port() -> int:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            return listener.getsockname()[1]
+
+    def run_stop_dev_selection_fixture(
+        self,
+        *,
+        processes: list[dict],
+        port_owner_pid: int | None = None,
+        ports_manifest: dict | str | None = None,
+        processes_manifest: dict | str | None = None,
+        cim_available: bool = True,
+        backend_http_identity: bool = False,
+        api_post_fails: bool = False,
+        port_owner_lookup_available: bool = True,
+        taskkill_exit_code: int = 0,
+        taskkill_removes_process: bool = True,
+        respawn_process: dict | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], list[str], bool, bool]:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        self.assertIsNotNone(powershell, "PowerShell is required to exercise stop-dev.ps1")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            scripts_root = temporary_root / "scripts"
+            logs_root = temporary_root / "data" / "logs"
+            scripts_root.mkdir(parents=True)
+            logs_root.mkdir(parents=True)
+            shutil.copy2(ROOT / "scripts" / "stop-dev.ps1", scripts_root / "stop-dev.ps1")
+
+            def normalize_fixture_value(value: object) -> object:
+                if isinstance(value, dict):
+                    return {key: normalize_fixture_value(item) for key, item in value.items()}
+                if isinstance(value, list):
+                    return [normalize_fixture_value(item) for item in value]
+                if not isinstance(value, str):
+                    return value
+                normalized = value.replace("__ROOT__", str(temporary_root))
+                if os.name != "nt":
+                    normalized = normalized.replace("\\", "/")
+                    normalized = re.sub(
+                        r"(?<![A-Za-z0-9_])([A-Za-z]):/",
+                        lambda match: f"/synthetic-drive-{match.group(1).upper()}/",
+                        normalized,
+                    )
+                return normalized
+
+            def serialize_fixture_manifest(value: dict | str) -> str:
+                if isinstance(value, str):
+                    try:
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        return value.replace("__ROOT__", str(temporary_root))
+                return json.dumps(normalize_fixture_value(value))
+
+            ports_path = logs_root / "dev-ports.json"
+            processes_path = logs_root / "dev-processes.json"
+            manifest_generated_at = "2026-01-01T00:00:00.0000000Z"
+            process_creation_date = "2025-12-31T23:59:59.0000000Z"
+            port_owner_local_port = 0
+            if isinstance(ports_manifest, dict):
+                port_owner_local_port = int(ports_manifest.get("backend_port", 0))
+            elif isinstance(processes_manifest, dict):
+                port_owner_local_port = int(processes_manifest.get("backend_port", 0))
+            if ports_manifest is not None:
+                ports_content = serialize_fixture_manifest(ports_manifest)
+                ports_path.write_text(ports_content, encoding="utf-8")
+            if processes_manifest is not None:
+                if isinstance(processes_manifest, dict):
+                    processes_manifest = {
+                        "generated_at": manifest_generated_at,
+                        "backend_executable": "__ROOT__\\.venv\\Scripts\\python.exe",
+                        "backend_base_executable": "__ROOT__\\.venv\\Scripts\\python.exe",
+                        **processes_manifest,
+                    }
+                processes_content = serialize_fixture_manifest(processes_manifest)
+                processes_path.write_text(processes_content, encoding="utf-8")
+            action_path = temporary_root / "actions.log"
+            processes = [
+                {"CreationDate": process_creation_date, **process}
+                for process in processes
+            ]
+            if respawn_process is not None:
+                respawn_process = {
+                    "CreationDate": process_creation_date,
+                    **respawn_process,
+                }
+            process_json = json.dumps(normalize_fixture_value(processes))
+            respawn_json = json.dumps(normalize_fixture_value(respawn_process))
+            wrapper_path = temporary_root / "run-stop-dev.ps1"
+            wrapper_path.write_text(
+                f"$actionPath = '{action_path}'\n"
+                f"$processJson = @'\n{process_json}\n'@\n"
+                f"$respawnJson = @'\n{respawn_json}\n'@\n"
+                "$global:syntheticProcesses = @($processJson | ConvertFrom-Json | ForEach-Object { $_ })\n"
+                "$global:respawnProcess = $respawnJson | ConvertFrom-Json\n"
+                "$global:respawned = $false\n"
+                "function Get-NetTCPConnection {\n"
+                "  [CmdletBinding()]\n"
+                "  param([int[]]$LocalPort, [string]$State)\n"
+                + (
+                    "  throw 'Get-NetTCPConnection unavailable'\n"
+                    if not port_owner_lookup_available
+                    else (
+                        "  $matchingOwners = @($global:syntheticProcesses | "
+                        f"Where-Object {{ [int]$_.ProcessId -eq {port_owner_pid} }})\n"
+                        "  if ($matchingOwners.Count -gt 0) {\n"
+                        f"    [pscustomobject]@{{ OwningProcess = {port_owner_pid}; "
+                        f"State = 'Listen'; LocalPort = {port_owner_local_port} }}\n"
+                        "  } elseif ($PSBoundParameters.ContainsKey('LocalPort')) {\n"
+                        "    throw 'No matching MSFT_NetTCPConnection objects found'\n"
+                        "  }\n"
+                        if port_owner_pid is not None
+                        else (
+                            "  if ($PSBoundParameters.ContainsKey('LocalPort')) {\n"
+                            "    throw 'No matching MSFT_NetTCPConnection objects found'\n"
+                            "  }\n"
+                            "  return @()\n"
+                        )
+                    )
+                )
+                + "}\n"
+                "function Get-CimInstance {\n"
+                "  [CmdletBinding()]\n"
+                "  param([string]$ClassName)\n"
+                + (
+                    "  return $global:syntheticProcesses\n"
+                    if cim_available
+                    else "  throw 'Get-CimInstance unavailable'\n"
+                )
+                +
+                "}\n"
+                "function Invoke-RestMethod {\n"
+                "  [CmdletBinding()]\n"
+                "  param([string]$Uri, [string]$Method, [int]$TimeoutSec)\n"
+                "  Add-Content -LiteralPath $actionPath -Value \"post:$Uri\"\n"
+                "}\n"
+                "function Invoke-WebRequest {\n"
+                "  [CmdletBinding()]\n"
+                "  param([switch]$UseBasicParsing, [string]$Uri, [string]$Method, "
+                "[int]$TimeoutSec, [int]$MaximumRedirection)\n"
+                "  if ($Method -eq 'Post') {\n"
+                "    Add-Content -LiteralPath $actionPath "
+                "-Value \"post:$Uri redirects:$MaximumRedirection timeout:$TimeoutSec\"\n"
+                + (
+                    "    throw 'Synthetic API stop failure'\n"
+                    if api_post_fails
+                    else "    return [pscustomobject]@{ StatusCode = 200; Content = '' }\n"
+                )
+                +
+                "  }\n"
+                + (
+                    "  if ($Uri -like '*/openapi.json') {\n"
+                    "    return [pscustomobject]@{ Content = '{\"info\":{\"title\":\"CryptoARC v2 API\"}}' }\n"
+                    "  }\n"
+                    if backend_http_identity
+                    else ""
+                )
+                + "  throw [System.Net.Sockets.SocketException]::new("
+                "[System.Net.Sockets.SocketError]::ConnectionRefused)\n"
+                "}\n"
+                "function taskkill.exe {\n"
+                "  Add-Content -LiteralPath $actionPath -Value \"taskkill:$($args -join ' ')\"\n"
+                f"  $global:LASTEXITCODE = {taskkill_exit_code}\n"
+                + (
+                    "  $targetIndex = [array]::IndexOf($args, '/PID') + 1\n"
+                    "  if ($targetIndex -gt 0 -and $targetIndex -lt $args.Count) {\n"
+                    "    $targetPid = [int]$args[$targetIndex]\n"
+                    "    $global:syntheticProcesses = @("
+                    "$global:syntheticProcesses | Where-Object { [int]$_.ProcessId -ne $targetPid })\n"
+                    "    if ($global:respawnProcess -and -not $global:respawned) {\n"
+                    "      $global:syntheticProcesses += $global:respawnProcess\n"
+                    "      $global:respawned = $true\n"
+                    "    }\n"
+                    "  }\n"
+                    if taskkill_removes_process
+                    else ""
+                )
+                +
+                "}\n"
+                "function Stop-Process {\n"
+                "  [CmdletBinding()]\n"
+                "  param([int]$Id, [switch]$Force)\n"
+                "  Add-Content -LiteralPath $actionPath -Value \"stop:$Id\"\n"
+                "}\n"
+                "try {\n"
+                f"  & '{scripts_root / 'stop-dev.ps1'}'\n"
+                "  exit 0\n"
+                "} catch {\n"
+                "  Write-Error $_\n"
+                "  exit 1\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(wrapper_path),
+                ],
+                cwd=temporary_root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            actions = action_path.read_text(encoding="utf-8").splitlines() if action_path.exists() else []
+            return completed, actions, ports_path.exists(), processes_path.exists()
+
     def run_frontend_audit_fixture(
         self,
         audit: dict,
@@ -319,7 +534,84 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("dev-ports.json", status_script)
         self.assertIn("backend_port", status_script)
         self.assertIn("frontend_port", status_script)
-        self.assertIn("Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue", stop_script)
+        self.assertIn(
+            "Get-NetTCPConnection -State Listen -ErrorAction Stop",
+            stop_script,
+        )
+        self.assertIn("Where-Object { [int]$_.LocalPort -eq $BackendPort }", stop_script)
+        self.assertNotIn("defaultBackendPorts", stop_script)
+
+    def test_stop_dev_manifest_timestamp_parser_is_strict_across_powershell_versions(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell")
+        self.assertIsNotNone(powershell, "PowerShell is required to test manifest timestamp parsing")
+        stop_script = (ROOT / "scripts" / "stop-dev.ps1").read_text(encoding="utf-8")
+        function_start = stop_script.index("function ConvertTo-CryptoArcManifestTimestamp")
+        function_end = stop_script.index(
+            "\nfunction Test-CryptoArcManifestProcessFreshness",
+            function_start,
+        )
+        function_source = stop_script[function_start:function_end]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            wrapper_path = Path(temporary_directory) / "test-manifest-timestamp.ps1"
+            wrapper_path.write_text(
+                function_source
+                + """
+$pastUtc = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Utc)
+$pastLocal = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Local)
+$pastUnspecified = [DateTime]::SpecifyKind([DateTime]::new(2020, 1, 1), [DateTimeKind]::Unspecified)
+$cases = [ordered]@{
+  native_datetime_utc = $pastUtc
+  native_datetime_local = $pastLocal
+  native_datetime_unspecified = $pastUnspecified
+  native_datetimeoffset_utc = [DateTimeOffset]::new(2020, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+  native_datetimeoffset_nonzero = [DateTimeOffset]::new(
+    2020, 1, 1, 0, 0, 0, [TimeSpan]::FromHours(1)
+  )
+  native_future_utc = [DateTime]::UtcNow.AddMinutes(5)
+  strict_utc_string = "2020-01-01T00:00:00.0000000Z"
+}
+$results = [ordered]@{}
+foreach ($case in $cases.GetEnumerator()) {
+  try {
+    ConvertTo-CryptoArcManifestTimestamp -Value $case.Value -Name $case.Key | Out-Null
+    $results[$case.Key] = $true
+  } catch {
+    $results[$case.Key] = $false
+  }
+}
+$results | ConvertTo-Json -Compress
+""",
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(wrapper_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {
+                "native_datetime_utc": True,
+                "native_datetime_local": False,
+                "native_datetime_unspecified": False,
+                "native_datetimeoffset_utc": True,
+                "native_datetimeoffset_nonzero": False,
+                "native_future_utc": False,
+                "strict_utc_string": True,
+            },
+        )
 
     def test_start_dev_records_process_manifest(self) -> None:
         script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
@@ -329,16 +621,1274 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertIn("frontend_launcher_pid", script)
         self.assertIn("backend_port_owner_pids", script)
         self.assertIn("frontend_port_owner_pids", script)
+        self.assertIn("backend_executable", script)
+        self.assertIn("backend_base_executable", script)
+        self.assertIn("sys._base_executable", script)
         self.assertIn("Write-CryptoArcProcessManifest", script)
 
-    def test_stop_dev_cleans_reload_children_and_verifies_ports(self) -> None:
+    def test_start_dev_refreshes_process_manifest_before_startup_rethrow(self) -> None:
+        script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
+        startup_catch = script.rsplit("} catch {", 1)[1]
+
+        self.assertIn("Write-CryptoArcProcessManifest", startup_catch)
+        self.assertLess(
+            startup_catch.index("Write-CryptoArcProcessManifest"),
+            startup_catch.index("\n  throw"),
+        )
+
+    def test_stop_dev_uses_only_validated_processes_and_bounded_api_stop(self) -> None:
         script = (ROOT / "scripts" / "stop-dev.ps1").read_text(encoding="utf-8")
 
         self.assertIn("dev-processes.json", script)
         self.assertIn("multiprocessing-fork", script)
         self.assertIn("/api/stop", script)
-        self.assertIn("Assert-CryptoArcDevPortsStopped", script)
+        self.assertIn("-MaximumRedirection 0", script)
+        self.assertIn("-TimeoutSec 1", script)
+        self.assertNotIn("Invoke-RestMethod", script)
         self.assertIn("taskkill.exe", script)
+
+    def test_stop_dev_deletes_manifests_fail_closed_before_reporting_success(self) -> None:
+        script = (ROOT / "scripts" / "stop-dev.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Remove-CryptoArcManifest", script)
+        cleanup_start = script.index("function Remove-CryptoArcManifest")
+        cleanup_end = script.index("\n}", cleanup_start)
+        cleanup = script[cleanup_start:cleanup_end]
+        self.assertIn("Remove-Item", cleanup)
+        self.assertIn("-ErrorAction Stop", cleanup)
+        self.assertIn("Test-Path", cleanup)
+        self.assertIn("throw", cleanup)
+        self.assertLess(
+            script.rindex("Remove-CryptoArcManifest"),
+            script.index('Write-Host "CryptoARC dev processes stopped."'),
+        )
+
+    def test_stop_dev_does_not_target_default_port_occupants_without_a_manifest(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 41001,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Windows\\System32\\unrelated.exe",
+                    "CommandLine": "unrelated-service",
+                }
+            ],
+            port_owner_pid=41001,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+
+    def test_stop_dev_does_not_kill_a_reused_manifest_pid(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42001,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Windows\\System32\\unrelated.exe",
+                    "CommandLine": "unrelated-service",
+                }
+            ],
+            port_owner_pid=42001,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 42001,
+                "frontend_launcher_pid": 42001,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [42001],
+                "frontend_port_owner_pids": [42001],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith(("taskkill:", "stop:")) for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_does_not_kill_a_reused_manifest_fork_pid_from_another_checkout(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42002,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__-other\\.venv\\Scripts\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=1) --multiprocessing-fork",
+                }
+            ],
+            port_owner_pid=42002,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [42002],
+                "backend_port_owner_pids": [42002],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith(("post:", "taskkill:", "stop:")) for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_does_not_kill_a_stale_global_frontend_manifest_pid(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42003,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Program Files\\nodejs\\node.exe",
+                    "CommandLine": (
+                        '"C:\\Program Files\\nodejs\\node.exe" '
+                        "C:\\global\\vite.js --host 127.0.0.1"
+                    ),
+                    "CreationDate": "2026-01-01T00:00:01.0000000Z",
+                }
+            ],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": 42003,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [42003],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith(("post:", "taskkill:", "stop:")) for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_does_not_post_or_kill_a_stale_global_backend_manifest_pid(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42004,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Python\\python.exe",
+                    "CommandLine": '"C:\\Python\\python.exe" -m uvicorn app.main:app',
+                    "CreationDate": "2026-01-01T00:00:01.0000000Z",
+                }
+            ],
+            port_owner_pid=42004,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 42004,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [42004],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith(("post:", "taskkill:", "stop:")) for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_fails_closed_when_manifest_process_creation_proof_is_missing_or_invalid(self) -> None:
+        for process_id, creation_date in ((42007, None), (42008, "not-a-timestamp")):
+            with self.subTest(creation_date=creation_date):
+                backend_port = self.unused_local_port()
+                frontend_port = self.unused_local_port()
+                completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+                    processes=[
+                        {
+                            "ProcessId": process_id,
+                            "ParentProcessId": 1,
+                            "ExecutablePath": "C:\\Python\\python.exe",
+                            "CommandLine": '"C:\\Python\\python.exe" -m uvicorn app.main:app',
+                            "CreationDate": creation_date,
+                        }
+                    ],
+                    port_owner_pid=process_id,
+                    ports_manifest={
+                        "backend_port": backend_port,
+                        "frontend_port": frontend_port,
+                    },
+                    processes_manifest={
+                        "root": "__ROOT__",
+                        "backend_port": backend_port,
+                        "frontend_port": frontend_port,
+                        "backend_launcher_pid": process_id,
+                        "frontend_launcher_pid": None,
+                        "backend_child_pids": [],
+                        "backend_port_owner_pids": [process_id],
+                        "frontend_port_owner_pids": [],
+                    },
+                )
+
+                self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+                self.assertFalse(
+                    any(action.startswith(("post:", "taskkill:", "stop:")) for action in actions),
+                    actions,
+                )
+                self.assertTrue(ports_exist)
+                self.assertTrue(processes_exist)
+
+    def test_stop_dev_rejects_a_non_utc_process_manifest_timestamp(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T01:00:00.0000000+01:00",
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_rejects_a_future_process_manifest_timestamp(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2099-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_quiesces_fresh_external_backend_and_frontend_manifest_processes(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42005,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "D:\\Python\\python.exe",
+                    "CommandLine": '"D:\\Python\\python.exe" -m uvicorn app.main:app',
+                    "CreationDate": "2025-12-31T23:59:58.0000000Z",
+                },
+                {
+                    "ProcessId": 42006,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Program Files\\nodejs\\node.exe",
+                    "CommandLine": (
+                        '"C:\\Program Files\\nodejs\\node.exe" '
+                        "C:\\global\\vite.js --host 127.0.0.1"
+                    ),
+                    "CreationDate": "2025-12-31T23:59:58.0000000Z",
+                },
+            ],
+            port_owner_pid=42005,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 42005,
+                "frontend_launcher_pid": 42006,
+                "backend_executable": "D:\\Python\\python.exe",
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [42005],
+                "frontend_port_owner_pids": [42006],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 42005 " in action for action in actions),
+            actions,
+        )
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 42006 " in action for action in actions),
+            actions,
+        )
+        self.assertFalse(ports_exist)
+        self.assertFalse(processes_exist)
+
+    def test_stop_dev_quiesces_a_fresh_recorded_shared_venv_backend(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        shared_python = "D:\\shared\\.venv\\Scripts\\python.exe"
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42009,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": shared_python,
+                    "CommandLine": f'"{shared_python}" -m uvicorn app.main:app',
+                    "CreationDate": "2025-12-31T23:59:58.0000000Z",
+                }
+            ],
+            port_owner_pid=42009,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_executable": shared_python,
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 42009,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [42009],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 42009 " in action for action in actions),
+            actions,
+        )
+        self.assertFalse(ports_exist)
+        self.assertFalse(processes_exist)
+
+    def test_stop_dev_quiesces_recorded_base_interpreter_reloader_and_worker(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        selected_python = "D:\\shared\\.venv\\Scripts\\python.exe"
+        base_python = "C:\\Users\\Ari Rosner\\.cache\\uv\\python\\python.exe"
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 42010,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": base_python,
+                    "CommandLine": f'"{base_python}" -m uvicorn app.main:app',
+                    "CreationDate": "2025-12-31T23:59:58.0000000Z",
+                },
+                {
+                    "ProcessId": 42011,
+                    "ParentProcessId": 42010,
+                    "ExecutablePath": base_python,
+                    "CommandLine": "spawn_main(parent_pid=42010) --multiprocessing-fork",
+                    "CreationDate": "2025-12-31T23:59:58.0000000Z",
+                },
+            ],
+            port_owner_pid=42010,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_executable": selected_python,
+                "backend_base_executable": base_python,
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 42010,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [42011],
+                "backend_port_owner_pids": [42010],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(
+            [action for action in actions if action.startswith("post:")],
+            [f"post:http://127.0.0.1:{backend_port}/api/stop redirects:0 timeout:1"],
+        )
+        taskkills = [action for action in actions if action.startswith("taskkill:")]
+        self.assertTrue(any("/PID 42010 " in action for action in taskkills), actions)
+        self.assertTrue(any("/PID 42011 " in action for action in taskkills), actions)
+        self.assertFalse(ports_exist)
+        self.assertFalse(processes_exist)
+
+    def test_stop_dev_does_not_match_another_checkout_with_a_shared_path_prefix(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 43001,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__-other\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__-other\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=43001,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 43001,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [43001],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_never_posts_to_a_same_title_other_checkout_endpoint(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        _, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 43501,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__-other\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__-other\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=43501,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 43501,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [43501],
+                "frontend_port_owner_pids": [],
+            },
+            backend_http_identity=True,
+        )
+
+        self.assertFalse(any(action.startswith("post:") for action in actions), actions)
+        self.assertFalse(any(action.startswith("taskkill:") for action in actions), actions)
+
+    def test_stop_dev_does_not_select_system_wide_multiprocessing_forks(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 44001,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Python\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=12345) --multiprocessing-fork",
+                }
+            ],
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+
+    def test_stop_dev_kills_only_validated_same_checkout_processes(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46001,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": (
+                        '"__ROOT__\\.venv\\Scripts\\python.exe" '
+                        "-m uvicorn app.main:app --host 127.0.0.1"
+                    ),
+                },
+                {
+                    "ProcessId": 46002,
+                    "ParentProcessId": 46001,
+                    "ExecutablePath": "C:\\Python\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=46001) --multiprocessing-fork",
+                },
+            ],
+            port_owner_pid=46001,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46001,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [46002],
+                "backend_port_owner_pids": [46001],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        taskkills = [action for action in actions if action.startswith("taskkill:")]
+        self.assertTrue(any("/PID 46001 " in action for action in taskkills), actions)
+        self.assertTrue(any("/PID 46002 " in action for action in taskkills), actions)
+        parent_kill = next(i for i, action in enumerate(taskkills) if "/PID 46001 " in action)
+        child_kill = next(i for i, action in enumerate(taskkills) if "/PID 46002 " in action)
+        self.assertLess(parent_kill, child_kill, actions)
+        self.assertFalse(any("/T" in action for action in taskkills), actions)
+
+    def test_stop_dev_kills_a_validated_same_checkout_fork_child(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46101,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": (
+                        '"__ROOT__\\.venv\\Scripts\\python.exe" '
+                        "-m uvicorn app.main:app --host 127.0.0.1"
+                    ),
+                },
+                {
+                    "ProcessId": 46102,
+                    "ParentProcessId": 46101,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=46101) --multiprocessing-fork",
+                },
+            ],
+            port_owner_pid=46101,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46101,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [46102],
+                "backend_port_owner_pids": [46101],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        taskkills = [action for action in actions if action.startswith("taskkill:")]
+        self.assertTrue(any("/PID 46101 " in action for action in taskkills), actions)
+        self.assertTrue(any("/PID 46102 " in action for action in taskkills), actions)
+        self.assertLess(
+            next(index for index, action in enumerate(taskkills) if "/PID 46101 " in action),
+            next(index for index, action in enumerate(taskkills) if "/PID 46102 " in action),
+        )
+        self.assertFalse(any("/T" in action for action in taskkills), actions)
+
+    def test_stop_dev_kills_a_manifest_authorized_orphan_fork_worker(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46151,
+                    "ParentProcessId": 99999,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=99999) --multiprocessing-fork",
+                }
+            ],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [46151],
+                "backend_port_owner_pids": [46151],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 46151 " in action for action in actions),
+            actions,
+        )
+
+    def test_stop_dev_leaves_a_same_root_unrelated_orphan_fork_untouched(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46150,
+                    "ParentProcessId": 99999,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=99999) --multiprocessing-fork",
+                }
+            ],
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith("taskkill:") for action in actions), actions)
+
+    def test_stop_dev_rechecks_an_exact_checkout_orphan_worker_after_taskkill(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, _, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46152,
+                    "ParentProcessId": 99999,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=99999) --multiprocessing-fork",
+                }
+            ],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [46152],
+                "backend_port_owner_pids": [46152],
+                "frontend_port_owner_pids": [],
+            },
+            taskkill_removes_process=False,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_uses_final_state_when_taskkill_races_an_exited_process(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46153,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            taskkill_exit_code=1,
+            taskkill_removes_process=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("taskkill:") for action in actions), actions)
+
+    def test_stop_dev_rescans_and_stops_an_exact_checkout_respawn(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46154,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            respawn_process={
+                "ProcessId": 46155,
+                "ParentProcessId": 46154,
+                "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                "CommandLine": "spawn_main(parent_pid=46154) --multiprocessing-fork",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 46155 " in action for action in actions),
+            actions,
+        )
+
+    def test_stop_dev_posts_only_to_a_fresh_exact_backend_port_owner(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46161,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46161,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46161,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46161],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        posts = [action for action in actions if action.startswith("post:")]
+        self.assertEqual(
+            posts,
+            [f"post:http://127.0.0.1:{backend_port}/api/stop redirects:0 timeout:1"],
+        )
+        self.assertTrue(any(action.startswith("taskkill:") for action in actions), actions)
+
+    def test_stop_dev_quiesces_manifest_authorized_external_python_backend(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46164,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "D:\\Python\\python.exe",
+                    "CommandLine": '"D:\\Python\\python.exe" -m uvicorn app.main:app',
+                },
+                {
+                    "ProcessId": 46165,
+                    "ParentProcessId": 46164,
+                    "ExecutablePath": "D:\\Python\\python.exe",
+                    "CommandLine": "spawn_main(parent_pid=46164) --multiprocessing-fork",
+                },
+            ],
+            port_owner_pid=46164,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46164,
+                "frontend_launcher_pid": None,
+                "backend_executable": "D:\\Python\\python.exe",
+                "backend_child_pids": [46165],
+                "backend_port_owner_pids": [46164],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        taskkills = [action for action in actions if action.startswith("taskkill:")]
+        self.assertTrue(any("/PID 46164 " in action for action in taskkills), actions)
+        self.assertTrue(any("/PID 46165 " in action for action in taskkills), actions)
+        self.assertTrue(any(action.startswith("post:") for action in actions), actions)
+
+    def test_stop_dev_cleans_exact_root_launcher_but_preserves_malformed_manifest(self) -> None:
+        completed, actions, ports_exist, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46166,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            ports_manifest="{malformed",
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("taskkill:") for action in actions), actions)
+        self.assertTrue(ports_exist)
+
+    def test_stop_dev_treats_a_legacy_manifest_without_backend_executable_as_untrusted(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        legacy_manifest = json.dumps(
+            {
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46168,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46168],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            }
+        )
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46168,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46168,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest=legacy_manifest,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 46168 " in action for action in actions),
+            actions,
+        )
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_accepts_a_legacy_manifest_without_backend_base_executable(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        legacy_manifest = json.dumps(
+            {
+                "root": "__ROOT__",
+                "backend_executable": "D:\\Python\\python.exe",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46169,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46169],
+                "frontend_port_owner_pids": [],
+                "generated_at": "2026-01-01T00:00:00.0000000Z",
+            }
+        )
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46169,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "D:\\Python\\python.exe",
+                    "CommandLine": '"D:\\Python\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46169,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest=legacy_manifest,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(
+            any(action.startswith("taskkill:") and "/PID 46169 " in action for action in actions),
+            actions,
+        )
+        self.assertFalse(ports_exist)
+        self.assertFalse(processes_exist)
+
+    def test_stop_dev_rejects_an_invalid_backend_base_executable_without_broadening_authority(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46170,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Python\\python.exe",
+                    "CommandLine": '"C:\\Python\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46170,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_executable": "__ROOT__\\.venv\\Scripts\\python.exe",
+                "backend_base_executable": "python.exe",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46170,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46170],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(
+            any(action.startswith(("post:", "taskkill:", "stop:")) for action in actions),
+            actions,
+        )
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_fails_closed_on_unknown_recorded_backend_port_owner(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46167,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "C:\\Windows\\unrelated.exe",
+                    "CommandLine": "unrelated-listener",
+                }
+            ],
+            port_owner_pid=46167,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_falls_back_to_exact_process_kill_when_api_stop_fails(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46162,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46162,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46162,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46162],
+                "frontend_port_owner_pids": [],
+            },
+            api_post_fails=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(any(action.startswith("taskkill:") for action in actions), actions)
+
+    def test_stop_dev_skips_api_when_recorded_port_owner_lookup_is_unavailable(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46163,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46163,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46163],
+                "frontend_port_owner_pids": [],
+            },
+            port_owner_lookup_available=False,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertFalse(any(action.startswith("post:") for action in actions), actions)
+        self.assertTrue(any(action.startswith("taskkill:") for action in actions), actions)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_fails_closed_when_taskkill_reports_failure(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, _, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46201,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46201,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46201,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46201],
+                "frontend_port_owner_pids": [],
+            },
+            taskkill_exit_code=1,
+            taskkill_removes_process=False,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_fails_closed_when_taskkill_target_survives(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, _, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[
+                {
+                    "ProcessId": 46301,
+                    "ParentProcessId": 1,
+                    "ExecutablePath": "__ROOT__\\.venv\\Scripts\\python.exe",
+                    "CommandLine": '"__ROOT__\\.venv\\Scripts\\python.exe" -m uvicorn app.main:app',
+                }
+            ],
+            port_owner_pid=46301,
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": 46301,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [46301],
+                "frontend_port_owner_pids": [],
+            },
+            taskkill_exit_code=0,
+            taskkill_removes_process=False,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_fails_closed_when_process_discovery_is_unavailable_without_manifests(self) -> None:
+        completed, actions, _, _ = self.run_stop_dev_selection_fixture(
+            processes=[],
+            cim_available=False,
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+
+    def test_stop_dev_rejects_a_malformed_ports_manifest_before_destructive_action(self) -> None:
+        completed, actions, ports_exist, _ = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest="{malformed",
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": 45001,
+                "frontend_port": 45002,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+
+    def test_stop_dev_rejects_a_malformed_process_manifest_before_destructive_action(self) -> None:
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": 45101,
+                "frontend_port": 45102,
+            },
+            processes_manifest="{malformed",
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_rejects_a_process_manifest_from_another_checkout(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__-other",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertNotEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertTrue(ports_exist)
+        self.assertTrue(processes_exist)
+
+    def test_stop_dev_accepts_a_valid_ports_only_manifest_after_interrupted_startup(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, _ = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertFalse(ports_exist)
+
+    def test_stop_dev_accepts_a_valid_process_only_manifest_after_interrupted_startup(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, _, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertFalse(processes_exist)
+
+    def test_stop_dev_removes_valid_manifests_when_no_checkout_processes_exist(self) -> None:
+        backend_port = self.unused_local_port()
+        frontend_port = self.unused_local_port()
+        completed, actions, ports_exist, processes_exist = self.run_stop_dev_selection_fixture(
+            processes=[],
+            ports_manifest={
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+            },
+            processes_manifest={
+                "root": "__ROOT__",
+                "backend_port": backend_port,
+                "frontend_port": frontend_port,
+                "backend_launcher_pid": None,
+                "frontend_launcher_pid": None,
+                "backend_child_pids": [],
+                "backend_port_owner_pids": [],
+                "frontend_port_owner_pids": [],
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout or completed.stderr)
+        self.assertEqual(actions, [])
+        self.assertFalse(ports_exist)
+        self.assertFalse(processes_exist)
 
     def test_reset_runtime_state_exists_and_preserves_configuration(self) -> None:
         script_path = ROOT / "scripts" / "reset-runtime-state.ps1"
