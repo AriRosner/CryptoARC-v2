@@ -1,5 +1,8 @@
 import type { MobileCockpitPayload, MobileFeedPayload, PairingClaimResponse } from "./types";
 
+export { mobileAction, mobileGet } from "./core/api/client";
+export { MobileApiError } from "./core/api/errors";
+
 const MOBILE_COCKPIT_TIMEOUT_MS = 10000;
 
 export interface PairingClaimInput {

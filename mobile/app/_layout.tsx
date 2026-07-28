@@ -2,10 +2,14 @@ import { useFonts } from "expo-font";
 import { DarkTheme, Stack, ThemeProvider } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
 import "react-native-reanimated";
 
 import { MobileSessionProvider } from "@/src/MobileSession";
+import { mobileQueryClient } from "@/src/core/api/queryClient";
+import { ConnectionProvider } from "@/src/core/connectivity/ConnectionProvider";
+import { SessionProvider } from "@/src/core/session/SessionProvider";
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -45,13 +49,19 @@ export default function RootLayout() {
 
 function RootLayoutNav() {
   return (
-    <MobileSessionProvider>
-      <ThemeProvider value={DarkTheme}>
-        <StatusBar style="light" />
-        <Stack>
-          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-        </Stack>
-      </ThemeProvider>
-    </MobileSessionProvider>
+    <QueryClientProvider client={mobileQueryClient}>
+      <SessionProvider>
+        <ConnectionProvider>
+          <MobileSessionProvider>
+            <ThemeProvider value={DarkTheme}>
+              <StatusBar style="light" />
+              <Stack>
+                <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+              </Stack>
+            </ThemeProvider>
+          </MobileSessionProvider>
+        </ConnectionProvider>
+      </SessionProvider>
+    </QueryClientProvider>
   );
 }
