@@ -2307,6 +2307,10 @@ class Storage:
             "source_soak_history": self.count_source_soak_history(),
             "mobile_pairing_requests": self.count_mobile_pairing_requests(),
             "mobile_devices": self.count_mobile_devices(),
+            "mobile_action_receipts": self.count_mobile_action_receipts(),
+            "mobile_destination_authorizations": (
+                self.count_mobile_destination_authorizations()
+            ),
         }
 
     def data_summary_counts(self) -> dict[str, int]:
@@ -2390,12 +2394,33 @@ class Storage:
     def count_mobile_devices(self) -> int:
         return self._count_table("mobile_devices")
 
+    def count_mobile_action_receipts(self) -> int:
+        return self._count_table_if_exists("mobile_action_receipts")
+
+    def count_mobile_destination_authorizations(self) -> int:
+        return self._count_table_if_exists(
+            "mobile_destination_authorizations"
+        )
+
     def count_mobile_push_registrations(self) -> int:
         return self._count_table("mobile_push_registrations")
 
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:
             row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        return int(row["count"] if row else 0)
+
+    def _count_table_if_exists(self, table: str) -> int:
+        with self._connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if not exists:
+                return 0
+            row = connection.execute(
+                f"SELECT COUNT(*) AS count FROM {table}"
+            ).fetchone()
         return int(row["count"] if row else 0)
 
     def save_settings_version(self, version: SettingsVersion) -> None:

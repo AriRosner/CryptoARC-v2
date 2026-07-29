@@ -1405,6 +1405,63 @@ class ProductionTreasurySafetyTests(unittest.TestCase):
                 else None
             )
 
+    def test_restore_preview_detects_current_treasury_state_missing_from_artifact(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            artifact_source = Storage(str(Path(directory) / "artifact.db"))
+            target = Storage(str(Path(directory) / "target.db"))
+            artifact = artifact_source.create_backup_artifact()
+            now = utc_now()
+            authorization = MobileDestinationAuthorization(
+                id="current-only-authorization",
+                payload={
+                    "device_id": "current-device",
+                    "action": "withdrawal",
+                    "address": self.destination,
+                    "asset": "SOL",
+                    "max_amount": "0.2",
+                    "purpose": "current unresolved treasury state",
+                },
+                created_at=now,
+                expires_at=now + timedelta(minutes=5),
+            )
+            target.create_mobile_destination_authorization(authorization)
+            target.reserve_mobile_action_receipt(
+                MobileActionReceipt(
+                    id="current-only-review",
+                    idempotency_key_hash="current-only-review-hash",
+                    device_id="current-device",
+                    action_type="withdrawal",
+                    entity_id=authorization.id,
+                    payload={
+                        "source_wallet_public_key": self.wallet,
+                        "asset": "SOL",
+                        "amount": "0.2",
+                    },
+                    status="review_required",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+            preview = target.preview_restore_artifact(artifact)
+
+            self.assertEqual(preview["risk_level"], "review")
+            self.assertIn("mobile_action_receipts", preview["changed_tables"])
+            self.assertIn(
+                "mobile_destination_authorizations",
+                preview["changed_tables"],
+            )
+            self.assertEqual(
+                preview["table_deltas"]["mobile_action_receipts"],
+                {"current": 1, "artifact": 0, "delta": -1},
+            )
+            self.assertEqual(
+                preview["table_deltas"]["mobile_destination_authorizations"],
+                {"current": 1, "artifact": 0, "delta": -1},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
