@@ -649,7 +649,11 @@ class BotState:
         position = self.storage.load_live_ledger_position(position_id)
         if position is None:
             return None
+        previous_status = position.status
         self._normalize_live_position_status(position)
+        if position.status != previous_status:
+            position.version += 1
+            position.updated_at = utc_now()
         self._refresh_live_position_estimate(position)
         self.storage.save_live_ledger_position(position)
         return self._mobile_live_position_detail(position, now)
@@ -661,6 +665,7 @@ class BotState:
         expected_version: int,
         stop_pct: float,
         target_pct: float,
+        mobile_action_id: str = "",
     ) -> dict[str, object]:
         position = self.storage.load_live_ledger_position(position_id)
         if position is None:
@@ -673,6 +678,7 @@ class BotState:
             raise ValueError("Exit controls are outside backend bounds")
         position.stop_pct = round(float(stop_pct), 4)
         position.target_pct = round(float(target_pct), 4)
+        position.last_mobile_action_id = mobile_action_id
         position.version += 1
         position.updated_at = utc_now()
         self.storage.save_live_ledger_position(position)
@@ -835,6 +841,10 @@ class BotState:
                 "notes": ["Paper PnL is simulated and is not account equity."],
             },
             "reconciliation_status": "paper_model",
+            "version": 1,
+            "stop_pct": float(self.settings.stop_loss_pct),
+            "target_pct": float(self.settings.take_profit_pct),
+            "prepared_close": None,
             "allowed_actions": {
                 "adjust_exit": False,
                 "close": False,
@@ -856,13 +866,52 @@ class BotState:
                 intent
                 for intent in self.storage.load_live_intents(200)
                 if intent.action == "sell"
+                and intent.amount == "100%"
                 and intent.mint == position.mint
                 and intent.wallet_public_key == position.wallet_public_key
+                and intent.generated_from_position
+                and intent.generated_position_id == position.id
+                and int(intent.generated_position_version)
+                == int(position.version)
+                and abs(
+                    float(intent.generated_position_token_balance)
+                    - float(position.token_balance)
+                )
+                <= 1e-12
                 and intent.status == "simulated"
                 and not intent.stale
+                and (
+                    intent.expires_at is None
+                    or intent.expires_at > now
+                )
             ),
             None,
         )
+        prepared_close_audit = (
+            self.storage.load_live_execution_audit(prepared_close.audit_id)
+            if prepared_close is not None
+            else None
+        )
+        if (
+            prepared_close_audit is None
+            or prepared_close_audit.status != "simulated"
+            or prepared_close_audit.final_status != "simulated"
+            or bool(prepared_close_audit.guarded_action_id)
+            or prepared_close_audit.action != "sell"
+            or prepared_close_audit.amount != "100%"
+            or str(prepared_close_audit.quote.get("status") or "") != "ready"
+            or bool(prepared_close_audit.quote.get("shadow_only"))
+            or float(prepared_close_audit.quote.get("slippage_pct") or 0) <= 0
+            or (
+                self._parse_iso_datetime(
+                    str(prepared_close_audit.quote.get("expires_at") or "")
+                )
+                or now
+            )
+            <= now
+        ):
+            prepared_close = None
+            prepared_close_audit = None
         controls_available = (
             position.status == "open"
             and position.token_balance > 0
@@ -890,6 +939,33 @@ class BotState:
                 "notes": list(position.pnl_confidence_notes),
             },
             "reconciliation_status": position.reconciliation_status,
+            "version": int(position.version),
+            "stop_pct": float(
+                position.stop_pct
+                if position.stop_pct is not None
+                else self.settings.stop_loss_pct
+            ),
+            "target_pct": float(
+                position.target_pct
+                if position.target_pct is not None
+                else self.settings.take_profit_pct
+            ),
+            "prepared_close": (
+                {
+                    "intent_id": prepared_close.id,
+                    "intent_version": int(prepared_close.version),
+                    "position_version": int(position.version),
+                    "amount": "100%",
+                    "slippage_pct": float(
+                        prepared_close_audit.quote.get("slippage_pct") or 0
+                    ),
+                    "expires_at": prepared_close.expires_at.isoformat()
+                    if prepared_close.expires_at
+                    else None,
+                }
+                if prepared_close is not None
+                else None
+            ),
             "allowed_actions": {
                 "adjust_exit": controls_available,
                 "close": controls_available and prepared_close is not None,
@@ -6890,6 +6966,11 @@ class BotState:
                         expires_at=now + timedelta(seconds=30),
                         priority_reason=str(top_signal["priority_reason"]),
                         generated_from_position=True,
+                        generated_position_id=position.id,
+                        generated_position_version=int(position.version),
+                        generated_position_token_balance=float(
+                            position.token_balance
+                        ),
                         operator_recommendation="Review the triggered risk condition, then use manual quote/sign if you want to exit now.",
                     )
                 )
@@ -7246,13 +7327,35 @@ class BotState:
                 self.storage.save_live_intent(intent)
         return audit.to_dict()
 
-    def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
-        audit = self._require_live_audit(audit_id)
+    def live_submit(
+        self,
+        audit_id: str,
+        signature: str,
+        *,
+        guarded_action_id: str = "",
+    ) -> dict[str, object]:
+        if guarded_action_id:
+            claimed = self.storage.begin_mobile_execution_dispatch(
+                audit_id=audit_id,
+                action_id=guarded_action_id,
+            )
+            if claimed is None:
+                return self._require_live_audit(audit_id).to_dict()
+            audit = claimed
+        else:
+            audit = self._require_live_audit(audit_id)
+            if audit.guarded_action_id:
+                raise ValueError(
+                    "guarded execution audits require their owning mobile action"
+                )
         if audit.quote.get("shadow_only"):
             raise ValueError("shadow-only quote cannot be submitted")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
-        preflight_blockers = self._live_audit_preflight_blockers(audit)
+        preflight_blockers = self._live_audit_preflight_blockers(
+            audit,
+            require_exact=bool(guarded_action_id),
+        )
         if preflight_blockers:
             raise ValueError(f"cannot submit live audit with failed preflight checks: {'; '.join(preflight_blockers[:4])}")
         if audit.action == "buy":
@@ -7942,18 +8045,61 @@ class BotState:
             "reason": reason,
         }
 
-    def _live_audit_preflight_blockers(self, audit: LiveExecutionAudit | None) -> list[str]:
+    def _live_audit_preflight_blockers(
+        self,
+        audit: LiveExecutionAudit | None,
+        *,
+        require_exact: bool = False,
+    ) -> list[str]:
         if audit is None:
             return ["missing live audit"]
         rows = audit.preflight_checks or []
         if not rows:
-            return []
+            return ["missing preflight inventory"] if require_exact else []
+        required_ids = {
+            "environment",
+            "mint",
+            "wallet",
+            "signer",
+            "amount",
+            "slippage",
+            "priority_fee",
+            "pool",
+            "caps",
+            "blockers",
+        }
+        optional_ids = {
+            "estimated_wallet_spend",
+            "rent_dominance",
+            "wallet_token_balance",
+        }
         blockers = []
+        seen: set[str] = set()
         for row in rows:
-            if str(row.get("status") or "").lower() == "fail":
-                label = str(row.get("label") or row.get("id") or "preflight")
-                reason = str(row.get("reason") or "failed")
-                blockers.append(f"{label}: {reason}")
+            if not isinstance(row, dict):
+                if require_exact:
+                    blockers.append("malformed preflight row")
+                continue
+            check_id = str(row.get("id") or "").strip()
+            label = str(row.get("label") or "").strip()
+            reason = str(row.get("reason") or "").strip()
+            status = str(row.get("status") or "").lower()
+            if not check_id or not label or not reason:
+                if require_exact:
+                    blockers.append("malformed preflight row")
+                continue
+            if check_id in seen:
+                if require_exact:
+                    blockers.append(f"duplicate preflight check: {check_id}")
+                continue
+            seen.add(check_id)
+            if require_exact and check_id not in required_ids | optional_ids:
+                blockers.append(f"unknown preflight check: {check_id}")
+            if status == "fail" or (require_exact and status != "pass"):
+                blockers.append(f"{label}: {reason or 'not passing'}")
+        missing = sorted(required_ids - seen) if require_exact else []
+        if require_exact and missing:
+            blockers.append("missing preflight checks: " + ", ".join(missing))
         return blockers
 
     def _wallet_token_balance(self, wallet_public_key: str, mint: str) -> dict[str, object]:
@@ -8388,6 +8534,30 @@ class BotState:
         if audit.action == "buy":
             position.cost_basis_sol = round(position.cost_basis_sol + amount_sol + priority_fee, 9)
             position.status = "open"
+            authorization = (
+                audit.guarded_authorization
+                if isinstance(audit.guarded_authorization, dict)
+                else {}
+            )
+            if not authorization and isinstance(audit.request, dict):
+                candidate = audit.request.get("mobile_authorization")
+                authorization = candidate if isinstance(candidate, dict) else {}
+            if authorization:
+                try:
+                    stop_pct = float(authorization.get("stop_pct"))
+                    target_pct = float(authorization.get("target_pct"))
+                except (TypeError, ValueError):
+                    stop_pct = 0.0
+                    target_pct = 0.0
+                if not (0 < stop_pct <= 100 and 0 < target_pct <= 100):
+                    raise ValueError(
+                        "guarded buy authorization is missing bounded exit controls"
+                    )
+                position.stop_pct = round(stop_pct, 4)
+                position.target_pct = round(target_pct, 4)
+                position.last_mobile_action_id = str(
+                    authorization.get("action_id") or ""
+                )
             fill["accounting"] = {
                 "type": "buy",
                 "method": position.cost_basis_method,
@@ -8427,6 +8597,7 @@ class BotState:
         position.cost_basis_breakdown = self._live_cost_basis_breakdown(position)
         position.updated_at = now
         position.reconciliation_status = "pending"
+        position.version += 1
         self.storage.save_live_ledger_position(position)
         return self._reconcile_live_audit(audit)
 
@@ -8688,6 +8859,12 @@ class BotState:
         position = next((item for item in self.storage.load_live_ledger_positions(500) if item.mint == audit.mint and item.wallet_public_key == wallet), None)
         if position is None:
             return None
+        material_before = (
+            position.status,
+            float(position.token_balance),
+            position.reconciliation_status,
+            len(position.fills),
+        )
         balance = self._wallet_token_balance(wallet, audit.mint)
         if not balance.get("checked_at"):
             balance["checked_at"] = utc_now().isoformat()
@@ -8732,6 +8909,14 @@ class BotState:
                 self._recompute_live_position_accounting(position)
         self._refresh_live_position_estimate(position)
         position.updated_at = utc_now()
+        material_after = (
+            position.status,
+            float(position.token_balance),
+            position.reconciliation_status,
+            len(position.fills),
+        )
+        if material_after != material_before:
+            position.version += 1
         audit.updated_at = utc_now()
         self.storage.save_live_ledger_position(position)
         self.storage.save_live_execution_audit(audit)
@@ -8743,7 +8928,11 @@ class BotState:
             positions = [position for position in positions if position.wallet_public_key == wallet_public_key.strip()]
         refreshed: list[LiveLedgerPosition] = []
         for position in positions:
+            previous_status = position.status
             self._normalize_live_position_status(position)
+            if position.status != previous_status:
+                position.version += 1
+                position.updated_at = utc_now()
             self._refresh_live_position_estimate(position)
             self.storage.save_live_ledger_position(position)
             refreshed.append(position)

@@ -395,6 +395,10 @@ class LiveExecutionIntent:
     operator_recommendation: str = ""
     priority_reason: str = ""
     generated_from_position: bool = False
+    generated_position_id: str = ""
+    generated_position_version: int = 0
+    generated_position_token_balance: float = 0.0
+    last_mobile_action_id: str = ""
     version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
@@ -480,12 +484,16 @@ class LiveExecutionAudit:
     recommended_action: str = ""
     shadow_comparison: dict[str, Any] = field(default_factory=dict)
     execution_timing: dict[str, Any] = field(default_factory=dict)
+    guarded_action_id: str = ""
+    guarded_authorization: dict[str, Any] = field(default_factory=dict)
+    dispatch_started_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
         payload["updated_at"] = self.updated_at.isoformat()
         payload["confirmation_checked_at"] = self.confirmation_checked_at.isoformat() if self.confirmation_checked_at else None
+        payload["dispatch_started_at"] = self.dispatch_started_at.isoformat() if self.dispatch_started_at else None
         return payload
 
 
@@ -546,6 +554,7 @@ class LiveLedgerPosition:
     pnl_confidence_notes: list[str] = field(default_factory=list)
     stop_pct: float | None = None
     target_pct: float | None = None
+    last_mobile_action_id: str = ""
     version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
@@ -848,6 +857,7 @@ class MobileActionReceipt:
     status: str
     created_at: datetime
     updated_at: datetime
+    execution_audit_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

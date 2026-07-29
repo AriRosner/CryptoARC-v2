@@ -37,6 +37,23 @@ class _MobileWebSocketTicket:
 class MobileCommandCenterService:
     WEBSOCKET_TICKET_TTL_SECONDS = 30
     MAX_WEBSOCKET_TICKETS = 512
+    REQUIRED_PREFLIGHT_CHECKS = frozenset(
+        {
+            "environment",
+            "mint",
+            "wallet",
+            "signer",
+            "amount",
+            "slippage",
+            "priority_fee",
+            "pool",
+            "caps",
+            "blockers",
+        }
+    )
+    OPTIONAL_PREFLIGHT_CHECKS = frozenset(
+        {"estimated_wallet_spend", "rent_dominance", "wallet_token_balance"}
+    )
 
     def __init__(
         self,
@@ -293,6 +310,8 @@ class MobileCommandCenterService:
                         "operator_message": "Rejecting prepared intent",
                         "reconcile_after_ms": 1000,
                         "submitted_at": now.isoformat(),
+                        "expected_version": expected_version,
+                        "reason": clean_reason,
                     },
                     status=MobileActionStatus.PENDING.value,
                     created_at=now,
@@ -309,6 +328,7 @@ class MobileCommandCenterService:
                 )
             intent.status = "cancelled"
             intent.reason = f"Rejected from paired mobile device: {clean_reason}"
+            intent.last_mobile_action_id = receipt.id
             intent.updated_at = utc_now()
             intent.version = int(getattr(intent, "version", 1)) + 1
             self.state.storage.save_live_intent(intent)
@@ -388,6 +408,9 @@ class MobileCommandCenterService:
                         "operator_message": "Applying bounded exit controls",
                         "reconcile_after_ms": 500,
                         "submitted_at": now.isoformat(),
+                        "expected_version": expected_version,
+                        "stop_pct": str(stop),
+                        "target_pct": str(target),
                     },
                     status=MobileActionStatus.PENDING.value,
                     created_at=now,
@@ -407,6 +430,7 @@ class MobileCommandCenterService:
                 expected_version=expected_version,
                 stop_pct=float(stop),
                 target_pct=float(target),
+                mobile_action_id=receipt.id,
             )
             receipt.status = MobileActionStatus.CONFIRMED.value
             receipt.updated_at = utc_now()
@@ -431,11 +455,31 @@ class MobileCommandCenterService:
             raise LookupError("Mobile live position not found")
         if int(getattr(position, "version", 1)) != int(position_version):
             raise ValueError("Position version conflict")
+        if (
+            str(getattr(position, "status", "")) != "open"
+            or float(getattr(position, "token_balance", 0) or 0) <= 0
+            or str(getattr(position, "reconciliation_status", ""))
+            == "needs_review"
+        ):
+            raise ValueError("Position is not eligible for a guarded full close")
         intent = self.state.storage.load_live_intent(intent_id)
         if intent is None:
             raise LookupError("Prepared close intent not found")
         if (
             str(getattr(intent, "action", "")) != "sell"
+            or str(getattr(intent, "amount", "")) != "100%"
+            or not bool(getattr(intent, "generated_from_position", False))
+            or str(getattr(intent, "generated_position_id", "")) != position_id
+            or int(getattr(intent, "generated_position_version", 0))
+            != int(position_version)
+            or abs(
+                float(
+                    getattr(intent, "generated_position_token_balance", 0)
+                    or 0
+                )
+                - float(getattr(position, "token_balance", 0) or 0)
+            )
+            > 1e-12
             or str(getattr(intent, "mint", "")) != str(position.mint)
             or str(getattr(intent, "wallet_public_key", ""))
             != str(position.wallet_public_key)
@@ -450,6 +494,11 @@ class MobileCommandCenterService:
             escalation_acknowledged=escalation_acknowledged,
             action_type="position_close",
             entity_id=position_id,
+            position_binding={
+                "position_id": position_id,
+                "position_version": position_version,
+                "token_balance": float(position.token_balance),
+            },
         )
 
     def action(
@@ -461,7 +510,11 @@ class MobileCommandCenterService:
         receipt = self.state.storage.load_mobile_action_receipt(action_id)
         if receipt is None or receipt.device_id != self._device_id(device):
             raise LookupError("Mobile action receipt not found")
-        audit_id = str(receipt.payload.get("audit_id") or "")
+        audit_id = str(
+            receipt.execution_audit_id
+            or receipt.payload.get("audit_id")
+            or ""
+        )
         if audit_id and receipt.status in {
             MobileActionStatus.PENDING.value,
             MobileActionStatus.VERIFYING.value,
@@ -485,7 +538,66 @@ class MobileCommandCenterService:
             receipt.updated_at = utc_now()
             receipt.payload["operator_message"] = message
             self.state.storage.save_mobile_action_receipt(receipt)
+        elif receipt.status == MobileActionStatus.PENDING.value:
+            self._reconcile_local_mobile_action(receipt)
         return self._receipt_public(receipt)
+
+    def _reconcile_local_mobile_action(
+        self,
+        receipt: StoredMobileActionReceipt,
+    ) -> None:
+        if receipt.action_type == "trade_reject":
+            intent = self.state.storage.load_live_intent(receipt.entity_id)
+            expected_reason = (
+                "Rejected from paired mobile device: "
+                + str(receipt.payload.get("reason") or "")
+            )
+            expected_version = int(
+                receipt.payload.get("expected_version") or 0
+            )
+            if intent is not None and (
+                str(getattr(intent, "last_mobile_action_id", "")) == receipt.id
+                or (
+                    str(getattr(intent, "status", "")) == "cancelled"
+                    and str(getattr(intent, "reason", "")) == expected_reason
+                    and int(getattr(intent, "version", 0))
+                    >= expected_version + 1
+                )
+            ):
+                receipt.status = MobileActionStatus.CANCELLED.value
+                receipt.payload["operator_message"] = "Trade intent rejected"
+        elif receipt.action_type == "position_adjust_exit":
+            position = self.state.storage.load_live_ledger_position(
+                receipt.entity_id
+            )
+            expected_version = int(
+                receipt.payload.get("expected_version") or 0
+            )
+            expected_stop = float(receipt.payload.get("stop_pct") or 0)
+            expected_target = float(receipt.payload.get("target_pct") or 0)
+            if position is not None and (
+                str(getattr(position, "last_mobile_action_id", ""))
+                == receipt.id
+                or (
+                    int(getattr(position, "version", 0))
+                    >= expected_version + 1
+                    and abs(
+                        float(getattr(position, "stop_pct", 0) or 0)
+                        - expected_stop
+                    )
+                    <= 1e-12
+                    and abs(
+                        float(getattr(position, "target_pct", 0) or 0)
+                        - expected_target
+                    )
+                    <= 1e-12
+                )
+            ):
+                receipt.status = MobileActionStatus.CONFIRMED.value
+                receipt.payload["operator_message"] = "Exit controls updated"
+        if receipt.status != MobileActionStatus.PENDING.value:
+            receipt.updated_at = utc_now()
+            self.state.storage.save_mobile_action_receipt(receipt)
 
     def _approve_prepared_intent(
         self,
@@ -498,6 +610,7 @@ class MobileCommandCenterService:
         escalation_acknowledged: bool,
         action_type: str,
         entity_id: str,
+        position_binding: dict[str, object] | None = None,
     ) -> dict[str, object]:
         device_id = self._device_id(device)
         draft_payload = self._draft_payload(draft)
@@ -536,29 +649,42 @@ class MobileCommandCenterService:
             intent = self.state.storage.load_live_intent(intent_id)
             audit_id = str(getattr(intent, "audit_id", ""))
             now = utc_now()
-            receipt, created = self.state.storage.reserve_mobile_action_receipt(
-                StoredMobileActionReceipt(
-                    id=self._action_id(idempotency_key),
-                    idempotency_key_hash=self._idempotency_hash(
-                        device_id, idempotency_key
-                    ),
-                    device_id=device_id,
-                    action_type=action_type,
-                    entity_id=entity_id,
-                    payload={
-                        "request_fingerprint": fingerprint,
-                        "audit_id": audit_id,
-                        "intent_id": intent_id,
-                        "intent_version": expected_version,
-                        "operator_message": "Authorization accepted",
-                        "reconcile_after_ms": 1000,
-                        "submitted_at": now.isoformat(),
-                        "escalation_reasons": validation["escalation_reasons"],
-                    },
-                    status=MobileActionStatus.PENDING.value,
-                    created_at=now,
-                    updated_at=now,
-                )
+            action_id = self._action_id(idempotency_key)
+            authorization = {
+                "action_id": action_id,
+                "stop_pct": draft_payload["stop_pct"],
+                "target_pct": draft_payload["target_pct"],
+            }
+            stored_receipt = StoredMobileActionReceipt(
+                id=action_id,
+                idempotency_key_hash=self._idempotency_hash(
+                    device_id, idempotency_key
+                ),
+                device_id=device_id,
+                action_type=action_type,
+                entity_id=entity_id,
+                payload={
+                    "request_fingerprint": fingerprint,
+                    "audit_id": audit_id,
+                    "intent_id": intent_id,
+                    "intent_version": expected_version,
+                    "operator_message": "Authorization accepted",
+                    "reconcile_after_ms": 1000,
+                    "submitted_at": now.isoformat(),
+                    "escalation_reasons": validation["escalation_reasons"],
+                },
+                status=MobileActionStatus.PENDING.value,
+                created_at=now,
+                updated_at=now,
+                execution_audit_id=audit_id,
+            )
+            receipt, created = self.state.storage.reserve_mobile_execution_action(
+                stored_receipt,
+                audit_id=audit_id,
+                intent_id=intent_id,
+                expected_intent_version=expected_version,
+                guarded_authorization=authorization,
+                position_binding=position_binding,
             )
             if not created:
                 return self._verify_existing_receipt(
@@ -569,7 +695,11 @@ class MobileCommandCenterService:
                     request_fingerprint=fingerprint,
                 )
             try:
-                result = self.state.live_submit(audit_id, "")
+                result = self.state.live_submit(
+                    audit_id,
+                    "",
+                    guarded_action_id=receipt.id,
+                )
                 status, message = self._receipt_status_from_audit(result)
             except (TimeoutError, ConnectionError, OSError):
                 status = MobileActionStatus.VERIFYING.value
@@ -639,6 +769,7 @@ class MobileCommandCenterService:
                 "warning": str(simulation.get("warning") or ""),
                 "error": str(simulation.get("error") or ""),
             },
+            "default_draft": default_draft,
             "limits": validation["limits"],
             "blockers": validation["blockers"],
             "escalation_reasons": validation["escalation_reasons"],
@@ -658,7 +789,11 @@ class MobileCommandCenterService:
         draft: Any,
     ) -> dict[str, object]:
         payload = self._draft_payload(draft)
-        amount = self._decimal(payload["amount"], "amount")
+        amount, amount_is_full_close = self._prepared_amount(
+            payload["amount"],
+            action=str(getattr(intent, "action", "")),
+            label="amount",
+        )
         slippage = self._decimal(payload["slippage_pct"], "slippage_pct")
         stop = (
             self._decimal(payload["stop_pct"], "stop_pct")
@@ -679,8 +814,10 @@ class MobileCommandCenterService:
             if audit is not None and isinstance(audit.simulation, dict)
             else {}
         )
-        prepared_amount = self._decimal(
-            getattr(intent, "amount", "0"), "prepared amount"
+        prepared_amount, prepared_is_full_close = self._prepared_amount(
+            getattr(intent, "amount", "0"),
+            action=str(getattr(intent, "action", "")),
+            label="prepared amount",
         )
         prepared_slippage = self._decimal(
             quote.get("slippage_pct") or "0", "prepared slippage"
@@ -705,7 +842,10 @@ class MobileCommandCenterService:
         blockers: list[str] = []
         if int(getattr(intent, "version", 1)) != int(expected_version):
             blockers.append("Trade intent version conflict")
-        if amount != prepared_amount:
+        if (
+            amount != prepared_amount
+            or amount_is_full_close != prepared_is_full_close
+        ):
             blockers.append("Trade amount must match the prepared intent bound")
         if amount > amount_cap and str(getattr(intent, "action", "")) == "buy":
             blockers.append("Trade amount exceeds the live size limit")
@@ -750,6 +890,14 @@ class MobileCommandCenterService:
             != str(getattr(intent, "wallet_public_key", ""))
         ):
             blockers.append("prepared execution audit does not match the intent")
+        elif (
+            str(getattr(audit, "status", "")) != "simulated"
+            or str(getattr(audit, "final_status", "")) != "simulated"
+            or bool(str(getattr(audit, "guarded_action_id", "") or ""))
+        ):
+            blockers.append(
+                "prepared execution audit is not exactly simulated or is already claimed"
+            )
         if not quote or str(quote.get("status") or "") != "ready":
             blockers.append("prepared quote is not ready")
         if bool(quote.get("shadow_only")):
@@ -760,12 +908,7 @@ class MobileCommandCenterService:
             blockers.append("prepared quote is stale or expired")
         if simulation.get("ok") is not True or str(simulation.get("status") or "") != "ok":
             blockers.append("successful prepared simulation is required")
-        if audit is not None:
-            for check in audit.preflight_checks or []:
-                if str(check.get("status") or "").lower() == "fail":
-                    blockers.append(
-                        f"{check.get('label') or check.get('id') or 'preflight'} failed"
-                    )
+        blockers.extend(self._preflight_inventory_blockers(audit))
         signer = self.state.signer_status(
             str(getattr(intent, "signer_mode", "")),
             str(getattr(intent, "wallet_public_key", "")),
@@ -808,7 +951,11 @@ class MobileCommandCenterService:
             escalation_reasons.append(
                 "Target is above the configured strategy target"
             )
-        if amount_cap > 0 and amount >= amount_cap * Decimal("0.75"):
+        if (
+            str(getattr(intent, "action", "")) == "buy"
+            and amount_cap > 0
+            and amount >= amount_cap * Decimal("0.75")
+        ):
             escalation_reasons.append("Trade size is near the configured live cap")
         if slippage_cap > 0 and slippage >= slippage_cap * Decimal("0.75"):
             escalation_reasons.append(
@@ -822,6 +969,46 @@ class MobileCommandCenterService:
             "escalation_reasons": list(dict.fromkeys(escalation_reasons)),
             "requires_escalation": bool(escalation_reasons),
         }
+
+    def _preflight_inventory_blockers(self, audit: Any) -> list[str]:
+        if audit is None:
+            return ["prepared preflight inventory is missing"]
+        rows = getattr(audit, "preflight_checks", None)
+        if not isinstance(rows, list) or not rows:
+            return ["prepared preflight inventory is missing"]
+        blockers: list[str] = []
+        seen: set[str] = set()
+        allowed = self.REQUIRED_PREFLIGHT_CHECKS | self.OPTIONAL_PREFLIGHT_CHECKS
+        for row in rows:
+            if not isinstance(row, dict):
+                blockers.append("prepared preflight row is malformed")
+                continue
+            check_id = str(row.get("id") or "").strip()
+            label = str(row.get("label") or "").strip()
+            reason = str(row.get("reason") or "").strip()
+            status = str(row.get("status") or "").strip().lower()
+            if not check_id or not label or not reason:
+                blockers.append("prepared preflight row is malformed")
+                continue
+            if check_id in seen:
+                blockers.append(f"prepared preflight check {check_id} is duplicated")
+                continue
+            seen.add(check_id)
+            if check_id not in allowed:
+                blockers.append(
+                    f"prepared preflight check {check_id} is not recognized"
+                )
+            if status != "pass":
+                blockers.append(
+                    f"prepared preflight check {label} is not passing"
+                )
+        missing = sorted(self.REQUIRED_PREFLIGHT_CHECKS - seen)
+        if missing:
+            blockers.append(
+                "prepared preflight inventory is missing: "
+                + ", ".join(missing)
+            )
+        return blockers
 
     def _existing_idempotent_receipt(
         self,
@@ -962,6 +1149,23 @@ class MobileCommandCenterService:
         if not result.is_finite() or result <= 0:
             raise ValueError(f"{label} must be positive and finite")
         return result
+
+    @classmethod
+    def _prepared_amount(
+        cls,
+        value: Any,
+        *,
+        action: str,
+        label: str,
+    ) -> tuple[Decimal, bool]:
+        text = str(value).strip()
+        if text == "100%":
+            if action != "sell":
+                raise ValueError("Only a sell can use the canonical 100% amount")
+            return Decimal("100"), True
+        if text.endswith("%"):
+            raise ValueError(f"{label} must use the exact canonical 100% value")
+        return cls._decimal(text, label), False
 
     @staticmethod
     def _is_expired(value: Any) -> bool:

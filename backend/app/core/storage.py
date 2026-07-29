@@ -43,7 +43,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -205,6 +205,7 @@ class Storage:
             (8, "008_source_soak_history", "durable hybrid source soak snapshots", self._migration_008_source_soak_history),
             (9, "009_mobile_companion", "mobile companion pairing and devices", self._migration_009_mobile_companion),
             (10, "010_mobile_command_center", "scoped mobile command center persistence", self._migration_010_mobile_command_center),
+            (11, "011_mobile_guarded_execution_claims", "durable guarded execution audit claims", self._migration_011_mobile_guarded_execution_claims),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -468,6 +469,68 @@ class Storage:
             )
             """
         )
+
+    def _migration_011_mobile_guarded_execution_claims(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(mobile_action_receipts)"
+            ).fetchall()
+        }
+        unique_execution_audit = any(
+            int(index[2])
+            and str(index[3]) == "u"
+            and tuple(
+                str(row[2])
+                for row in connection.execute(
+                    f"PRAGMA index_info({index[1]})"
+                ).fetchall()
+            )
+            == ("execution_audit_id",)
+            for index in connection.execute(
+                "PRAGMA index_list(mobile_action_receipts)"
+            ).fetchall()
+        )
+        if "execution_audit_id" not in columns or not unique_execution_audit:
+            connection.execute(
+                "ALTER TABLE mobile_action_receipts RENAME TO mobile_action_receipts_010"
+            )
+            connection.execute(
+                """
+                CREATE TABLE mobile_action_receipts (
+                    id TEXT PRIMARY KEY,
+                    idempotency_key_hash TEXT NOT NULL UNIQUE,
+                    device_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    execution_audit_id TEXT UNIQUE
+                )
+                """
+            )
+            source_execution_audit = (
+                "execution_audit_id"
+                if "execution_audit_id" in columns
+                else "NULL"
+            )
+            connection.execute(
+                f"""
+                INSERT INTO mobile_action_receipts (
+                    id, idempotency_key_hash, device_id, action_type,
+                    entity_id, payload, status, created_at, updated_at,
+                    execution_audit_id
+                )
+                SELECT
+                    id, idempotency_key_hash, device_id, action_type,
+                    entity_id, payload, status, created_at, updated_at,
+                    {source_execution_audit}
+                FROM mobile_action_receipts_010
+                """
+            )
+            connection.execute("DROP TABLE mobile_action_receipts_010")
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -958,7 +1021,7 @@ class Storage:
             existing = connection.execute(
                 """
                 SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
-                       payload, status, created_at, updated_at
+                       payload, status, created_at, updated_at, execution_audit_id
                 FROM mobile_action_receipts
                 WHERE idempotency_key_hash = ?
                 """,
@@ -970,9 +1033,9 @@ class Storage:
                 """
                 INSERT INTO mobile_action_receipts (
                     id, idempotency_key_hash, device_id, action_type, entity_id,
-                    payload, status, created_at, updated_at
+                    payload, status, created_at, updated_at, execution_audit_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     receipt.id,
@@ -984,9 +1047,235 @@ class Storage:
                     receipt.status,
                     payload["created_at"],
                     payload["updated_at"],
+                    receipt.execution_audit_id or None,
                 ),
             )
         return receipt, True
+
+    def reserve_mobile_execution_action(
+        self,
+        receipt: MobileActionReceipt,
+        *,
+        audit_id: str,
+        intent_id: str,
+        expected_intent_version: int,
+        guarded_authorization: dict[str, Any],
+        position_binding: dict[str, Any] | None = None,
+    ) -> tuple[MobileActionReceipt, bool]:
+        """Atomically bind one guarded action to one prepared audit."""
+        receipt.execution_audit_id = audit_id
+        payload = receipt.to_dict()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at, execution_audit_id
+                FROM mobile_action_receipts
+                WHERE idempotency_key_hash = ?
+                """,
+                (receipt.idempotency_key_hash,),
+            ).fetchone()
+            if existing:
+                return self._mobile_action_receipt_from_row(existing), False
+            claimed = connection.execute(
+                """
+                SELECT id
+                FROM mobile_action_receipts
+                WHERE execution_audit_id = ?
+                """,
+                (audit_id,),
+            ).fetchone()
+            if claimed:
+                raise ValueError("Prepared execution audit is already claimed")
+
+            audit_row = connection.execute(
+                "SELECT payload FROM live_execution_audits WHERE id = ?",
+                (audit_id,),
+            ).fetchone()
+            intent_row = connection.execute(
+                "SELECT payload FROM live_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if not audit_row or not intent_row:
+                raise LookupError("Prepared execution audit or intent not found")
+            audit_payload = json.loads(str(audit_row["payload"]))
+            intent_payload = json.loads(str(intent_row["payload"]))
+            if (
+                str(audit_payload.get("intent_id") or "") != intent_id
+                or str(audit_payload.get("status") or "") != "simulated"
+                or str(audit_payload.get("final_status") or "") != "simulated"
+                or str(audit_payload.get("guarded_action_id") or "")
+            ):
+                raise ValueError(
+                    "Prepared execution audit is not exactly simulated or is already claimed"
+                )
+            if (
+                str(intent_payload.get("status") or "") != "simulated"
+                or int(intent_payload.get("version") or 1)
+                != int(expected_intent_version)
+            ):
+                raise ValueError(
+                    "Prepared intent is not exactly simulated or has a version conflict"
+                )
+
+            if position_binding:
+                position_id = str(position_binding.get("position_id") or "")
+                position_row = connection.execute(
+                    "SELECT payload FROM live_ledger_positions WHERE id = ?",
+                    (position_id,),
+                ).fetchone()
+                if not position_row:
+                    raise LookupError("Mobile live position not found")
+                position_payload = json.loads(str(position_row["payload"]))
+                expected_position_version = int(
+                    position_binding.get("position_version") or 0
+                )
+                expected_balance = float(
+                    position_binding.get("token_balance") or 0
+                )
+                if (
+                    int(position_payload.get("version") or 1)
+                    != expected_position_version
+                    or str(position_payload.get("status") or "") != "open"
+                    or float(position_payload.get("token_balance") or 0) <= 0
+                    or str(position_payload.get("reconciliation_status") or "")
+                    == "needs_review"
+                ):
+                    raise ValueError(
+                        "position changed before the guarded close claim"
+                    )
+                if abs(
+                    float(position_payload.get("token_balance") or 0)
+                    - expected_balance
+                ) > 1e-12:
+                    raise ValueError(
+                        "position balance changed before the guarded close claim"
+                    )
+                if (
+                    audit_payload.get("action") != "sell"
+                    or str(audit_payload.get("amount") or "") != "100%"
+                    or intent_payload.get("action") != "sell"
+                    or str(intent_payload.get("amount") or "") != "100%"
+                    or not bool(intent_payload.get("generated_from_position"))
+                    or str(intent_payload.get("generated_position_id") or "")
+                    != position_id
+                    or int(
+                        intent_payload.get("generated_position_version") or 0
+                    )
+                    != expected_position_version
+                    or abs(
+                        float(
+                            intent_payload.get(
+                                "generated_position_token_balance"
+                            )
+                            or 0
+                        )
+                        - expected_balance
+                    )
+                    > 1e-12
+                    or str(intent_payload.get("mint") or "")
+                    != str(position_payload.get("mint") or "")
+                    or str(intent_payload.get("wallet_public_key") or "")
+                    != str(position_payload.get("wallet_public_key") or "")
+                ):
+                    raise ValueError(
+                        "Prepared close is not the exact canonical full-position intent"
+                    )
+
+            now = datetime.now(timezone.utc).isoformat()
+            authorization = dict(guarded_authorization)
+            audit_payload["guarded_action_id"] = receipt.id
+            audit_payload["guarded_authorization"] = authorization
+            audit_payload["dispatch_started_at"] = None
+            audit_payload["status"] = "submitting"
+            audit_payload["final_status"] = "submitting"
+            audit_payload["updated_at"] = now
+            request = audit_payload.get("request")
+            if not isinstance(request, dict):
+                request = {}
+            request["mobile_authorization"] = authorization
+            audit_payload["request"] = request
+            intent_payload["last_mobile_action_id"] = receipt.id
+            intent_payload["status"] = "submitting"
+            intent_payload["version"] = int(
+                intent_payload.get("version") or 1
+            ) + 1
+            intent_payload["updated_at"] = now
+            connection.execute(
+                "UPDATE live_execution_audits SET payload = ? WHERE id = ?",
+                (json.dumps(audit_payload), audit_id),
+            )
+            connection.execute(
+                "UPDATE live_intents SET payload = ? WHERE id = ?",
+                (json.dumps(intent_payload), intent_id),
+            )
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO mobile_action_receipts (
+                        id, idempotency_key_hash, device_id, action_type,
+                        entity_id, payload, status, created_at, updated_at,
+                        execution_audit_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        receipt.id,
+                        receipt.idempotency_key_hash,
+                        receipt.device_id,
+                        receipt.action_type,
+                        receipt.entity_id,
+                        json.dumps(payload["payload"]),
+                        receipt.status,
+                        payload["created_at"],
+                        payload["updated_at"],
+                        audit_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    "Prepared execution audit is already claimed"
+                ) from exc
+        return receipt, True
+
+    def begin_mobile_execution_dispatch(
+        self,
+        *,
+        audit_id: str,
+        action_id: str,
+    ) -> LiveExecutionAudit | None:
+        """Durably mark the only permitted dispatch before invoking a signer."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload FROM live_execution_audits WHERE id = ?",
+                (audit_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError(f"Live execution audit not found: {audit_id}")
+            payload = json.loads(str(row["payload"]))
+            if str(payload.get("guarded_action_id") or "") != action_id:
+                raise ValueError(
+                    "Guarded execution action does not own this audit"
+                )
+            if payload.get("dispatch_started_at"):
+                return None
+            if (
+                str(payload.get("status") or "") != "submitting"
+                or str(payload.get("final_status") or "") != "submitting"
+            ):
+                raise ValueError(
+                    "Guarded execution audit is not in claimed submitting state"
+                )
+            now = datetime.now(timezone.utc)
+            payload["dispatch_started_at"] = now.isoformat()
+            payload["updated_at"] = now.isoformat()
+            connection.execute(
+                "UPDATE live_execution_audits SET payload = ? WHERE id = ?",
+                (json.dumps(payload), audit_id),
+            )
+        return self._live_execution_audit_from_payload(payload)
 
     def save_mobile_action_receipt(
         self,
@@ -1019,7 +1308,7 @@ class Storage:
             row = connection.execute(
                 """
                 SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
-                       payload, status, created_at, updated_at
+                       payload, status, created_at, updated_at, execution_audit_id
                 FROM mobile_action_receipts
                 WHERE id = ?
                 """,
@@ -1035,7 +1324,7 @@ class Storage:
             row = connection.execute(
                 """
                 SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
-                       payload, status, created_at, updated_at
+                       payload, status, created_at, updated_at, execution_audit_id
                 FROM mobile_action_receipts
                 WHERE idempotency_key_hash = ?
                 """,
@@ -1055,6 +1344,7 @@ class Storage:
             status=str(row["status"]),
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
+            execution_audit_id=str(row["execution_audit_id"] or ""),
         )
 
     def backup_restore_status(self) -> dict[str, Any]:
@@ -1712,6 +2002,7 @@ class Storage:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["updated_at"] = datetime.fromisoformat(payload["updated_at"])
         payload["confirmation_checked_at"] = datetime.fromisoformat(payload["confirmation_checked_at"]) if payload.get("confirmation_checked_at") else None
+        payload["dispatch_started_at"] = datetime.fromisoformat(payload["dispatch_started_at"]) if payload.get("dispatch_started_at") else None
         allowed = set(LiveExecutionAudit.__dataclass_fields__.keys())
         return LiveExecutionAudit(**{key: value for key, value in payload.items() if key in allowed})
 

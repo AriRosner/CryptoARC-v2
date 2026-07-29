@@ -1677,6 +1677,46 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(loaded.wallet_public_key, "WalletLiveToken")
 
+    def test_guarded_buy_fill_applies_authorized_controls_and_versions_material_changes(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state._wallet_token_balance = lambda wallet, mint: {
+                "wallet_public_key": wallet,
+                "mint": mint,
+                "token_balance": 250.0,
+                "error": "",
+                "checked_at": utc_now().isoformat(),
+            }
+            audit = LiveExecutionAudit(
+                id="audit_guarded_controls",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                action="buy",
+                mint="MintGuardedControls",
+                amount="0.05",
+                wallet_public_key="WalletGuardedControls",
+                signer_mode="local_signer_daemon",
+                status="confirmed",
+                final_status="confirmed",
+                request={
+                    "denominated_in_sol": True,
+                    "mobile_authorization": {
+                        "action_id": "guarded-action",
+                        "stop_pct": "20",
+                        "target_pct": "40",
+                    },
+                },
+            )
+
+            state._record_live_fill(audit)
+
+            position = state.storage.load_live_ledger_positions(10)[0]
+            self.assertEqual(position.stop_pct, 20.0)
+            self.assertEqual(position.target_pct, 40.0)
+            self.assertGreaterEqual(position.version, 3)
+            self.assertEqual(position.token_balance, 250.0)
+            self.assertEqual(position.reconciliation_status, "matched")
+
     def configure_live_caps(self, state: BotState, include_backup: bool = True) -> None:
         state.settings.live_max_trade_sol = 0.01
         state.settings.live_daily_loss_cap_sol = 0.05

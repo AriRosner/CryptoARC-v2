@@ -50,6 +50,22 @@ class MobilePushRegistrationRequest(BaseModel):
     platform: str = Field(default="android", max_length=40)
 
 
+class MobileValidationRedactedRoute(APIRoute):
+    def get_route_handler(self):
+        route_handler = super().get_route_handler()
+
+        async def redacted_route_handler(request: Request):
+            try:
+                return await route_handler(request)
+            except RequestValidationError:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": "Invalid mobile request"},
+                )
+
+        return redacted_route_handler
+
+
 class MobilePushRegistrationRoute(APIRoute):
     def get_route_handler(self):
         route_handler = super().get_route_handler()
@@ -60,7 +76,9 @@ class MobilePushRegistrationRoute(APIRoute):
             except RequestValidationError:
                 return JSONResponse(
                     status_code=422,
-                    content={"detail": "Invalid mobile push registration request"},
+                    content={
+                        "detail": "Invalid mobile push registration request"
+                    },
                 )
 
         return redacted_route_handler
@@ -70,7 +88,11 @@ def create_mobile_router(
     service: MobileCommandCenterService,
     require_scope: Callable[[str], Callable[..., dict[str, object]]],
 ) -> APIRouter:
-    router = APIRouter(prefix="/api/mobile", tags=["mobile"])
+    router = APIRouter(
+        prefix="/api/mobile",
+        tags=["mobile"],
+        route_class=MobileValidationRedactedRoute,
+    )
 
     def guarded_error(exc: Exception) -> HTTPException:
         if isinstance(exc, LookupError):

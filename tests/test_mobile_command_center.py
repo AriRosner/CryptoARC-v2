@@ -12,7 +12,15 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.auth import AuthManager
-from app.core.models import LiveLedgerPosition, PriceObservation, TokenSignal, TokenStatus, TradeRecord
+from app.core.models import (
+    LiveExecutionAudit,
+    LiveExecutionIntent,
+    LiveLedgerPosition,
+    PriceObservation,
+    TokenSignal,
+    TokenStatus,
+    TradeRecord,
+)
 from app.core.state import BotState
 from app.core.storage import Storage
 from app.mobile.contracts import MobileActionStatus, MobileRealtimeEnvelope, MobileScope
@@ -190,8 +198,123 @@ class MobileCommandCenterContractTests(unittest.TestCase):
                 position_id="live-position-1",
             )
             self.assertEqual(detail["id"], "live-position-1")
+            self.assertEqual(detail["version"], 1)
+            self.assertIn("stop_pct", detail)
+            self.assertIn("target_pct", detail)
+            self.assertIn("prepared_close", detail)
             self.assertFalse(detail["mark"]["fresh"])
             self.assertTrue(detail["pnl"]["approximate"])
+
+    def test_guarded_validation_redacts_forbidden_secret_and_transaction_values(self) -> None:
+        with self.mobile_client() as (client, desktop_headers):
+            claim = self.claim_device(
+                client,
+                desktop_headers,
+                name="Guarded redaction",
+                scopes=[MobileScope.TRADE_REVIEW, MobileScope.TRADE_EXECUTE],
+            )
+            headers = {
+                "Authorization": f"Bearer {claim['token']}",
+                "Idempotency-Key": "redaction-test",
+            }
+            response = client.post(
+                "/api/mobile/trades/missing-intent/approve",
+                headers=headers,
+                json={
+                    "expected_version": 1,
+                    "draft": {
+                        "amount": "0.01",
+                        "slippage_pct": "1",
+                        "stop_pct": "20",
+                        "target_pct": "40",
+                        "raw_transaction": "RAW-TRANSACTION-MUST-NOT-ECHO",
+                    },
+                    "private_key": "PRIVATE-KEY-MUST-NOT-ECHO",
+                },
+            )
+
+        self.assertEqual(response.status_code, 422)
+        encoded = response.text.lower()
+        self.assertNotIn("private-key-must-not-echo", encoded)
+        self.assertNotIn("raw-transaction-must-not-echo", encoded)
+        self.assertNotIn("private_key", encoded)
+        self.assertNotIn("raw_transaction", encoded)
+
+    def test_position_detail_exposes_only_exact_bound_full_close_identity(self) -> None:
+        from app import main as main_app
+
+        self.seed_portfolio()
+        now = datetime.now(timezone.utc)
+        position = self.state.storage.load_live_ledger_position(
+            "live-position-1"
+        )
+        self.assertIsNotNone(position)
+        intent = LiveExecutionIntent(
+            id="intent-exact-close",
+            created_at=now,
+            updated_at=now,
+            action="sell",
+            mint=position.mint,
+            amount="100%",
+            denominated_in_sol=False,
+            signer_mode="local_signer_daemon",
+            wallet_public_key=position.wallet_public_key,
+            status="simulated",
+            expires_at=now + timedelta(minutes=2),
+            audit_id="audit-exact-close",
+            generated_from_position=True,
+            generated_position_id=position.id,
+            generated_position_version=position.version,
+            generated_position_token_balance=position.token_balance,
+            version=6,
+        )
+        audit = LiveExecutionAudit(
+            id="audit-exact-close",
+            created_at=now,
+            updated_at=now,
+            action="sell",
+            mint=position.mint,
+            amount="100%",
+            status="simulated",
+            final_status="simulated",
+            signer_mode=intent.signer_mode,
+            wallet_public_key=position.wallet_public_key,
+            intent_id=intent.id,
+            quote={
+                "status": "ready",
+                "slippage_pct": 1.0,
+                "expires_at": (now + timedelta(minutes=2)).isoformat(),
+            },
+        )
+        self.state.storage.save_live_intent(intent)
+        self.state.storage.save_live_execution_audit(audit)
+
+        with self.mobile_client():
+            detail = main_app.mobile_service.position(
+                device={"id": "mobile-portfolio"},
+                position_id=position.id,
+            )
+            self.assertTrue(detail["allowed_actions"]["close"])
+            self.assertEqual(
+                detail["prepared_close"],
+                {
+                    "intent_id": intent.id,
+                    "intent_version": 6,
+                    "position_version": position.version,
+                    "amount": "100%",
+                    "slippage_pct": 1.0,
+                    "expires_at": intent.expires_at.isoformat(),
+                },
+            )
+
+            intent.amount = "50"
+            self.state.storage.save_live_intent(intent)
+            partial = main_app.mobile_service.position(
+                device={"id": "mobile-portfolio"},
+                position_id=position.id,
+            )
+            self.assertFalse(partial["allowed_actions"]["close"])
+            self.assertIsNone(partial["prepared_close"])
 
     def test_portfolio_uses_remaining_paper_basis_without_double_counting_partial_exit_pnl(self) -> None:
         from app import main as main_app
@@ -717,6 +840,7 @@ class MobileCommandCenterContractTests(unittest.TestCase):
                 ("status", "TEXT", 1, 0),
                 ("created_at", "TEXT", 1, 0),
                 ("updated_at", "TEXT", 1, 0),
+                ("execution_audit_id", "TEXT", 0, 0),
             ],
             "mobile_destination_authorizations": [
                 ("id", "TEXT", 0, 1),
@@ -743,7 +867,10 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             ],
         }
         expected_unique_columns = {
-            "mobile_action_receipts": {("idempotency_key_hash",)},
+            "mobile_action_receipts": {
+                ("idempotency_key_hash",),
+                ("execution_audit_id",),
+            },
             "mobile_destination_authorizations": set(),
             "mobile_push_registrations": {("token_fingerprint",)},
             "mobile_alert_acknowledgements": {("device_id", "event_id")},
@@ -771,18 +898,18 @@ class MobileCommandCenterContractTests(unittest.TestCase):
                 actual_unique_columns[table] = unique_columns
             migration = connection.execute(
                 "SELECT version FROM schema_migrations WHERE migration_id = ?",
-                ("010_mobile_command_center",),
+                ("011_mobile_guarded_execution_claims",),
             ).fetchone()
 
         self.assertEqual(actual_columns, expected_columns)
         self.assertEqual(actual_unique_columns, expected_unique_columns)
-        self.assertEqual(migration, (10,))
+        self.assertEqual(migration, (11,))
 
         Storage(str(self.state.storage.path))
         with closing(sqlite3.connect(self.state.storage.path)) as connection:
             migration_count = connection.execute(
                 "SELECT COUNT(*) FROM schema_migrations WHERE migration_id = ?",
-                ("010_mobile_command_center",),
+                ("011_mobile_guarded_execution_claims",),
             ).fetchone()
         self.assertEqual(migration_count, (1,))
 
@@ -799,8 +926,8 @@ class MobileCommandCenterContractTests(unittest.TestCase):
             for table in task_tables:
                 connection.execute(f"DROP TABLE {table}")
             connection.execute(
-                "DELETE FROM schema_migrations WHERE migration_id = ?",
-                ("010_mobile_command_center",),
+                "DELETE FROM schema_migrations WHERE version >= ?",
+                (10,),
             )
             connection.commit()
         artifact = source.create_backup_artifact()
@@ -812,7 +939,7 @@ class MobileCommandCenterContractTests(unittest.TestCase):
         self.assertEqual(preview["schema_version"], 9)
         self.assertIn("Artifact will be migrated forward after restore.", preview["warnings"])
         self.assertEqual(result["status"], "restored")
-        self.assertEqual(target.schema_status()["current_version"], 10)
+        self.assertEqual(target.schema_status()["current_version"], 11)
         with closing(sqlite3.connect(target.path)) as connection:
             restored_tables = {
                 str(row[0])

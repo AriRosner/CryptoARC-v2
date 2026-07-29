@@ -42,7 +42,7 @@ class MobileActionStatus(str, Enum):
 class MobileTradeDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    amount: Decimal = Field(gt=0)
+    amount: Decimal | Literal["100%"]
     slippage_pct: Decimal = Field(gt=0)
     stop_pct: Decimal | None = Field(default=None, gt=0)
     target_pct: Decimal | None = Field(default=None, gt=0)
@@ -182,6 +182,15 @@ class MobilePositionAllowedActions(BaseModel):
     reason: str
 
 
+class MobilePreparedClose(BaseModel):
+    intent_id: str
+    intent_version: int = Field(ge=1)
+    position_version: int = Field(ge=1)
+    amount: Literal["100%"]
+    slippage_pct: float = Field(gt=0)
+    expires_at: datetime | None = None
+
+
 class MobilePositionDetail(BaseModel):
     id: str
     mode: Literal["paper", "live"]
@@ -197,6 +206,10 @@ class MobilePositionDetail(BaseModel):
     mark: MobilePositionMark
     pnl: MobilePositionPnl
     reconciliation_status: str
+    version: int = Field(ge=1)
+    stop_pct: float
+    target_pct: float
+    prepared_close: MobilePreparedClose | None = None
     allowed_actions: MobilePositionAllowedActions
 
 
