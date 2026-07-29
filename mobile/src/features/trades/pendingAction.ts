@@ -143,7 +143,7 @@ export function pendingActionRoute(
   ) {
     return action.actionType === "withdrawal"
       ? "/wallet/withdraw"
-      : "/wallet";
+      : `/wallet/treasury?action=${action.actionType}`;
   }
   return null;
 }

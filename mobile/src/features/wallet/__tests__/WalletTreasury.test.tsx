@@ -4,6 +4,7 @@ import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 
 import {
   TEST_PENDING_ACTION_OWNER,
+  pendingActionRoute,
   type PendingActionStore,
   type PendingMobileAction,
 } from "../../trades/pendingAction";
@@ -16,6 +17,7 @@ import {
 } from "../WithdrawalScreen";
 import type {
   MobileTreasuryPreview,
+  MobileDestinationAuthorization,
   MobileWalletPayload,
   MobileWalletTransaction,
 } from "../types";
@@ -56,6 +58,10 @@ const wallet: MobileWalletPayload = {
   rent: {
     recoverable_sol: 0.004,
     eligible_accounts: 2,
+    eligible_token_accounts: [
+      "RentTokenAccount11111111111111111111111111111",
+      "RentTokenAccount22222222222222222222222222222",
+    ],
     status: "ready",
     approximate: false,
   },
@@ -101,8 +107,53 @@ function preview(
     expires_at: "2026-07-29T14:05:00Z",
     warnings: ["Treasury movement requires elevated confirmation."],
     token_accounts: [],
+    source_wallet_public_key:
+      "WalletTreasurySource1111111111111111111111111",
+    purpose: `${action} operator authorization`,
   };
 }
+
+const destinations: MobileDestinationAuthorization[] = [
+  {
+    id: "withdrawal-authorization",
+    device_id: "test-device",
+    action: "withdrawal",
+    address: "DestinationTreasury111111111111111111111111",
+    asset: "SOL",
+    max_amount: "0.2",
+    purpose: "manual withdrawal",
+    created_at: "2026-07-29T14:00:00Z",
+    expires_at: "2026-07-29T14:05:00Z",
+    used_at: null,
+    status: "active",
+  },
+  {
+    id: "profit-authorization",
+    device_id: "test-device",
+    action: "profit_sweep",
+    address: "ProfitDestination111111111111111111111111111",
+    asset: "SOL",
+    max_amount: "0.025",
+    purpose: "configured profit sweep",
+    created_at: "2026-07-29T14:00:00Z",
+    expires_at: "2026-07-29T14:05:00Z",
+    used_at: null,
+    status: "active",
+  },
+  {
+    id: "rent-authorization",
+    device_id: "test-device",
+    action: "rent_recovery",
+    address: wallet.wallet_public_key,
+    asset: "SOL",
+    max_amount: "0.004",
+    purpose: "eligible rent recovery",
+    created_at: "2026-07-29T14:00:00Z",
+    expires_at: "2026-07-29T14:05:00Z",
+    used_at: null,
+    status: "active",
+  },
+];
 
 function pendingStore(initial: PendingMobileAction | null = null) {
   let pending = initial;
@@ -130,13 +181,19 @@ describe("wallet analytics and guarded treasury", () => {
   });
 
   it("renders balance groups, allocation, fees, rent, reconciliation, health, and transactions", async () => {
+    const onWithdraw = jest.fn();
+    const onProfitSweep = jest.fn();
+    const onRentRecovery = jest.fn();
     const view = await render(
       <WalletScreen
         wallet={wallet}
         transactions={transactions}
+        destinations={destinations}
         loading={false}
         onRefresh={jest.fn()}
-        onWithdraw={jest.fn()}
+        onWithdraw={onWithdraw}
+        onProfitSweep={onProfitSweep}
+        onRentRecovery={onRentRecovery}
       />,
     );
 
@@ -155,6 +212,12 @@ describe("wallet analytics and guarded treasury", () => {
     expect(view.getByText("Signer healthy")).toBeTruthy();
     expect(view.getByText("Withdrawal")).toBeTruthy();
     expect(view.getByText("0.2 SOL")).toBeTruthy();
+    await fireEvent.press(view.getByText("Review withdrawal"));
+    await fireEvent.press(view.getByText("Review profit sweep"));
+    await fireEvent.press(view.getByText("Review rent recovery"));
+    expect(onWithdraw).toHaveBeenCalledTimes(1);
+    expect(onProfitSweep).toHaveBeenCalledTimes(1);
+    expect(onRentRecovery).toHaveBeenCalledTimes(1);
   });
 
   it("keeps every treasury execute disabled offline", async () => {
@@ -324,6 +387,159 @@ describe("wallet analytics and guarded treasury", () => {
         tokenAccounts: rentPreview.token_accounts,
       }),
     );
+  });
+
+  it("never confirms from one accessibility activation and supports cancellation", async () => {
+    const execute = jest.fn(async () => ({
+      action_id: "accessible-action",
+      status: "pending" as const,
+      submitted_at: "2026-07-29T14:00:00Z",
+      updated_at: "2026-07-29T14:00:00Z",
+      operator_message: "Treasury request submitted",
+      reconcile_after_ms: 1000,
+    }));
+    const view = await render(
+      <WithdrawalScreen
+        preview={preview()}
+        online
+        execute={execute}
+        reconcileAction={jest.fn()}
+        createIdempotencyKey={() => "accessible-action"}
+        pendingActionStore={pendingStore().store}
+        pendingOwner={TEST_PENDING_ACTION_OWNER}
+      />,
+    );
+    await fireEvent.press(view.getByText("Authenticate treasury action"));
+    const hold = await view.findByTestId("hold-to-confirm-1400");
+
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(1400);
+    });
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      view.getByText(
+        "Accessibility confirmation armed. Activate again after the safety delay.",
+      ),
+    ).toBeTruthy();
+
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "escape" },
+    });
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(1399);
+    });
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    expect(execute).not.toHaveBeenCalled();
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    await waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
+  });
+
+  it("retains review-required recovery until deliberate resolution", async () => {
+    const actionId = "review-required-action";
+    const pending = pendingStore({
+      actionId,
+      entityId: preview().authorization_id,
+      actionType: "withdrawal",
+      owner: TEST_PENDING_ACTION_OWNER,
+      state: "pending",
+    });
+    const reconcile = jest.fn(async () => ({
+      action_id: actionId,
+      status: "review_required" as const,
+      submitted_at: "2026-07-29T14:00:00Z",
+      updated_at: "2026-07-29T14:01:00Z",
+      operator_message: "Signature unavailable; review locally",
+      reconcile_after_ms: 1000,
+    }));
+    const view = await render(
+      <WithdrawalScreen
+        preview={preview()}
+        online
+        execute={jest.fn()}
+        reconcileAction={reconcile}
+        pendingActionStore={pending.store}
+        pendingOwner={TEST_PENDING_ACTION_OWNER}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(1000);
+    });
+    expect(
+      await view.findByText("Signature unavailable; review locally"),
+    ).toBeTruthy();
+    expect(pending.store.clear).not.toHaveBeenCalled();
+    expect(pending.current()).toEqual(
+      expect.objectContaining({
+        actionId,
+        state: "review_required",
+      }),
+    );
+  });
+
+  it("opens a same-owner cross-entity pending action without allowing abandon", async () => {
+    const crossEntity = {
+      actionId: "profit-elsewhere",
+      entityId: "profit-authorization",
+      actionType: "profit_sweep",
+      owner: TEST_PENDING_ACTION_OWNER,
+      state: "pending" as const,
+    };
+    const pending = pendingStore(crossEntity);
+    const openPending = jest.fn();
+    const view = await render(
+      <WithdrawalScreen
+        preview={preview()}
+        online
+        execute={jest.fn()}
+        reconcileAction={jest.fn()}
+        pendingActionStore={pending.store}
+        pendingOwner={TEST_PENDING_ACTION_OWNER}
+        onOpenPendingAction={openPending}
+      />,
+    );
+
+    await fireEvent.press(await view.findByText("Open pending action"));
+    expect(openPending).toHaveBeenCalledWith(crossEntity);
+    expect(view.queryByText("Abandon pending action")).toBeNull();
+    expect(pending.store.clear).not.toHaveBeenCalled();
+  });
+
+  it("routes every treasury pending action to a reachable recovery screen", () => {
+    expect(
+      pendingActionRoute({
+        actionId: "profit",
+        entityId: "profit-auth",
+        actionType: "profit_sweep",
+        owner: TEST_PENDING_ACTION_OWNER,
+        state: "pending",
+      }),
+    ).toBe("/wallet/treasury?action=profit_sweep");
+    expect(
+      pendingActionRoute({
+        actionId: "rent",
+        entityId: "rent-auth",
+        actionType: "rent_recovery",
+        owner: TEST_PENDING_ACTION_OWNER,
+        state: "pending",
+      }),
+    ).toBe("/wallet/treasury?action=rent_recovery");
   });
 
   it("does not reconcile or replace a pending action owned by another pairing", async () => {

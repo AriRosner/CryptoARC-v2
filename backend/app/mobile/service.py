@@ -220,6 +220,7 @@ class MobileCommandCenterService:
         *,
         desktop_operator: dict[str, object],
         device_id: str,
+        action: str,
         address: str,
         asset: str,
         max_amount: Any,
@@ -229,12 +230,15 @@ class MobileCommandCenterService:
         if not desktop_operator or not desktop_operator.get("authenticated"):
             raise ValueError("Desktop authentication is required")
         clean_device_id = device_id.strip()
+        clean_action = action.strip().lower()
         clean_address = address.strip()
         clean_asset = asset.strip().upper()
         clean_purpose = purpose.strip()
         maximum = self._decimal(max_amount, "maximum amount")
         if not clean_device_id:
             raise ValueError("Mobile device binding is required")
+        if clean_action not in self.TREASURY_ACTIONS:
+            raise ValueError("Destination authorization action is invalid")
         if (
             len(clean_address) < 32
             or len(clean_address) > 100
@@ -255,6 +259,7 @@ class MobileCommandCenterService:
             id=new_id("destinationauth"),
             payload={
                 "device_id": clean_device_id,
+                "action": clean_action,
                 "address": clean_address,
                 "asset": clean_asset,
                 "max_amount": str(maximum),
@@ -264,7 +269,7 @@ class MobileCommandCenterService:
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
         )
-        self.state.storage.save_mobile_destination_authorization(authorization)
+        self.state.storage.create_mobile_destination_authorization(authorization)
         return authorization.to_public_dict()
 
     def preview_withdrawal(self, **kwargs: Any) -> dict[str, object]:
@@ -306,6 +311,7 @@ class MobileCommandCenterService:
         authorization = self._require_destination_authorization(
             authorization_id=authorization_id,
             device_id=device_id,
+            action=action,
             address=clean_address,
             asset=clean_asset,
             amount=numeric_amount,
@@ -331,6 +337,9 @@ class MobileCommandCenterService:
             "asset": clean_asset,
             "amount": str(numeric_amount),
             "authorization_id": authorization.id,
+            "source_wallet_public_key": str(
+                preflight.get("wallet_public_key") or ""
+            ),
             "expected_fee_sol": str(
                 preflight.get("expected_fee_sol") or "0"
             ),
@@ -341,8 +350,10 @@ class MobileCommandCenterService:
             "token_accounts": clean_accounts,
             "created_at": now.isoformat(),
         }
-        authorization.payload["preview"] = preview
-        self.state.storage.save_mobile_destination_authorization(authorization)
+        self.state.storage.attach_mobile_destination_preview(
+            authorization.id,
+            preview,
+        )
         return {
             "preview_id": preview_id,
             "action": action,
@@ -359,6 +370,8 @@ class MobileCommandCenterService:
                 str(value) for value in preflight.get("warnings", [])
             ],
             "token_accounts": clean_accounts,
+            "source_wallet_public_key": preview["source_wallet_public_key"],
+            "purpose": str(authorization.payload.get("purpose") or ""),
         }
 
     def _request_treasury(
@@ -407,6 +420,7 @@ class MobileCommandCenterService:
             self._require_destination_authorization(
                 authorization_id=authorization_id,
                 device_id=device_id,
+                action=action,
                 address=clean_address,
                 asset=clean_asset,
                 amount=numeric_amount,
@@ -422,6 +436,9 @@ class MobileCommandCenterService:
             if blockers:
                 raise ValueError("; ".join(blockers))
             now = utc_now()
+            source_wallet_public_key = str(
+                preflight.get("wallet_public_key") or ""
+            )
             action_id = self._action_id(idempotency_key)
             receipt = StoredMobileActionReceipt(
                 id=action_id,
@@ -438,6 +455,10 @@ class MobileCommandCenterService:
                     "address": clean_address,
                     "asset": clean_asset,
                     "amount": str(numeric_amount),
+                    "expected_fee_sol": str(
+                        preflight.get("expected_fee_sol") or "0"
+                    ),
+                    "source_wallet_public_key": source_wallet_public_key,
                     "token_accounts": clean_accounts,
                     "operator_message": "Treasury request pending",
                     "reconcile_after_ms": 1000,
@@ -457,6 +478,7 @@ class MobileCommandCenterService:
                 asset=clean_asset,
                 amount=str(numeric_amount),
                 token_accounts=clean_accounts,
+                source_wallet_public_key=source_wallet_public_key,
             )
             if not created:
                 return self._verify_existing_receipt(
@@ -470,6 +492,7 @@ class MobileCommandCenterService:
                 result = self.state.execute_mobile_treasury(
                     action_id=action_id,
                     action=action,
+                    source_wallet_public_key=source_wallet_public_key,
                     address=clean_address,
                     asset=clean_asset,
                     amount=numeric_amount,
@@ -499,6 +522,7 @@ class MobileCommandCenterService:
         *,
         authorization_id: str,
         device_id: str,
+        action: str,
         address: str,
         asset: str,
         amount: Decimal,
@@ -515,6 +539,8 @@ class MobileCommandCenterService:
         payload = authorization.payload
         if str(payload.get("device_id") or "") != device_id:
             raise ValueError("Destination authorization device binding does not match")
+        if str(payload.get("action") or "") != action:
+            raise ValueError("Destination authorization action binding does not match")
         if str(payload.get("address") or "") != address:
             raise ValueError("Destination authorization address binding does not match")
         if str(payload.get("asset") or "") != asset:

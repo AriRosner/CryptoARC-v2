@@ -1010,31 +1010,72 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def save_mobile_destination_authorization(
+    def create_mobile_destination_authorization(
         self,
         authorization: MobileDestinationAuthorization,
     ) -> MobileDestinationAuthorization:
         payload = authorization.to_dict()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO mobile_destination_authorizations (
-                    id, payload, created_at, expires_at, used_at
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO mobile_destination_authorizations (
+                        id, payload, created_at, expires_at, used_at
+                    )
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        authorization.id,
+                        json.dumps(payload["payload"]),
+                        payload["created_at"],
+                        payload["expires_at"],
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    payload = excluded.payload,
-                    expires_at = excluded.expires_at,
-                    used_at = excluded.used_at
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("Mobile destination authorization already exists") from exc
+        return authorization
+
+    def attach_mobile_destination_preview(
+        self,
+        authorization_id: str,
+        preview: dict[str, Any],
+    ) -> MobileDestinationAuthorization:
+        """Attach a preview only while the authorization is still unused."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id, payload, created_at, expires_at, used_at
+                FROM mobile_destination_authorizations
+                WHERE id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("Mobile destination authorization not found")
+            authorization = self._mobile_destination_authorization_from_row(row)
+            now = datetime.now(timezone.utc)
+            if authorization.used_at:
+                raise ValueError("Destination authorization is already used")
+            if authorization.expires_at <= now:
+                raise ValueError("Destination authorization expired")
+            authorization.payload["preview"] = dict(preview)
+            cursor = connection.execute(
+                """
+                UPDATE mobile_destination_authorizations
+                SET payload = ?
+                WHERE id = ? AND used_at IS NULL AND expires_at > ?
                 """,
                 (
-                    authorization.id,
-                    json.dumps(payload["payload"]),
-                    payload["created_at"],
-                    payload["expires_at"],
-                    payload["used_at"],
+                    json.dumps(authorization.payload),
+                    authorization_id,
+                    now.isoformat(),
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "Destination authorization changed before preview could be attached"
+                )
         return authorization
 
     def load_mobile_destination_authorization(
@@ -1149,6 +1190,7 @@ class Storage:
         asset: str,
         amount: str,
         token_accounts: list[str],
+        source_wallet_public_key: str,
     ) -> tuple[MobileActionReceipt, bool]:
         """Consume one exact preview while durably reserving its side effect."""
         with self._connect() as connection:
@@ -1201,6 +1243,10 @@ class Storage:
                     str(preview.get("authorization_id") or ""),
                     authorization_id,
                 ),
+                "source wallet": (
+                    str(preview.get("source_wallet_public_key") or ""),
+                    source_wallet_public_key,
+                ),
             }
             for label, (expected, actual) in bindings.items():
                 if expected != actual:
@@ -1211,13 +1257,17 @@ class Storage:
                 raise ValueError(
                     "Treasury preview token account binding does not match"
                 )
+            if str(authorization.payload.get("action") or "") != action:
+                raise ValueError(
+                    "Destination authorization action binding does not match"
+                )
             authorization.payload["preview"] = {
                 **preview,
                 "used_at": now.isoformat(),
             }
             authorization.used_at = now
             payload = receipt.to_dict()
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE mobile_destination_authorizations
                 SET payload = ?, used_at = ?
@@ -1229,8 +1279,45 @@ class Storage:
                     authorization_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    "Destination authorization changed before it could be consumed"
+                )
             self._insert_mobile_action_receipt(connection, receipt)
         return receipt, True
+
+    def load_pending_mobile_treasury_receipts(
+        self,
+        *,
+        wallet_public_key: str,
+        asset: str,
+        exclude_action_id: str = "",
+    ) -> list[MobileActionReceipt]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at, execution_audit_id
+                FROM mobile_action_receipts
+                WHERE action_type IN (
+                    'withdrawal', 'profit_sweep', 'rent_recovery'
+                )
+                  AND status IN (
+                      'pending', 'verifying', 'review_required'
+                  )
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        return [
+            receipt
+            for receipt in (
+                self._mobile_action_receipt_from_row(row) for row in rows
+            )
+            if receipt.id != exclude_action_id
+            and str(receipt.payload.get("source_wallet_public_key") or "")
+            == wallet_public_key
+            and str(receipt.payload.get("asset") or "") == asset
+        ]
 
     def load_mobile_action_receipts(
         self,
@@ -2105,7 +2192,10 @@ class Storage:
     def save_live_session(self, session: LiveSession) -> None:
         self._save_payload("live_sessions", session.id, session.to_dict(), session.created_at)
 
-    def load_live_execution_audits(self, limit: int = 100) -> list[LiveExecutionAudit]:
+    def load_live_execution_audits(
+        self,
+        limit: int | None = 100,
+    ) -> list[LiveExecutionAudit]:
         return [self._live_execution_audit_from_payload(payload) for payload in self._load_payloads("live_execution_audits", limit)]
 
     def load_live_execution_audit(self, audit_id: str) -> LiveExecutionAudit | None:
@@ -2144,9 +2234,21 @@ class Storage:
     def save_live_ledger_position(self, position: LiveLedgerPosition) -> None:
         self._save_payload("live_ledger_positions", position.id, position.to_dict(), position.created_at)
 
-    def _load_payloads(self, table: str, limit: int) -> list[dict[str, Any]]:
+    def _load_payloads(
+        self,
+        table: str,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
         with self._connect() as connection:
-            rows = connection.execute(f"SELECT payload FROM {table} ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            if limit is None:
+                rows = connection.execute(
+                    f"SELECT payload FROM {table} ORDER BY created_at DESC"
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f"SELECT payload FROM {table} ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
     def _save_payload(self, table: str, item_id: str, payload: dict[str, Any], created_at: datetime) -> None:

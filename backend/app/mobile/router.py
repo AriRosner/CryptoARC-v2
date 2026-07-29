@@ -260,6 +260,7 @@ def create_mobile_router(
             return service.authorize_destination(
                 desktop_operator={"authenticated": True, "id": "desktop"},
                 device_id=payload.device_id,
+                action=payload.action,
                 address=payload.address,
                 asset=payload.asset,
                 max_amount=payload.max_amount,

@@ -49,6 +49,7 @@ export interface MobileWalletPayload {
   rent: {
     recoverable_sol: number;
     eligible_accounts: number;
+    eligible_token_accounts: string[];
     status: string;
     approximate: boolean;
   };
@@ -87,6 +88,7 @@ export interface MobileWalletTransactionsPayload {
 export interface MobileDestinationAuthorization {
   id: string;
   device_id: string;
+  action: TreasuryAction;
   address: string;
   asset: string;
   max_amount: string;
@@ -116,6 +118,8 @@ export interface MobileTreasuryPreview {
   expires_at: string;
   warnings: string[];
   token_accounts: string[];
+  source_wallet_public_key: string;
+  purpose: string;
 }
 
 export interface TreasuryPreviewInput {

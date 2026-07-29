@@ -11,6 +11,7 @@ import { ActionStatus } from "../trades/ActionStatus";
 import {
   pendingActionForOwner,
   pendingActionForReview,
+  pendingActionRoute,
   pendingActionStore as durablePendingActionStore,
   samePendingActionOwner,
   TEST_PENDING_ACTION_OWNER,
@@ -32,6 +33,7 @@ export interface GuardedTreasuryActionProps {
   createIdempotencyKey?(): string;
   pendingActionStore?: PendingActionStore;
   pendingOwner?: PendingActionOwner;
+  onOpenPendingAction?(action: PendingMobileAction): void;
 }
 
 export interface TreasuryPendingRecoveryProps {
@@ -83,11 +85,13 @@ export function GuardedTreasuryAction({
   createIdempotencyKey = createMobileIdempotencyKey,
   pendingActionStore = durablePendingActionStore,
   pendingOwner = TEST_PENDING_ACTION_OWNER,
+  onOpenPendingAction,
 }: GuardedTreasuryActionProps) {
   const [authenticatedAt, setAuthenticatedAt] = useState(0);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingElsewhere, setPendingElsewhere] = useState(false);
   const [abandonArmed, setAbandonArmed] = useState(false);
   const inFlight = useRef(false);
   const pendingAction = useRef<PendingMobileAction | null>(null);
@@ -98,6 +102,7 @@ export function GuardedTreasuryAction({
     setReceipt(null);
     setError("");
     setAbandonArmed(false);
+    setPendingElsewhere(false);
     inFlight.current = false;
     actionId.current = "";
   }, [preview.preview_id]);
@@ -117,16 +122,19 @@ export function GuardedTreasuryAction({
         const reviewed = pendingActionForReview(pending, message);
         pendingAction.current = reviewed;
         actionId.current = pending.actionId;
+        setPendingElsewhere(false);
         void pendingActionStore.save(reviewed);
         setReceipt(reviewReceipt(pending.actionId, message));
       } else if (belongsHere) {
         pendingAction.current = pending;
         actionId.current = pending.actionId;
+        setPendingElsewhere(false);
         setReceipt(verifyingReceipt(pending.actionId));
       } else {
         const message =
           "Another financial action is pending. Open its owning screen to reconcile it.";
         pendingAction.current = pending;
+        setPendingElsewhere(true);
         setReceipt(reviewReceipt(pending.actionId, message));
       }
     });
@@ -159,6 +167,16 @@ export function GuardedTreasuryAction({
             setReceipt(next);
             if (["pending", "verifying"].includes(next.status)) {
               poll();
+            } else if (next.status === "review_required") {
+              const current = pendingAction.current;
+              if (current) {
+                const reviewed = pendingActionForReview(
+                  current,
+                  next.operator_message,
+                );
+                pendingAction.current = reviewed;
+                void pendingActionStore.save(reviewed);
+              }
             } else {
               pendingAction.current = null;
               void pendingActionStore.clear(next.action_id);
@@ -253,7 +271,14 @@ export function GuardedTreasuryAction({
         idempotencyKey: actionId.current,
       });
       setReceipt(next);
-      if (!["pending", "verifying"].includes(next.status)) {
+      if (next.status === "review_required") {
+        const reviewed = pendingActionForReview(
+          durable,
+          next.operator_message,
+        );
+        pendingAction.current = reviewed;
+        await pendingActionStore.save(reviewed);
+      } else if (!["pending", "verifying"].includes(next.status)) {
         await pendingActionStore.clear(next.action_id);
         pendingAction.current = null;
       }
@@ -283,12 +308,18 @@ export function GuardedTreasuryAction({
 
   const confirmAbandon = async () => {
     const current = pendingAction.current;
-    if (!current) return;
+    if (!current || pendingElsewhere) return;
     await pendingActionStore.clear(current.actionId);
     pendingAction.current = null;
     actionId.current = "";
     setReceipt(null);
     setAbandonArmed(false);
+  };
+
+  const openPendingAction = () => {
+    const current = pendingAction.current;
+    if (!current || !pendingActionRoute(current)) return;
+    onOpenPendingAction?.(current);
   };
 
   const blocked =
@@ -321,6 +352,11 @@ export function GuardedTreasuryAction({
         value={`${preview.remaining_balance_sol} SOL`}
       />
       <DetailRow label="Authorization" value={preview.authorization_id} />
+      <DetailRow label="Purpose" value={preview.purpose} />
+      <DetailRow
+        label="Source wallet"
+        value={preview.source_wallet_public_key}
+      />
       <DetailRow
         label="Expires"
         value={new Date(preview.expires_at).toLocaleString()}
@@ -352,7 +388,20 @@ export function GuardedTreasuryAction({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {receipt ? <ActionStatus receipt={receipt} /> : null}
       {receipt?.status === "review_required" ? (
-        abandonArmed ? (
+        pendingElsewhere ? (
+          pendingAction.current &&
+          pendingActionRoute(pendingAction.current) &&
+          onOpenPendingAction ? (
+            <ActionButton
+              label="Open pending action"
+              onPress={openPendingAction}
+            />
+          ) : (
+            <Text style={styles.warning}>
+              Open the owning treasury screen to reconcile this action.
+            </Text>
+          )
+        ) : abandonArmed ? (
           <>
             <Text style={styles.warning}>
               Abandoning removes only local recovery state. Verify the desktop
@@ -441,6 +490,16 @@ export function TreasuryPendingRecovery({
             setReceipt(next);
             if (["pending", "verifying"].includes(next.status)) {
               poll();
+            } else if (next.status === "review_required") {
+              const current = pendingAction.current;
+              if (current) {
+                const reviewed = pendingActionForReview(
+                  current,
+                  next.operator_message,
+                );
+                pendingAction.current = reviewed;
+                void pendingActionStore.save(reviewed);
+              }
             } else {
               pendingAction.current = null;
               void pendingActionStore.clear(next.action_id);

@@ -1,5 +1,10 @@
 import { router } from "expo-router";
-import { ArrowUpRight, RefreshCw } from "lucide-react-native";
+import {
+  ArrowUpRight,
+  BadgeDollarSign,
+  RefreshCw,
+  RotateCcw,
+} from "lucide-react-native";
 import React from "react";
 import {
   RefreshControl,
@@ -37,6 +42,8 @@ export interface WalletScreenProps {
   error?: string;
   onRefresh?(): void;
   onWithdraw?(): void;
+  onProfitSweep?(): void;
+  onRentRecovery?(): void;
 }
 
 function sol(value: number) {
@@ -51,7 +58,15 @@ function WalletView({
   error = "",
   onRefresh = () => undefined,
   onWithdraw = () => undefined,
+  onProfitSweep = () => undefined,
+  onRentRecovery = () => undefined,
 }: WalletScreenProps) {
+  const hasAuthorization = (action: MobileDestinationAuthorization["action"]) =>
+    destinations.some(
+      (destination) =>
+        destination.status === "active" && destination.action === action,
+    );
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView
@@ -177,19 +192,30 @@ function WalletView({
               <ActionButton
                 label="Review withdrawal"
                 icon={<ArrowUpRight color={colors.text} size={16} />}
-                disabled={
-                  !destinations.some(
-                    (destination) => destination.status === "active",
-                  )
-                }
+                disabled={!hasAuthorization("withdrawal")}
                 onPress={onWithdraw}
+              />
+              <ActionButton
+                label="Review profit sweep"
+                icon={<BadgeDollarSign color={colors.text} size={16} />}
+                disabled={!hasAuthorization("profit_sweep")}
+                onPress={onProfitSweep}
+              />
+              <ActionButton
+                label="Review rent recovery"
+                icon={<RotateCcw color={colors.text} size={16} />}
+                disabled={
+                  !hasAuthorization("rent_recovery") ||
+                  wallet.rent.eligible_token_accounts.length === 0
+                }
+                onPress={onRentRecovery}
               />
               {!destinations.some(
                 (destination) => destination.status === "active",
               ) ? (
                 <Text style={styles.note}>
                   Issue a short-lived destination authorization from the
-                  desktop before reviewing a withdrawal.
+                  desktop before reviewing a treasury action.
                 </Text>
               ) : null}
             </Section>
@@ -212,9 +238,26 @@ function ConnectedWalletScreen() {
   const transactionsQuery = useWalletTransactionsQuery();
   const destinationsQuery = useDestinationsQuery();
   const destinations = destinationsQuery.data?.destinations ?? [];
-  const active = destinations.find(
-    (destination) => destination.status === "active",
-  );
+  const activeAuthorization = (
+    action: MobileDestinationAuthorization["action"],
+  ) =>
+    destinations.find(
+      (destination) =>
+        destination.status === "active" && destination.action === action,
+    );
+  const treasuryParams = (
+    action: MobileDestinationAuthorization["action"],
+  ) => {
+    const authorization = activeAuthorization(action);
+    if (!authorization) return null;
+    return {
+      action,
+      authorizationId: authorization.id,
+      address: authorization.address,
+      asset: authorization.asset,
+      amount: authorization.max_amount,
+    };
+  };
   const refresh = () => {
     void walletQuery.refetch();
     void transactionsQuery.refetch();
@@ -238,6 +281,7 @@ function ConnectedWalletScreen() {
       }
       onRefresh={refresh}
       onWithdraw={() => {
+        const active = activeAuthorization("withdrawal");
         if (!active) return;
         router.push({
           pathname: "/wallet/withdraw",
@@ -246,6 +290,23 @@ function ConnectedWalletScreen() {
             address: active.address,
             asset: active.asset,
             maxAmount: active.max_amount,
+          },
+        });
+      }}
+      onProfitSweep={() => {
+        const params = treasuryParams("profit_sweep");
+        if (!params) return;
+        router.push({ pathname: "/wallet/treasury", params });
+      }}
+      onRentRecovery={() => {
+        const params = treasuryParams("rent_recovery");
+        if (!params || !walletQuery.data) return;
+        router.push({
+          pathname: "/wallet/treasury",
+          params: {
+            ...params,
+            tokenAccounts:
+              walletQuery.data.rent.eligible_token_accounts.join(","),
           },
         });
       }}

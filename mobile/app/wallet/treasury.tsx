@@ -2,13 +2,7 @@ import { useNetInfo } from "@react-native-community/netinfo";
 import { router, useLocalSearchParams } from "expo-router";
 import { ArrowLeft } from "lucide-react-native";
 import React, { useState } from "react";
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  TextInput,
-  View,
-} from "react-native";
+import { Pressable, ScrollView, StyleSheet, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
@@ -19,63 +13,99 @@ import {
 } from "@/src/components/ui";
 import { authenticatedRead } from "@/src/core/api/authenticatedRead";
 import { useOptionalSession } from "@/src/core/session/SessionProvider";
+import type { PendingMobileAction } from "@/src/features/trades/pendingAction";
+import {
+  pendingActionRoute,
+  TEST_PENDING_ACTION_OWNER,
+} from "@/src/features/trades/pendingAction";
 import {
   executeTreasuryAction,
   fetchTreasuryAction,
   previewTreasuryAction,
 } from "@/src/features/wallet/api";
-import type { MobileTreasuryPreview } from "@/src/features/wallet/types";
-import {
-  TreasuryPendingRecovery,
-  WithdrawalScreen,
-} from "@/src/features/wallet/WithdrawalScreen";
-import {
-  pendingActionRoute,
-  TEST_PENDING_ACTION_OWNER,
-} from "@/src/features/trades/pendingAction";
+import { ProfitSweepSheet } from "@/src/features/wallet/ProfitSweepSheet";
+import { RentRecoverySheet } from "@/src/features/wallet/RentRecoverySheet";
+import type {
+  MobileTreasuryPreview,
+  TreasuryAction,
+  TreasuryExecuteInput,
+} from "@/src/features/wallet/types";
+import { TreasuryPendingRecovery } from "@/src/features/wallet/WithdrawalScreen";
 import { colors, radius, spacing } from "@/src/theme";
 
 function parameter(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] ?? "" : value ?? "";
 }
 
-export default function WithdrawalRoute() {
+function treasuryAction(value: string): TreasuryAction | null {
+  return value === "profit_sweep" || value === "rent_recovery"
+    ? value
+    : null;
+}
+
+export default function TreasuryRoute() {
   const params = useLocalSearchParams<{
+    action?: string;
     authorizationId?: string;
     address?: string;
     asset?: string;
-    maxAmount?: string;
+    amount?: string;
+    tokenAccounts?: string;
   }>();
+  const action = treasuryAction(parameter(params.action));
   const authorizationId = parameter(params.authorizationId);
   const address = parameter(params.address);
   const asset = parameter(params.asset) || "SOL";
-  const maxAmount = parameter(params.maxAmount);
+  const amount = parameter(params.amount);
+  const tokenAccounts = parameter(params.tokenAccounts)
+    .split(",")
+    .map((account) => account.trim())
+    .filter(Boolean);
   const session = useOptionalSession();
   const netInfo = useNetInfo();
-  const [amount, setAmount] = useState(maxAmount);
   const [preview, setPreview] = useState<MobileTreasuryPreview | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const connection = session
     ? { apiBaseUrl: session.apiBaseUrl, token: session.token }
     : {};
+  const pendingOwner = session
+    ? {
+        apiBaseUrl: session.apiBaseUrl,
+        deviceId: session.device?.id || "unpaired-device",
+        sessionId:
+          session.record?.savedAt || `session-${session.generation}`,
+      }
+    : TEST_PENDING_ACTION_OWNER;
   const online = Boolean(
     netInfo.isConnected && netInfo.isInternetReachable !== false,
   );
+  const title =
+    action === "profit_sweep" ? "Profit sweep" : "Rent recovery";
 
   const loadPreview = async () => {
-    if (!online || loading || !authorizationId || !address || !amount) return;
+    if (
+      !action ||
+      !online ||
+      loading ||
+      !authorizationId ||
+      !address ||
+      !amount
+    ) {
+      return;
+    }
     setLoading(true);
     setError("");
     try {
       const next = await authenticatedRead(session, () =>
         previewTreasuryAction(
-          "withdrawal",
+          action,
           {
             authorizationId,
             address,
             asset,
             amount,
+            tokenAccounts,
           },
           connection,
         ),
@@ -86,12 +116,42 @@ export default function WithdrawalRoute() {
       setError(
         caught instanceof Error
           ? caught.message
-          : "Withdrawal preview is unavailable",
+          : "Treasury preview is unavailable",
       );
     } finally {
       setLoading(false);
     }
   };
+
+  const reconcileAction = (actionId: string) =>
+    authenticatedRead(session, () =>
+      fetchTreasuryAction(actionId, connection),
+    );
+
+  const openPendingAction = (pending: PendingMobileAction) => {
+    const path = pendingActionRoute(pending);
+    if (path) router.push(path);
+  };
+
+  const execute = (input: TreasuryExecuteInput) => {
+    if (!action) {
+      throw new Error("Unsupported treasury action");
+    }
+    return authenticatedRead(session, () =>
+      executeTreasuryAction(action, input, connection),
+    );
+  };
+
+  const actionProps = preview
+    ? {
+        preview,
+        online,
+        execute,
+        reconcileAction,
+        pendingOwner,
+        onOpenPendingAction: openPendingAction,
+      }
+    : null;
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -105,82 +165,41 @@ export default function WithdrawalRoute() {
         </Pressable>
         <PageHeader
           eyebrow="Authorized treasury"
-          title="Withdrawal"
-          subtitle="Destination and asset are fixed by the desktop-issued authorization."
+          title={action ? title : "Treasury recovery"}
+          subtitle="Desktop policy, source wallet, amount, and destination are revalidated before local signing."
         />
-        {!authorizationId || !address ? (
+        {!action ? (
+          <EmptyState
+            title="Unsupported treasury action"
+            body="Return to Wallet and open an active treasury authorization."
+          />
+        ) : !authorizationId || !address ? (
           <Section title="Pending recovery">
             <TreasuryPendingRecovery
-              reconcileAction={(actionId) =>
-                authenticatedRead(session, () =>
-                  fetchTreasuryAction(actionId, connection),
-                )
-              }
-              pendingOwner={
-                session
-                  ? {
-                      apiBaseUrl: session.apiBaseUrl,
-                      deviceId:
-                        session.device?.id || "unpaired-device",
-                      sessionId:
-                        session.record?.savedAt ||
-                        `session-${session.generation}`,
-                    }
-                  : TEST_PENDING_ACTION_OWNER
-              }
+              reconcileAction={reconcileAction}
+              pendingOwner={pendingOwner}
             />
             <EmptyState
               title="Authorization required"
-              body="Open an active desktop-issued destination authorization from the Wallet tab to start a new withdrawal."
+              body="Open an active desktop-issued authorization from the Wallet tab to start a new treasury action."
             />
           </Section>
-        ) : preview ? (
+        ) : preview && actionProps ? (
           <Section title="Elevated confirmation">
-            <WithdrawalScreen
-              preview={preview}
-              online={online}
-              execute={(input) =>
-                authenticatedRead(session, () =>
-                  executeTreasuryAction("withdrawal", input, connection),
-                )
-              }
-              reconcileAction={(actionId) =>
-                authenticatedRead(session, () =>
-                  fetchTreasuryAction(actionId, connection),
-                )
-              }
-              pendingOwner={
-                session
-                  ? {
-                      apiBaseUrl: session.apiBaseUrl,
-                      deviceId:
-                        session.device?.id || "unpaired-device",
-                      sessionId:
-                        session.record?.savedAt ||
-                        `session-${session.generation}`,
-                    }
-                  : TEST_PENDING_ACTION_OWNER
-              }
-              onOpenPendingAction={(action) => {
-                const path = pendingActionRoute(action);
-                if (path) router.push(path);
-              }}
-            />
+            {action === "profit_sweep" ? (
+              <ProfitSweepSheet {...actionProps} />
+            ) : (
+              <RentRecoverySheet {...actionProps} />
+            )}
           </Section>
         ) : (
-          <Section title="Bound amount">
-            <TextInput
-              accessibilityLabel="Withdrawal amount"
-              editable={online && !loading}
-              keyboardType="decimal-pad"
-              value={amount}
-              onChangeText={setAmount}
-              placeholder={maxAmount || "0.0"}
-              placeholderTextColor={colors.faint}
-              style={styles.input}
-            />
+          <Section title="Policy-bound preview">
             <ActionButton
-              label={online ? "Create exact preview" : "Unavailable offline"}
+              label={
+                online
+                  ? `Create ${title.toLowerCase()} preview`
+                  : "Unavailable offline"
+              }
               disabled={!online || loading || !amount}
               loading={loading}
               onPress={() => void loadPreview()}
@@ -212,15 +231,5 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
     borderRadius: radius.md,
     borderWidth: 1,
-  },
-  input: {
-    minHeight: 48,
-    color: colors.text,
-    backgroundColor: colors.panelRaised,
-    borderColor: colors.borderStrong,
-    borderRadius: radius.md,
-    borderWidth: 1,
-    fontSize: 16,
-    paddingHorizontal: spacing.md,
   },
 });

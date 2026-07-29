@@ -885,6 +885,7 @@ class MobileDestinationAuthorization:
         return {
             "id": self.id,
             "device_id": str(self.payload.get("device_id") or ""),
+            "action": str(self.payload.get("action") or ""),
             "address": str(self.payload.get("address") or ""),
             "asset": str(self.payload.get("asset") or ""),
             "max_amount": str(self.payload.get("max_amount") or ""),

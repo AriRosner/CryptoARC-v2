@@ -90,6 +90,7 @@ class MobileDestinationAuthorizationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     device_id: str = Field(min_length=1, max_length=120)
+    action: Literal["withdrawal", "profit_sweep", "rent_recovery"]
     address: str = Field(min_length=32, max_length=100)
     asset: str = Field(min_length=1, max_length=16)
     max_amount: Decimal = Field(gt=0)
@@ -120,6 +121,8 @@ class MobileTreasuryPreview(BaseModel):
     expires_at: datetime
     warnings: list[str]
     token_accounts: list[str] = Field(default_factory=list, max_length=64)
+    source_wallet_public_key: str
+    purpose: str
 
 
 class MobileFreshness(BaseModel):

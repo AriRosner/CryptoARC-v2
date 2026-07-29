@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+import base64
 import json
+import threading
 import unittest
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from solders.keypair import Keypair
 
-from app.core.models import utc_now
+from app.core.models import (
+    LiveExecutionAudit,
+    MobileActionReceipt,
+    utc_now,
+)
+from app.core.state import BotState
 from app.core.storage import Storage
 from app.mobile.router import create_mobile_router
 from app.mobile.service import MobileCommandCenterService
@@ -70,6 +79,9 @@ class TreasuryState:
             "rent": {
                 "recoverable_sol": 0.004,
                 "eligible_accounts": 2,
+                "eligible_token_accounts": [
+                    "TokenAccount111111111111111111111111111111"
+                ],
                 "status": "ready",
                 "approximate": False,
             },
@@ -118,8 +130,9 @@ class TreasuryState:
         asset: str,
         amount: Decimal,
         token_accounts: list[str],
+        exclude_action_id: str = "",
     ) -> dict[str, object]:
-        del address, asset
+        del address, asset, exclude_action_id
         if self.blockers:
             return {"blockers": list(self.blockers)}
         expected_fee = Decimal("0.000005")
@@ -142,6 +155,7 @@ class TreasuryState:
         *,
         action_id: str,
         action: str,
+        source_wallet_public_key: str,
         address: str,
         asset: str,
         amount: Decimal,
@@ -155,6 +169,11 @@ class TreasuryState:
         )
         if authorization is None or authorization.used_at is None:
             raise AssertionError("authorization was not consumed atomically")
+        if (
+            source_wallet_public_key
+            != self.settings.live_active_wallet_public_key
+        ):
+            raise AssertionError("treasury source wallet was not bound")
         self.execute_calls += 1
         return {
             "status": self.execute_status,
@@ -219,6 +238,7 @@ class MobileTreasuryTests(unittest.TestCase):
         self,
         *,
         device_id: str | None = None,
+        action: str = "withdrawal",
         address: str | None = None,
         asset: str = "SOL",
         max_amount: Decimal = Decimal("0.25"),
@@ -228,6 +248,7 @@ class MobileTreasuryTests(unittest.TestCase):
         return self.service.authorize_destination(
             desktop_operator=self.desktop_operator,
             device_id=device_id or self.device["id"],
+            action=action,
             address=address or self.destination,
             asset=asset,
             max_amount=max_amount,
@@ -298,6 +319,64 @@ class MobileTreasuryTests(unittest.TestCase):
             )
         self.assertEqual(self.state.execute_calls, 1)
 
+    def test_concurrent_stale_preview_cannot_reactivate_consumed_authorization(self) -> None:
+        authorization = self.authorize()
+        original_preview = self.preview(authorization)
+        late_preflight_started = threading.Event()
+        release_late_preflight = threading.Event()
+        original_preflight = self.state.mobile_treasury_preflight
+        late_result: list[object] = []
+
+        def delayed_preflight(**kwargs: object) -> dict[str, object]:
+            if kwargs.get("amount") == Decimal("0.19"):
+                late_preflight_started.set()
+                self.assertTrue(release_late_preflight.wait(timeout=5))
+            return original_preflight(**kwargs)
+
+        self.state.mobile_treasury_preflight = delayed_preflight  # type: ignore[method-assign]
+
+        def create_late_preview() -> None:
+            try:
+                late_result.append(
+                    self.preview(authorization, amount=Decimal("0.19"))
+                )
+            except Exception as exc:
+                late_result.append(exc)
+
+        thread = threading.Thread(target=create_late_preview)
+        thread.start()
+        self.assertTrue(late_preflight_started.wait(timeout=5))
+        self.execute(authorization, original_preview)
+        release_late_preflight.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+
+        stored = self.storage.load_mobile_destination_authorization(
+            str(authorization["id"])
+        )
+        self.assertIsNotNone(stored)
+        self.assertIsNotNone(stored.used_at if stored else None)
+        self.assertEqual(len(late_result), 1)
+        self.assertIsInstance(late_result[0], ValueError)
+        self.assertIn("already used", str(late_result[0]))
+        with self.assertRaisesRegex(ValueError, "already used"):
+            self.preview(authorization, amount=Decimal("0.18"))
+        self.assertEqual(self.state.execute_calls, 1)
+
+    def test_destination_authorization_is_bound_to_one_treasury_action(self) -> None:
+        authorization = self.service.authorize_destination(
+            desktop_operator=self.desktop_operator,
+            device_id=self.device["id"],
+            action="profit_sweep",
+            address=self.destination,
+            asset="SOL",
+            max_amount=Decimal("0.25"),
+            expires_in_seconds=300,
+            purpose="configured profit sweep",
+        )
+        with self.assertRaisesRegex(ValueError, "action"):
+            self.preview(authorization, action="withdrawal")
+
     def test_execute_requires_exact_unexpired_preview_binding(self) -> None:
         cases = [
             ("address", {"address": "OtherDestination1111111111111111111111111"}),
@@ -337,8 +416,18 @@ class MobileTreasuryTests(unittest.TestCase):
             str(authorization["id"])
         )
         assert stored is not None
-        stored.expires_at = utc_now() - timedelta(seconds=1)
-        self.storage.save_mobile_destination_authorization(stored)
+        with self.storage._connect() as connection:
+            connection.execute(
+                """
+                UPDATE mobile_destination_authorizations
+                SET expires_at = ?
+                WHERE id = ?
+                """,
+                (
+                    (utc_now() - timedelta(seconds=1)).isoformat(),
+                    stored.id,
+                ),
+            )
         with self.assertRaisesRegex(ValueError, "expired"):
             self.preview(authorization)
 
@@ -413,7 +502,7 @@ class MobileTreasuryTests(unittest.TestCase):
             ),
         ]:
             with self.subTest(action=action):
-                authorization = self.authorize(purpose=action)
+                authorization = self.authorize(action=action, purpose=action)
                 preview = self.preview(
                     authorization,
                     action=action,
@@ -497,6 +586,7 @@ class MobileTreasuryTests(unittest.TestCase):
             "/api/mobile/destination-authorizations",
             json={
                 "device_id": self.device["id"],
+                "action": "withdrawal",
                 "address": self.destination,
                 "asset": "SOL",
                 "max_amount": "0.25",
@@ -506,6 +596,469 @@ class MobileTreasuryTests(unittest.TestCase):
         )
         self.assertEqual(desktop.status_code, 200)
         self.assertNotIn("desktop_operator", json.dumps(desktop.json()).lower())
+
+
+class ProductionTreasurySafetyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.state = BotState(
+            database_path=str(Path(self.directory.name) / "production-treasury.db")
+        )
+        self.wallet = str(Keypair().pubkey())
+        self.destination = str(Keypair().pubkey())
+        settings = self.state.settings
+        settings.live_active_backend_armed = True
+        settings.live_active_wallet_public_key = self.wallet
+        settings.live_hot_wallet_public_key = self.wallet
+        settings.live_signer_mode = "local_hot_wallet"
+        settings.live_session_acknowledged = True
+        settings.kill_switch_enabled = False
+        settings.solana_rpc_url = "http://127.0.0.1:1"
+        settings.profit_sweep_min_reserve_sol = 0.05
+        settings.profit_sweep_enabled = True
+        settings.profit_sweep_mode = "fixed_sol"
+        settings.profit_sweep_threshold_sol = 0.05
+        settings.profit_sweep_min_profit_sol = 0.05
+        settings.profit_sweep_amount_sol = 0.02
+        settings.profit_sweep_percentage = 25.0
+        settings.profit_sweep_destination_wallet = self.destination
+        settings.profit_sweep_cooldown_seconds = 3600
+        settings.profit_sweep_max_per_day = 2
+        self.balance = Decimal("0.50")
+        self.realized = Decimal("0.10")
+        self._configure_safe_fakes()
+
+    def _configure_safe_fakes(self) -> None:
+        self.state.signer_status = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+            "connected": True,
+            "healthy": True,
+            "can_sign": True,
+            "wallet_public_key": self.wallet,
+        }
+        self.state.hot_wallet = SimpleNamespace(
+            status=lambda: {
+                "imported": True,
+                "unlocked": True,
+                "wallet_public_key": self.wallet,
+            },
+            transfer_sol=lambda *_args, **_kwargs: {
+                "signature": "must-not-run-unless-asserted"
+            },
+            simulate_and_submit=lambda *_args, **_kwargs: {
+                "signature": "PublicRentSignature111"
+            },
+        )
+        self.state.live_wallet_balance = lambda wallet: {  # type: ignore[method-assign]
+            "wallet_public_key": wallet,
+            "balance_sol": float(self.balance),
+            "error": "",
+        }
+        self.state.live_ledger = lambda _wallet: {  # type: ignore[method-assign]
+            "summary": {"realized_pnl_sol": float(self.realized)}
+        }
+        self.state._recent_readiness_status = lambda: {  # type: ignore[method-assign]
+            "strategy_promotion": {"can_promote": True}
+        }
+        self.state._execution_readiness_status = (  # type: ignore[method-assign]
+            lambda **_kwargs: {
+                "status": "live_ready",
+                "can_live_submit": True,
+                "blockers": [],
+            }
+        )
+        self.state._pre_run_backup_status = lambda: {  # type: ignore[method-assign]
+            "fresh": True,
+            "state": "fresh",
+            "blocker": "",
+        }
+        self.state._manual_live_verification_status = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: {"verified": True, "blocker": ""}
+        )
+
+    def _receipt(
+        self,
+        action_id: str,
+        *,
+        action: str = "withdrawal",
+        wallet: str | None = None,
+        amount: str = "0.10",
+        expected_fee: str = "0.000005",
+        status: str = "pending",
+    ) -> MobileActionReceipt:
+        now = utc_now()
+        receipt = MobileActionReceipt(
+            id=action_id,
+            idempotency_key_hash=f"hash-{action_id}",
+            device_id="device-production",
+            action_type=action,
+            entity_id=f"authorization-{action_id}",
+            payload={
+                "source_wallet_public_key": wallet or self.wallet,
+                "address": self.destination,
+                "asset": "SOL",
+                "amount": amount,
+                "expected_fee_sol": expected_fee,
+                "submitted_at": now.isoformat(),
+            },
+            status=status,
+            created_at=now,
+            updated_at=now,
+        )
+        self.state.storage.reserve_mobile_action_receipt(receipt)
+        return receipt
+
+    def _preflight(
+        self,
+        *,
+        action: str = "withdrawal",
+        amount: str = "0.20",
+        address: str | None = None,
+        exclude_action_id: str = "",
+        token_accounts: list[str] | None = None,
+    ) -> dict[str, object]:
+        return self.state.mobile_treasury_preflight(
+            action=action,
+            address=address or self.destination,
+            asset="SOL",
+            amount=Decimal(amount),
+            token_accounts=token_accounts or [],
+            exclude_action_id=exclude_action_id,
+        )
+
+    def test_preflight_rejects_reimported_or_mismatched_unlocked_wallet(self) -> None:
+        replacement = str(Keypair().pubkey())
+        self.state.signer_status = lambda *_args, **_kwargs: {  # type: ignore[method-assign]
+            "connected": True,
+            "healthy": True,
+            "can_sign": True,
+            "wallet_public_key": replacement,
+        }
+        self.state.hot_wallet.status = lambda: {
+            "imported": True,
+            "unlocked": True,
+            "wallet_public_key": replacement,
+        }
+
+        result = self._preflight()
+
+        self.assertIn(
+            "armed wallet does not match unlocked local hot wallet",
+            result["blockers"],
+        )
+
+    def test_execute_rechecks_source_wallet_immediately_before_signing(self) -> None:
+        receipt = self._receipt("wallet-swap")
+        transfer_calls: list[object] = []
+        self.state.hot_wallet.transfer_sol = lambda *_args, **_kwargs: transfer_calls.append(
+            True
+        )
+        original_preflight = self.state.mobile_treasury_preflight
+
+        def swap_after_preflight(**kwargs: object) -> dict[str, object]:
+            result = original_preflight(**kwargs)
+            replacement = str(Keypair().pubkey())
+            self.state.hot_wallet.status = lambda: {
+                "imported": True,
+                "unlocked": True,
+                "wallet_public_key": replacement,
+            }
+            return result
+
+        self.state.mobile_treasury_preflight = swap_after_preflight  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            ValueError, "armed wallet does not match unlocked local hot wallet"
+        ):
+            self.state.execute_mobile_treasury(
+                action_id=receipt.id,
+                action="withdrawal",
+                source_wallet_public_key=self.wallet,
+                address=self.destination,
+                asset="SOL",
+                amount=Decimal("0.10"),
+                token_accounts=[],
+            )
+        self.assertEqual(transfer_calls, [])
+
+    def test_profit_sweep_rechecks_wallet_after_audit_before_transfer(self) -> None:
+        receipt = self._receipt(
+            "profit-wallet-swap",
+            action="profit_sweep",
+            amount="0.02",
+        )
+        transfer_calls: list[object] = []
+        self.state.hot_wallet.transfer_sol = lambda *_args, **_kwargs: transfer_calls.append(
+            True
+        )
+        self.state.mobile_treasury_preflight = lambda **_kwargs: {  # type: ignore[method-assign]
+            "blockers": [],
+            "wallet_public_key": self.wallet,
+            "profit_sweep_policy": {"sweep_mode": "fixed_sol"},
+        }
+        original_audit = self.state._mobile_treasury_audit
+
+        def swap_after_audit(**kwargs: object) -> LiveExecutionAudit:
+            audit = original_audit(**kwargs)
+            replacement = str(Keypair().pubkey())
+            self.state.hot_wallet.status = lambda: {
+                "imported": True,
+                "unlocked": True,
+                "wallet_public_key": replacement,
+            }
+            return audit
+
+        self.state._mobile_treasury_audit = swap_after_audit  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            ValueError, "armed wallet does not match unlocked local hot wallet"
+        ):
+            self.state.execute_mobile_treasury(
+                action_id=receipt.id,
+                action="profit_sweep",
+                source_wallet_public_key=self.wallet,
+                address=self.destination,
+                asset="SOL",
+                amount=Decimal("0.02"),
+                token_accounts=[],
+            )
+        self.assertEqual(transfer_calls, [])
+
+    def test_rent_recovery_rechecks_wallet_after_build_before_signing(self) -> None:
+        receipt = self._receipt(
+            "rent-wallet-swap",
+            action="rent_recovery",
+            amount="0.004",
+        )
+        submit_calls: list[object] = []
+        self.state.hot_wallet.simulate_and_submit = lambda *_args, **_kwargs: submit_calls.append(
+            True
+        )
+        self.state.mobile_treasury_preflight = lambda **_kwargs: {  # type: ignore[method-assign]
+            "blockers": [],
+            "wallet_public_key": self.wallet,
+        }
+
+        def build_then_swap(*_args: object, **_kwargs: object) -> dict[str, object]:
+            replacement = str(Keypair().pubkey())
+            self.state.hot_wallet.status = lambda: {
+                "imported": True,
+                "unlocked": True,
+                "wallet_public_key": replacement,
+            }
+            return {
+                "unsigned_transaction_base64": base64.b64encode(b"unsigned").decode(),
+                "selected_count": 1,
+                "recoverable_rent_sol": "0.004",
+            }
+
+        self.state._build_mobile_rent_recovery_transaction = build_then_swap  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            ValueError, "armed wallet does not match unlocked local hot wallet"
+        ):
+            self.state.execute_mobile_treasury(
+                action_id=receipt.id,
+                action="rent_recovery",
+                source_wallet_public_key=self.wallet,
+                address=self.wallet,
+                asset="SOL",
+                amount=Decimal("0.004"),
+                token_accounts=[str(Keypair().pubkey())],
+            )
+        self.assertEqual(submit_calls, [])
+
+    def test_profit_sweep_requires_exact_existing_policy(self) -> None:
+        self.state.settings.profit_sweep_enabled = False
+        disabled = self._preflight(
+            action="profit_sweep",
+            amount="0.02",
+        )
+        self.assertIn("profit sweep is disabled", disabled["blockers"])
+
+        self.state.settings.profit_sweep_enabled = True
+        wrong_amount = self._preflight(
+            action="profit_sweep",
+            amount="0.03",
+        )
+        self.assertIn(
+            "profit sweep amount does not match configured policy",
+            wrong_amount["blockers"],
+        )
+
+        self.realized = Decimal("0.01")
+        below_profit = self._preflight(
+            action="profit_sweep",
+            amount="0.02",
+        )
+        self.assertIn(
+            "realized live profit is below minimum profit to sweep",
+            below_profit["blockers"],
+        )
+
+        self.realized = Decimal("0.10")
+        self.state.settings.profit_sweep_mode = "percentage"
+        percentage = self._preflight(
+            action="profit_sweep",
+            amount="0.025",
+        )
+        self.assertEqual(percentage["blockers"], [])
+        self.assertEqual(
+            Decimal(str(percentage["profit_sweep_policy"]["expected_amount_sol"])),
+            Decimal("0.025"),
+        )
+
+        self.state.settings.profit_sweep_max_per_day = 1
+        now = utc_now()
+        self.state.storage.save_live_execution_audit(
+            LiveExecutionAudit(
+                id="existing-sweep",
+                created_at=now,
+                updated_at=now,
+                action="profit_sweep",
+                mint="SOL",
+                amount="0.025",
+                status="submitted",
+                signer_mode="local_hot_wallet",
+                wallet_public_key=self.wallet,
+                final_status="submitted",
+            )
+        )
+        capped = self._preflight(
+            action="profit_sweep",
+            amount="0.025",
+        )
+        self.assertIn("daily sweep cap reached", capped["blockers"])
+        self.assertIn("profit sweep cooldown active", capped["blockers"])
+
+    def test_reservations_are_wallet_scoped_unbounded_and_exclude_current(self) -> None:
+        current = self._receipt("current", amount="0.25")
+        self._receipt("older-same-wallet", amount="0.10")
+        self._receipt(
+            "rent-fee-same-wallet",
+            action="rent_recovery",
+            amount="0.004",
+        )
+        self._receipt(
+            "review-required-same-wallet",
+            amount="0.01",
+            status="review_required",
+        )
+        other_wallet = str(Keypair().pubkey())
+        for index in range(510):
+            self._receipt(
+                f"newer-other-{index}",
+                wallet=other_wallet,
+                amount="0.40",
+            )
+
+        result = self._preflight(
+            amount="0.25",
+            exclude_action_id=current.id,
+        )
+        self.assertEqual(result["blockers"], [])
+        self.assertEqual(
+            Decimal(str(result["remaining_balance_sol"])),
+            Decimal("0.139980"),
+        )
+
+        wallet = self.state.mobile_wallet()
+        sol = wallet["balances"][0]
+        self.assertEqual(Decimal(str(sol["reserved"])), Decimal("0.410020"))
+        self.assertEqual(Decimal(str(sol["available"])), Decimal("0.089980"))
+
+    def test_live_execution_recovery_backup_and_operator_proof_all_gate(self) -> None:
+        self.state._execution_readiness_status = (  # type: ignore[method-assign]
+            lambda **_kwargs: {
+                "status": "blocked",
+                "can_live_submit": False,
+                "blockers": ["live quote evidence blocked"],
+            }
+        )
+        self.state._pre_run_backup_status = lambda: {  # type: ignore[method-assign]
+            "fresh": False,
+            "state": "missing",
+            "blocker": "pre-run backup artifact is required",
+        }
+        self.state._manual_live_verification_status = (  # type: ignore[method-assign]
+            lambda *_args, **_kwargs: {
+                "verified": False,
+                "blocker": "manual live proof is required",
+            }
+        )
+        now = utc_now()
+        self.state.storage.save_live_execution_audit(
+            LiveExecutionAudit(
+                id="unresolved-live-audit",
+                created_at=now,
+                updated_at=now,
+                action="buy",
+                mint="MintUnresolved",
+                amount="0.01",
+                status="submitted",
+                signer_mode="local_hot_wallet",
+                wallet_public_key=self.wallet,
+                final_status="submitted",
+            )
+        )
+
+        result = self._preflight()
+        joined = "; ".join(result["blockers"])
+        self.assertIn("live execution readiness", joined)
+        self.assertIn("recovery debt", joined)
+        self.assertIn("pre-run backup", joined)
+        self.assertIn("manual live proof", joined)
+
+    def test_mobile_rent_audit_and_backup_never_persist_transaction_blob(self) -> None:
+        receipt = self._receipt(
+            "rent-redaction",
+            action="rent_recovery",
+            amount="0.004",
+        )
+        raw_marker = "RAW_UNSIGNED_MOBILE_RENT_TRANSACTION_MUST_NOT_PERSIST"
+        encoded = base64.b64encode(raw_marker.encode()).decode()
+        self.state.mobile_treasury_preflight = lambda **_kwargs: {  # type: ignore[method-assign]
+            "blockers": [],
+            "wallet_public_key": self.wallet,
+        }
+        self.state.live_rent_recovery_preview = lambda *_args, **_kwargs: (  # type: ignore[method-assign]
+            self.fail("mobile execution must not call the persisted browser preview")
+        )
+        self.state._build_mobile_rent_recovery_transaction = (  # type: ignore[attr-defined]
+            lambda *_args, **_kwargs: {
+                "unsigned_transaction_base64": encoded,
+                "selected_count": 1,
+                "recoverable_rent_sol": 0.004,
+            }
+        )
+
+        result = self.state.execute_mobile_treasury(
+            action_id=receipt.id,
+            action="rent_recovery",
+            source_wallet_public_key=self.wallet,
+            address=self.wallet,
+            asset="SOL",
+            amount=Decimal("0.004"),
+            token_accounts=[str(Keypair().pubkey())],
+        )
+
+        self.assertEqual(result["status"], "submitted")
+        audits = [
+            audit
+            for audit in self.state.storage.load_live_execution_audits(20)
+            if audit.action == "rent_recovery"
+        ]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].signer_mode, "local_hot_wallet")
+        serialized_audit = json.dumps(audits[0].to_dict())
+        self.assertNotIn(raw_marker, serialized_audit)
+        self.assertNotIn(encoded, serialized_audit)
+        self.assertNotIn("unsigned_transaction", serialized_audit.lower())
+
+        artifact = self.state.storage.create_backup_artifact()
+        backup_bytes = base64.b64decode(str(artifact["database_base64"]))
+        self.assertNotIn(raw_marker.encode(), backup_bytes)
+        self.assertNotIn(encoded.encode(), backup_bytes)
 
 
 if __name__ == "__main__":

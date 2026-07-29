@@ -286,6 +286,37 @@ describe("guarded mobile trade flow", () => {
     await act(async () => {
       jest.advanceTimersByTime(1);
     });
+    expect(confirm).not.toHaveBeenCalled();
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("latches a completed continuous hold against duplicate confirmation", async () => {
+    jest.useFakeTimers();
+    const confirm = jest.fn();
+    const screen = await render(
+      <HoldToConfirm
+        label="Hold to approve trade"
+        durationMs={1400}
+        disabled={false}
+        onConfirm={confirm}
+        accessibilityHint="Hold continuously to confirm this elevated-risk approval"
+      />,
+    );
+    const hold = screen.getByTestId("hold-to-confirm-1400");
+
+    await fireEvent(hold, "pressIn");
+    await act(async () => {
+      jest.advanceTimersByTime(1400);
+    });
+    await fireEvent(hold, "pressOut");
+    await fireEvent(hold, "pressIn");
+    await act(async () => {
+      jest.advanceTimersByTime(1400);
+    });
+
     expect(confirm).toHaveBeenCalledTimes(1);
   });
 
