@@ -136,6 +136,15 @@ export function pendingActionRoute(
   ) {
     return `/position/${entityId}`;
   }
+  if (
+    ["withdrawal", "profit_sweep", "rent_recovery"].includes(
+      action.actionType,
+    )
+  ) {
+    return action.actionType === "withdrawal"
+      ? "/wallet/withdraw"
+      : "/wallet";
+  }
   return null;
 }
 

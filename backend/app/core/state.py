@@ -637,6 +637,439 @@ class BotState:
             "positions": positions,
         }
 
+    def mobile_wallet(self) -> dict[str, object]:
+        now = utc_now()
+        wallet = (
+            self.settings.live_active_wallet_public_key.strip()
+            or self.settings.live_hot_wallet_public_key.strip()
+        )
+        balance = (
+            self.live_wallet_balance(wallet)
+            if wallet
+            else {
+                "wallet_public_key": "",
+                "balance_sol": 0.0,
+                "error": "armed wallet public key is required",
+            }
+        )
+        balance_sol = float(balance.get("balance_sol") or 0.0)
+        balance_error = str(balance.get("error") or "")
+        positions = [
+            position
+            for position in self.storage.load_live_ledger_positions(500)
+            if position.wallet_public_key == wallet and position.status == "open"
+        ]
+        pending_receipts = [
+            receipt
+            for receipt in self.storage.load_mobile_action_receipts(limit=500)
+            if receipt.action_type in {"withdrawal", "profit_sweep"}
+            and receipt.status in {"pending", "verifying"}
+            and str(receipt.payload.get("address") or "")
+        ]
+        reserved_sol = sum(
+            float(receipt.payload.get("amount") or 0.0)
+            for receipt in pending_receipts
+        )
+        available_sol = max(0.0, balance_sol - reserved_sol)
+        committed_rows = []
+        for position in positions:
+            value_sol = max(
+                0.0,
+                float(position.cost_basis_sol or 0.0)
+                + float(position.unrealized_pnl_sol or 0.0),
+            )
+            committed_rows.append(
+                {
+                    "asset": position.symbol or position.mint[:8] or "TOKEN",
+                    "total": round(value_sol, 9),
+                    "committed": round(value_sol, 9),
+                    "available": 0.0,
+                    "reserved": 0.0,
+                    "approximate": True,
+                }
+            )
+        balances = [
+            {
+                "asset": "SOL",
+                "total": round(balance_sol, 9),
+                "committed": 0.0,
+                "available": round(available_sol, 9),
+                "reserved": round(reserved_sol, 9),
+                "approximate": bool(balance_error),
+            },
+            *committed_rows,
+        ]
+        total_value_sol = sum(float(row["total"]) for row in balances)
+        allocation = [
+            {
+                "asset": str(row["asset"]),
+                "value_sol": float(row["total"]),
+                "percentage": round(
+                    (float(row["total"]) / total_value_sol) * 100, 1
+                )
+                if total_value_sol > 0
+                else 0.0,
+            }
+            for row in balances
+            if float(row["total"]) > 0
+        ]
+        fees = sum(float(position.total_fees_sol or 0.0) for position in positions)
+        priority_fees = sum(
+            float(position.total_priority_fees_sol or 0.0)
+            for position in positions
+        )
+        realized = sum(
+            float(position.realized_pnl_sol or 0.0) for position in positions
+        )
+        unrealized = sum(
+            float(position.unrealized_pnl_sol or 0.0) for position in positions
+        )
+        reconciliation_statuses = [
+            str(position.reconciliation_status or "pending")
+            for position in positions
+        ]
+        reconciliation_status = (
+            "matched"
+            if reconciliation_statuses
+            and all(status == "matched" for status in reconciliation_statuses)
+            else "pending"
+            if not reconciliation_statuses
+            else "needs_review"
+        )
+        reconciled_at = max(
+            (
+                position.balance_verified_at or position.updated_at
+                for position in positions
+            ),
+            default=None,
+        )
+        try:
+            rent = self.live_rent_recovery_scan(wallet) if wallet else {}
+            rent_status = "ready" if rent.get("eligible_count") else "clear"
+            rent_error = ""
+        except Exception as exc:
+            rent = {}
+            rent_status = "unavailable"
+            rent_error = f"{exc.__class__.__name__}: {exc}"
+        signer = self.signer_status(
+            self.settings.live_signer_mode,
+            wallet,
+        )
+        readiness = self._recent_readiness_status()
+        approximate = bool(
+            balance_error
+            or reconciliation_status != "matched"
+            or committed_rows
+        )
+        return {
+            "artifact_type": "cryptoarc_mobile_wallet",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "wallet_public_key": wallet,
+            "total_value_sol": round(total_value_sol, 9),
+            "freshness": {
+                "status": "unavailable" if balance_error else "fresh",
+                "generated_at": now.isoformat(),
+                "age_seconds": 0,
+                "stale_after_seconds": 30,
+                "approximate": approximate,
+            },
+            "balances": balances,
+            "allocation": allocation,
+            "pnl": {
+                "realized_sol": round(realized, 9),
+                "unrealized_sol": round(unrealized, 9),
+                "approximate": True,
+            },
+            "fees": {
+                "network_sol": round(max(0.0, fees - priority_fees), 9),
+                "priority_sol": round(priority_fees, 9),
+                "total_sol": round(fees, 9),
+                "approximate": reconciliation_status != "matched",
+            },
+            "rent": {
+                "recoverable_sol": round(
+                    float(rent.get("recoverable_rent_sol") or 0.0), 9
+                ),
+                "eligible_accounts": int(rent.get("eligible_count") or 0),
+                "status": rent_status,
+                "approximate": bool(rent_error),
+            },
+            "reconciliation": {
+                "status": reconciliation_status,
+                "last_reconciled_at": (
+                    reconciled_at.isoformat() if reconciled_at else None
+                ),
+                "approximate": reconciliation_status != "matched",
+            },
+            "health": {
+                "rpc": "unavailable" if balance_error else "healthy",
+                "signer": (
+                    "healthy"
+                    if signer.get("connected")
+                    and signer.get("healthy")
+                    and signer.get("can_sign")
+                    else "unavailable"
+                ),
+                "backend": (
+                    "armed"
+                    if self.settings.live_active_backend_armed
+                    else "disarmed"
+                ),
+                "readiness": str(readiness.get("status") or "unknown"),
+                "kill_switch": (
+                    "enabled"
+                    if self.settings.kill_switch_enabled
+                    else "clear"
+                ),
+            },
+        }
+
+    def mobile_wallet_transactions(self) -> dict[str, object]:
+        receipts = [
+            receipt
+            for receipt in self.storage.load_mobile_action_receipts(limit=500)
+            if receipt.action_type
+            in {"withdrawal", "profit_sweep", "rent_recovery"}
+        ]
+        return {
+            "artifact_type": "cryptoarc_mobile_wallet_transactions",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "transactions": [
+                {
+                    "id": receipt.id,
+                    "action": receipt.action_type,
+                    "asset": str(receipt.payload.get("asset") or ""),
+                    "amount": str(receipt.payload.get("amount") or ""),
+                    "destination": str(
+                        receipt.payload.get("address") or ""
+                    ),
+                    "status": receipt.status,
+                    "created_at": receipt.created_at.isoformat(),
+                    "transaction_signature": str(
+                        receipt.payload.get("transaction_signature") or ""
+                    ),
+                }
+                for receipt in receipts
+            ],
+        }
+
+    def mobile_treasury_preflight(
+        self,
+        *,
+        action: str,
+        address: str,
+        asset: str,
+        amount: Decimal,
+        token_accounts: list[str],
+    ) -> dict[str, object]:
+        blockers: list[str] = []
+        wallet = self.settings.live_active_wallet_public_key.strip()
+        if action not in {"withdrawal", "profit_sweep", "rent_recovery"}:
+            blockers.append("treasury action is not supported")
+        if self.settings.kill_switch_enabled:
+            blockers.append("kill switch is enabled")
+        if not self.settings.live_active_backend_armed:
+            blockers.append("treasury backend is not armed")
+        if self.settings.live_signer_mode != "local_hot_wallet":
+            blockers.append("treasury requires the local hot wallet signer")
+        if not wallet:
+            blockers.append("armed wallet public key is required")
+        if asset != "SOL":
+            blockers.append("treasury executor currently supports SOL only")
+        signer = self.signer_status(self.settings.live_signer_mode, wallet)
+        if not (
+            signer.get("connected")
+            and signer.get("healthy")
+            and signer.get("can_sign")
+        ):
+            blockers.append(
+                str(signer.get("disabled_reason") or "signer is unhealthy")
+            )
+        readiness = self._recent_readiness_status()
+        if str(readiness.get("status") or "") != "ready":
+            blockers.append("readiness is not ready")
+        balance = self.live_wallet_balance(wallet)
+        balance_error = str(balance.get("error") or "")
+        if balance_error:
+            blockers.append(
+                f"RPC wallet health is unavailable: {balance_error}"
+            )
+        balance_sol = Decimal(str(balance.get("balance_sol") or "0"))
+        expected_fee = Decimal(SOLANA_SIGNATURE_BASE_FEE_LAMPORTS) / Decimal(
+            LAMPORTS_PER_SOL
+        )
+        pending_reserved = sum(
+            Decimal(str(receipt.payload.get("amount") or "0"))
+            for receipt in self.storage.load_mobile_action_receipts(limit=500)
+            if receipt.action_type in {"withdrawal", "profit_sweep"}
+            and receipt.status in {"pending", "verifying"}
+        )
+        configured_reserve = Decimal(
+            str(self.settings.profit_sweep_min_reserve_sol or "0")
+        )
+        available = balance_sol - pending_reserved
+        warnings = [
+            "Treasury movement requires fresh biometric authentication and a deliberate hold."
+        ]
+        if action == "rent_recovery":
+            if address != wallet:
+                blockers.append(
+                    "rent recovery destination must be the armed wallet"
+                )
+            try:
+                scan = self.live_rent_recovery_scan(wallet) if wallet else {}
+            except Exception as exc:
+                scan = {}
+                blockers.append(
+                    f"rent recovery RPC scan failed: {exc.__class__.__name__}: {exc}"
+                )
+            eligible = {
+                str(row.get("token_account") or ""): row
+                for row in scan.get("eligible_accounts", [])
+                if isinstance(row, dict)
+            }
+            if not token_accounts:
+                blockers.append("rent recovery requires eligible token accounts")
+            if any(account not in eligible for account in token_accounts):
+                blockers.append(
+                    "rent recovery contains an ineligible token account"
+                )
+            recoverable = sum(
+                Decimal(str(eligible[account].get("rent_sol") or "0"))
+                for account in token_accounts
+                if account in eligible
+            )
+            if recoverable != amount:
+                blockers.append(
+                    "rent recovery amount does not match eligible rent"
+                )
+            if available < expected_fee:
+                blockers.append(
+                    "insufficient available balance for rent recovery fees"
+                )
+            remaining = balance_sol + recoverable - expected_fee
+        else:
+            if address == wallet:
+                blockers.append(
+                    "treasury destination must differ from the armed wallet"
+                )
+            if (
+                action == "profit_sweep"
+                and address
+                != self.settings.profit_sweep_destination_wallet.strip()
+            ):
+                blockers.append(
+                    "profit sweep destination does not match desktop settings"
+                )
+            remaining = available - amount - expected_fee
+            if remaining < configured_reserve:
+                blockers.append(
+                    "insufficient available balance after reserves and fees"
+                )
+        return {
+            "blockers": list(dict.fromkeys(blockers)),
+            "expected_fee_sol": expected_fee,
+            "remaining_balance_sol": remaining,
+            "warnings": warnings,
+            "wallet_public_key": wallet,
+            "token_accounts": list(token_accounts),
+        }
+
+    def execute_mobile_treasury(
+        self,
+        *,
+        action_id: str,
+        action: str,
+        address: str,
+        asset: str,
+        amount: Decimal,
+        token_accounts: list[str],
+    ) -> dict[str, object]:
+        receipt = self.storage.load_mobile_action_receipt(action_id)
+        if receipt is None or receipt.action_type != action:
+            raise ValueError("Durable treasury action receipt is required")
+        preflight = self.mobile_treasury_preflight(
+            action=action,
+            address=address,
+            asset=asset,
+            amount=amount,
+            token_accounts=token_accounts,
+        )
+        blockers = [str(value) for value in preflight.get("blockers", [])]
+        if blockers:
+            raise ValueError("; ".join(blockers))
+        if action in {"withdrawal", "profit_sweep"}:
+            result = self.hot_wallet.transfer_sol(
+                address,
+                float(amount),
+                self.settings.solana_rpc_url,
+            )
+        else:
+            generated = self.live_rent_recovery_preview(
+                self.settings.live_active_wallet_public_key,
+                token_accounts,
+            )
+            unsigned = str(generated.get("unsigned_transaction_base64") or "")
+            if not unsigned:
+                raise ValueError(
+                    "rent recovery transaction generation failed"
+                )
+            result = self.hot_wallet.simulate_and_submit(
+                unsigned,
+                self.settings.solana_rpc_url,
+            )
+        return {
+            "status": "submitted",
+            "operator_message": "Treasury transaction submitted; verifying outcome",
+            "transaction_signature": str(
+                result.get("signature")
+                or result.get("transaction_signature")
+                or ""
+            ),
+        }
+
+    def reconcile_mobile_treasury_action(
+        self,
+        receipt: object,
+    ) -> dict[str, object]:
+        payload = getattr(receipt, "payload", {})
+        signature = (
+            str(payload.get("transaction_signature") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
+        if not signature:
+            return {
+                "status": "review_required",
+                "operator_message": (
+                    "Treasury dispatch has no transaction signature; review locally "
+                    "and do not resubmit."
+                ),
+            }
+        status = self._signature_status(signature)
+        if not status.get("ok"):
+            return {
+                "status": "review_required",
+                "operator_message": "RPC reconciliation failed; review locally",
+            }
+        if status.get("err"):
+            return {
+                "status": "failed",
+                "operator_message": "Treasury transaction failed on chain",
+            }
+        confirmation = str(status.get("confirmation_status") or "")
+        if confirmation in {"confirmed", "finalized"}:
+            return {
+                "status": "confirmed",
+                "operator_message": "Treasury transaction confirmed",
+            }
+        return {
+            "status": "verifying",
+            "operator_message": "Verifying treasury outcome",
+        }
+
     def mobile_position(self, position_id: str) -> dict[str, object] | None:
         now = utc_now()
         if position_id.startswith("paper:"):

@@ -13,7 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -1010,6 +1010,92 @@ class Storage:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def save_mobile_destination_authorization(
+        self,
+        authorization: MobileDestinationAuthorization,
+    ) -> MobileDestinationAuthorization:
+        payload = authorization.to_dict()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO mobile_destination_authorizations (
+                    id, payload, created_at, expires_at, used_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    payload = excluded.payload,
+                    expires_at = excluded.expires_at,
+                    used_at = excluded.used_at
+                """,
+                (
+                    authorization.id,
+                    json.dumps(payload["payload"]),
+                    payload["created_at"],
+                    payload["expires_at"],
+                    payload["used_at"],
+                ),
+            )
+        return authorization
+
+    def load_mobile_destination_authorization(
+        self,
+        authorization_id: str,
+    ) -> MobileDestinationAuthorization | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, payload, created_at, expires_at, used_at
+                FROM mobile_destination_authorizations
+                WHERE id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+        return self._mobile_destination_authorization_from_row(row) if row else None
+
+    def load_mobile_destination_authorizations(
+        self,
+        *,
+        device_id: str = "",
+        limit: int = 100,
+    ) -> list[MobileDestinationAuthorization]:
+        bounded_limit = max(1, min(int(limit or 100), 500))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, payload, created_at, expires_at, used_at
+                FROM mobile_destination_authorizations
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        authorizations = [
+            self._mobile_destination_authorization_from_row(row) for row in rows
+        ]
+        if device_id:
+            authorizations = [
+                authorization
+                for authorization in authorizations
+                if str(authorization.payload.get("device_id") or "") == device_id
+            ]
+        return authorizations
+
+    @staticmethod
+    def _mobile_destination_authorization_from_row(
+        row: sqlite3.Row,
+    ) -> MobileDestinationAuthorization:
+        return MobileDestinationAuthorization(
+            id=str(row["id"]),
+            payload=json.loads(str(row["payload"]) or "{}"),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            expires_at=datetime.fromisoformat(str(row["expires_at"])),
+            used_at=(
+                datetime.fromisoformat(str(row["used_at"]))
+                if row["used_at"]
+                else None
+            ),
+        )
+
     def reserve_mobile_action_receipt(
         self,
         receipt: MobileActionReceipt,
@@ -1051,6 +1137,125 @@ class Storage:
                 ),
             )
         return receipt, True
+
+    def reserve_mobile_treasury_action(
+        self,
+        receipt: MobileActionReceipt,
+        *,
+        authorization_id: str,
+        preview_id: str,
+        action: str,
+        address: str,
+        asset: str,
+        amount: str,
+        token_accounts: list[str],
+    ) -> tuple[MobileActionReceipt, bool]:
+        """Consume one exact preview while durably reserving its side effect."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._mobile_action_receipt_by_key(
+                connection,
+                receipt.idempotency_key_hash,
+            )
+            if existing:
+                return existing, False
+            row = connection.execute(
+                """
+                SELECT id, payload, created_at, expires_at, used_at
+                FROM mobile_destination_authorizations
+                WHERE id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("Mobile destination authorization not found")
+            authorization = self._mobile_destination_authorization_from_row(row)
+            now = datetime.now(timezone.utc)
+            if authorization.used_at:
+                raise ValueError("Destination authorization is already used")
+            if authorization.expires_at <= now:
+                raise ValueError("Destination authorization expired")
+            preview = authorization.payload.get("preview")
+            if not isinstance(preview, dict) or not preview_id:
+                raise ValueError("Treasury preview is missing")
+            if str(preview.get("preview_id") or "") != preview_id:
+                raise ValueError("Treasury preview does not match preview binding")
+            try:
+                preview_expires_at = datetime.fromisoformat(
+                    str(preview.get("expires_at") or "")
+                )
+            except ValueError as exc:
+                raise ValueError("Treasury preview expiry is invalid") from exc
+            if preview_expires_at <= now:
+                raise ValueError("Treasury preview expired")
+            bindings = {
+                "device": (
+                    str(preview.get("device_id") or ""),
+                    receipt.device_id,
+                ),
+                "action": (str(preview.get("action") or ""), action),
+                "address": (str(preview.get("address") or ""), address),
+                "asset": (str(preview.get("asset") or ""), asset),
+                "amount": (str(preview.get("amount") or ""), amount),
+                "authorization": (
+                    str(preview.get("authorization_id") or ""),
+                    authorization_id,
+                ),
+            }
+            for label, (expected, actual) in bindings.items():
+                if expected != actual:
+                    raise ValueError(
+                        f"Treasury preview {label} binding does not match"
+                    )
+            if list(preview.get("token_accounts") or []) != list(token_accounts):
+                raise ValueError(
+                    "Treasury preview token account binding does not match"
+                )
+            authorization.payload["preview"] = {
+                **preview,
+                "used_at": now.isoformat(),
+            }
+            authorization.used_at = now
+            payload = receipt.to_dict()
+            connection.execute(
+                """
+                UPDATE mobile_destination_authorizations
+                SET payload = ?, used_at = ?
+                WHERE id = ? AND used_at IS NULL
+                """,
+                (
+                    json.dumps(authorization.payload),
+                    now.isoformat(),
+                    authorization_id,
+                ),
+            )
+            self._insert_mobile_action_receipt(connection, receipt)
+        return receipt, True
+
+    def load_mobile_action_receipts(
+        self,
+        *,
+        device_id: str = "",
+        limit: int = 200,
+    ) -> list[MobileActionReceipt]:
+        bounded_limit = max(1, min(int(limit or 200), 1000))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at, execution_audit_id
+                FROM mobile_action_receipts
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        receipts = [self._mobile_action_receipt_from_row(row) for row in rows]
+        if device_id:
+            receipts = [
+                receipt for receipt in receipts if receipt.device_id == device_id
+            ]
+        return receipts
 
     def apply_mobile_trade_rejection(
         self,

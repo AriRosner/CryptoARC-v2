@@ -881,6 +881,26 @@ class MobileDestinationAuthorization:
         payload["used_at"] = self.used_at.isoformat() if self.used_at else None
         return payload
 
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "device_id": str(self.payload.get("device_id") or ""),
+            "address": str(self.payload.get("address") or ""),
+            "asset": str(self.payload.get("asset") or ""),
+            "max_amount": str(self.payload.get("max_amount") or ""),
+            "purpose": str(self.payload.get("purpose") or ""),
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "used_at": self.used_at.isoformat() if self.used_at else None,
+            "status": (
+                "used"
+                if self.used_at
+                else "expired"
+                if self.expires_at <= utc_now()
+                else "active"
+            ),
+        }
+
 
 @dataclass(slots=True)
 class MobilePushRegistration:

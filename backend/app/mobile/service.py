@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet
 
 from app.core.models import (
     MobileActionReceipt as StoredMobileActionReceipt,
+    MobileDestinationAuthorization,
     MobilePushRegistration,
     new_id,
     utc_now,
@@ -53,6 +54,9 @@ class MobileCommandCenterService:
     )
     OPTIONAL_PREFLIGHT_CHECKS = frozenset(
         {"estimated_wallet_spend", "rent_dominance", "wallet_token_balance"}
+    )
+    TREASURY_ACTIONS = frozenset(
+        {"withdrawal", "profit_sweep", "rent_recovery"}
     )
 
     def __init__(
@@ -178,6 +182,356 @@ class MobileCommandCenterService:
         if payload is None:
             raise LookupError("Mobile position not found")
         return payload
+
+    def wallet(self, *, device: dict[str, object]) -> dict[str, object]:
+        del device
+        return self.state.mobile_wallet()
+
+    def wallet_transactions(
+        self,
+        *,
+        device: dict[str, object],
+    ) -> dict[str, object]:
+        del device
+        return self.state.mobile_wallet_transactions()
+
+    def destinations(
+        self,
+        *,
+        device: dict[str, object],
+    ) -> dict[str, object]:
+        device_id = self._device_id(device)
+        authorizations = self.state.storage.load_mobile_destination_authorizations(
+            device_id=device_id,
+            limit=100,
+        )
+        return {
+            "artifact_type": "cryptoarc_mobile_destinations",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "destinations": [
+                authorization.to_public_dict()
+                for authorization in authorizations
+            ],
+        }
+
+    def authorize_destination(
+        self,
+        *,
+        desktop_operator: dict[str, object],
+        device_id: str,
+        address: str,
+        asset: str,
+        max_amount: Any,
+        expires_in_seconds: int,
+        purpose: str,
+    ) -> dict[str, object]:
+        if not desktop_operator or not desktop_operator.get("authenticated"):
+            raise ValueError("Desktop authentication is required")
+        clean_device_id = device_id.strip()
+        clean_address = address.strip()
+        clean_asset = asset.strip().upper()
+        clean_purpose = purpose.strip()
+        maximum = self._decimal(max_amount, "maximum amount")
+        if not clean_device_id:
+            raise ValueError("Mobile device binding is required")
+        if (
+            len(clean_address) < 32
+            or len(clean_address) > 100
+            or not re.fullmatch(r"[A-Za-z0-9]+", clean_address)
+        ):
+            raise ValueError("Destination address is invalid")
+        if not re.fullmatch(r"[A-Z0-9_-]{1,16}", clean_asset):
+            raise ValueError("Destination asset is invalid")
+        if not clean_purpose:
+            raise ValueError("Destination purpose is required")
+        ttl_seconds = int(expires_in_seconds)
+        if ttl_seconds < 1 or ttl_seconds > 900:
+            raise ValueError(
+                "Destination authorization expiry must be between 1 and 900 seconds"
+            )
+        now = utc_now()
+        authorization = MobileDestinationAuthorization(
+            id=new_id("destinationauth"),
+            payload={
+                "device_id": clean_device_id,
+                "address": clean_address,
+                "asset": clean_asset,
+                "max_amount": str(maximum),
+                "purpose": clean_purpose,
+                "issued_by": str(desktop_operator.get("id") or "desktop"),
+            },
+            created_at=now,
+            expires_at=now + timedelta(seconds=ttl_seconds),
+        )
+        self.state.storage.save_mobile_destination_authorization(authorization)
+        return authorization.to_public_dict()
+
+    def preview_withdrawal(self, **kwargs: Any) -> dict[str, object]:
+        return self._preview_treasury(action="withdrawal", **kwargs)
+
+    def preview_profit_sweep(self, **kwargs: Any) -> dict[str, object]:
+        return self._preview_treasury(action="profit_sweep", **kwargs)
+
+    def preview_rent_recovery(self, **kwargs: Any) -> dict[str, object]:
+        return self._preview_treasury(action="rent_recovery", **kwargs)
+
+    def request_withdrawal(self, **kwargs: Any) -> dict[str, object]:
+        return self._request_treasury(action="withdrawal", **kwargs)
+
+    def request_profit_sweep(self, **kwargs: Any) -> dict[str, object]:
+        return self._request_treasury(action="profit_sweep", **kwargs)
+
+    def request_rent_recovery(self, **kwargs: Any) -> dict[str, object]:
+        return self._request_treasury(action="rent_recovery", **kwargs)
+
+    def _preview_treasury(
+        self,
+        *,
+        action: str,
+        device: dict[str, object],
+        authorization_id: str,
+        address: str,
+        asset: str,
+        amount: Any,
+        token_accounts: list[str] | None = None,
+    ) -> dict[str, object]:
+        device_id = self._device_id(device)
+        clean_address = address.strip()
+        clean_asset = asset.strip().upper()
+        numeric_amount = self._decimal(amount, "amount")
+        clean_accounts = self._token_accounts(token_accounts or [])
+        if not bool(self.config.live_trading_enabled):
+            raise ValueError("Live treasury environment is disabled")
+        authorization = self._require_destination_authorization(
+            authorization_id=authorization_id,
+            device_id=device_id,
+            address=clean_address,
+            asset=clean_asset,
+            amount=numeric_amount,
+        )
+        preflight = self.state.mobile_treasury_preflight(
+            action=action,
+            address=clean_address,
+            asset=clean_asset,
+            amount=numeric_amount,
+            token_accounts=clean_accounts,
+        )
+        blockers = [str(value) for value in preflight.get("blockers", [])]
+        if blockers:
+            raise ValueError("; ".join(blockers))
+        now = utc_now()
+        expires_at = min(authorization.expires_at, now + timedelta(seconds=60))
+        preview_id = new_id("treasurypreview")
+        preview = {
+            "preview_id": preview_id,
+            "action": action,
+            "device_id": device_id,
+            "address": clean_address,
+            "asset": clean_asset,
+            "amount": str(numeric_amount),
+            "authorization_id": authorization.id,
+            "expected_fee_sol": str(
+                preflight.get("expected_fee_sol") or "0"
+            ),
+            "remaining_balance_sol": str(
+                preflight.get("remaining_balance_sol") or "0"
+            ),
+            "expires_at": expires_at.isoformat(),
+            "token_accounts": clean_accounts,
+            "created_at": now.isoformat(),
+        }
+        authorization.payload["preview"] = preview
+        self.state.storage.save_mobile_destination_authorization(authorization)
+        return {
+            "preview_id": preview_id,
+            "action": action,
+            "destination": clean_address,
+            "asset": clean_asset,
+            "amount": numeric_amount,
+            "expected_fee_sol": Decimal(preview["expected_fee_sol"]),
+            "remaining_balance_sol": Decimal(
+                preview["remaining_balance_sol"]
+            ),
+            "authorization_id": authorization.id,
+            "expires_at": expires_at.isoformat(),
+            "warnings": [
+                str(value) for value in preflight.get("warnings", [])
+            ],
+            "token_accounts": clean_accounts,
+        }
+
+    def _request_treasury(
+        self,
+        *,
+        action: str,
+        device: dict[str, object],
+        authorization_id: str,
+        preview_id: str,
+        address: str,
+        asset: str,
+        amount: Any,
+        idempotency_key: str,
+        token_accounts: list[str] | None = None,
+    ) -> dict[str, object]:
+        device_id = self._device_id(device)
+        clean_address = address.strip()
+        clean_asset = asset.strip().upper()
+        numeric_amount = self._decimal(amount, "amount")
+        clean_accounts = self._token_accounts(token_accounts or [])
+        fingerprint = self._request_fingerprint(
+            {
+                "action": action,
+                "authorization_id": authorization_id,
+                "preview_id": preview_id,
+                "address": clean_address,
+                "asset": clean_asset,
+                "amount": str(numeric_amount),
+                "token_accounts": clean_accounts,
+            }
+        )
+        with self._guarded_action_lock:
+            existing = self._existing_idempotent_receipt(
+                device_id=device_id,
+                action_type=action,
+                entity_id=authorization_id,
+                idempotency_key=idempotency_key,
+                request_fingerprint=fingerprint,
+            )
+            if existing:
+                return self._receipt_public(existing)
+            if not bool(self.config.live_trading_enabled):
+                raise ValueError("Live treasury environment is disabled")
+            if not preview_id:
+                raise ValueError("Treasury preview is missing")
+            self._require_destination_authorization(
+                authorization_id=authorization_id,
+                device_id=device_id,
+                address=clean_address,
+                asset=clean_asset,
+                amount=numeric_amount,
+            )
+            preflight = self.state.mobile_treasury_preflight(
+                action=action,
+                address=clean_address,
+                asset=clean_asset,
+                amount=numeric_amount,
+                token_accounts=clean_accounts,
+            )
+            blockers = [str(value) for value in preflight.get("blockers", [])]
+            if blockers:
+                raise ValueError("; ".join(blockers))
+            now = utc_now()
+            action_id = self._action_id(idempotency_key)
+            receipt = StoredMobileActionReceipt(
+                id=action_id,
+                idempotency_key_hash=self._idempotency_hash(
+                    device_id, idempotency_key
+                ),
+                device_id=device_id,
+                action_type=action,
+                entity_id=authorization_id,
+                payload={
+                    "request_fingerprint": fingerprint,
+                    "authorization_id": authorization_id,
+                    "preview_id": preview_id,
+                    "address": clean_address,
+                    "asset": clean_asset,
+                    "amount": str(numeric_amount),
+                    "token_accounts": clean_accounts,
+                    "operator_message": "Treasury request pending",
+                    "reconcile_after_ms": 1000,
+                    "submitted_at": now.isoformat(),
+                    "dispatch_claimed_at": now.isoformat(),
+                },
+                status=MobileActionStatus.PENDING.value,
+                created_at=now,
+                updated_at=now,
+            )
+            receipt, created = self.state.storage.reserve_mobile_treasury_action(
+                receipt,
+                authorization_id=authorization_id,
+                preview_id=preview_id,
+                action=action,
+                address=clean_address,
+                asset=clean_asset,
+                amount=str(numeric_amount),
+                token_accounts=clean_accounts,
+            )
+            if not created:
+                return self._verify_existing_receipt(
+                    receipt,
+                    device_id=device_id,
+                    action_type=action,
+                    entity_id=authorization_id,
+                    request_fingerprint=fingerprint,
+                )
+            try:
+                result = self.state.execute_mobile_treasury(
+                    action_id=action_id,
+                    action=action,
+                    address=clean_address,
+                    asset=clean_asset,
+                    amount=numeric_amount,
+                    token_accounts=clean_accounts,
+                )
+                status, message = self._treasury_receipt_status(result)
+                transaction_signature = str(
+                    result.get("transaction_signature")
+                    or result.get("signature")
+                    or ""
+                )
+                if transaction_signature:
+                    receipt.payload["transaction_signature"] = (
+                        transaction_signature
+                    )
+            except Exception:
+                status = MobileActionStatus.VERIFYING.value
+                message = "Verifying treasury outcome"
+            receipt.status = status
+            receipt.updated_at = utc_now()
+            receipt.payload["operator_message"] = message
+            self.state.storage.save_mobile_action_receipt(receipt)
+            return self._receipt_public(receipt)
+
+    def _require_destination_authorization(
+        self,
+        *,
+        authorization_id: str,
+        device_id: str,
+        address: str,
+        asset: str,
+        amount: Decimal,
+    ) -> MobileDestinationAuthorization:
+        authorization = self.state.storage.load_mobile_destination_authorization(
+            authorization_id
+        )
+        if authorization is None:
+            raise LookupError("Mobile destination authorization not found")
+        if authorization.used_at:
+            raise ValueError("Destination authorization is already used")
+        if authorization.expires_at <= utc_now():
+            raise ValueError("Destination authorization expired")
+        payload = authorization.payload
+        if str(payload.get("device_id") or "") != device_id:
+            raise ValueError("Destination authorization device binding does not match")
+        if str(payload.get("address") or "") != address:
+            raise ValueError("Destination authorization address binding does not match")
+        if str(payload.get("asset") or "") != asset:
+            raise ValueError("Destination authorization asset binding does not match")
+        maximum = self._decimal(payload.get("max_amount"), "maximum amount")
+        if amount > maximum:
+            raise ValueError("Destination authorization maximum amount exceeded")
+        return authorization
+
+    @staticmethod
+    def _token_accounts(values: list[str]) -> list[str]:
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        if len(cleaned) != len(set(cleaned)):
+            raise ValueError("Treasury token account binding contains duplicates")
+        if len(cleaned) > 64:
+            raise ValueError("Treasury token account selection is too large")
+        return cleaned
 
     def trades(self, *, device: dict[str, object]) -> dict[str, object]:
         del device
@@ -526,6 +880,25 @@ class MobileCommandCenterService:
             else:
                 result = {}
             status, message = self._receipt_status_from_audit(result)
+            receipt.status = status
+            receipt.updated_at = utc_now()
+            receipt.payload["operator_message"] = message
+            self.state.storage.save_mobile_action_receipt(receipt)
+        elif (
+            receipt.action_type in self.TREASURY_ACTIONS
+            and receipt.status
+            in {
+                MobileActionStatus.PENDING.value,
+                MobileActionStatus.VERIFYING.value,
+                MobileActionStatus.REVIEW_REQUIRED.value,
+            }
+        ):
+            try:
+                result = self.state.reconcile_mobile_treasury_action(receipt)
+                status, message = self._treasury_receipt_status(result)
+            except Exception:
+                status = MobileActionStatus.REVIEW_REQUIRED.value
+                message = "Treasury outcome requires operator review"
             receipt.status = status
             receipt.updated_at = utc_now()
             receipt.payload["operator_message"] = message
@@ -1011,6 +1384,47 @@ class MobileCommandCenterService:
         if status in {"failed", "cancelled", "expired", "stale"}:
             return MobileActionStatus.FAILED.value, "Trade authorization failed"
         return MobileActionStatus.VERIFYING.value, "Verifying outcome"
+
+    @staticmethod
+    def _treasury_receipt_status(
+        result: dict[str, object],
+    ) -> tuple[str, str]:
+        status = str(result.get("status") or "").lower()
+        message = str(result.get("operator_message") or "").strip()
+        if status in {"confirmed", "reconciled", "executed"}:
+            return (
+                MobileActionStatus.CONFIRMED.value,
+                message or "Treasury transaction confirmed",
+            )
+        if status in {"failed"}:
+            return (
+                MobileActionStatus.FAILED.value,
+                message or "Treasury transaction failed",
+            )
+        if status in {"cancelled"}:
+            return (
+                MobileActionStatus.CANCELLED.value,
+                message or "Treasury transaction cancelled",
+            )
+        if status in {"expired", "stale"}:
+            return (
+                MobileActionStatus.EXPIRED.value,
+                message or "Treasury authorization expired",
+            )
+        if status in {"review_required", "needs_review"}:
+            return (
+                MobileActionStatus.REVIEW_REQUIRED.value,
+                message or "Treasury outcome requires operator review",
+            )
+        if status in {"verifying", "submitted"}:
+            return (
+                MobileActionStatus.VERIFYING.value,
+                message or "Verifying treasury outcome",
+            )
+        return (
+            MobileActionStatus.PENDING.value,
+            message or "Treasury request pending",
+        )
 
     @staticmethod
     def _receipt_public(receipt: StoredMobileActionReceipt) -> dict[str, object]:

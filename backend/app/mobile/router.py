@@ -11,6 +11,7 @@ from starlette.responses import JSONResponse
 from app.mobile.contracts import (
     MobileActionReceipt,
     MobileAdjustExitRequest,
+    MobileDestinationAuthorizationRequest,
     MobileGuardedActionRequest,
     MobilePortfolioPayload,
     MobilePositionCloseRequest,
@@ -18,6 +19,8 @@ from app.mobile.contracts import (
     MobilePositionsPayload,
     MobileRejectTradeRequest,
     MobileScope,
+    MobileTreasuryPreview,
+    MobileTreasuryRequest,
 )
 from app.mobile.service import (
     MobileCommandCenterService,
@@ -230,9 +233,209 @@ def create_mobile_router(
 
     @router.get("/wallet")
     async def mobile_wallet(
-        _: dict[str, object] = Depends(require_scope(MobileScope.WALLET_READ)),
+        device: dict[str, object] = Depends(require_scope(MobileScope.WALLET_READ)),
     ) -> dict[str, object]:
-        raise HTTPException(status_code=501, detail="Mobile wallet read is not implemented")
+        return service.wallet(device=device)
+
+    @router.get("/wallet/transactions")
+    async def mobile_wallet_transactions(
+        device: dict[str, object] = Depends(require_scope(MobileScope.WALLET_READ)),
+    ) -> dict[str, object]:
+        return service.wallet_transactions(device=device)
+
+    @router.get("/wallet/destinations")
+    async def mobile_wallet_destinations(
+        device: dict[str, object] = Depends(require_scope(MobileScope.WALLET_READ)),
+    ) -> dict[str, object]:
+        return service.destinations(device=device)
+
+    @router.post(
+        "/destination-authorizations",
+        dependencies=[Depends(service.require_dashboard_auth)],
+    )
+    async def mobile_destination_authorization(
+        payload: MobileDestinationAuthorizationRequest,
+    ) -> dict[str, object]:
+        try:
+            return service.authorize_destination(
+                desktop_operator={"authenticated": True, "id": "desktop"},
+                device_id=payload.device_id,
+                address=payload.address,
+                asset=payload.asset,
+                max_amount=payload.max_amount,
+                expires_in_seconds=payload.expires_in_seconds,
+                purpose=payload.purpose,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/withdrawals/preview",
+        response_model=MobileTreasuryPreview,
+    )
+    async def mobile_withdrawal_preview(
+        payload: MobileTreasuryRequest,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.preview_withdrawal(
+                device=device,
+                authorization_id=payload.authorization_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/withdrawals",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_withdrawal(
+        payload: MobileTreasuryRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.request_withdrawal(
+                device=device,
+                authorization_id=payload.authorization_id,
+                preview_id=payload.preview_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/profit-sweeps/preview",
+        response_model=MobileTreasuryPreview,
+    )
+    async def mobile_profit_sweep_preview(
+        payload: MobileTreasuryRequest,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.preview_profit_sweep(
+                device=device,
+                authorization_id=payload.authorization_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/profit-sweeps",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_profit_sweep(
+        payload: MobileTreasuryRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.request_profit_sweep(
+                device=device,
+                authorization_id=payload.authorization_id,
+                preview_id=payload.preview_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/rent-recovery/preview",
+        response_model=MobileTreasuryPreview,
+    )
+    async def mobile_rent_recovery_preview(
+        payload: MobileTreasuryRequest,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.preview_rent_recovery(
+                device=device,
+                authorization_id=payload.authorization_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.post(
+        "/wallet/rent-recovery",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_rent_recovery(
+        payload: MobileTreasuryRequest,
+        idempotency_key: str = Header(
+            min_length=8,
+            max_length=120,
+            alias="Idempotency-Key",
+        ),
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.request_rent_recovery(
+                device=device,
+                authorization_id=payload.authorization_id,
+                preview_id=payload.preview_id,
+                address=payload.address,
+                asset=payload.asset,
+                amount=payload.amount,
+                token_accounts=payload.token_accounts,
+                idempotency_key=idempotency_key,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.get(
+        "/wallet/actions/{action_id}",
+        response_model=MobileActionReceipt,
+    )
+    async def mobile_wallet_action(
+        action_id: str,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.TREASURY_REQUEST)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.action(device=device, action_id=action_id)
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
 
     @router.get("/trades")
     async def mobile_trades(
