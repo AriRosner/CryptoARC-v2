@@ -92,3 +92,66 @@ and shutdown commands were not run, as required by the task boundary.
 - No real signer daemon, hot wallet, Solana RPC, or confirmation integration.
 - Concurrent claims were tested with two service instances and one SQLite file,
   but not with two independently launched backend processes.
+
+## Final Re-review Fix Pass
+
+Commit `18ac72b` closes the three blockers appended by the final independent
+re-review.
+
+### Finding Resolution
+
+1. Guarded trade drafts now require finite, positive, at-most-100 stop and
+   target values in the HTTP contract. Service validation independently rejects
+   null or omitted controls before receipt reservation, audit claim, or
+   dispatch. The production fill recorder retains its fail-closed invariant if
+   corrupt or legacy authorization reaches confirmation recovery.
+2. Trade rejection and exit adjustment now reserve the idempotency key,
+   compare-and-swap the entity version/state, apply the mutation, and write a
+   terminal receipt in one SQLite `BEGIN IMMEDIATE` transaction. Existing
+   pre-effect pending receipts are recoverable through the same idempotent POST
+   or receipt reconciliation. Exact-version operations apply once; stale,
+   missing, or changed entities terminate as `review_required`.
+3. Durable mobile records now bind API base, device ID, and stable saved-session
+   identity. Definitive pre-receipt `401`, `403`, `409`, and `422` responses
+   clear the local record. Permanent reconciliation `404` and owner mismatch
+   become non-polling `review_required` states with an explicit local abandon
+   action. Both trade and position flows use the same fail-closed lifecycle.
+
+### Test-First Evidence
+
+- Before the backend correction, both null service cases failed to raise, one
+  dispatched, and both HTTP null/omission cases reached the approval service.
+- Seeded pre-effect reject and adjustment receipts remained `pending` after a
+  fresh service instance; stale seeded operations also remained `pending`
+  instead of becoming review-required.
+- The expanded focused mobile suite was red at 12 passed / 13 failed. Failures
+  covered definitive-response cleanup, trade and position `404` handling, and
+  re-pair ownership.
+- After correction, the exact backend blocker tests passed 5/5: HTTP
+  null/omission, service zero-dispatch, confirmed-fill invariant, pre-effect
+  retry/restart, and stale version classification.
+
+### Final Verification
+
+- Guarded backend suite: 24/24 passed.
+- Guarded, command-center, and mobile API suites: 62/62 passed in 15.407s.
+  The former 58-test gate now includes four new route/recovery regressions.
+- Focused guarded mobile suite: 25/25 passed in 10.149s.
+- Mobile TypeScript: passed.
+- `scripts/verify-mobile.ps1`: passed:
+  - 18 suites, 133 tests passed.
+  - Production dependency audit: 0 vulnerabilities.
+  - Expo Doctor: 20/20.
+  - Android export: passed, 4,434 modules bundled.
+- `git diff --check`: passed.
+
+No shared runtime or database was started. No backend was armed, and no signer,
+wallet, RPC, private tunnel, or live network was invoked. The full repository
+verifier, pnpm, and shutdown commands remained outside this pass.
+
+### Remaining Concerns
+
+The residual concerns remain integration-only: physical biometric and gesture
+behavior, private-tunnel interruption, operating-system process kills at each
+transaction boundary, two independently launched backend processes contending
+on one database, and real signer/wallet/RPC confirmation reconciliation.
