@@ -1052,6 +1052,328 @@ class Storage:
             )
         return receipt, True
 
+    def apply_mobile_trade_rejection(
+        self,
+        receipt: MobileActionReceipt,
+        *,
+        expected_version: int,
+        reason: str,
+    ) -> tuple[MobileActionReceipt, bool]:
+        """Atomically reject a version-bound intent and write its terminal receipt."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._mobile_action_receipt_by_key(
+                connection,
+                receipt.idempotency_key_hash,
+            )
+            if existing:
+                return existing, False
+            row = connection.execute(
+                "SELECT payload FROM live_intents WHERE id = ?",
+                (receipt.entity_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("Mobile trade intent not found")
+            intent = json.loads(str(row["payload"]))
+            if int(intent.get("version") or 1) != int(expected_version):
+                raise ValueError("Trade intent version conflict")
+            if str(intent.get("status") or "") in {
+                "submitted",
+                "executed",
+                "confirmed",
+                "reconciled",
+            }:
+                raise ValueError("Submitted trade intent cannot be rejected")
+            now = datetime.now(timezone.utc)
+            intent["status"] = "cancelled"
+            intent["reason"] = f"Rejected from paired mobile device: {reason}"
+            intent["last_mobile_action_id"] = receipt.id
+            intent["updated_at"] = now.isoformat()
+            intent["version"] = int(intent.get("version") or 1) + 1
+            receipt.status = "cancelled"
+            receipt.updated_at = now
+            receipt.payload["operator_message"] = "Trade intent rejected"
+            connection.execute(
+                "UPDATE live_intents SET payload = ? WHERE id = ?",
+                (json.dumps(intent), receipt.entity_id),
+            )
+            self._insert_mobile_action_receipt(connection, receipt)
+        return receipt, True
+
+    def apply_mobile_position_exit_adjustment(
+        self,
+        receipt: MobileActionReceipt,
+        *,
+        expected_version: int,
+        stop_pct: float,
+        target_pct: float,
+    ) -> tuple[MobileActionReceipt, bool]:
+        """Atomically adjust a version-bound position and write its terminal receipt."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._mobile_action_receipt_by_key(
+                connection,
+                receipt.idempotency_key_hash,
+            )
+            if existing:
+                return existing, False
+            row = connection.execute(
+                "SELECT payload FROM live_ledger_positions WHERE id = ?",
+                (receipt.entity_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError("Mobile live position not found")
+            position = json.loads(str(row["payload"]))
+            if int(position.get("version") or 1) != int(expected_version):
+                raise ValueError("Position version conflict")
+            if (
+                str(position.get("status") or "") != "open"
+                or float(position.get("token_balance") or 0) <= 0
+            ):
+                raise ValueError(
+                    "Only an open live position can change exit controls"
+                )
+            if not (0 < float(stop_pct) <= 100) or not (
+                0 < float(target_pct) <= 100
+            ):
+                raise ValueError("Exit controls are outside backend bounds")
+            now = datetime.now(timezone.utc)
+            position["stop_pct"] = round(float(stop_pct), 4)
+            position["target_pct"] = round(float(target_pct), 4)
+            position["last_mobile_action_id"] = receipt.id
+            position["version"] = int(position.get("version") or 1) + 1
+            position["updated_at"] = now.isoformat()
+            receipt.status = "confirmed"
+            receipt.updated_at = now
+            receipt.payload["operator_message"] = "Exit controls updated"
+            connection.execute(
+                "UPDATE live_ledger_positions SET payload = ? WHERE id = ?",
+                (json.dumps(position), receipt.entity_id),
+            )
+            self._insert_mobile_action_receipt(connection, receipt)
+        return receipt, True
+
+    def reconcile_mobile_local_action(
+        self,
+        action_id: str,
+    ) -> MobileActionReceipt:
+        """Apply or terminally classify a durable local action exactly once."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at, execution_audit_id
+                FROM mobile_action_receipts
+                WHERE id = ?
+                """,
+                (action_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError(f"Mobile action receipt not found: {action_id}")
+            receipt = self._mobile_action_receipt_from_row(row)
+            if receipt.status != "pending":
+                return receipt
+            now = datetime.now(timezone.utc)
+            expected_version = int(
+                receipt.payload.get("expected_version") or 0
+            )
+            if receipt.action_type == "trade_reject":
+                entity_row = connection.execute(
+                    "SELECT payload FROM live_intents WHERE id = ?",
+                    (receipt.entity_id,),
+                ).fetchone()
+                entity = (
+                    json.loads(str(entity_row["payload"]))
+                    if entity_row
+                    else None
+                )
+                reason = str(receipt.payload.get("reason") or "")
+                expected_reason = (
+                    f"Rejected from paired mobile device: {reason}"
+                )
+                already_applied = bool(
+                    entity
+                    and (
+                        str(entity.get("last_mobile_action_id") or "")
+                        == receipt.id
+                        or (
+                            str(entity.get("status") or "") == "cancelled"
+                            and str(entity.get("reason") or "")
+                            == expected_reason
+                            and int(entity.get("version") or 0)
+                            >= expected_version + 1
+                        )
+                    )
+                )
+                if already_applied:
+                    receipt.status = "cancelled"
+                    receipt.payload["operator_message"] = "Trade intent rejected"
+                elif (
+                    entity
+                    and int(entity.get("version") or 1) == expected_version
+                    and str(entity.get("status") or "")
+                    not in {
+                        "submitted",
+                        "executed",
+                        "confirmed",
+                        "reconciled",
+                    }
+                ):
+                    entity["status"] = "cancelled"
+                    entity["reason"] = expected_reason
+                    entity["last_mobile_action_id"] = receipt.id
+                    entity["version"] = expected_version + 1
+                    entity["updated_at"] = now.isoformat()
+                    connection.execute(
+                        "UPDATE live_intents SET payload = ? WHERE id = ?",
+                        (json.dumps(entity), receipt.entity_id),
+                    )
+                    receipt.status = "cancelled"
+                    receipt.payload["operator_message"] = "Trade intent rejected"
+                else:
+                    receipt.status = "review_required"
+                    receipt.payload["operator_message"] = (
+                        "Trade intent changed before rejection recovery; review required"
+                    )
+            elif receipt.action_type == "position_adjust_exit":
+                entity_row = connection.execute(
+                    "SELECT payload FROM live_ledger_positions WHERE id = ?",
+                    (receipt.entity_id,),
+                ).fetchone()
+                entity = (
+                    json.loads(str(entity_row["payload"]))
+                    if entity_row
+                    else None
+                )
+                stop_pct = float(receipt.payload.get("stop_pct") or 0)
+                target_pct = float(receipt.payload.get("target_pct") or 0)
+                already_applied = bool(
+                    entity
+                    and (
+                        str(entity.get("last_mobile_action_id") or "")
+                        == receipt.id
+                        or (
+                            int(entity.get("version") or 0)
+                            >= expected_version + 1
+                            and abs(
+                                float(entity.get("stop_pct") or 0)
+                                - stop_pct
+                            )
+                            <= 1e-12
+                            and abs(
+                                float(entity.get("target_pct") or 0)
+                                - target_pct
+                            )
+                            <= 1e-12
+                        )
+                    )
+                )
+                if already_applied:
+                    receipt.status = "confirmed"
+                    receipt.payload["operator_message"] = "Exit controls updated"
+                elif (
+                    entity
+                    and int(entity.get("version") or 1) == expected_version
+                    and str(entity.get("status") or "") == "open"
+                    and float(entity.get("token_balance") or 0) > 0
+                    and 0 < stop_pct <= 100
+                    and 0 < target_pct <= 100
+                ):
+                    entity["stop_pct"] = round(stop_pct, 4)
+                    entity["target_pct"] = round(target_pct, 4)
+                    entity["last_mobile_action_id"] = receipt.id
+                    entity["version"] = expected_version + 1
+                    entity["updated_at"] = now.isoformat()
+                    connection.execute(
+                        """
+                        UPDATE live_ledger_positions
+                        SET payload = ?
+                        WHERE id = ?
+                        """,
+                        (json.dumps(entity), receipt.entity_id),
+                    )
+                    receipt.status = "confirmed"
+                    receipt.payload["operator_message"] = "Exit controls updated"
+                else:
+                    receipt.status = "review_required"
+                    receipt.payload["operator_message"] = (
+                        "Position changed before exit recovery; review required"
+                    )
+            else:
+                receipt.status = "review_required"
+                receipt.payload["operator_message"] = (
+                    "Unknown local action requires review"
+                )
+            receipt.updated_at = now
+            self._update_mobile_action_receipt(connection, receipt)
+        return receipt
+
+    @classmethod
+    def _mobile_action_receipt_by_key(
+        cls,
+        connection: sqlite3.Connection,
+        idempotency_key_hash: str,
+    ) -> MobileActionReceipt | None:
+        row = connection.execute(
+            """
+            SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                   payload, status, created_at, updated_at, execution_audit_id
+            FROM mobile_action_receipts
+            WHERE idempotency_key_hash = ?
+            """,
+            (idempotency_key_hash,),
+        ).fetchone()
+        return cls._mobile_action_receipt_from_row(row) if row else None
+
+    @staticmethod
+    def _insert_mobile_action_receipt(
+        connection: sqlite3.Connection,
+        receipt: MobileActionReceipt,
+    ) -> None:
+        payload = receipt.to_dict()
+        connection.execute(
+            """
+            INSERT INTO mobile_action_receipts (
+                id, idempotency_key_hash, device_id, action_type, entity_id,
+                payload, status, created_at, updated_at, execution_audit_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                receipt.id,
+                receipt.idempotency_key_hash,
+                receipt.device_id,
+                receipt.action_type,
+                receipt.entity_id,
+                json.dumps(payload["payload"]),
+                receipt.status,
+                payload["created_at"],
+                payload["updated_at"],
+                receipt.execution_audit_id or None,
+            ),
+        )
+
+    @staticmethod
+    def _update_mobile_action_receipt(
+        connection: sqlite3.Connection,
+        receipt: MobileActionReceipt,
+    ) -> None:
+        payload = receipt.to_dict()
+        connection.execute(
+            """
+            UPDATE mobile_action_receipts
+            SET payload = ?, status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(payload["payload"]),
+                receipt.status,
+                payload["updated_at"],
+                receipt.id,
+            ),
+        )
+
     def reserve_mobile_execution_action(
         self,
         receipt: MobileActionReceipt,

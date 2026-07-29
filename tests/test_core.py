@@ -1717,6 +1717,35 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(position.token_balance, 250.0)
             self.assertEqual(position.reconciliation_status, "matched")
 
+    def test_guarded_buy_fill_rejects_missing_controls_without_saving_position(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            audit = LiveExecutionAudit(
+                id="audit_guarded_missing_controls",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+                action="buy",
+                mint="MintGuardedMissingControls",
+                amount="0.05",
+                wallet_public_key="WalletGuardedMissingControls",
+                signer_mode="local_signer_daemon",
+                status="confirmed",
+                final_status="confirmed",
+                guarded_authorization={
+                    "action_id": "guarded-action-missing-controls",
+                    "stop_pct": None,
+                    "target_pct": None,
+                },
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "missing bounded exit controls",
+            ):
+                state._record_live_fill(audit)
+
+            self.assertEqual(state.storage.load_live_ledger_positions(10), [])
+
     def configure_live_caps(self, state: BotState, include_backup: bool = True) -> None:
         state.settings.live_max_trade_sol = 0.01
         state.settings.live_daily_loss_cap_sol = 0.05

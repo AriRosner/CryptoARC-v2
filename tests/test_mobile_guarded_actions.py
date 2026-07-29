@@ -423,6 +423,36 @@ class MobileGuardedActionTests(unittest.TestCase):
                 self.approve(key=f"bounds-{name}", draft=draft)
         self.assertEqual(self.state.signer_submit_calls, 0)
 
+    def test_missing_guarded_buy_controls_fail_before_claim_or_submission(self) -> None:
+        cases = {
+            "null": {
+                **self.valid_draft,
+                "stop_pct": None,
+                "target_pct": None,
+            },
+            "missing": {
+                "amount": self.valid_draft["amount"],
+                "slippage_pct": self.valid_draft["slippage_pct"],
+            },
+        }
+
+        for name, draft in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError,
+                "stop.*target|bounded exit controls",
+            ):
+                self.approve(key=f"missing-controls-{name}", draft=draft)
+
+        self.assertEqual(self.state.signer_submit_calls, 0)
+        self.assertEqual(self.storage.audit.status, "simulated")
+        self.assertEqual(self.storage.intent.status, "simulated")
+        for name in cases:
+            self.assertIsNone(
+                self.storage.load_mobile_action_receipt(
+                    f"missing-controls-{name}"
+                )
+            )
+
     def test_position_exit_adjustment_is_bounded_versioned_and_idempotent(self) -> None:
         first = self.service.adjust_position_exit(
             device=self.execute_device,
@@ -446,8 +476,13 @@ class MobileGuardedActionTests(unittest.TestCase):
         self.assertEqual(first["status"], MobileActionStatus.CONFIRMED.value)
         self.assertEqual(first["action_id"], "adjust-key")
         self.assertEqual(first, second)
-        self.assertEqual(self.state.position_adjust_calls, 1)
         self.assertEqual(self.storage.position.version, 5)
+        self.assertEqual(self.storage.position.stop_pct, 25)
+        self.assertEqual(self.storage.position.target_pct, 45)
+        self.assertEqual(
+            self.storage.position.last_mobile_action_id,
+            "adjust-key",
+        )
 
         with self.assertRaisesRegex(ValueError, "version"):
             self.service.adjust_position_exit(
@@ -786,6 +821,14 @@ class MobileGuardedActionTests(unittest.TestCase):
             action_type="trade_reject",
             entity_id=intent.id,
             payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "trade_reject",
+                        "intent_id": intent.id,
+                        "expected_version": intent.version,
+                        "reason": "operator rejected",
+                    }
+                ),
                 "operator_message": "Rejecting prepared intent",
                 "submitted_at": now.isoformat(),
                 "reconcile_after_ms": 500,
@@ -810,6 +853,16 @@ class MobileGuardedActionTests(unittest.TestCase):
             action_type="position_adjust_exit",
             entity_id=position.id,
             payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "position_adjust_exit",
+                        "position_id": position.id,
+                        "expected_version": position.version,
+                        "stop_pct": "25",
+                        "target_pct": "45",
+                        "escalation_acknowledged": False,
+                    }
+                ),
                 "operator_message": "Applying bounded exit controls",
                 "submitted_at": now.isoformat(),
                 "reconcile_after_ms": 500,
@@ -835,6 +888,222 @@ class MobileGuardedActionTests(unittest.TestCase):
 
         self.assertEqual(rejected["status"], MobileActionStatus.CANCELLED.value)
         self.assertEqual(adjusted["status"], MobileActionStatus.CONFIRMED.value)
+
+    def test_restart_applies_pre_effect_reject_and_adjust_once(self) -> None:
+        now = utc_now()
+        intent = self.storage.intent
+        reject_receipt = MobileActionReceipt(
+            id="recover-pre-effect-reject",
+            idempotency_key_hash=self.service._idempotency_hash(
+                self.execute_device["id"],
+                "recover-pre-effect-reject",
+            ),
+            device_id=self.execute_device["id"],
+            action_type="trade_reject",
+            entity_id=intent.id,
+            payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "trade_reject",
+                        "intent_id": intent.id,
+                        "expected_version": intent.version,
+                        "reason": "operator rejected",
+                    }
+                ),
+                "operator_message": "Rejecting prepared intent",
+                "submitted_at": now.isoformat(),
+                "reconcile_after_ms": 500,
+                "expected_version": intent.version,
+                "reason": "operator rejected",
+            },
+            status=MobileActionStatus.PENDING.value,
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.reserve_mobile_action_receipt(reject_receipt)
+
+        position = self.storage.position
+        adjust_receipt = MobileActionReceipt(
+            id="recover-pre-effect-adjust",
+            idempotency_key_hash=self.service._idempotency_hash(
+                self.execute_device["id"],
+                "recover-pre-effect-adjust",
+            ),
+            device_id=self.execute_device["id"],
+            action_type="position_adjust_exit",
+            entity_id=position.id,
+            payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "position_adjust_exit",
+                        "position_id": position.id,
+                        "expected_version": position.version,
+                        "stop_pct": "25",
+                        "target_pct": "45",
+                        "escalation_acknowledged": False,
+                    }
+                ),
+                "operator_message": "Applying bounded exit controls",
+                "submitted_at": now.isoformat(),
+                "reconcile_after_ms": 500,
+                "expected_version": position.version,
+                "stop_pct": "25",
+                "target_pct": "45",
+            },
+            status=MobileActionStatus.PENDING.value,
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.reserve_mobile_action_receipt(adjust_receipt)
+        restarted = self.create_service()
+
+        rejected = restarted.reject_trade(
+            device=self.execute_device,
+            intent_id=intent.id,
+            expected_version=intent.version,
+            reason="operator rejected",
+            idempotency_key=reject_receipt.id,
+        )
+        adjusted = restarted.adjust_position_exit(
+            device=self.execute_device,
+            position_id=position.id,
+            expected_version=position.version,
+            stop_pct="25",
+            target_pct="45",
+            escalation_acknowledged=False,
+            idempotency_key=adjust_receipt.id,
+        )
+        intent_version = self.storage.intent.version
+        position_version = self.storage.position.version
+
+        retried_reject = restarted.action(
+            device=self.execute_device,
+            action_id=reject_receipt.id,
+        )
+        retried_adjust = restarted.action(
+            device=self.execute_device,
+            action_id=adjust_receipt.id,
+        )
+
+        self.assertEqual(rejected["status"], MobileActionStatus.CANCELLED.value)
+        self.assertEqual(adjusted["status"], MobileActionStatus.CONFIRMED.value)
+        self.assertEqual(retried_reject, rejected)
+        self.assertEqual(retried_adjust, adjusted)
+        self.assertEqual(self.storage.intent.version, intent_version)
+        self.assertEqual(self.storage.position.version, position_version)
+        self.assertEqual(
+            self.storage.intent.last_mobile_action_id,
+            reject_receipt.id,
+        )
+        self.assertEqual(
+            self.storage.position.last_mobile_action_id,
+            adjust_receipt.id,
+        )
+
+    def test_restart_marks_stale_pre_effect_local_actions_for_review(self) -> None:
+        now = utc_now()
+        intent = self.storage.intent
+        stale_intent_version = intent.version
+        intent.version += 1
+        intent.updated_at = now
+        self.storage.intent = intent
+        reject_receipt = MobileActionReceipt(
+            id="recover-stale-reject",
+            idempotency_key_hash=self.service._idempotency_hash(
+                self.execute_device["id"],
+                "recover-stale-reject",
+            ),
+            device_id=self.execute_device["id"],
+            action_type="trade_reject",
+            entity_id=intent.id,
+            payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "trade_reject",
+                        "intent_id": intent.id,
+                        "expected_version": stale_intent_version,
+                        "reason": "operator rejected",
+                    }
+                ),
+                "operator_message": "Rejecting prepared intent",
+                "submitted_at": now.isoformat(),
+                "reconcile_after_ms": 500,
+                "expected_version": stale_intent_version,
+                "reason": "operator rejected",
+            },
+            status=MobileActionStatus.PENDING.value,
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.reserve_mobile_action_receipt(reject_receipt)
+
+        position = self.storage.position
+        stale_position_version = position.version
+        position.version += 1
+        position.updated_at = now
+        self.storage.position = position
+        adjust_receipt = MobileActionReceipt(
+            id="recover-stale-adjust",
+            idempotency_key_hash=self.service._idempotency_hash(
+                self.execute_device["id"],
+                "recover-stale-adjust",
+            ),
+            device_id=self.execute_device["id"],
+            action_type="position_adjust_exit",
+            entity_id=position.id,
+            payload={
+                "request_fingerprint": self.service._request_fingerprint(
+                    {
+                        "action": "position_adjust_exit",
+                        "position_id": position.id,
+                        "expected_version": stale_position_version,
+                        "stop_pct": "25",
+                        "target_pct": "45",
+                        "escalation_acknowledged": False,
+                    }
+                ),
+                "operator_message": "Applying bounded exit controls",
+                "submitted_at": now.isoformat(),
+                "reconcile_after_ms": 500,
+                "expected_version": stale_position_version,
+                "stop_pct": "25",
+                "target_pct": "45",
+            },
+            status=MobileActionStatus.PENDING.value,
+            created_at=now,
+            updated_at=now,
+        )
+        self.storage.reserve_mobile_action_receipt(adjust_receipt)
+        restarted = self.create_service()
+
+        rejected = restarted.reject_trade(
+            device=self.execute_device,
+            intent_id=intent.id,
+            expected_version=stale_intent_version,
+            reason="operator rejected",
+            idempotency_key=reject_receipt.id,
+        )
+        adjusted = restarted.adjust_position_exit(
+            device=self.execute_device,
+            position_id=position.id,
+            expected_version=stale_position_version,
+            stop_pct="25",
+            target_pct="45",
+            escalation_acknowledged=False,
+            idempotency_key=adjust_receipt.id,
+        )
+
+        self.assertEqual(
+            rejected["status"],
+            MobileActionStatus.REVIEW_REQUIRED.value,
+        )
+        self.assertEqual(
+            adjusted["status"],
+            MobileActionStatus.REVIEW_REQUIRED.value,
+        )
+        self.assertEqual(self.storage.intent.status, "simulated")
+        self.assertIsNone(self.storage.position.stop_pct)
+        self.assertIsNone(self.storage.position.target_pct)
 
     def test_receipt_payload_never_persists_request_secrets_or_transaction_material(self) -> None:
         receipt = self.approve(key="secret-surface")

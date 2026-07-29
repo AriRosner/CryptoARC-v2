@@ -176,6 +176,17 @@ export function PositionDetailScreen({
                       ),
                     )
                   }
+                  pendingOwner={
+                    session
+                      ? {
+                          apiBaseUrl: session.apiBaseUrl,
+                          deviceId: session.device?.id || "unpaired-device",
+                          sessionId:
+                            session.record?.savedAt ||
+                            `session-${session.generation}`,
+                        }
+                      : undefined
+                  }
                   onCompleted={() => query.refetch()}
                 />
               </Section>

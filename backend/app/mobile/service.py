@@ -282,6 +282,8 @@ class MobileCommandCenterService:
                 request_fingerprint=fingerprint,
             )
             if existing:
+                if existing.status == MobileActionStatus.PENDING.value:
+                    existing = self._reconcile_local_mobile_action(existing)
                 return self._receipt_public(existing)
             intent = self.state.storage.load_live_intent(intent_id)
             if intent is None:
@@ -296,26 +298,30 @@ class MobileCommandCenterService:
             }:
                 raise ValueError("Submitted trade intent cannot be rejected")
             now = utc_now()
-            receipt, created = self.state.storage.reserve_mobile_action_receipt(
-                StoredMobileActionReceipt(
-                    id=self._action_id(idempotency_key),
-                    idempotency_key_hash=self._idempotency_hash(
-                        device_id, idempotency_key
+            receipt, created = (
+                self.state.storage.apply_mobile_trade_rejection(
+                    StoredMobileActionReceipt(
+                        id=self._action_id(idempotency_key),
+                        idempotency_key_hash=self._idempotency_hash(
+                            device_id, idempotency_key
+                        ),
+                        device_id=device_id,
+                        action_type="trade_reject",
+                        entity_id=intent_id,
+                        payload={
+                            "request_fingerprint": fingerprint,
+                            "operator_message": "Trade intent rejected",
+                            "reconcile_after_ms": 1000,
+                            "submitted_at": now.isoformat(),
+                            "expected_version": expected_version,
+                            "reason": clean_reason,
+                        },
+                        status=MobileActionStatus.CANCELLED.value,
+                        created_at=now,
+                        updated_at=now,
                     ),
-                    device_id=device_id,
-                    action_type="trade_reject",
-                    entity_id=intent_id,
-                    payload={
-                        "request_fingerprint": fingerprint,
-                        "operator_message": "Rejecting prepared intent",
-                        "reconcile_after_ms": 1000,
-                        "submitted_at": now.isoformat(),
-                        "expected_version": expected_version,
-                        "reason": clean_reason,
-                    },
-                    status=MobileActionStatus.PENDING.value,
-                    created_at=now,
-                    updated_at=now,
+                    expected_version=expected_version,
+                    reason=clean_reason,
                 )
             )
             if not created:
@@ -326,16 +332,6 @@ class MobileCommandCenterService:
                     entity_id=intent_id,
                     request_fingerprint=fingerprint,
                 )
-            intent.status = "cancelled"
-            intent.reason = f"Rejected from paired mobile device: {clean_reason}"
-            intent.last_mobile_action_id = receipt.id
-            intent.updated_at = utc_now()
-            intent.version = int(getattr(intent, "version", 1)) + 1
-            self.state.storage.save_live_intent(intent)
-            receipt.status = MobileActionStatus.CANCELLED.value
-            receipt.updated_at = utc_now()
-            receipt.payload["operator_message"] = "Trade intent rejected"
-            self.state.storage.save_mobile_action_receipt(receipt)
             return self._receipt_public(receipt)
 
     def adjust_position_exit(
@@ -380,6 +376,8 @@ class MobileCommandCenterService:
                 request_fingerprint=fingerprint,
             )
             if existing:
+                if existing.status == MobileActionStatus.PENDING.value:
+                    existing = self._reconcile_local_mobile_action(existing)
                 return self._receipt_public(existing)
             position = self.state.storage.load_live_ledger_position(position_id)
             if position is None:
@@ -394,27 +392,32 @@ class MobileCommandCenterService:
                     "Only an open live position can change exit controls"
                 )
             now = utc_now()
-            receipt, created = self.state.storage.reserve_mobile_action_receipt(
-                StoredMobileActionReceipt(
-                    id=self._action_id(idempotency_key),
-                    idempotency_key_hash=self._idempotency_hash(
-                        device_id, idempotency_key
+            receipt, created = (
+                self.state.storage.apply_mobile_position_exit_adjustment(
+                    StoredMobileActionReceipt(
+                        id=self._action_id(idempotency_key),
+                        idempotency_key_hash=self._idempotency_hash(
+                            device_id, idempotency_key
+                        ),
+                        device_id=device_id,
+                        action_type="position_adjust_exit",
+                        entity_id=position_id,
+                        payload={
+                            "request_fingerprint": fingerprint,
+                            "operator_message": "Exit controls updated",
+                            "reconcile_after_ms": 500,
+                            "submitted_at": now.isoformat(),
+                            "expected_version": expected_version,
+                            "stop_pct": str(stop),
+                            "target_pct": str(target),
+                        },
+                        status=MobileActionStatus.CONFIRMED.value,
+                        created_at=now,
+                        updated_at=now,
                     ),
-                    device_id=device_id,
-                    action_type="position_adjust_exit",
-                    entity_id=position_id,
-                    payload={
-                        "request_fingerprint": fingerprint,
-                        "operator_message": "Applying bounded exit controls",
-                        "reconcile_after_ms": 500,
-                        "submitted_at": now.isoformat(),
-                        "expected_version": expected_version,
-                        "stop_pct": str(stop),
-                        "target_pct": str(target),
-                    },
-                    status=MobileActionStatus.PENDING.value,
-                    created_at=now,
-                    updated_at=now,
+                    expected_version=expected_version,
+                    stop_pct=float(stop),
+                    target_pct=float(target),
                 )
             )
             if not created:
@@ -425,17 +428,6 @@ class MobileCommandCenterService:
                     entity_id=position_id,
                     request_fingerprint=fingerprint,
                 )
-            self.state.mobile_adjust_position_exit(
-                position_id=position_id,
-                expected_version=expected_version,
-                stop_pct=float(stop),
-                target_pct=float(target),
-                mobile_action_id=receipt.id,
-            )
-            receipt.status = MobileActionStatus.CONFIRMED.value
-            receipt.updated_at = utc_now()
-            receipt.payload["operator_message"] = "Exit controls updated"
-            self.state.storage.save_mobile_action_receipt(receipt)
             return self._receipt_public(receipt)
 
     def close_position(
@@ -539,65 +531,14 @@ class MobileCommandCenterService:
             receipt.payload["operator_message"] = message
             self.state.storage.save_mobile_action_receipt(receipt)
         elif receipt.status == MobileActionStatus.PENDING.value:
-            self._reconcile_local_mobile_action(receipt)
+            receipt = self._reconcile_local_mobile_action(receipt)
         return self._receipt_public(receipt)
 
     def _reconcile_local_mobile_action(
         self,
         receipt: StoredMobileActionReceipt,
-    ) -> None:
-        if receipt.action_type == "trade_reject":
-            intent = self.state.storage.load_live_intent(receipt.entity_id)
-            expected_reason = (
-                "Rejected from paired mobile device: "
-                + str(receipt.payload.get("reason") or "")
-            )
-            expected_version = int(
-                receipt.payload.get("expected_version") or 0
-            )
-            if intent is not None and (
-                str(getattr(intent, "last_mobile_action_id", "")) == receipt.id
-                or (
-                    str(getattr(intent, "status", "")) == "cancelled"
-                    and str(getattr(intent, "reason", "")) == expected_reason
-                    and int(getattr(intent, "version", 0))
-                    >= expected_version + 1
-                )
-            ):
-                receipt.status = MobileActionStatus.CANCELLED.value
-                receipt.payload["operator_message"] = "Trade intent rejected"
-        elif receipt.action_type == "position_adjust_exit":
-            position = self.state.storage.load_live_ledger_position(
-                receipt.entity_id
-            )
-            expected_version = int(
-                receipt.payload.get("expected_version") or 0
-            )
-            expected_stop = float(receipt.payload.get("stop_pct") or 0)
-            expected_target = float(receipt.payload.get("target_pct") or 0)
-            if position is not None and (
-                str(getattr(position, "last_mobile_action_id", ""))
-                == receipt.id
-                or (
-                    int(getattr(position, "version", 0))
-                    >= expected_version + 1
-                    and abs(
-                        float(getattr(position, "stop_pct", 0) or 0)
-                        - expected_stop
-                    )
-                    <= 1e-12
-                    and abs(
-                        float(getattr(position, "target_pct", 0) or 0)
-                        - expected_target
-                    )
-                    <= 1e-12
-                )
-            ):
-                receipt.status = MobileActionStatus.CONFIRMED.value
-                receipt.payload["operator_message"] = "Exit controls updated"
-        if receipt.status != MobileActionStatus.PENDING.value:
-            receipt.updated_at = utc_now()
-            self.state.storage.save_mobile_action_receipt(receipt)
+    ) -> StoredMobileActionReceipt:
+        return self.state.storage.reconcile_mobile_local_action(receipt.id)
 
     def _approve_prepared_intent(
         self,
@@ -853,6 +794,10 @@ class MobileCommandCenterService:
             blockers.append("Slippage must match the prepared quote bound")
         if slippage > slippage_cap:
             blockers.append("Slippage exceeds the live limit")
+        if stop is None or target is None:
+            blockers.append(
+                "Guarded action requires both bounded stop and target controls"
+            )
         if stop is not None and stop > Decimal("100"):
             blockers.append("Stop is outside the backend bound")
         if target is not None and target > Decimal("100"):

@@ -85,6 +85,54 @@ class MobileCommandCenterContractTests(unittest.TestCase):
         self.assertEqual(claim_response.status_code, 200)
         return claim_response.json()
 
+    def test_guarded_buy_http_rejects_null_or_omitted_controls_before_service(
+        self,
+    ) -> None:
+        from app import main as main_app
+
+        with self.mobile_client() as (client, desktop_headers):
+            claim = self.claim_device(
+                client,
+                desktop_headers,
+                name="Bounded Controls Pixel",
+                scopes=[MobileScope.TRADE_EXECUTE],
+            )
+            headers = {
+                "Authorization": f"Bearer {claim['token']}",
+                "Idempotency-Key": "bounded-controls-http",
+            }
+            cases = (
+                {
+                    "expected_version": 1,
+                    "draft": {
+                        "amount": "0.05",
+                        "slippage_pct": "1",
+                        "stop_pct": None,
+                        "target_pct": None,
+                    },
+                },
+                {
+                    "expected_version": 1,
+                    "draft": {
+                        "amount": "0.05",
+                        "slippage_pct": "1",
+                    },
+                },
+            )
+            with patch.object(
+                main_app.mobile_service,
+                "approve_trade",
+            ) as approve:
+                for payload in cases:
+                    with self.subTest(payload=payload):
+                        response = client.post(
+                            "/api/mobile/trades/intent-null-controls/approve",
+                            json=payload,
+                            headers=headers,
+                        )
+                        self.assertEqual(response.status_code, 422)
+                approve.assert_not_called()
+
     def seed_portfolio(self) -> None:
         now = datetime.now(timezone.utc)
         paper = TokenSignal(

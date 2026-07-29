@@ -37,8 +37,14 @@ import { BoundedTradeForm } from "./BoundedTradeForm";
 import { useTradeQuery } from "./queries";
 import { RiskEscalation } from "./RiskEscalation";
 import {
+  pendingActionForOwner,
+  pendingActionForReview,
   pendingActionStore as durablePendingActionStore,
+  samePendingActionOwner,
+  TEST_PENDING_ACTION_OWNER,
+  type PendingActionOwner,
   type PendingActionStore,
+  type PendingMobileAction,
 } from "./pendingAction";
 import type {
   GuardedApprovalInput,
@@ -63,6 +69,7 @@ export interface GuardedTradeApprovalProps {
   reconcileAction?(actionId: string): Promise<MobileActionReceipt>;
   createIdempotencyKey?(): string;
   pendingActionStore?: PendingActionStore;
+  pendingOwner?: PendingActionOwner;
 }
 
 function ambiguousReceipt(actionId: string): MobileActionReceipt {
@@ -77,6 +84,30 @@ function ambiguousReceipt(actionId: string): MobileActionReceipt {
   };
 }
 
+function reviewReceipt(
+  actionId: string,
+  operatorMessage: string,
+): MobileActionReceipt {
+  const now = new Date().toISOString();
+  return {
+    action_id: actionId,
+    status: "review_required",
+    submitted_at: now,
+    updated_at: now,
+    operator_message: operatorMessage,
+    reconcile_after_ms: 1000,
+  };
+}
+
+function isDefinitivePreReceiptFailure(caught: unknown): boolean {
+  return (
+    caught instanceof MobileApiError &&
+    !caught.actionId &&
+    caught.status !== null &&
+    [400, 401, 403, 404, 409, 410, 412, 422, 426].includes(caught.status)
+  );
+}
+
 export function GuardedTradeApproval({
   trade,
   initialDraft,
@@ -87,6 +118,7 @@ export function GuardedTradeApproval({
   reconcileAction,
   createIdempotencyKey = createMobileIdempotencyKey,
   pendingActionStore = durablePendingActionStore,
+  pendingOwner = TEST_PENDING_ACTION_OWNER,
 }: GuardedTradeApprovalProps) {
   const [draft, setDraft] = useState(initialDraft);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
@@ -96,6 +128,7 @@ export function GuardedTradeApproval({
     useState<MobileTradeValidation | null>(null);
   const inFlight = useRef(false);
   const idempotencyKey = useRef("");
+  const pendingAction = useRef<PendingMobileAction | null>(null);
 
   useEffect(() => {
     setDraft(initialDraft);
@@ -109,11 +142,22 @@ export function GuardedTradeApproval({
   useEffect(() => {
     let active = true;
     void pendingActionStore.load().then((pending) => {
-      if (
-        active &&
-        pending?.entityId === trade.id &&
-        ["trade_approve", "trade_reject"].includes(pending.actionType)
-      ) {
+      if (!active || !pending) return;
+      const belongsToTrade =
+        pending.entityId === trade.id &&
+        ["trade_approve", "trade_reject"].includes(pending.actionType);
+      const ownerMatches = samePendingActionOwner(pending, pendingOwner);
+      if (!ownerMatches || pending.state === "review_required") {
+        const message =
+          pending.reviewMessage ||
+          "Pending action belongs to a different pairing. Review it before abandoning.";
+        const reviewed = pendingActionForReview(pending, message);
+        pendingAction.current = reviewed;
+        idempotencyKey.current = pending.actionId;
+        void pendingActionStore.save(reviewed);
+        setReceipt(reviewReceipt(pending.actionId, message));
+      } else if (belongsToTrade) {
+        pendingAction.current = pending;
         idempotencyKey.current = pending.actionId;
         setReceipt(ambiguousReceipt(pending.actionId));
       }
@@ -121,7 +165,13 @@ export function GuardedTradeApproval({
     return () => {
       active = false;
     };
-  }, [pendingActionStore, trade.id]);
+  }, [
+    pendingActionStore,
+    pendingOwner.apiBaseUrl,
+    pendingOwner.deviceId,
+    pendingOwner.sessionId,
+    trade.id,
+  ]);
 
   useEffect(() => {
     if (!validateDraft) return;
@@ -163,14 +213,29 @@ export function GuardedTradeApproval({
             if (!active) return;
             setReceipt(next);
             if (["pending", "verifying"].includes(next.status)) poll();
-            else void pendingActionStore.clear(next.action_id);
+            else {
+              pendingAction.current = null;
+              void pendingActionStore.clear(next.action_id);
+            }
           },
           (caught) => {
             if (!active) return;
-            if (caught instanceof MobileApiError && caught.status === 403) {
-              setError(
-                "This device does not have trade review access.",
-              );
+            if (
+              caught instanceof MobileApiError &&
+              caught.status !== null &&
+              [401, 403, 404, 409, 410, 412, 422].includes(caught.status)
+            ) {
+              const current = pendingAction.current;
+              if (current) {
+                const message =
+                  caught.status === 404
+                    ? "The pending action is not visible to this pairing. Review before abandoning it."
+                    : "This pairing cannot reconcile the pending action. Review before abandoning it.";
+                const reviewed = pendingActionForReview(current, message);
+                pendingAction.current = reviewed;
+                void pendingActionStore.save(reviewed);
+                setReceipt(reviewReceipt(current.actionId, message));
+              }
               return;
             }
             poll();
@@ -196,7 +261,10 @@ export function GuardedTradeApproval({
     !trade.allowed_actions.approve ||
     blockers.length > 0 ||
     busy ||
-    Boolean(receipt && ["pending", "verifying"].includes(receipt.status));
+    Boolean(
+      receipt &&
+        ["pending", "verifying", "review_required"].includes(receipt.status),
+    );
 
   const authorize = async (escalationAcknowledged: boolean) => {
     if (disabled || inFlight.current) return;
@@ -227,11 +295,14 @@ export function GuardedTradeApproval({
         );
         return;
       }
-      await pendingActionStore.save({
-        actionId: idempotencyKey.current,
-        entityId: trade.id,
-        actionType: "trade_approve",
-      });
+      const durableAction = pendingActionForOwner(
+        idempotencyKey.current,
+        trade.id,
+        "trade_approve",
+        pendingOwner,
+      );
+      pendingAction.current = durableAction;
+      await pendingActionStore.save(durableAction);
       const next = await submitApproval({
         expectedVersion: trade.version,
         draft,
@@ -241,6 +312,7 @@ export function GuardedTradeApproval({
       setReceipt(next);
       if (!["pending", "verifying"].includes(next.status)) {
         await pendingActionStore.clear(next.action_id);
+        pendingAction.current = null;
       }
     } catch (caught) {
       if (
@@ -248,7 +320,10 @@ export function GuardedTradeApproval({
         caught.category === "ambiguous_outcome"
       ) {
         setReceipt(ambiguousReceipt(idempotencyKey.current));
-      } else {
+      } else if (isDefinitivePreReceiptFailure(caught)) {
+        await pendingActionStore.clear(idempotencyKey.current);
+        pendingAction.current = null;
+        setReceipt(null);
         idempotencyKey.current = "";
         if (caught instanceof MobileApiError && caught.status === 403) {
           setError(
@@ -259,6 +334,9 @@ export function GuardedTradeApproval({
             caught instanceof Error ? caught.message : "Trade approval failed",
           );
         }
+      } else {
+        setReceipt(ambiguousReceipt(idempotencyKey.current));
+        setError("Approval outcome is unknown. Reconciliation will continue.");
       }
     } finally {
       inFlight.current = false;
@@ -288,11 +366,14 @@ export function GuardedTradeApproval({
         );
         return;
       }
-      await pendingActionStore.save({
+      const durableAction = pendingActionForOwner(
         actionId,
-        entityId: trade.id,
-        actionType: "trade_reject",
-      });
+        trade.id,
+        "trade_reject",
+        pendingOwner,
+      );
+      pendingAction.current = durableAction;
+      await pendingActionStore.save(durableAction);
       const next = await submitRejection({
         expectedVersion: trade.version,
         reason: "Rejected from mobile review",
@@ -301,6 +382,7 @@ export function GuardedTradeApproval({
       setReceipt(next);
       if (!["pending", "verifying"].includes(next.status)) {
         await pendingActionStore.clear(next.action_id);
+        pendingAction.current = null;
       }
     } catch (caught) {
       if (
@@ -308,20 +390,36 @@ export function GuardedTradeApproval({
         caught.category === "ambiguous_outcome"
       ) {
         setReceipt(ambiguousReceipt(actionId));
-      } else if (
-        caught instanceof MobileApiError &&
-        caught.status === 403
-      ) {
-        setError("This device does not have trade review access.");
+      } else if (isDefinitivePreReceiptFailure(caught)) {
+        await pendingActionStore.clear(actionId);
+        pendingAction.current = null;
+        setReceipt(null);
+        if (caught instanceof MobileApiError && caught.status === 403) {
+          setError("This device does not have trade review access.");
+        } else {
+          setError(
+            caught instanceof Error ? caught.message : "Trade rejection failed",
+          );
+        }
       } else {
-        setError(
-          caught instanceof Error ? caught.message : "Trade rejection failed",
-        );
+        setReceipt(ambiguousReceipt(actionId));
+        setError("Rejection outcome is unknown. Reconciliation will continue.");
       }
     } finally {
       inFlight.current = false;
       setBusy(false);
     }
+  };
+
+  const abandonPendingAction = async () => {
+    const actionId =
+      pendingAction.current?.actionId || receipt?.action_id || "";
+    if (!actionId) return;
+    await pendingActionStore.clear(actionId);
+    pendingAction.current = null;
+    idempotencyKey.current = "";
+    setReceipt(null);
+    setError("");
   };
 
   return (
@@ -369,14 +467,22 @@ export function GuardedTradeApproval({
             !trade.allowed_actions.reject ||
             busy ||
             Boolean(
-              receipt &&
-                ["pending", "verifying"].includes(receipt.status),
+                receipt &&
+                ["pending", "verifying", "review_required"].includes(
+                  receipt.status,
+                ),
             )
           }
           onPress={() => void reject()}
         />
       ) : null}
       {receipt ? <ActionStatus receipt={receipt} /> : null}
+      {receipt?.status === "review_required" ? (
+        <ActionButton
+          label="Abandon pending action"
+          onPress={() => void abandonPendingAction()}
+        />
+      ) : null}
     </View>
   );
 }
@@ -487,6 +593,17 @@ export function TradeDetailScreen({
                   authenticatedRead(session, () =>
                     fetchAction(actionId, connectionOptions),
                   )
+                }
+                pendingOwner={
+                  session
+                    ? {
+                        apiBaseUrl: session.apiBaseUrl,
+                        deviceId: session.device?.id || "unpaired-device",
+                        sessionId:
+                          session.record?.savedAt ||
+                          `session-${session.generation}`,
+                      }
+                    : TEST_PENDING_ACTION_OWNER
                 }
               />
             </Section>

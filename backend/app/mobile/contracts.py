@@ -44,8 +44,8 @@ class MobileTradeDraft(BaseModel):
 
     amount: Decimal | Literal["100%"]
     slippage_pct: Decimal = Field(gt=0)
-    stop_pct: Decimal | None = Field(default=None, gt=0)
-    target_pct: Decimal | None = Field(default=None, gt=0)
+    stop_pct: Decimal = Field(gt=0, le=100)
+    target_pct: Decimal = Field(gt=0, le=100)
 
 
 class MobileGuardedActionRequest(BaseModel):

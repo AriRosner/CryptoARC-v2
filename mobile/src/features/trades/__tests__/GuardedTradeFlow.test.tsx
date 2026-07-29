@@ -16,6 +16,11 @@ import type { PositionDetail } from "../../positions/types";
 import { ActionStatus } from "../ActionStatus";
 import { BoundedTradeForm } from "../BoundedTradeForm";
 import { GuardedTradeApproval } from "../TradeDetailScreen";
+import type {
+  PendingActionOwner,
+  PendingActionStore,
+  PendingMobileAction,
+} from "../pendingAction";
 import type { MobileActionReceipt, MobileTradeDetail, MobileTradeDraft } from "../types";
 
 const routineTrade: MobileTradeDetail = {
@@ -61,6 +66,92 @@ const validDraft: MobileTradeDraft = {
   stop_pct: "20",
   target_pct: "40",
 };
+
+const ownerA: PendingActionOwner = {
+  apiBaseUrl: "https://node-a.test",
+  deviceId: "device-a",
+  sessionId: "session-a",
+};
+
+const ownerB: PendingActionOwner = {
+  apiBaseUrl: "https://node-b.test",
+  deviceId: "device-b",
+  sessionId: "session-b",
+};
+
+function createPendingStore(initial: PendingMobileAction | null = null) {
+  let current = initial;
+  const store: PendingActionStore & {
+    current(): PendingMobileAction | null;
+    setCurrent(action: PendingMobileAction | null): void;
+  } = {
+    load: jest.fn(async () => current),
+    save: jest.fn(async (action) => {
+      current = action;
+    }),
+    clear: jest.fn(async (actionId) => {
+      if (current?.actionId === actionId) current = null;
+    }),
+    current: () => current,
+    setCurrent: (action) => {
+      current = action;
+    },
+  };
+  return store;
+}
+
+function makeGuardedPosition(): PositionDetail {
+  return {
+    id: "live-position-guarded",
+    mode: "live",
+    symbol: "ARC",
+    mint: "MintRoutine",
+    status: "open",
+    opened_at: "2026-07-28T12:00:00Z",
+    updated_at: "2026-07-28T12:00:00Z",
+    wallet_label: "Wallet",
+    token_balance: 100,
+    cost_basis_sol: 0.05,
+    value_sol: 0.06,
+    realized_pnl_sol: 0,
+    unrealized_pnl_sol: 0.01,
+    pnl_pct: 20,
+    pnl_approximate: false,
+    mark_fresh: true,
+    mark_age_seconds: 1,
+    mark_source: "test",
+    mark: {
+      price_sol: 0.001,
+      source: "test",
+      confidence: 1,
+      observed_at: "2026-07-28T12:00:00Z",
+      age_seconds: 1,
+      fresh: true,
+    },
+    pnl: {
+      realized_sol: 0,
+      unrealized_sol: 0.01,
+      total_sol: 0.01,
+      percentage: 20,
+      approximate: false,
+      confidence: "audited",
+      notes: [],
+    },
+    reconciliation_status: "matched",
+    version: 7,
+    stop_pct: 20,
+    target_pct: 40,
+    prepared_close: {
+      intent_id: "intent-close",
+      intent_version: 5,
+      position_version: 7,
+      amount: "100%",
+      slippage_pct: 1,
+      expires_at: "2026-07-28T12:02:00Z",
+    },
+    allowed_actions: { adjust_exit: true, close: true, reason: "Ready" },
+  };
+}
 
 function verifyingReceipt(): MobileActionReceipt {
   return {
@@ -295,15 +386,7 @@ describe("guarded mobile trade flow", () => {
 
   it("persists a known action before dispatch and resumes retrying after remount", async () => {
     const actionId = "mobile-00000000-0000-4000-8000-000000000009";
-    const pendingStore = {
-      load: jest.fn(async () => null as {
-        actionId: string;
-        entityId: string;
-        actionType: string;
-      } | null),
-      save: jest.fn(async () => undefined),
-      clear: jest.fn(async () => undefined),
-    };
+    const pendingStore = createPendingStore();
     const submit = jest.fn(async () => {
       throw new MobileApiError(
         "Financial action outcome is unknown",
@@ -321,6 +404,7 @@ describe("guarded mobile trade flow", () => {
         reconcileAction={jest.fn()}
         createIdempotencyKey={() => actionId}
         pendingActionStore={pendingStore}
+        pendingOwner={ownerA}
       />,
     );
 
@@ -330,14 +414,18 @@ describe("guarded mobile trade flow", () => {
         actionId,
         entityId: routineTrade.id,
         actionType: "trade_approve",
+        owner: ownerA,
+        state: "pending",
       }),
     );
     await first.unmount();
 
-    pendingStore.load.mockResolvedValue({
+    pendingStore.setCurrent({
       actionId,
       entityId: routineTrade.id,
       actionType: "trade_approve",
+      owner: ownerA,
+      state: "pending",
     });
     const reconcile = jest
       .fn()
@@ -356,6 +444,7 @@ describe("guarded mobile trade flow", () => {
         submitApproval={submit}
         reconcileAction={reconcile}
         pendingActionStore={pendingStore}
+        pendingOwner={ownerA}
       />,
     );
 
@@ -459,56 +548,7 @@ describe("guarded mobile trade flow", () => {
 
   it("submits functional version-bound position adjust and full-close actions", async () => {
     jest.useFakeTimers();
-    const position: PositionDetail = {
-      id: "live-position-guarded",
-      mode: "live",
-      symbol: "ARC",
-      mint: "MintRoutine",
-      status: "open",
-      opened_at: "2026-07-28T12:00:00Z",
-      updated_at: "2026-07-28T12:00:00Z",
-      wallet_label: "Wallet",
-      token_balance: 100,
-      cost_basis_sol: 0.05,
-      value_sol: 0.06,
-      realized_pnl_sol: 0,
-      unrealized_pnl_sol: 0.01,
-      pnl_pct: 20,
-      pnl_approximate: false,
-      mark_fresh: true,
-      mark_age_seconds: 1,
-      mark_source: "test",
-      mark: {
-        price_sol: 0.001,
-        source: "test",
-        confidence: 1,
-        observed_at: "2026-07-28T12:00:00Z",
-        age_seconds: 1,
-        fresh: true,
-      },
-      pnl: {
-        realized_sol: 0,
-        unrealized_sol: 0.01,
-        total_sol: 0.01,
-        percentage: 20,
-        approximate: false,
-        confidence: "audited",
-        notes: [],
-      },
-      reconciliation_status: "matched",
-      version: 7,
-      stop_pct: 20,
-      target_pct: 40,
-      prepared_close: {
-        intent_id: "intent-close",
-        intent_version: 5,
-        position_version: 7,
-        amount: "100%",
-        slippage_pct: 1,
-        expires_at: "2026-07-28T12:02:00Z",
-      },
-      allowed_actions: { adjust_exit: true, close: true, reason: "Ready" },
-    };
+    const position = makeGuardedPosition();
     const adjust = jest.fn(async () => ({
       ...verifyingReceipt(),
       status: "confirmed" as const,
@@ -548,6 +588,217 @@ describe("guarded mobile trade flow", () => {
           draft: expect.objectContaining({ amount: "100%" }),
         }),
       ),
+    );
+  });
+
+  it.each([401, 403, 409, 422])(
+    "clears a definitive pre-receipt trade approval failure (%s)",
+    async (status) => {
+      const actionId = `trade-definitive-${status}`;
+      const pendingStore = createPendingStore();
+      const submit = jest.fn(async () => {
+        throw new MobileApiError(
+          "definitive rejection",
+          status === 401
+            ? "authentication"
+            : status === 403
+              ? "authorization"
+              : status === 409
+                ? "conflict"
+                : "validation",
+          status,
+          false,
+        );
+      });
+      const screen = await render(
+        <GuardedTradeApproval
+          trade={routineTrade}
+          initialDraft={validDraft}
+          online
+          submitApproval={submit}
+          createIdempotencyKey={() => actionId}
+          pendingActionStore={pendingStore}
+          pendingOwner={ownerA}
+        />,
+      );
+
+      await fireEvent.press(screen.getByText("Approve trade"));
+      await waitFor(() =>
+        expect(pendingStore.clear).toHaveBeenCalledWith(actionId),
+      );
+      expect(pendingStore.current()).toBeNull();
+      await screen.unmount();
+    },
+  );
+
+  it("clears a definitive pre-receipt trade rejection failure", async () => {
+    const actionId = "trade-reject-definitive";
+    const pendingStore = createPendingStore();
+    const reject = jest.fn(async () => {
+      throw new MobileApiError(
+        "stale intent",
+        "validation",
+        422,
+        false,
+      );
+    });
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={jest.fn(async () => verifyingReceipt())}
+        submitRejection={reject}
+        createIdempotencyKey={() => actionId}
+        pendingActionStore={pendingStore}
+        pendingOwner={ownerA}
+      />,
+    );
+
+    await fireEvent.press(screen.getByText("Reject trade"));
+    await waitFor(() =>
+      expect(pendingStore.clear).toHaveBeenCalledWith(actionId),
+    );
+    expect(pendingStore.current()).toBeNull();
+  });
+
+  it.each([401, 403, 409, 422])(
+    "clears a definitive pre-receipt position failure (%s)",
+    async (status) => {
+      const actionId = `position-definitive-${status}`;
+      const pendingStore = createPendingStore();
+      const submitAdjustment = jest.fn(async () => {
+        throw new MobileApiError(
+          "definitive position rejection",
+          status === 401
+            ? "authentication"
+            : status === 403
+              ? "authorization"
+              : status === 409
+                ? "conflict"
+                : "validation",
+          status,
+          false,
+        );
+      });
+      const screen = await render(
+        <GuardedPositionActions
+          position={makeGuardedPosition()}
+          online
+          submitAdjustment={submitAdjustment}
+          submitClose={jest.fn(async () => verifyingReceipt())}
+          createIdempotencyKey={() => actionId}
+          pendingActionStore={pendingStore}
+          pendingOwner={ownerA}
+        />,
+      );
+
+      await fireEvent.press(screen.getByText("Apply exit controls"));
+      await waitFor(() =>
+        expect(pendingStore.clear).toHaveBeenCalledWith(actionId),
+      );
+      expect(pendingStore.current()).toBeNull();
+      await screen.unmount();
+    },
+  );
+
+  it.each([
+    ["trade", "trade_approve", routineTrade.id],
+    ["position", "position_adjust_exit", "live-position-guarded"],
+  ] as const)(
+    "turns a permanent 404 %s reconciliation into an abandonable review",
+    async (kind, actionType, entityId) => {
+      const actionId = `${kind}-missing-receipt`;
+      const pendingStore = createPendingStore({
+        actionId,
+        entityId,
+        actionType,
+        owner: ownerA,
+        state: "pending",
+      });
+      const reconcile = jest.fn(async () => {
+        throw new MobileApiError(
+          "Mobile action receipt not found",
+          "validation",
+          404,
+          false,
+        );
+      });
+      const screen =
+        kind === "trade"
+          ? await render(
+              <GuardedTradeApproval
+                trade={routineTrade}
+                initialDraft={validDraft}
+                online
+                submitApproval={jest.fn(async () => verifyingReceipt())}
+                reconcileAction={reconcile}
+                pendingActionStore={pendingStore}
+                pendingOwner={ownerA}
+              />,
+            )
+          : await render(
+              <GuardedPositionActions
+                position={makeGuardedPosition()}
+                online
+                submitAdjustment={jest.fn(async () => verifyingReceipt())}
+                submitClose={jest.fn(async () => verifyingReceipt())}
+                reconcileAction={reconcile}
+                pendingActionStore={pendingStore}
+                pendingOwner={ownerA}
+              />,
+            );
+
+      expect(
+        await screen.findByText("Review required", {}, { timeout: 2000 }),
+      ).toBeTruthy();
+      expect(reconcile).toHaveBeenCalledTimes(1);
+      expect(pendingStore.current()).toEqual(
+        expect.objectContaining({ state: "review_required" }),
+      );
+      await fireEvent.press(screen.getByText("Abandon pending action"));
+      await waitFor(() => expect(pendingStore.current()).toBeNull());
+      await screen.unmount();
+    },
+  );
+
+  it("requires review then abandon when a pending action belongs to an old pairing", async () => {
+    const oldActionId = "old-pairing-action";
+    const newActionId = "new-pairing-action";
+    const pendingStore = createPendingStore({
+      actionId: oldActionId,
+      entityId: routineTrade.id,
+      actionType: "trade_approve",
+      owner: ownerA,
+      state: "pending",
+    });
+    const reconcile = jest.fn(async () => verifyingReceipt());
+    const submit = jest.fn(async () => verifyingReceipt());
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        reconcileAction={reconcile}
+        createIdempotencyKey={() => newActionId}
+        pendingActionStore={pendingStore}
+        pendingOwner={ownerB}
+      />,
+    );
+
+    expect(await screen.findByText("Review required")).toBeTruthy();
+    expect(reconcile).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByText("Abandon pending action"));
+    await waitFor(() => expect(pendingStore.current()).toBeNull());
+    await fireEvent.press(screen.getByText("Approve trade"));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(pendingStore.current()).toEqual(
+      expect.objectContaining({
+        actionId: newActionId,
+        owner: ownerB,
+        state: "pending",
+      }),
     );
   });
 
