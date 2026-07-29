@@ -93,6 +93,10 @@ const detail: PositionDetail = {
     notes: ["Live PnL remains approximate until reconciliation."],
   },
   reconciliation_status: "matched",
+  version: 4,
+  stop_pct: 20,
+  target_pct: 40,
+  prepared_close: null,
   allowed_actions: {
     adjust_exit: false,
     close: false,

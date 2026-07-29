@@ -169,8 +169,18 @@ export function PortfolioScreen() {
           setSelectedPositionId(null);
           router.push(`/position/${encodeURIComponent(positionId)}`);
         }}
-        onAdjustExit={() => undefined}
-        onClose={() => undefined}
+        onAdjustExit={(positionId) => {
+          setSelectedPositionId(null);
+          router.push(
+            `/position/${encodeURIComponent(positionId)}?action=adjust`,
+          );
+        }}
+        onClose={(positionId) => {
+          setSelectedPositionId(null);
+          router.push(
+            `/position/${encodeURIComponent(positionId)}?action=close`,
+          );
+        }}
       />
     </SafeAreaView>
   );

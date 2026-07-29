@@ -38,6 +38,17 @@ export interface PositionDetail extends PositionSummary {
     notes: string[];
   };
   reconciliation_status: string;
+  version: number;
+  stop_pct: number;
+  target_pct: number;
+  prepared_close: {
+    intent_id: string;
+    intent_version: number;
+    position_version: number;
+    amount: "100%";
+    slippage_pct: number;
+    expires_at: string | null;
+  } | null;
   allowed_actions: {
     adjust_exit: boolean;
     close: boolean;

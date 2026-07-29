@@ -1,13 +1,18 @@
 import * as LocalAuthentication from "expo-local-authentication";
 import React from "react";
 import {
+  act,
   fireEvent,
   render,
   waitFor,
 } from "@testing-library/react-native";
+import { AppState, type AppStateStatus } from "react-native";
 
 import { HoldToConfirm } from "../../../components/actions/HoldToConfirm";
 import { MobileApiError } from "../../../core/api/errors";
+import { authenticatedRead } from "../../../core/api/authenticatedRead";
+import { GuardedPositionActions } from "../../positions/GuardedPositionActions";
+import type { PositionDetail } from "../../positions/types";
 import { ActionStatus } from "../ActionStatus";
 import { BoundedTradeForm } from "../BoundedTradeForm";
 import { GuardedTradeApproval } from "../TradeDetailScreen";
@@ -32,6 +37,12 @@ const routineTrade: MobileTradeDetail = {
     stale: false,
   },
   simulation: { status: "ok", ok: true, warning: "", error: "" },
+  default_draft: {
+    amount: "0.05",
+    slippage_pct: "1",
+    stop_pct: "20",
+    target_pct: "40",
+  },
   limits: {
     amount: { min: 0.05, max: 0.05, unit: "SOL" },
     slippage_pct: { min: 1, max: 1 },
@@ -70,6 +81,11 @@ describe("guarded mobile trade flow", () => {
     authenticate.mockResolvedValue({ success: true });
   });
 
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
   it("requires biometric confirmation before a routine approval", async () => {
     const submit = jest.fn(async () => verifyingReceipt());
     const screen = await render(
@@ -95,6 +111,7 @@ describe("guarded mobile trade flow", () => {
   });
 
   it("requires biometric plus a 1400ms hold for elevated risk", async () => {
+    jest.useFakeTimers();
     const submit = jest.fn(async () => verifyingReceipt());
     const elevated = {
       ...routineTrade,
@@ -112,9 +129,17 @@ describe("guarded mobile trade flow", () => {
     );
     const hold = screen.getByTestId("hold-to-confirm-1400");
 
-    await fireEvent(hold, "longPress");
+    await fireEvent(hold, "pressIn");
+    await act(async () => {
+      jest.advanceTimersByTime(1399);
+    });
+    expect(authenticate).not.toHaveBeenCalled();
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
 
-    await waitFor(() => expect(authenticate).toHaveBeenCalledTimes(1));
+    expect(authenticate).toHaveBeenCalledTimes(1);
     expect(submit).toHaveBeenCalledWith(
       expect.objectContaining({
         escalationAcknowledged: true,
@@ -124,8 +149,16 @@ describe("guarded mobile trade flow", () => {
     expect(await screen.findByText("No automatic resubmission")).toBeTruthy();
   });
 
-  it("resets an interrupted hold without submitting", async () => {
+  it("resets interrupted, backgrounded, and screen-reader holds safely", async () => {
+    jest.useFakeTimers();
     const confirm = jest.fn();
+    let appStateListener: ((state: AppStateStatus) => void) | undefined;
+    jest.spyOn(AppState, "addEventListener").mockImplementation(
+      (_event, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      },
+    );
     const screen = await render(
       <HoldToConfirm
         label="Hold to approve trade"
@@ -139,8 +172,29 @@ describe("guarded mobile trade flow", () => {
 
     await fireEvent(hold, "pressIn");
     await fireEvent(hold, "pressOut");
-
+    await act(async () => {
+      jest.advanceTimersByTime(1400);
+    });
     expect(confirm).not.toHaveBeenCalled();
+
+    await fireEvent(hold, "pressIn");
+    await act(async () => {
+      appStateListener?.("background");
+      jest.advanceTimersByTime(1400);
+    });
+    expect(confirm).not.toHaveBeenCalled();
+
+    await fireEvent(hold, "accessibilityAction", {
+      nativeEvent: { actionName: "activate" },
+    });
+    await act(async () => {
+      jest.advanceTimersByTime(1399);
+    });
+    expect(confirm).not.toHaveBeenCalled();
+    await act(async () => {
+      jest.advanceTimersByTime(1);
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
   });
 
   it("does not submit when the device is offline or the backend disables approval", async () => {
@@ -237,6 +291,264 @@ describe("guarded mobile trade flow", () => {
     await waitFor(() => expect(reconcile).toHaveBeenCalledWith(actionId));
     expect(await screen.findByText("Confirmed")).toBeTruthy();
     expect(submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists a known action before dispatch and resumes retrying after remount", async () => {
+    const actionId = "mobile-00000000-0000-4000-8000-000000000009";
+    const pendingStore = {
+      load: jest.fn(async () => null as {
+        actionId: string;
+        entityId: string;
+        actionType: string;
+      } | null),
+      save: jest.fn(async () => undefined),
+      clear: jest.fn(async () => undefined),
+    };
+    const submit = jest.fn(async () => {
+      throw new MobileApiError(
+        "Financial action outcome is unknown",
+        "ambiguous_outcome",
+        null,
+        false,
+      );
+    });
+    const first = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        reconcileAction={jest.fn()}
+        createIdempotencyKey={() => actionId}
+        pendingActionStore={pendingStore}
+      />,
+    );
+
+    await fireEvent.press(first.getByText("Approve trade"));
+    await waitFor(() =>
+      expect(pendingStore.save).toHaveBeenCalledWith({
+        actionId,
+        entityId: routineTrade.id,
+        actionType: "trade_approve",
+      }),
+    );
+    await first.unmount();
+
+    pendingStore.load.mockResolvedValue({
+      actionId,
+      entityId: routineTrade.id,
+      actionType: "trade_approve",
+    });
+    const reconcile = jest
+      .fn()
+      .mockRejectedValueOnce(new Error("transient tunnel drop"))
+      .mockResolvedValueOnce({
+        ...verifyingReceipt(),
+        action_id: actionId,
+        status: "confirmed",
+        operator_message: "Trade confirmed",
+      });
+    const resumed = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        reconcileAction={reconcile}
+        pendingActionStore={pendingStore}
+      />,
+    );
+
+    await waitFor(() => expect(pendingStore.load).toHaveBeenCalled());
+    await waitFor(() => expect(reconcile).toHaveBeenCalledTimes(2), {
+      timeout: 2000,
+    });
+    expect(await resumed.findByText("Confirmed")).toBeTruthy();
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(pendingStore.clear).toHaveBeenCalledWith(actionId);
+  });
+
+  it("exposes rejection and renders a stable execute-scope denial", async () => {
+    const reject = jest.fn(async () => ({
+      ...verifyingReceipt(),
+      status: "cancelled" as const,
+      operator_message: "Trade intent rejected",
+    }));
+    const denied = jest.fn(async () => {
+      throw new MobileApiError(
+        "mobile:trade:execute required",
+        "authorization",
+        403,
+        false,
+      );
+    });
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={denied}
+        submitRejection={reject}
+      />,
+    );
+
+    await fireEvent.press(screen.getByText("Reject trade"));
+    await waitFor(() => expect(reject).toHaveBeenCalledTimes(1));
+    await fireEvent.press(screen.getByText("Approve trade"));
+    expect(
+      await screen.findByText(
+        "This device does not have trade execution access.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("revalidates edited risk controls before choosing the approval gesture", async () => {
+    const validate = jest.fn(async () => ({
+      intent_id: routineTrade.id,
+      expected_version: routineTrade.version,
+      valid: false,
+      limits: routineTrade.limits,
+      blockers: [],
+      escalation_reasons: ["Stop is wider than the configured strategy stop"],
+      requires_escalation: true,
+      escalation_acknowledged: false,
+    }));
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={jest.fn(async () => verifyingReceipt())}
+        validateDraft={validate}
+      />,
+    );
+
+    await fireEvent.changeText(
+      screen.getByTestId("trade-field-stop_pct"),
+      "35",
+    );
+    expect(
+      await screen.findByText("Hold to approve trade", {}, { timeout: 1500 }),
+    ).toBeTruthy();
+    expect(validate).toHaveBeenCalledWith(
+      expect.objectContaining({ stop_pct: "35" }),
+    );
+  });
+
+  it("passes the captured session generation when an action 401 quarantines credentials", async () => {
+    const revokeSession = jest.fn(async () => true);
+    await expect(
+      authenticatedRead(
+        {
+          generation: 12,
+          token: "revoked-token",
+          revokeSession,
+        },
+        async () => {
+          throw new MobileApiError(
+            "session revoked",
+            "authentication",
+            401,
+            false,
+          );
+        },
+      ),
+    ).rejects.toMatchObject({ status: 401 });
+    expect(revokeSession).toHaveBeenCalledWith(12);
+  });
+
+  it("submits functional version-bound position adjust and full-close actions", async () => {
+    jest.useFakeTimers();
+    const position: PositionDetail = {
+      id: "live-position-guarded",
+      mode: "live",
+      symbol: "ARC",
+      mint: "MintRoutine",
+      status: "open",
+      opened_at: "2026-07-28T12:00:00Z",
+      updated_at: "2026-07-28T12:00:00Z",
+      wallet_label: "Wallet",
+      token_balance: 100,
+      cost_basis_sol: 0.05,
+      value_sol: 0.06,
+      realized_pnl_sol: 0,
+      unrealized_pnl_sol: 0.01,
+      pnl_pct: 20,
+      pnl_approximate: false,
+      mark_fresh: true,
+      mark_age_seconds: 1,
+      mark_source: "test",
+      mark: {
+        price_sol: 0.001,
+        source: "test",
+        confidence: 1,
+        observed_at: "2026-07-28T12:00:00Z",
+        age_seconds: 1,
+        fresh: true,
+      },
+      pnl: {
+        realized_sol: 0,
+        unrealized_sol: 0.01,
+        total_sol: 0.01,
+        percentage: 20,
+        approximate: false,
+        confidence: "audited",
+        notes: [],
+      },
+      reconciliation_status: "matched",
+      version: 7,
+      stop_pct: 20,
+      target_pct: 40,
+      prepared_close: {
+        intent_id: "intent-close",
+        intent_version: 5,
+        position_version: 7,
+        amount: "100%",
+        slippage_pct: 1,
+        expires_at: "2026-07-28T12:02:00Z",
+      },
+      allowed_actions: { adjust_exit: true, close: true, reason: "Ready" },
+    };
+    const adjust = jest.fn(async () => ({
+      ...verifyingReceipt(),
+      status: "confirmed" as const,
+    }));
+    const close = jest.fn(async () => verifyingReceipt());
+    const screen = await render(
+      <GuardedPositionActions
+        position={position}
+        online
+        submitAdjustment={adjust}
+        submitClose={close}
+        createIdempotencyKey={() => "position-action-key"}
+      />,
+    );
+
+    await fireEvent.press(screen.getByText("Apply exit controls"));
+    await waitFor(() =>
+      expect(adjust).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expectedVersion: 7,
+          stopPct: "20",
+          targetPct: "40",
+        }),
+      ),
+    );
+    await fireEvent(screen.getByTestId("hold-to-confirm-1400"), "pressIn");
+    await act(async () => {
+      jest.advanceTimersByTime(1400);
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(close).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expectedVersion: 5,
+          positionVersion: 7,
+          intentId: "intent-close",
+          draft: expect.objectContaining({ amount: "100%" }),
+        }),
+      ),
+    );
   });
 
   it("clamps bounded fields to backend-provided limits", async () => {

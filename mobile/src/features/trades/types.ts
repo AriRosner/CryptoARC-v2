@@ -50,6 +50,7 @@ export interface MobileTradeSummary {
     warning: string;
     error: string;
   };
+  default_draft: MobileTradeDraft;
   limits: MobileTradeLimits;
   blockers: string[];
   escalation_reasons: string[];
@@ -93,5 +94,11 @@ export interface GuardedApprovalInput {
   expectedVersion: number;
   draft: MobileTradeDraft;
   escalationAcknowledged: boolean;
+  idempotencyKey: string;
+}
+
+export interface GuardedRejectionInput {
+  expectedVersion: number;
+  reason: string;
   idempotencyKey: string;
 }

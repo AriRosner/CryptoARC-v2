@@ -1,4 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
+import { useNetInfo } from "@react-native-community/netinfo";
 import { router } from "expo-router";
 import { ArrowLeft, ShieldAlert } from "lucide-react-native";
 import React from "react";
@@ -11,6 +12,12 @@ import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
 import { colors, radius, spacing } from "../../theme";
 import { fetchPositionDetail } from "./api";
+import { GuardedPositionActions } from "./GuardedPositionActions";
+import {
+  adjustPositionExit,
+  closePosition,
+  fetchAction,
+} from "../trades/api";
 
 export function PositionDetailScreen({
   positionId,
@@ -20,6 +27,7 @@ export function PositionDetailScreen({
   onBack(): void;
 }) {
   const session = useOptionalSession();
+  const netInfo = useNetInfo();
   const query = useQuery({
     queryKey: ["mobile", "position", positionId, session?.generation ?? "test"],
     queryFn: () =>
@@ -119,6 +127,59 @@ export function PositionDetailScreen({
               <ShieldAlert size={18} color={colors.amber} />
               <Text style={styles.guardText}>{position.allowed_actions.reason}</Text>
             </View>
+            {position.mode === "live" ? (
+              <Section title="Guarded controls">
+                <GuardedPositionActions
+                  position={position}
+                  online={Boolean(
+                    netInfo.isConnected &&
+                      netInfo.isInternetReachable !== false
+                  )}
+                  submitAdjustment={(input) =>
+                    authenticatedRead(session, () =>
+                      adjustPositionExit(
+                        position.id,
+                        input,
+                        session
+                          ? {
+                              apiBaseUrl: session.apiBaseUrl,
+                              token: session.token,
+                            }
+                          : {},
+                      ),
+                    )
+                  }
+                  submitClose={(input) =>
+                    authenticatedRead(session, () =>
+                      closePosition(
+                        position.id,
+                        input,
+                        session
+                          ? {
+                              apiBaseUrl: session.apiBaseUrl,
+                              token: session.token,
+                            }
+                          : {},
+                      ),
+                    )
+                  }
+                  reconcileAction={(actionId) =>
+                    authenticatedRead(session, () =>
+                      fetchAction(
+                        actionId,
+                        session
+                          ? {
+                              apiBaseUrl: session.apiBaseUrl,
+                              token: session.token,
+                            }
+                          : {},
+                      ),
+                    )
+                  }
+                  onCompleted={() => query.refetch()}
+                />
+              </Section>
+            ) : null}
           </>
         )}
       </ScrollView>

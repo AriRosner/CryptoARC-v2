@@ -1,5 +1,5 @@
-import React, { useRef, useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import React, { useEffect, useRef, useState } from "react";
+import { AppState, Pressable, StyleSheet, Text, View } from "react-native";
 
 import { colors, radius, spacing } from "../../theme";
 
@@ -19,29 +19,48 @@ export function HoldToConfirm({
   accessibilityHint,
 }: HoldToConfirmProps) {
   const confirmed = useRef(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [holding, setHolding] = useState(false);
 
   const reset = () => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
     setHolding(false);
     confirmed.current = false;
   };
 
+  const begin = () => {
+    if (disabled || confirmed.current || timer.current) return;
+    setHolding(true);
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      confirmed.current = true;
+      setHolding(false);
+      void onConfirm();
+    }, durationMs);
+  };
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state !== "active") reset();
+    });
+    return () => {
+      subscription.remove();
+      if (timer.current) clearTimeout(timer.current);
+    };
+  }, []);
+
   return (
     <Pressable
+      accessibilityActions={[{ name: "activate", label }]}
       accessibilityHint={accessibilityHint}
       accessibilityLabel={label}
       accessibilityRole="button"
-      delayLongPress={durationMs}
       disabled={disabled}
-      onLongPress={() => {
-        if (disabled || confirmed.current) return;
-        confirmed.current = true;
-        setHolding(false);
-        void onConfirm();
+      onAccessibilityAction={(event) => {
+        if (event.nativeEvent.actionName === "activate") begin();
       }}
-      onPressIn={() => {
-        if (!disabled) setHolding(true);
-      }}
+      onPressIn={begin}
       onPressOut={reset}
       testID={`hold-to-confirm-${durationMs}`}
       style={[
