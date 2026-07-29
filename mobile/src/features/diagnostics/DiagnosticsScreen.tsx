@@ -1,0 +1,237 @@
+import { useQuery } from "@tanstack/react-query";
+import { Download, RefreshCw, Stethoscope } from "lucide-react-native";
+import React, { useState } from "react";
+import {
+  ScrollView,
+  Share,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { SafeAreaView } from "react-native-safe-area-context";
+
+import {
+  ActionButton,
+  DetailRow,
+  EmptyState,
+  ErrorBanner,
+  PageHeader,
+  Section,
+  StatusBadge,
+  type Tone,
+} from "../../components/ui";
+import { authenticatedRead } from "../../core/api/authenticatedRead";
+import { useSession } from "../../core/session/SessionProvider";
+import { colors, radius, spacing } from "../../theme";
+import { exportDiagnostics, fetchDiagnostics } from "./api";
+import { redactDiagnosticPayload } from "./redaction";
+import type {
+  MobileDiagnosticsPayload,
+  MobileDiagnosticStatus,
+} from "./types";
+
+interface DiagnosticsScreenProps {
+  diagnostics: MobileDiagnosticsPayload | null;
+  loading: boolean;
+  error: string;
+  exporting: boolean;
+  onRefresh(): void;
+  onExport(): void;
+}
+
+function statusTone(status: MobileDiagnosticStatus): Tone {
+  if (status === "healthy") return "success";
+  if (status === "warning") return "warning";
+  if (status === "blocked") return "danger";
+  return "neutral";
+}
+
+export function DiagnosticsScreen({
+  diagnostics,
+  loading,
+  error,
+  exporting,
+  onRefresh,
+  onExport,
+}: DiagnosticsScreenProps) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <ScrollView contentContainerStyle={styles.content}>
+        <PageHeader
+          eyebrow="Read-only recovery"
+          title="Diagnostics"
+          subtitle="Freshness-aware operator checks"
+          right={<Stethoscope color={colors.amber} size={24} />}
+        />
+        <ErrorBanner message={error} />
+        {loading ? (
+          <View accessibilityLabel="Loading diagnostics" style={styles.stack}>
+            <View style={styles.skeleton} />
+            <View style={styles.skeleton} />
+          </View>
+        ) : diagnostics ? (
+          <>
+            <Section
+              title="System checks"
+              right={
+                <StatusBadge
+                  label={diagnostics.freshness.status}
+                  tone={
+                    diagnostics.freshness.status === "fresh"
+                      ? "success"
+                      : diagnostics.freshness.status === "stale"
+                        ? "warning"
+                        : "neutral"
+                  }
+                />
+              }>
+              {diagnostics.checks.map((check) => (
+                <View key={check.id} style={styles.check}>
+                  <View style={styles.checkHeader}>
+                    <Text style={styles.checkLabel}>{check.label}</Text>
+                    <StatusBadge
+                      label={check.status}
+                      tone={statusTone(check.status)}
+                    />
+                  </View>
+                  <Text style={styles.detail}>{check.detail}</Text>
+                </View>
+              ))}
+            </Section>
+            <Section title="Recovery center">
+              {diagnostics.recovery_actions.map((action) => (
+                <DetailRow
+                  key={action.id}
+                  label={action.label}
+                  value={action.detail}
+                  tone={action.enabled ? "info" : "neutral"}
+                />
+              ))}
+            </Section>
+          </>
+        ) : (
+          <EmptyState
+            title="Diagnostics unavailable"
+            body="Reconnect to the trusted backend and refresh."
+          />
+        )}
+        <View style={styles.actions}>
+          <ActionButton
+            accessibilityLabel="Refresh diagnostics"
+            icon={<RefreshCw color={colors.text} size={17} />}
+            label="Refresh"
+            onPress={onRefresh}
+          />
+          <ActionButton
+            accessibilityLabel="Export redacted diagnostics"
+            disabled={!diagnostics || exporting}
+            icon={<Download color={colors.text} size={17} />}
+            label={exporting ? "Exporting" : "Export redacted diagnostics"}
+            loading={exporting}
+            onPress={onExport}
+            tone="primary"
+          />
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+export function DiagnosticsFeatureScreen() {
+  const session = useSession();
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const query = useQuery({
+    queryKey: ["mobile", "diagnostics", session.generation],
+    enabled: Boolean(session.token && session.apiBaseUrl),
+    queryFn: () =>
+      authenticatedRead(session, () =>
+        fetchDiagnostics({
+          apiBaseUrl: session.apiBaseUrl,
+          token: session.token,
+        }),
+      ),
+  });
+
+  const exportReport = async () => {
+    setExporting(true);
+    setExportError("");
+    try {
+      const payload = await authenticatedRead(session, () =>
+        exportDiagnostics({
+          apiBaseUrl: session.apiBaseUrl,
+          token: session.token,
+        }),
+      );
+      const redacted = redactDiagnosticPayload(payload);
+      await Share.share({
+        title: "CryptoARC redacted diagnostics",
+        message: JSON.stringify(redacted, null, 2),
+      });
+    } catch {
+      setExportError("Redacted diagnostic export failed.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  return (
+    <DiagnosticsScreen
+      diagnostics={query.data ?? null}
+      loading={query.isLoading}
+      error={
+        exportError ||
+        (query.isError ? "Diagnostics unavailable" : "")
+      }
+      exporting={exporting}
+      onRefresh={() => void query.refetch()}
+      onExport={() => void exportReport()}
+    />
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: {
+    flex: 1,
+    backgroundColor: colors.background,
+  },
+  content: {
+    padding: spacing.lg,
+    paddingBottom: spacing.xl,
+    gap: spacing.lg,
+  },
+  stack: {
+    gap: spacing.sm,
+  },
+  skeleton: {
+    height: 220,
+    borderRadius: radius.md,
+    backgroundColor: colors.panelRaised,
+  },
+  check: {
+    minHeight: 68,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+    paddingVertical: spacing.xs,
+    gap: 5,
+  },
+  checkHeader: {
+    alignItems: "center",
+    flexDirection: "row",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+  },
+  checkLabel: {
+    color: colors.text,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  detail: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 16,
+  },
+  actions: {
+    gap: spacing.sm,
+  },
+});

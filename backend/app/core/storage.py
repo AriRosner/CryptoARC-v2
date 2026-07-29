@@ -117,6 +117,7 @@ class Storage:
             with self._connect() as connection:
                 self._prepare_schema_migration_table(connection)
                 self._apply_migrations(connection)
+                self._ensure_mobile_notification_schema(connection)
             self._migration_status = {
                 "status": "ok",
                 "startup_error": "",
@@ -468,6 +469,27 @@ class Storage:
                 event_id TEXT NOT NULL,
                 acknowledged_at TEXT NOT NULL,
                 UNIQUE(device_id, event_id)
+            )
+            """
+        )
+
+    def _ensure_mobile_notification_schema(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """Keep the Task 7 delivery ledger available on existing v11 databases."""
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mobile_notification_deliveries (
+                id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                registration_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempted_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(event_id, device_id, channel)
             )
             """
         )
@@ -944,6 +966,22 @@ class Storage:
     ) -> MobilePushRegistration:
         payload = registration.to_dict()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE mobile_push_registrations
+                SET revoked_at = ?, updated_at = ?
+                WHERE device_id = ?
+                  AND token_fingerprint != ?
+                  AND (revoked_at IS NULL OR revoked_at = '')
+                """,
+                (
+                    payload["updated_at"],
+                    payload["updated_at"],
+                    payload["device_id"],
+                    payload["token_fingerprint"],
+                ),
+            )
             connection.execute(
                 """
                 INSERT INTO mobile_push_registrations (
@@ -1011,6 +1049,131 @@ class Storage:
                 (bounded_limit,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def revoke_mobile_push_registrations(
+        self,
+        *,
+        device_id: str,
+        revoked_at: str,
+    ) -> int:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mobile_push_registrations
+                SET revoked_at = ?, updated_at = ?
+                WHERE device_id = ? AND (revoked_at IS NULL OR revoked_at = '')
+                """,
+                (revoked_at, revoked_at, device_id),
+            )
+        return int(cursor.rowcount)
+
+    def reserve_mobile_notification_delivery(
+        self,
+        *,
+        delivery_id: str,
+        event_id: str,
+        device_id: str,
+        channel: str,
+        registration_id: str,
+        attempted_at: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO mobile_notification_deliveries (
+                    id, event_id, device_id, channel, registration_id,
+                    status, attempted_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    delivery_id,
+                    event_id,
+                    device_id,
+                    channel,
+                    registration_id,
+                    attempted_at,
+                    attempted_at,
+                ),
+            )
+        return int(cursor.rowcount) == 1
+
+    def finish_mobile_notification_delivery(
+        self,
+        *,
+        event_id: str,
+        device_id: str,
+        channel: str,
+        status: str,
+        updated_at: str,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE mobile_notification_deliveries
+                SET status = ?, updated_at = ?
+                WHERE event_id = ? AND device_id = ? AND channel = ?
+                """,
+                (status, updated_at, event_id, device_id, channel),
+            )
+
+    def acknowledge_mobile_alert(
+        self,
+        *,
+        acknowledgement_id: str,
+        device_id: str,
+        event_id: str,
+        acknowledged_at: str,
+    ) -> dict[str, str]:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO mobile_alert_acknowledgements (
+                    id, device_id, event_id, acknowledged_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    acknowledgement_id,
+                    device_id,
+                    event_id,
+                    acknowledged_at,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT id, device_id, event_id, acknowledged_at
+                FROM mobile_alert_acknowledgements
+                WHERE device_id = ? AND event_id = ?
+                """,
+                (device_id, event_id),
+            ).fetchone()
+        if not row:
+            raise RuntimeError("Mobile alert acknowledgement persistence failed")
+        return {str(key): str(row[key]) for key in row.keys()}
+
+    def load_mobile_alert_acknowledgements(
+        self,
+        *,
+        device_id: str,
+        limit: int = 500,
+    ) -> list[dict[str, str]]:
+        bounded_limit = max(1, min(1000, int(limit or 500)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, device_id, event_id, acknowledged_at
+                FROM mobile_alert_acknowledgements
+                WHERE device_id = ?
+                ORDER BY acknowledged_at DESC
+                LIMIT ?
+                """,
+                (device_id, bounded_limit),
+            ).fetchall()
+        return [
+            {str(key): str(row[key]) for key in row.keys()}
+            for row in rows
+        ]
 
     def create_mobile_destination_authorization(
         self,
@@ -2404,6 +2567,9 @@ class Storage:
 
     def count_mobile_push_registrations(self) -> int:
         return self._count_table("mobile_push_registrations")
+
+    def count_mobile_notification_deliveries(self) -> int:
+        return self._count_table("mobile_notification_deliveries")
 
     def _count_table(self, table: str) -> int:
         with self._connect() as connection:

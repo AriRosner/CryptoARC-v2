@@ -13,6 +13,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { MobileSessionProvider } from "@/src/MobileSession";
 import { mobileQueryClient } from "@/src/core/api/queryClient";
 import { ConnectionProvider } from "@/src/core/connectivity/ConnectionProvider";
+import { NotificationBridge } from "@/src/core/notifications/notifications";
 import { SessionProvider } from "@/src/core/session/SessionProvider";
 
 export {
@@ -57,6 +58,7 @@ export function RootLayoutNav() {
       <BottomSheetModalProvider>
         <QueryClientProvider client={mobileQueryClient}>
           <SessionProvider>
+            <NotificationBridge />
             <ConnectionProvider>
               <MobileSessionProvider>
                 <ThemeProvider value={DarkTheme}>
@@ -64,6 +66,8 @@ export function RootLayoutNav() {
                   <Stack>
                     <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
                     <Stack.Screen name="position/[positionId]" options={{ headerShown: false }} />
+                    <Stack.Screen name="trade/[intentId]" options={{ headerShown: false }} />
+                    <Stack.Screen name="diagnostics" options={{ headerShown: false }} />
                   </Stack>
                 </ThemeProvider>
               </MobileSessionProvider>

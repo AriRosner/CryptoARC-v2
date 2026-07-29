@@ -1,6 +1,7 @@
 import { Tabs } from "expo-router";
 import {
   Bell,
+  BellRing,
   ChartNoAxesCombined,
   Gauge,
   Link2,
@@ -59,6 +60,13 @@ export default function TabLayout() {
         options={{
           title: "Feed",
           tabBarIcon: ({ color }) => <Bell size={22} color={color} />,
+        }}
+      />
+      <Tabs.Screen
+        name="alerts"
+        options={{
+          title: "Alerts",
+          tabBarIcon: ({ color }) => <BellRing size={22} color={color} />,
         }}
       />
       <Tabs.Screen

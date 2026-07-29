@@ -1,4 +1,5 @@
-import { Lock, LogOut, RefreshCw, Server, ShieldCheck, Unlock, Wifi } from "lucide-react-native";
+import { Lock, LogOut, RefreshCw, Server, ShieldCheck, Stethoscope, Unlock, Wifi } from "lucide-react-native";
+import { router } from "expo-router";
 import React from "react";
 import { Alert, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
@@ -66,6 +67,12 @@ export default function DeviceScreen() {
             </Section>
 
             <Section title="Diagnostics">
+              <ActionButton
+                accessibilityLabel="Open diagnostics and recovery center"
+                label="Open recovery center"
+                onPress={() => router.push("/diagnostics")}
+                icon={<Stethoscope size={16} color={colors.text} />}
+              />
               <View style={styles.diagnosticRow}>
                 <View style={styles.diagnosticIcon}>
                   <Server size={18} color={colors.blue} />

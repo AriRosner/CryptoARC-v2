@@ -39,6 +39,68 @@ class MobileActionStatus(str, Enum):
     REVIEW_REQUIRED = "review_required"
 
 
+class MobileAlert(BaseModel):
+    event_id: str
+    created_at: datetime
+    severity: Literal["info", "warning", "danger", "error"]
+    subsystem: str
+    title: str
+    summary: str
+    route: str
+    acknowledged: bool
+    acknowledged_at: datetime | None = None
+
+
+class MobileAlertsPayload(BaseModel):
+    artifact_type: Literal["cryptoarc_mobile_alerts"] = "cryptoarc_mobile_alerts"
+    format_version: Literal[1] = 1
+    generated_at: datetime
+    alerts: list[MobileAlert]
+
+
+class MobileDiagnosticFreshness(BaseModel):
+    status: Literal["fresh", "stale", "unavailable"]
+    age_seconds: int | None = Field(default=None, ge=0)
+    stale_after_seconds: int = Field(ge=1)
+
+
+class MobileDiagnosticCheck(BaseModel):
+    id: Literal[
+        "tunnel",
+        "api",
+        "websocket",
+        "token_scope",
+        "push",
+        "telegram",
+        "clock_drift",
+        "snapshot_age",
+        "rpc",
+        "signer",
+    ]
+    label: str
+    status: Literal["healthy", "warning", "blocked", "unavailable"]
+    detail: str
+    observed_at: datetime
+
+
+class MobileRecoveryAction(BaseModel):
+    id: str
+    label: str
+    detail: str
+    enabled: bool
+
+
+class MobileDiagnosticsPayload(BaseModel):
+    artifact_type: Literal["cryptoarc_mobile_diagnostics"] = (
+        "cryptoarc_mobile_diagnostics"
+    )
+    format_version: Literal[1] = 1
+    generated_at: datetime
+    freshness: MobileDiagnosticFreshness
+    checks: list[MobileDiagnosticCheck] = Field(max_length=10)
+    recovery_actions: list[MobileRecoveryAction] = Field(max_length=8)
+
+
 class MobileTradeDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

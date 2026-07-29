@@ -14,6 +14,7 @@ jest.mock("expo-notifications", () => ({
   AndroidImportance: { DEFAULT: 3, HIGH: 4, MAX: 5 },
   addNotificationReceivedListener: jest.fn(() => ({ remove: jest.fn() })),
   addNotificationResponseReceivedListener: jest.fn(() => ({ remove: jest.fn() })),
+  addPushTokenListener: jest.fn(() => ({ remove: jest.fn() })),
   cancelAllScheduledNotificationsAsync: jest.fn(async () => undefined),
   cancelScheduledNotificationAsync: jest.fn(async () => undefined),
   getExpoPushTokenAsync: jest.fn(async () => ({ data: "ExponentPushToken[test]" })),

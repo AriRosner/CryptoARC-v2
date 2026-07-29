@@ -10,8 +10,10 @@ from starlette.responses import JSONResponse
 
 from app.mobile.contracts import (
     MobileActionReceipt,
+    MobileAlertsPayload,
     MobileAdjustExitRequest,
     MobileDestinationAuthorizationRequest,
+    MobileDiagnosticsPayload,
     MobileGuardedActionRequest,
     MobilePortfolioPayload,
     MobilePositionCloseRequest,
@@ -207,6 +209,50 @@ def create_mobile_router(
         device: dict[str, object] = Depends(require_scope(MobileScope.MONITOR)),
     ) -> dict[str, object]:
         return service.alerts_status(device)
+
+    @router.get("/alerts", response_model=MobileAlertsPayload)
+    async def mobile_alerts(
+        limit: int = 100,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.ALERTS)
+        ),
+    ) -> dict[str, object]:
+        return service.alerts(device=device, limit=limit)
+
+    @router.post("/alerts/{event_id}/acknowledge")
+    async def mobile_alert_acknowledge(
+        event_id: str,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.ALERTS)
+        ),
+    ) -> dict[str, object]:
+        try:
+            return service.acknowledge_alert(
+                device=device,
+                event_id=event_id,
+            )
+        except (LookupError, ValueError) as exc:
+            raise guarded_error(exc) from exc
+
+    @router.get("/diagnostics", response_model=MobileDiagnosticsPayload)
+    async def mobile_diagnostics(
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.DIAGNOSTICS)
+        ),
+    ) -> dict[str, object]:
+        return service.diagnostics(device=device)
+
+    @router.get("/diagnostics/export")
+    async def mobile_diagnostics_export(
+        include_public_identifiers: bool = False,
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.DIAGNOSTICS)
+        ),
+    ) -> dict[str, object]:
+        return service.diagnostic_export(
+            device=device,
+            include_public_identifiers=include_public_identifiers,
+        )
 
     @router.post("/actions/start")
     async def mobile_action_start(
@@ -622,5 +668,13 @@ def create_mobile_router(
         methods=["POST"],
         route_class_override=MobilePushRegistrationRoute,
     )
+
+    @router.post("/notifications/unregister")
+    async def mobile_notifications_unregister(
+        device: dict[str, object] = Depends(
+            require_scope(MobileScope.ALERTS)
+        ),
+    ) -> dict[str, object]:
+        return service.unregister_push_token(device=device)
 
     return router

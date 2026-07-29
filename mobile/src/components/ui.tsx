@@ -245,6 +245,7 @@ export function ActionButton({
   return (
     <Pressable
       {...props}
+      accessibilityRole={props.accessibilityRole ?? "button"}
       onPressIn={(event) => {
         Animated.timing(scale, { toValue: 0.98, duration: 80, useNativeDriver: true }).start();
         props.onPressIn?.(event);
@@ -278,7 +279,7 @@ export function ErrorBanner({ message }: { message: string }) {
   if (!message) return null;
   return (
     <AnimatedPanel>
-      <View style={styles.error}>
+      <View accessible accessibilityRole="alert" style={styles.error}>
         <Text style={styles.errorText}>{message}</Text>
       </View>
     </AnimatedPanel>

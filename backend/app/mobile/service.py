@@ -58,6 +58,27 @@ class MobileCommandCenterService:
     TREASURY_ACTIONS = frozenset(
         {"withdrawal", "profit_sweep", "rent_recovery"}
     )
+    PUSH_ROUTE_PATTERNS = (
+        re.compile(r"^/(?:alerts|diagnostics)$"),
+        re.compile(r"^/trade/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$"),
+        re.compile(r"^/position/[A-Za-z0-9][A-Za-z0-9_-]{0,119}$"),
+    )
+    MOBILE_IDENTIFIER_PATTERN = re.compile(
+        r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$"
+    )
+    DIAGNOSTIC_SENSITIVE_KEY = re.compile(
+        r"token|secret|seed|private|signature|pairing|authorization|"
+        r"credential|password|cipher|fingerprint|raw_?tx|logs?",
+        re.IGNORECASE,
+    )
+    DIAGNOSTIC_PUBLIC_IDENTIFIER_KEY = re.compile(
+        r"wallet|public_?key|address|mint",
+        re.IGNORECASE,
+    )
+    DIAGNOSTIC_PATH_KEY = re.compile(
+        r"path|directory|filename",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -69,6 +90,10 @@ class MobileCommandCenterService:
         broadcast_snapshot: Callable[[], Awaitable[None]],
         broadcast_mobile_cockpit: Callable[[], Awaitable[None]],
         stop_runtime_tasks: Callable[[], Awaitable[dict[str, object]]],
+        push_sender: Callable[
+            [str, dict[str, object]], dict[str, object] | bool
+        ]
+        | None = None,
     ) -> None:
         self._state_provider = state_provider
         self._config_provider = config_provider
@@ -81,6 +106,7 @@ class MobileCommandCenterService:
         self._ws_ticket_lock = threading.Lock()
         self._ws_tickets: dict[str, _MobileWebSocketTicket] = {}
         self._guarded_action_lock = threading.RLock()
+        self._push_sender = push_sender
 
     @property
     def state(self) -> Any:
@@ -1691,7 +1717,504 @@ class MobileCommandCenterService:
         }
 
     def alerts_status(self, device: dict[str, object]) -> dict[str, object]:
-        return {"device": device, "alerts": self.state.alerts.status()}
+        status = self.state.alerts.status()
+        last_result = (
+            status.get("last_result")
+            if isinstance(status.get("last_result"), dict)
+            else {}
+        )
+        return {
+            "device": device,
+            "alerts": {
+                "telegram_enabled": bool(status.get("telegram_enabled")),
+                "telegram_configured": bool(
+                    status.get("telegram_configured")
+                ),
+                "last_status": str(last_result.get("status") or "not_sent"),
+            },
+        }
+
+    def alerts(
+        self,
+        *,
+        device: dict[str, object],
+        limit: int = 100,
+    ) -> dict[str, object]:
+        device_id = self._device_id(device)
+        bounded_limit = max(1, min(200, int(limit or 100)))
+        acknowledgements = {
+            row["event_id"]: row
+            for row in self.state.storage.load_mobile_alert_acknowledgements(
+                device_id=device_id,
+                limit=500,
+            )
+        }
+        alert_events = [
+            event
+            for event in self.state.storage.load_all_events(bounded_limit * 3)
+            if str(event.level).lower() in {"warning", "danger", "error"}
+            or bool(event.operator_action)
+        ][:bounded_limit]
+        return {
+            "artifact_type": "cryptoarc_mobile_alerts",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "alerts": [
+                self._public_mobile_alert(
+                    event.to_dict(),
+                    acknowledgements.get(event.id),
+                )
+                for event in alert_events
+            ],
+        }
+
+    def acknowledge_alert(
+        self,
+        *,
+        device: dict[str, object],
+        event_id: str,
+    ) -> dict[str, object]:
+        clean_event_id = self._mobile_identifier(event_id, "event ID")
+        event = next(
+            (
+                candidate
+                for candidate in self.state.storage.load_all_events(1000)
+                if candidate.id == clean_event_id
+            ),
+            None,
+        )
+        if event is None:
+            raise LookupError("Mobile alert not found")
+        acknowledgement = self.state.storage.acknowledge_mobile_alert(
+            acknowledgement_id=new_id("malertack"),
+            device_id=self._device_id(device),
+            event_id=clean_event_id,
+            acknowledged_at=utc_now().isoformat(),
+        )
+        return {
+            "event_id": clean_event_id,
+            "acknowledged": True,
+            "acknowledged_at": acknowledgement["acknowledged_at"],
+        }
+
+    def build_push_payload(
+        self,
+        event: dict[str, object],
+    ) -> dict[str, object]:
+        event_id = self._mobile_identifier(event.get("id"), "event ID")
+        severity = str(event.get("level") or event.get("severity") or "").lower()
+        if severity not in {"info", "warning", "danger", "error"}:
+            raise ValueError("Push severity is invalid")
+        subsystem = str(event.get("subsystem") or "app").strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,39}", subsystem):
+            raise ValueError("Push subsystem is invalid")
+        route = self._event_route(event)
+        channel = self._push_channel(severity)
+        return {
+            "title": (
+                "Critical CryptoARC alert"
+                if severity in {"danger", "error"}
+                else "CryptoARC warning"
+                if severity == "warning"
+                else "CryptoARC activity"
+            ),
+            "body": "Open CryptoARC after unlocking.",
+            "channelId": channel,
+            "data": {
+                "event_id": event_id,
+                "severity": severity,
+                "subsystem": subsystem,
+                "route": route,
+            },
+        }
+
+    def deliver_push_event(
+        self,
+        event: dict[str, object],
+    ) -> dict[str, object]:
+        payload = self.build_push_payload(event)
+        event_id = str(payload["data"]["event_id"])
+        channel = str(payload["channelId"])
+        result = {
+            "event_id": event_id,
+            "channel": channel,
+            "sent": 0,
+            "failed": 0,
+            "deduplicated": 0,
+            "unavailable": self._push_sender is None,
+        }
+        if self._push_sender is None:
+            return result
+        registrations = self.state.storage.load_mobile_push_registrations(
+            limit=200
+        )
+        fernet = self._push_token_fernet()
+        for registration in registrations:
+            device_id = str(registration.get("device_id") or "")
+            registration_id = str(registration.get("id") or "")
+            reserved = self.state.storage.reserve_mobile_notification_delivery(
+                delivery_id=new_id("mpushdelivery"),
+                event_id=event_id,
+                device_id=device_id,
+                channel=channel,
+                registration_id=registration_id,
+                attempted_at=utc_now().isoformat(),
+            )
+            if not reserved:
+                result["deduplicated"] += 1
+                continue
+            status = "failed"
+            raw_token: str | None = None
+            try:
+                raw_token = fernet.decrypt(
+                    str(registration.get("token_ciphertext") or "").encode("ascii")
+                ).decode("utf-8")
+                self._push_sender(raw_token, payload)
+                result["sent"] += 1
+                status = "sent"
+            except Exception:
+                result["failed"] += 1
+            finally:
+                raw_token = None
+            self.state.storage.finish_mobile_notification_delivery(
+                event_id=event_id,
+                device_id=device_id,
+                channel=channel,
+                status=status,
+                updated_at=utc_now().isoformat(),
+            )
+        return result
+
+    def unregister_push_token(
+        self,
+        *,
+        device: dict[str, object],
+    ) -> dict[str, object]:
+        self.state.storage.revoke_mobile_push_registrations(
+            device_id=self._device_id(device),
+            revoked_at=utc_now().isoformat(),
+        )
+        return {"unregistered": True}
+
+    def diagnostics(
+        self,
+        *,
+        device: dict[str, object],
+    ) -> dict[str, object]:
+        now = utc_now()
+        device_id = self._device_id(device)
+        scopes = {str(scope) for scope in device.get("scopes") or []}
+        registrations = [
+            row
+            for row in self.state.storage.load_mobile_push_registrations(
+                limit=200
+            )
+            if str(row.get("device_id") or "") == device_id
+        ]
+        telegram = self.state.alerts.status()
+        runtime_status = self.state.mobile_diagnostic_runtime_status()
+        latest_event_value = runtime_status.get("latest_event_at")
+        latest_event_at = (
+            datetime.fromisoformat(
+                str(latest_event_value).replace("Z", "+00:00")
+            )
+            if latest_event_value
+            else None
+        )
+        age_seconds = (
+            max(0, int((now - latest_event_at).total_seconds()))
+            if latest_event_at
+            else None
+        )
+        stale_after_seconds = 60
+        freshness_status = (
+            "unavailable"
+            if age_seconds is None
+            else "fresh"
+            if age_seconds <= stale_after_seconds
+            else "stale"
+        )
+        source_status = str(
+            runtime_status.get("source_status") or "unknown"
+        ).lower()
+        rpc_healthy = source_status in {"healthy", "connected", "ok", "live"}
+        signer_configured = bool(
+            runtime_status.get("signer_mode_configured")
+        )
+        checks = [
+            self._diagnostic_check(
+                "tunnel",
+                "Private tunnel",
+                "healthy",
+                "Private-tunnel transport is required.",
+                now,
+            ),
+            self._diagnostic_check(
+                "api", "API", "healthy", "Authenticated API is responding.", now
+            ),
+            self._diagnostic_check(
+                "websocket",
+                "WebSocket",
+                "healthy",
+                "Mobile WebSocket endpoint is available.",
+                now,
+            ),
+            self._diagnostic_check(
+                "token_scope",
+                "Token scope",
+                "healthy" if MobileScope.DIAGNOSTICS in scopes else "blocked",
+                "Required diagnostics scope is present."
+                if MobileScope.DIAGNOSTICS in scopes
+                else "Diagnostics scope is missing.",
+                now,
+            ),
+            self._diagnostic_check(
+                "push",
+                "Push",
+                "healthy" if registrations else "warning",
+                "An active push registration exists."
+                if registrations
+                else "No active push registration exists.",
+                now,
+            ),
+            self._diagnostic_check(
+                "telegram",
+                "Telegram",
+                (
+                    "healthy"
+                    if telegram.get("telegram_enabled")
+                    and telegram.get("telegram_configured")
+                    else "warning"
+                ),
+                "Status only: enabled and configured."
+                if telegram.get("telegram_enabled")
+                and telegram.get("telegram_configured")
+                else "Status only: disabled or not configured.",
+                now,
+            ),
+            self._diagnostic_check(
+                "clock_drift",
+                "Clock drift",
+                "unavailable",
+                "Calculated on-device from server time.",
+                now,
+            ),
+            self._diagnostic_check(
+                "snapshot_age",
+                "Snapshot age",
+                "unavailable"
+                if age_seconds is None
+                else "healthy"
+                if age_seconds <= stale_after_seconds
+                else "warning",
+                "No stored event timestamp is available."
+                if age_seconds is None
+                else f"Latest stored event is {age_seconds} seconds old.",
+                now,
+            ),
+            self._diagnostic_check(
+                "rpc",
+                "RPC",
+                "healthy" if rpc_healthy else "warning",
+                "In-memory source state is healthy."
+                if rpc_healthy
+                else "In-memory source state is not healthy.",
+                now,
+            ),
+            self._diagnostic_check(
+                "signer",
+                "Signer",
+                "warning" if signer_configured else "unavailable",
+                "Signer mode is configured; readiness must be verified locally."
+                if signer_configured
+                else "No signer mode is configured.",
+                now,
+            ),
+        ]
+        return {
+            "artifact_type": "cryptoarc_mobile_diagnostics",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "freshness": {
+                "status": freshness_status,
+                "age_seconds": age_seconds,
+                "stale_after_seconds": stale_after_seconds,
+            },
+            "checks": checks,
+            "recovery_actions": [
+                {
+                    "id": "reconnect",
+                    "label": "Reconnect",
+                    "detail": "Restore the private tunnel, then refresh.",
+                    "enabled": True,
+                },
+                {
+                    "id": "re_register_push",
+                    "label": "Refresh push registration",
+                    "detail": "Retry after connectivity returns.",
+                    "enabled": not bool(registrations),
+                },
+                {
+                    "id": "review_desktop",
+                    "label": "Review desktop diagnostics",
+                    "detail": "Inspect signer and RPC readiness on the trusted host.",
+                    "enabled": True,
+                },
+            ],
+        }
+
+    def diagnostic_export(
+        self,
+        *,
+        device: dict[str, object],
+        include_public_identifiers: bool = False,
+    ) -> dict[str, object]:
+        payload = self.diagnostics(device=device)
+        payload["exported_at"] = utc_now().isoformat()
+        return self.redact_diagnostic_payload(
+            payload,
+            include_public_identifiers=include_public_identifiers,
+        )
+
+    @classmethod
+    def redact_diagnostic_payload(
+        cls,
+        value: Any,
+        *,
+        include_public_identifiers: bool = False,
+        _depth: int = 0,
+    ) -> Any:
+        if _depth >= 8:
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for index, (raw_key, item) in enumerate(value.items()):
+                if index >= 100:
+                    break
+                key = str(raw_key)
+                if cls.DIAGNOSTIC_PUBLIC_IDENTIFIER_KEY.search(key):
+                    if include_public_identifiers and isinstance(item, str):
+                        redacted[key] = cls._short_public_identifier(item)
+                    continue
+                if (
+                    cls.DIAGNOSTIC_SENSITIVE_KEY.search(key)
+                    or cls.DIAGNOSTIC_PATH_KEY.search(key)
+                ):
+                    redacted[key] = "[REDACTED]"
+                    continue
+                redacted[key] = cls.redact_diagnostic_payload(
+                    item,
+                    include_public_identifiers=include_public_identifiers,
+                    _depth=_depth + 1,
+                )
+            return redacted
+        if isinstance(value, (list, tuple)):
+            return [
+                cls.redact_diagnostic_payload(
+                    item,
+                    include_public_identifiers=include_public_identifiers,
+                    _depth=_depth + 1,
+                )
+                for item in list(value)[:100]
+            ]
+        if isinstance(value, str):
+            lowered = value.lower()
+            if (
+                "exponentpushtoken[" in lowered
+                or "expopushtoken[" in lowered
+                or "bearer " in lowered
+                or "seed phrase" in lowered
+                or "private key" in lowered
+                or re.search(r"(?:^|[\s\"'])/[a-z0-9_.-]+/", lowered)
+                or re.search(r"[a-z]:\\", lowered)
+            ):
+                return "[REDACTED]"
+            return value[:1000]
+        return value
+
+    @classmethod
+    def _event_route(cls, event: dict[str, object]) -> str:
+        explicit = str(event.get("route") or "").strip()
+        context = event.get("context")
+        event_context = context if isinstance(context, dict) else {}
+        if explicit:
+            route = explicit
+        elif event_context.get("intent_id"):
+            route = f"/trade/{event_context['intent_id']}"
+        elif event_context.get("position_id"):
+            route = f"/position/{event_context['position_id']}"
+        else:
+            route = "/alerts"
+        if not any(pattern.fullmatch(route) for pattern in cls.PUSH_ROUTE_PATTERNS):
+            raise ValueError("Push route is invalid")
+        return route
+
+    @classmethod
+    def _public_mobile_alert(
+        cls,
+        event: dict[str, object],
+        acknowledgement: dict[str, str] | None,
+    ) -> dict[str, object]:
+        severity = str(event.get("level") or "warning").lower()
+        subsystem = str(event.get("subsystem") or "app").lower()
+        return {
+            "event_id": cls._mobile_identifier(event.get("id"), "event ID"),
+            "created_at": str(event.get("created_at") or utc_now().isoformat()),
+            "severity": severity,
+            "subsystem": subsystem,
+            "title": (
+                "Critical "
+                if severity in {"danger", "error"}
+                else "Warning "
+            )
+            + f"{subsystem} alert",
+            "summary": "Review this event on the trusted backend.",
+            "route": cls._event_route(event),
+            "acknowledged": acknowledgement is not None,
+            "acknowledged_at": (
+                acknowledgement.get("acknowledged_at")
+                if acknowledgement
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _push_channel(severity: str) -> str:
+        if severity in {"danger", "error"}:
+            return "critical"
+        if severity == "warning":
+            return "warning"
+        return "activity"
+
+    @classmethod
+    def _mobile_identifier(cls, value: Any, label: str) -> str:
+        candidate = str(value or "").strip()
+        if not cls.MOBILE_IDENTIFIER_PATTERN.fullmatch(candidate):
+            raise ValueError(f"Mobile {label} is invalid")
+        return candidate
+
+    @staticmethod
+    def _diagnostic_check(
+        check_id: str,
+        label: str,
+        status: str,
+        detail: str,
+        observed_at: datetime,
+    ) -> dict[str, object]:
+        return {
+            "id": check_id,
+            "label": label,
+            "status": status,
+            "detail": detail,
+            "observed_at": observed_at.isoformat(),
+        }
+
+    @staticmethod
+    def _short_public_identifier(value: str) -> str:
+        candidate = value.strip()
+        if len(candidate) <= 12:
+            return candidate
+        return f"{candidate[:6]}...{candidate[-5:]}"
 
     async def start_action(self, device: dict[str, object]) -> dict[str, object]:
         mode = (

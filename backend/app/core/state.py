@@ -396,6 +396,25 @@ class BotState:
             "action_items": report.get("action_items", []),
         }
 
+    def mobile_diagnostic_runtime_status(self) -> dict[str, object]:
+        """Return bounded, in-memory status without probing RPC or signer transports."""
+        events = self.storage.load_all_events(1)
+        latest_event_at = events[0].created_at if events else None
+        source_status = getattr(self.source_status, "status", "")
+        return {
+            "latest_event_at": (
+                latest_event_at.isoformat() if latest_event_at else None
+            ),
+            "source_status": (
+                source_status.value
+                if hasattr(source_status, "value")
+                else str(source_status or "unknown")
+            ),
+            "signer_mode_configured": bool(
+                str(self.settings.live_signer_mode or "").strip()
+            ),
+        }
+
     def mobile_cockpit(
         self,
         live_trading_enabled: bool = False,
