@@ -155,3 +155,41 @@ The residual concerns remain integration-only: physical biometric and gesture
 behavior, private-tunnel interruption, operating-system process kills at each
 transaction boundary, two independently launched backend processes contending
 on one database, and real signer/wallet/RPC confirmation reconciliation.
+
+## Cross-entity Pending Action Closure
+
+Commit `efada05` closes the final Important re-review finding without backend
+changes.
+
+- A same-owner pending action is now visible from every guarded trade or
+  position screen, even when the displayed entity differs from the pending
+  record.
+- Trade approval/rejection records route to `/trade/{intentId}`. Position
+  adjustment/close records route to `/position/{positionId}`. Entity IDs are
+  URL-encoded before navigation.
+- The non-owning screen does not poll the receipt or permit another financial
+  submission. It directs the operator to the owning screen for reconciliation.
+- Owner-mismatched records remain review-required and are not offered an
+  unusable reconciliation route.
+- Local abandonment is two-step and warns that it removes only recovery state,
+  not any possible backend financial outcome.
+
+### Evidence
+
+- Focused RED: 22/27 passed and 5 failed. Both cross-entity directions were
+  invisible, and the existing 404/owner-mismatch abandon flows cleared without
+  the new warning confirmation.
+- Focused GREEN: 27/27 passed, including trade-to-position and
+  position-to-trade routing, same-owner visibility, owner mismatch, two-step
+  abandon, and zero submission from the non-owning screen.
+- Mobile TypeScript: passed.
+- `scripts/verify-mobile.ps1`: passed:
+  - 18 suites, 135 tests passed.
+  - Production dependency audit: 0 vulnerabilities.
+  - Expo Doctor: 20/20.
+  - Android export: passed, 4,434 modules bundled.
+- `git diff --check`: passed.
+
+No backend tests were rerun because this pass changed only mobile UI/state and
+component tests. No shared runtime/database, signer, wallet, RPC, tunnel, or
+live network was used.
