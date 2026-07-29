@@ -39,6 +39,7 @@ import { RiskEscalation } from "./RiskEscalation";
 import {
   pendingActionForOwner,
   pendingActionForReview,
+  pendingActionRoute,
   pendingActionStore as durablePendingActionStore,
   samePendingActionOwner,
   TEST_PENDING_ACTION_OWNER,
@@ -70,6 +71,7 @@ export interface GuardedTradeApprovalProps {
   createIdempotencyKey?(): string;
   pendingActionStore?: PendingActionStore;
   pendingOwner?: PendingActionOwner;
+  onOpenPendingAction?(action: PendingMobileAction): void;
 }
 
 function ambiguousReceipt(actionId: string): MobileActionReceipt {
@@ -119,11 +121,14 @@ export function GuardedTradeApproval({
   createIdempotencyKey = createMobileIdempotencyKey,
   pendingActionStore = durablePendingActionStore,
   pendingOwner = TEST_PENDING_ACTION_OWNER,
+  onOpenPendingAction,
 }: GuardedTradeApprovalProps) {
   const [draft, setDraft] = useState(initialDraft);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingElsewhere, setPendingElsewhere] = useState(false);
+  const [abandonArmed, setAbandonArmed] = useState(false);
   const [liveValidation, setLiveValidation] =
     useState<MobileTradeValidation | null>(null);
   const inFlight = useRef(false);
@@ -135,6 +140,8 @@ export function GuardedTradeApproval({
     setReceipt(null);
     setError("");
     setLiveValidation(null);
+    setPendingElsewhere(false);
+    setAbandonArmed(false);
     inFlight.current = false;
     idempotencyKey.current = "";
   }, [initialDraft, trade.id, trade.version]);
@@ -153,13 +160,21 @@ export function GuardedTradeApproval({
           "Pending action belongs to a different pairing. Review it before abandoning.";
         const reviewed = pendingActionForReview(pending, message);
         pendingAction.current = reviewed;
+        setPendingElsewhere(false);
         idempotencyKey.current = pending.actionId;
         void pendingActionStore.save(reviewed);
         setReceipt(reviewReceipt(pending.actionId, message));
       } else if (belongsToTrade) {
         pendingAction.current = pending;
+        setPendingElsewhere(false);
         idempotencyKey.current = pending.actionId;
         setReceipt(ambiguousReceipt(pending.actionId));
+      } else {
+        const message =
+          "Another financial action is pending. Open its owning screen to reconcile it.";
+        pendingAction.current = pending;
+        setPendingElsewhere(true);
+        setReceipt(reviewReceipt(pending.actionId, message));
       }
     });
     return () => {
@@ -411,7 +426,11 @@ export function GuardedTradeApproval({
     }
   };
 
-  const abandonPendingAction = async () => {
+  const requestPendingAbandon = () => {
+    setAbandonArmed(true);
+  };
+
+  const confirmPendingAbandon = async () => {
     const actionId =
       pendingAction.current?.actionId || receipt?.action_id || "";
     if (!actionId) return;
@@ -420,6 +439,14 @@ export function GuardedTradeApproval({
     idempotencyKey.current = "";
     setReceipt(null);
     setError("");
+    setPendingElsewhere(false);
+    setAbandonArmed(false);
+  };
+
+  const openPendingAction = () => {
+    const action = pendingAction.current;
+    if (!action || !pendingActionRoute(action)) return;
+    onOpenPendingAction?.(action);
   };
 
   return (
@@ -478,10 +505,34 @@ export function GuardedTradeApproval({
       ) : null}
       {receipt ? <ActionStatus receipt={receipt} /> : null}
       {receipt?.status === "review_required" ? (
-        <ActionButton
-          label="Abandon pending action"
-          onPress={() => void abandonPendingAction()}
-        />
+        <>
+          {pendingElsewhere &&
+          pendingAction.current &&
+          pendingActionRoute(pendingAction.current) &&
+          onOpenPendingAction ? (
+            <ActionButton
+              label="Open pending action"
+              onPress={openPendingAction}
+            />
+          ) : null}
+          {abandonArmed ? (
+            <>
+              <Text style={styles.blocker}>
+                Abandoning removes only local recovery state. Verify the backend
+                outcome first.
+              </Text>
+              <ActionButton
+                label="Confirm abandon pending action"
+                onPress={() => void confirmPendingAbandon()}
+              />
+            </>
+          ) : (
+            <ActionButton
+              label="Abandon pending action"
+              onPress={requestPendingAbandon}
+            />
+          )}
+        </>
       ) : null}
     </View>
   );
@@ -605,6 +656,10 @@ export function TradeDetailScreen({
                       }
                     : TEST_PENDING_ACTION_OWNER
                 }
+                onOpenPendingAction={(action) => {
+                  const path = pendingActionRoute(action);
+                  if (path) router.push(path as never);
+                }}
               />
             </Section>
           </>

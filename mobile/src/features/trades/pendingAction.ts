@@ -124,6 +124,21 @@ export function pendingActionForReview(
   };
 }
 
+export function pendingActionRoute(
+  action: PendingMobileAction,
+): string | null {
+  const entityId = encodeURIComponent(action.entityId);
+  if (["trade_approve", "trade_reject"].includes(action.actionType)) {
+    return `/trade/${entityId}`;
+  }
+  if (
+    ["position_adjust_exit", "position_close"].includes(action.actionType)
+  ) {
+    return `/position/${entityId}`;
+  }
+  return null;
+}
+
 export const pendingActionStore: PendingActionStore = {
   async load() {
     return parsePendingAction(

@@ -13,6 +13,7 @@ import {
 import {
   pendingActionForOwner,
   pendingActionForReview,
+  pendingActionRoute,
   pendingActionStore as durablePendingActionStore,
   samePendingActionOwner,
   TEST_PENDING_ACTION_OWNER,
@@ -48,6 +49,7 @@ export interface GuardedPositionActionsProps {
   createIdempotencyKey?(): string;
   pendingActionStore?: PendingActionStore;
   pendingOwner?: PendingActionOwner;
+  onOpenPendingAction?(action: PendingMobileAction): void;
   onCompleted?(): Promise<unknown> | void;
 }
 
@@ -96,6 +98,7 @@ export function GuardedPositionActions({
   createIdempotencyKey = createMobileIdempotencyKey,
   pendingActionStore = durablePendingActionStore,
   pendingOwner = TEST_PENDING_ACTION_OWNER,
+  onOpenPendingAction,
   onCompleted,
 }: GuardedPositionActionsProps) {
   const [stopPct, setStopPct] = useState(String(position.stop_pct));
@@ -103,6 +106,8 @@ export function GuardedPositionActions({
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pendingElsewhere, setPendingElsewhere] = useState(false);
+  const [abandonArmed, setAbandonArmed] = useState(false);
   const inFlight = useRef(false);
   const pendingAction = useRef<PendingMobileAction | null>(null);
 
@@ -127,11 +132,19 @@ export function GuardedPositionActions({
           "Pending action belongs to a different pairing. Review it before abandoning.";
         const reviewed = pendingActionForReview(pending, message);
         pendingAction.current = reviewed;
+        setPendingElsewhere(false);
         void pendingActionStore.save(reviewed);
         setReceipt(reviewReceipt(pending.actionId, message));
       } else if (belongsToPosition) {
         pendingAction.current = pending;
+        setPendingElsewhere(false);
         setReceipt(pendingReceipt(pending.actionId));
+      } else {
+        const message =
+          "Another financial action is pending. Open its owning screen to reconcile it.";
+        pendingAction.current = pending;
+        setPendingElsewhere(true);
+        setReceipt(reviewReceipt(pending.actionId, message));
       }
     });
     return () => {
@@ -267,7 +280,11 @@ export function GuardedPositionActions({
     }
   };
 
-  const abandonPendingAction = async () => {
+  const requestPendingAbandon = () => {
+    setAbandonArmed(true);
+  };
+
+  const confirmPendingAbandon = async () => {
     const actionId =
       pendingAction.current?.actionId || receipt?.action_id || "";
     if (!actionId) return;
@@ -275,6 +292,14 @@ export function GuardedPositionActions({
     pendingAction.current = null;
     setReceipt(null);
     setError("");
+    setPendingElsewhere(false);
+    setAbandonArmed(false);
+  };
+
+  const openPendingAction = () => {
+    const action = pendingAction.current;
+    if (!action || !pendingActionRoute(action)) return;
+    onOpenPendingAction?.(action);
   };
 
   const adjust = async () => {
@@ -364,10 +389,34 @@ export function GuardedPositionActions({
       {error ? <Text style={styles.error}>{error}</Text> : null}
       {receipt ? <ActionStatus receipt={receipt} /> : null}
       {receipt?.status === "review_required" ? (
-        <ActionButton
-          label="Abandon pending action"
-          onPress={() => void abandonPendingAction()}
-        />
+        <>
+          {pendingElsewhere &&
+          pendingAction.current &&
+          pendingActionRoute(pendingAction.current) &&
+          onOpenPendingAction ? (
+            <ActionButton
+              label="Open pending action"
+              onPress={openPendingAction}
+            />
+          ) : null}
+          {abandonArmed ? (
+            <>
+              <Text style={styles.error}>
+                Abandoning removes only local recovery state. Verify the backend
+                outcome first.
+              </Text>
+              <ActionButton
+                label="Confirm abandon pending action"
+                onPress={() => void confirmPendingAbandon()}
+              />
+            </>
+          ) : (
+            <ActionButton
+              label="Abandon pending action"
+              onPress={requestPendingAbandon}
+            />
+          )}
+        </>
       ) : null}
     </View>
   );

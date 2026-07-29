@@ -16,10 +16,11 @@ import type { PositionDetail } from "../../positions/types";
 import { ActionStatus } from "../ActionStatus";
 import { BoundedTradeForm } from "../BoundedTradeForm";
 import { GuardedTradeApproval } from "../TradeDetailScreen";
-import type {
-  PendingActionOwner,
-  PendingActionStore,
-  PendingMobileAction,
+import {
+  pendingActionRoute,
+  type PendingActionOwner,
+  type PendingActionStore,
+  type PendingMobileAction,
 } from "../pendingAction";
 import type { MobileActionReceipt, MobileTradeDetail, MobileTradeDraft } from "../types";
 
@@ -757,7 +758,101 @@ describe("guarded mobile trade flow", () => {
         expect.objectContaining({ state: "review_required" }),
       );
       await fireEvent.press(screen.getByText("Abandon pending action"));
+      expect(pendingStore.current()).not.toBeNull();
+      expect(
+        screen.getByText(
+          "Abandoning removes only local recovery state. Verify the backend outcome first.",
+        ),
+      ).toBeTruthy();
+      await fireEvent.press(screen.getByText("Confirm abandon pending action"));
       await waitFor(() => expect(pendingStore.current()).toBeNull());
+      await screen.unmount();
+    },
+  );
+
+  it.each([
+    [
+      "trade",
+      {
+        actionId: "position-pending-elsewhere",
+        entityId: "position-other",
+        actionType: "position_close",
+        owner: ownerA,
+        state: "pending" as const,
+      },
+      "/position/position-other",
+    ],
+    [
+      "position",
+      {
+        actionId: "trade-pending-elsewhere",
+        entityId: "intent-other",
+        actionType: "trade_reject",
+        owner: ownerA,
+        state: "pending" as const,
+      },
+      "/trade/intent-other",
+    ],
+  ] as const)(
+    "surfaces a same-owner pending action globally from the %s screen",
+    async (kind, pending, expectedRoute) => {
+      const pendingStore = createPendingStore(pending);
+      const openPending = jest.fn();
+      const reconcile = jest.fn(async () => verifyingReceipt());
+      const submitTrade = jest.fn(async () => verifyingReceipt());
+      const submitPosition = jest.fn(async () => verifyingReceipt());
+      const screen =
+        kind === "trade"
+          ? await render(
+              <GuardedTradeApproval
+                trade={routineTrade}
+                initialDraft={validDraft}
+                online
+                submitApproval={submitTrade}
+                reconcileAction={reconcile}
+                pendingActionStore={pendingStore}
+                pendingOwner={ownerA}
+                onOpenPendingAction={(action) =>
+                  openPending(pendingActionRoute(action))
+                }
+              />,
+            )
+          : await render(
+              <GuardedPositionActions
+                position={makeGuardedPosition()}
+                online
+                submitAdjustment={submitPosition}
+                submitClose={submitPosition}
+                reconcileAction={reconcile}
+                pendingActionStore={pendingStore}
+                pendingOwner={ownerA}
+                onOpenPendingAction={(action) =>
+                  openPending(pendingActionRoute(action))
+                }
+              />,
+            );
+
+      expect(await screen.findByText("Review required")).toBeTruthy();
+      expect(
+        screen.getByText(
+          "Another financial action is pending. Open its owning screen to reconcile it.",
+        ),
+      ).toBeTruthy();
+      expect(reconcile).not.toHaveBeenCalled();
+      expect(submitTrade).not.toHaveBeenCalled();
+      expect(submitPosition).not.toHaveBeenCalled();
+      expect(pendingStore.current()).toEqual(pending);
+
+      await fireEvent.press(screen.getByText("Open pending action"));
+      expect(openPending).toHaveBeenCalledWith(expectedRoute);
+      expect(pendingStore.current()).toEqual(pending);
+
+      await fireEvent.press(screen.getByText("Abandon pending action"));
+      expect(pendingStore.current()).toEqual(pending);
+      await fireEvent.press(screen.getByText("Confirm abandon pending action"));
+      await waitFor(() => expect(pendingStore.current()).toBeNull());
+      expect(submitTrade).not.toHaveBeenCalled();
+      expect(submitPosition).not.toHaveBeenCalled();
       await screen.unmount();
     },
   );
@@ -790,6 +885,8 @@ describe("guarded mobile trade flow", () => {
     expect(await screen.findByText("Review required")).toBeTruthy();
     expect(reconcile).not.toHaveBeenCalled();
     await fireEvent.press(screen.getByText("Abandon pending action"));
+    expect(pendingStore.current()).not.toBeNull();
+    await fireEvent.press(screen.getByText("Confirm abandon pending action"));
     await waitFor(() => expect(pendingStore.current()).toBeNull());
     await fireEvent.press(screen.getByText("Approve trade"));
     await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));

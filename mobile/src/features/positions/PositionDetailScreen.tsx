@@ -18,6 +18,7 @@ import {
   closePosition,
   fetchAction,
 } from "../trades/api";
+import { pendingActionRoute } from "../trades/pendingAction";
 
 export function PositionDetailScreen({
   positionId,
@@ -187,6 +188,10 @@ export function PositionDetailScreen({
                         }
                       : undefined
                   }
+                  onOpenPendingAction={(action) => {
+                    const path = pendingActionRoute(action);
+                    if (path) router.push(path as never);
+                  }}
                   onCompleted={() => query.refetch()}
                 />
               </Section>
