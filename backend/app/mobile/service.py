@@ -479,6 +479,14 @@ class MobileCommandCenterService:
                 amount=str(numeric_amount),
                 token_accounts=clean_accounts,
                 source_wallet_public_key=source_wallet_public_key,
+                profit_sweep_policy=(
+                    preflight.get("profit_sweep_policy")
+                    if isinstance(
+                        preflight.get("profit_sweep_policy"),
+                        dict,
+                    )
+                    else {}
+                ),
             )
             if not created:
                 return self._verify_existing_receipt(
@@ -508,6 +516,11 @@ class MobileCommandCenterService:
                     receipt.payload["transaction_signature"] = (
                         transaction_signature
                     )
+                execution_audit_id = str(
+                    result.get("execution_audit_id") or ""
+                )
+                if execution_audit_id:
+                    receipt.execution_audit_id = execution_audit_id
             except Exception:
                 status = MobileActionStatus.VERIFYING.value
                 message = "Verifying treasury outcome"
@@ -887,11 +900,16 @@ class MobileCommandCenterService:
             or receipt.payload.get("audit_id")
             or ""
         )
-        if audit_id and receipt.status in {
-            MobileActionStatus.PENDING.value,
-            MobileActionStatus.VERIFYING.value,
-            MobileActionStatus.REVIEW_REQUIRED.value,
-        }:
+        if (
+            receipt.action_type not in self.TREASURY_ACTIONS
+            and audit_id
+            and receipt.status
+            in {
+                MobileActionStatus.PENDING.value,
+                MobileActionStatus.VERIFYING.value,
+                MobileActionStatus.REVIEW_REQUIRED.value,
+            }
+        ):
             audit = self.state.storage.load_live_execution_audit(audit_id)
             if audit is not None and str(audit.status) in {
                 "submitting",

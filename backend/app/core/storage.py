@@ -88,6 +88,8 @@ class Storage:
         "source_soak_history",
         "mobile_pairing_requests",
         "mobile_devices",
+        "mobile_action_receipts",
+        "mobile_destination_authorizations",
     )
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
@@ -1191,6 +1193,7 @@ class Storage:
         amount: str,
         token_accounts: list[str],
         source_wallet_public_key: str,
+        profit_sweep_policy: dict[str, Any],
     ) -> tuple[MobileActionReceipt, bool]:
         """Consume one exact preview while durably reserving its side effect."""
         with self._connect() as connection:
@@ -1261,6 +1264,13 @@ class Storage:
                 raise ValueError(
                     "Destination authorization action binding does not match"
                 )
+            if action == "profit_sweep":
+                self._claim_mobile_profit_sweep_capacity(
+                    connection,
+                    receipt,
+                    source_wallet_public_key=source_wallet_public_key,
+                    policy=profit_sweep_policy,
+                )
             authorization.payload["preview"] = {
                 **preview,
                 "used_at": now.isoformat(),
@@ -1285,6 +1295,68 @@ class Storage:
                 )
             self._insert_mobile_action_receipt(connection, receipt)
         return receipt, True
+
+    @classmethod
+    def _claim_mobile_profit_sweep_capacity(
+        cls,
+        connection: sqlite3.Connection,
+        receipt: MobileActionReceipt,
+        *,
+        source_wallet_public_key: str,
+        policy: dict[str, Any],
+    ) -> None:
+        max_per_day = max(0, int(policy.get("max_per_day") or 0))
+        cooldown_seconds = max(
+            0,
+            int(policy.get("cooldown_seconds") or 0),
+        )
+        rows = connection.execute(
+            """
+            SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                   payload, status, created_at, updated_at, execution_audit_id
+            FROM mobile_action_receipts
+            WHERE action_type = 'profit_sweep'
+              AND status IN (
+                  'pending', 'submitting', 'verifying', 'review_required',
+                  'confirmed', 'reconciled'
+              )
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        now = receipt.created_at
+        matching = [
+            existing
+            for existing in (
+                cls._mobile_action_receipt_from_row(row) for row in rows
+            )
+            if str(
+                existing.payload.get("source_wallet_public_key") or ""
+            )
+            == source_wallet_public_key
+        ]
+        recent = [
+            existing
+            for existing in matching
+            if (now - existing.created_at).total_seconds() < 86400
+        ]
+        if max_per_day > 0 and len(recent) >= max_per_day:
+            raise ValueError("daily sweep cap reached")
+        if matching and cooldown_seconds > 0:
+            last_claim = max(
+                matching,
+                key=lambda existing: existing.created_at,
+            )
+            age_seconds = (now - last_claim.created_at).total_seconds()
+            if age_seconds < cooldown_seconds:
+                raise ValueError("profit sweep cooldown active")
+        receipt.payload["profit_sweep_policy_claim"] = {
+            "action": "profit_sweep",
+            "source_wallet_public_key": source_wallet_public_key,
+            "claim_day": now.date().isoformat(),
+            "max_per_day": max_per_day,
+            "cooldown_seconds": cooldown_seconds,
+            "claimed_at": now.isoformat(),
+        }
 
     def load_pending_mobile_treasury_receipts(
         self,
@@ -1655,13 +1727,15 @@ class Storage:
         connection.execute(
             """
             UPDATE mobile_action_receipts
-            SET payload = ?, status = ?, updated_at = ?
+            SET payload = ?, status = ?, updated_at = ?,
+                execution_audit_id = ?
             WHERE id = ?
             """,
             (
                 json.dumps(payload["payload"]),
                 receipt.status,
                 payload["updated_at"],
+                receipt.execution_audit_id or None,
                 receipt.id,
             ),
         )
@@ -1900,18 +1974,195 @@ class Storage:
             cursor = connection.execute(
                 """
                 UPDATE mobile_action_receipts
-                SET payload = ?, status = ?, updated_at = ?
+                SET payload = ?, status = ?, updated_at = ?,
+                    execution_audit_id = COALESCE(execution_audit_id, ?)
                 WHERE id = ?
+                  AND (
+                      ? IS NULL
+                      OR execution_audit_id IS NULL
+                      OR execution_audit_id = ?
+                  )
                 """,
                 (
                     json.dumps(payload["payload"]),
                     receipt.status,
                     payload["updated_at"],
+                    receipt.execution_audit_id or None,
                     receipt.id,
+                    receipt.execution_audit_id or None,
+                    receipt.execution_audit_id or None,
                 ),
             )
             if cursor.rowcount != 1:
-                raise LookupError(f"Mobile action receipt not found: {receipt.id}")
+                raise LookupError(
+                    "Mobile action receipt was not found or its execution "
+                    f"audit binding changed: {receipt.id}"
+                )
+        return receipt
+
+    def bind_mobile_treasury_execution_audit(
+        self,
+        receipt_id: str,
+        audit: LiveExecutionAudit,
+    ) -> MobileActionReceipt:
+        if (
+            str(audit.request.get("mobile_action_id") or "") != receipt_id
+            or audit.action not in {"profit_sweep", "rent_recovery"}
+        ):
+            raise ValueError("Treasury audit does not match its receipt")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT id, idempotency_key_hash, device_id, action_type, entity_id,
+                       payload, status, created_at, updated_at, execution_audit_id
+                FROM mobile_action_receipts
+                WHERE id = ?
+                """,
+                (receipt_id,),
+            ).fetchone()
+            if not row:
+                raise LookupError(
+                    f"Mobile action receipt not found: {receipt_id}"
+                )
+            receipt = self._mobile_action_receipt_from_row(row)
+            if (
+                receipt.action_type != audit.action
+                or str(
+                    receipt.payload.get("source_wallet_public_key") or ""
+                )
+                != audit.wallet_public_key
+            ):
+                raise ValueError(
+                    "Treasury audit action or source wallet binding does not match"
+                )
+            if (
+                receipt.execution_audit_id
+                and receipt.execution_audit_id != audit.id
+            ):
+                raise ValueError(
+                    "Treasury receipt already has another execution audit"
+                )
+            claimed = connection.execute(
+                """
+                SELECT id
+                FROM mobile_action_receipts
+                WHERE execution_audit_id = ? AND id != ?
+                """,
+                (audit.id, receipt_id),
+            ).fetchone()
+            if claimed:
+                raise ValueError(
+                    "Treasury execution audit is already bound to another receipt"
+                )
+            connection.execute(
+                """
+                INSERT INTO live_execution_audits (id, payload, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    audit.id,
+                    json.dumps(audit.to_dict()),
+                    audit.created_at.isoformat(),
+                ),
+            )
+            receipt.execution_audit_id = audit.id
+            receipt.updated_at = audit.updated_at
+            self._update_mobile_action_receipt(connection, receipt)
+        return receipt
+
+    def finalize_mobile_treasury_reconciliation(
+        self,
+        receipt: MobileActionReceipt,
+        *,
+        terminal_status: str,
+        confirmation: dict[str, Any],
+    ) -> MobileActionReceipt:
+        if terminal_status not in {"confirmed", "failed"}:
+            raise ValueError("Treasury audit terminal status is invalid")
+        if not receipt.execution_audit_id:
+            raise ValueError("Treasury receipt is missing its execution audit")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            receipt_row = connection.execute(
+                """
+                SELECT id, execution_audit_id
+                FROM mobile_action_receipts
+                WHERE id = ?
+                """,
+                (receipt.id,),
+            ).fetchone()
+            if not receipt_row:
+                raise LookupError(
+                    f"Mobile action receipt not found: {receipt.id}"
+                )
+            if str(receipt_row["execution_audit_id"] or "") != (
+                receipt.execution_audit_id
+            ):
+                raise ValueError(
+                    "Treasury receipt execution audit binding changed"
+                )
+            audit_row = connection.execute(
+                "SELECT payload FROM live_execution_audits WHERE id = ?",
+                (receipt.execution_audit_id,),
+            ).fetchone()
+            if not audit_row:
+                raise LookupError(
+                    "Treasury execution audit binding was not found"
+                )
+            audit = self._live_execution_audit_from_payload(
+                json.loads(str(audit_row["payload"]))
+            )
+            if (
+                audit.action != receipt.action_type
+                or str(audit.request.get("mobile_action_id") or "")
+                != receipt.id
+            ):
+                raise ValueError(
+                    "Treasury execution audit binding does not match receipt"
+                )
+            receipt_signature = str(
+                receipt.payload.get("transaction_signature") or ""
+            )
+            if (
+                not receipt_signature
+                or audit.transaction_signature != receipt_signature
+            ):
+                raise ValueError(
+                    "Treasury execution audit signature does not match receipt"
+                )
+            now = receipt.updated_at
+            audit.status = terminal_status
+            audit.final_status = terminal_status
+            audit.confirmation = dict(confirmation)
+            audit.confirmation_status = str(
+                confirmation.get("confirmation_status")
+                or confirmation.get("status")
+                or terminal_status
+            )
+            audit.confirmation_checked_at = now
+            audit.reconciliation_status = "matched"
+            audit.reconciliation = {
+                "source": "mobile_treasury_receipt",
+                "mobile_action_id": receipt.id,
+                "receipt_status": receipt.status,
+                "transaction_signature": receipt_signature,
+            }
+            audit.updated_at = now
+            audit.recommended_action = (
+                "Treasury signature confirmed and matched to the mobile receipt."
+                if terminal_status == "confirmed"
+                else "Treasury failure confirmed on chain; review before retrying."
+            )
+            if terminal_status == "failed":
+                error = str(confirmation.get("err") or "on-chain failure")
+                if error not in audit.errors:
+                    audit.errors.append(error)
+            connection.execute(
+                "UPDATE live_execution_audits SET payload = ? WHERE id = ?",
+                (json.dumps(audit.to_dict()), audit.id),
+            )
+            self._update_mobile_action_receipt(connection, receipt)
         return receipt
 
     def load_mobile_action_receipt(

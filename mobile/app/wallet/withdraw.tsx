@@ -27,6 +27,7 @@ import {
 import type { MobileTreasuryPreview } from "@/src/features/wallet/types";
 import {
   TreasuryPendingRecovery,
+  TreasuryPreviewError,
   WithdrawalScreen,
 } from "@/src/features/wallet/WithdrawalScreen";
 import {
@@ -185,7 +186,7 @@ export default function WithdrawalRoute() {
               loading={loading}
               onPress={() => void loadPreview()}
             />
-            {error ? <View accessibilityLabel={error} /> : null}
+            <TreasuryPreviewError message={error} />
           </Section>
         )}
       </ScrollView>

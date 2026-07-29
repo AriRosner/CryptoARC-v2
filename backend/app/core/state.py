@@ -1308,6 +1308,7 @@ class BotState:
                 address,
                 float(amount),
                 self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
             )
         elif action == "profit_sweep":
             policy = preflight.get("profit_sweep_policy", {})
@@ -1344,6 +1345,7 @@ class BotState:
                 address,
                 float(amount),
                 self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
             )
             self._complete_mobile_treasury_audit(audit, result)
         else:
@@ -1379,6 +1381,7 @@ class BotState:
             result = self.hot_wallet.simulate_and_submit(
                 unsigned,
                 self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
             )
             self._complete_mobile_treasury_audit(audit, result)
         return {
@@ -1388,6 +1391,11 @@ class BotState:
                 result.get("signature")
                 or result.get("transaction_signature")
                 or ""
+            ),
+            "execution_audit_id": (
+                audit.id
+                if action in {"profit_sweep", "rent_recovery"}
+                else ""
             ),
         }
 
@@ -1428,7 +1436,10 @@ class BotState:
                 "while the outcome is unknown."
             ),
         )
-        self.storage.save_live_execution_audit(audit)
+        self.storage.bind_mobile_treasury_execution_audit(
+            action_id,
+            audit,
+        )
         return audit
 
     def _complete_mobile_treasury_audit(
@@ -1525,6 +1536,29 @@ class BotState:
             if isinstance(payload, dict)
             else ""
         )
+        action_type = str(getattr(receipt, "action_type", "") or "")
+        audit_id = str(
+            getattr(receipt, "execution_audit_id", "") or ""
+        )
+        audit = (
+            self.storage.load_live_execution_audit(audit_id)
+            if audit_id
+            else None
+        )
+        if action_type in {"profit_sweep", "rent_recovery"}:
+            if (
+                audit is None
+                or audit.action != action_type
+                or str(audit.request.get("mobile_action_id") or "")
+                != str(getattr(receipt, "id", "") or "")
+            ):
+                return {
+                    "status": "review_required",
+                    "operator_message": (
+                        "Treasury execution audit binding is missing or invalid; "
+                        "review locally and do not resubmit."
+                    ),
+                }
         if not signature:
             return {
                 "status": "review_required",
@@ -1540,15 +1574,41 @@ class BotState:
                 "operator_message": "RPC reconciliation failed; review locally",
             }
         if status.get("err"):
+            if audit is not None:
+                receipt.status = "failed"
+                receipt.updated_at = utc_now()
+                receipt.payload["operator_message"] = (
+                    "Treasury transaction failed on chain"
+                )
+                self.storage.finalize_mobile_treasury_reconciliation(
+                    receipt,
+                    terminal_status="failed",
+                    confirmation=status,
+                )
             return {
                 "status": "failed",
                 "operator_message": "Treasury transaction failed on chain",
+                "audit_terminal_status": "failed",
+                "confirmation": status,
             }
         confirmation = str(status.get("confirmation_status") or "")
         if confirmation in {"confirmed", "finalized"}:
+            if audit is not None:
+                receipt.status = "confirmed"
+                receipt.updated_at = utc_now()
+                receipt.payload["operator_message"] = (
+                    "Treasury transaction confirmed"
+                )
+                self.storage.finalize_mobile_treasury_reconciliation(
+                    receipt,
+                    terminal_status="confirmed",
+                    confirmation=status,
+                )
             return {
                 "status": "confirmed",
                 "operator_message": "Treasury transaction confirmed",
+                "audit_terminal_status": "confirmed",
+                "confirmation": status,
             }
         return {
             "status": "verifying",
@@ -6556,17 +6616,35 @@ class BotState:
             hot_wallet = self.hot_wallet.status()
             imported = bool(hot_wallet["imported"])
             unlocked = bool(hot_wallet["unlocked"])
+            sidecar_mismatch = bool(hot_wallet.get("sidecar_mismatch"))
+            can_sign = unlocked and not sidecar_mismatch
             return SignerStatus(
                 mode="local_hot_wallet",
                 connected=imported,
                 wallet_public_key=str(hot_wallet["wallet_public_key"] or ""),
-                healthy=imported,
-                can_sign=unlocked,
-                can_unattended_sign=unlocked,
-                supports_auto_sell=unlocked,
-                supports_auto_buy=unlocked,
-                disabled_reason="" if unlocked else "Unlock the encrypted local hot wallet to enable unattended execution." if imported else "Import an encrypted local hot wallet first.",
-                message="Encrypted local hot wallet is unlocked and ready." if unlocked else "Encrypted local hot wallet is imported but locked." if imported else "No local hot wallet is imported.",
+                healthy=imported and can_sign,
+                can_sign=can_sign,
+                can_unattended_sign=can_sign,
+                supports_auto_sell=can_sign,
+                supports_auto_buy=can_sign,
+                disabled_reason=(
+                    "Hot wallet sidecar does not match the actual unlocked signer."
+                    if sidecar_mismatch
+                    else ""
+                    if unlocked
+                    else "Unlock the encrypted local hot wallet to enable unattended execution."
+                    if imported
+                    else "Import an encrypted local hot wallet first."
+                ),
+                message=(
+                    "Encrypted local hot wallet identity changed on disk; lock and unlock again."
+                    if sidecar_mismatch
+                    else "Encrypted local hot wallet is unlocked and ready."
+                    if unlocked
+                    else "Encrypted local hot wallet is imported but locked."
+                    if imported
+                    else "No local hot wallet is imported."
+                ),
                 transport="encrypted_local_file",
                 version="v1",
                 last_heartbeat_at=str(hot_wallet["last_unlock_at"] or ""),
@@ -8390,7 +8468,11 @@ class BotState:
     def _execute_backend_audit(self, audit: LiveExecutionAudit) -> dict[str, object]:
         unsigned_transaction_base64 = str(audit.quote.get("unsigned_transaction_base64") or "")
         if audit.signer_mode == "local_hot_wallet":
-            return self.hot_wallet.simulate_and_submit(unsigned_transaction_base64, self.settings.solana_rpc_url)
+            return self.hot_wallet.simulate_and_submit(
+                unsigned_transaction_base64,
+                self.settings.solana_rpc_url,
+                expected_public_key=audit.wallet_public_key,
+            )
         if audit.signer_mode == "local_signer_daemon":
             base_endpoint = self.signer_daemon_url or "http://127.0.0.1:8799"
             if not self._local_signer_daemon_endpoint_allowed(base_endpoint):
@@ -8787,7 +8869,12 @@ class BotState:
         )
         self.storage.save_live_execution_audit(audit)
         try:
-            execution = self.hot_wallet.transfer_sol(destination, amount, self.settings.solana_rpc_url)
+            execution = self.hot_wallet.transfer_sol(
+                destination,
+                amount,
+                self.settings.solana_rpc_url,
+                expected_public_key=wallet,
+            )
             audit.transaction_signature = str(execution.get("signature") or execution.get("transaction_signature") or "")
             simulation = execution.get("simulation")
             if isinstance(simulation, dict):

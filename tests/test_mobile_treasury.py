@@ -18,6 +18,7 @@ from solders.keypair import Keypair
 from app.core.models import (
     LiveExecutionAudit,
     MobileActionReceipt,
+    MobileDestinationAuthorization,
     utc_now,
 )
 from app.core.state import BotState
@@ -148,6 +149,14 @@ class TreasuryState:
             "warnings": ["Treasury movement requires elevated confirmation."],
             "token_accounts": list(token_accounts),
             "wallet_public_key": self.settings.live_active_wallet_public_key,
+            "profit_sweep_policy": (
+                {
+                    "max_per_day": 1,
+                    "cooldown_seconds": 3600,
+                }
+                if action == "profit_sweep"
+                else {}
+            ),
         }
 
     def execute_mobile_treasury(
@@ -175,7 +184,7 @@ class TreasuryState:
         ):
             raise AssertionError("treasury source wallet was not bound")
         self.execute_calls += 1
-        return {
+        result = {
             "status": self.execute_status,
             "operator_message": "Treasury request submitted",
             "transaction_signature": "PublicSignature111",
@@ -185,6 +194,9 @@ class TreasuryState:
             "amount": str(amount),
             "token_accounts": token_accounts,
         }
+        if action in {"profit_sweep", "rent_recovery"}:
+            result["execution_audit_id"] = f"audit-{action}-{action_id}"
+        return result
 
     def reconcile_mobile_treasury_action(
         self,
@@ -363,6 +375,104 @@ class MobileTreasuryTests(unittest.TestCase):
             self.preview(authorization, amount=Decimal("0.18"))
         self.assertEqual(self.state.execute_calls, 1)
 
+    def test_concurrent_services_atomically_claim_one_profit_sweep_slot(
+        self,
+    ) -> None:
+        first_authorization = self.authorize(
+            action="profit_sweep",
+            purpose="first concurrent sweep",
+        )
+        second_authorization = self.authorize(
+            action="profit_sweep",
+            purpose="second concurrent sweep",
+        )
+        first_preview = self.preview(
+            first_authorization,
+            action="profit_sweep",
+        )
+        second_preview = self.preview(
+            second_authorization,
+            action="profit_sweep",
+        )
+        first_service = self.create_service()
+        second_service = self.create_service()
+        start = threading.Barrier(2)
+        outcomes: list[object] = []
+
+        def request(
+            service: MobileCommandCenterService,
+            authorization: dict[str, object],
+            preview: dict[str, object],
+            key: str,
+        ) -> None:
+            start.wait(timeout=5)
+            try:
+                outcomes.append(
+                    service.request_profit_sweep(
+                        device=self.device,
+                        authorization_id=authorization["id"],
+                        preview_id=preview["preview_id"],
+                        address=self.destination,
+                        asset="SOL",
+                        amount=Decimal("0.20"),
+                        idempotency_key=key,
+                        token_accounts=[],
+                    )
+                )
+            except Exception as exc:
+                outcomes.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=request,
+                args=(
+                    first_service,
+                    first_authorization,
+                    first_preview,
+                    "concurrent-profit-first",
+                ),
+            ),
+            threading.Thread(
+                target=request,
+                args=(
+                    second_service,
+                    second_authorization,
+                    second_preview,
+                    "concurrent-profit-second",
+                ),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+
+        receipts = [value for value in outcomes if isinstance(value, dict)]
+        errors = [value for value in outcomes if isinstance(value, Exception)]
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertRegex(str(errors[0]), "daily sweep cap|cooldown")
+        self.assertEqual(self.state.execute_calls, 1)
+        stored = self.storage.load_mobile_action_receipt(
+            str(receipts[0]["action_id"])
+        )
+        self.assertIsNotNone(stored)
+        claim = stored.payload.get("profit_sweep_policy_claim") if stored else None
+        self.assertEqual(
+            claim,
+            {
+                "action": "profit_sweep",
+                "source_wallet_public_key": (
+                    self.state.settings.live_active_wallet_public_key
+                ),
+                "claim_day": stored.created_at.date().isoformat(),
+                "max_per_day": 1,
+                "cooldown_seconds": 3600,
+                "claimed_at": stored.created_at.isoformat(),
+            },
+        )
+
     def test_destination_authorization_is_bound_to_one_treasury_action(self) -> None:
         authorization = self.service.authorize_destination(
             desktop_operator=self.desktop_operator,
@@ -492,6 +602,34 @@ class MobileTreasuryTests(unittest.TestCase):
                 action_id=receipt["action_id"],
             )
 
+    def test_restart_routes_bound_treasury_audit_through_treasury_reconciliation(
+        self,
+    ) -> None:
+        authorization = self.authorize(
+            action="profit_sweep",
+            purpose="profit sweep restart",
+        )
+        preview = self.preview(
+            authorization,
+            action="profit_sweep",
+        )
+        receipt = self.execute(
+            authorization,
+            preview,
+            action="profit_sweep",
+            idempotency_key="profit-sweep-restart",
+        )
+
+        restarted = self.create_service()
+        reconciled = restarted.action(
+            device=self.device,
+            action_id=str(receipt["action_id"]),
+        )
+
+        self.assertEqual(reconciled["status"], "confirmed")
+        self.assertEqual(self.state.execute_calls, 1)
+        self.assertEqual(self.state.reconcile_calls, 1)
+
     def test_all_treasury_actions_are_preview_first_and_authorization_bound(self) -> None:
         for action, token_accounts in [
             ("withdrawal", []),
@@ -520,6 +658,41 @@ class MobileTreasuryTests(unittest.TestCase):
                 )
                 self.assertEqual(receipt["status"], "pending")
         self.assertEqual(self.state.execute_calls, 3)
+
+    def test_profit_and_rent_receipts_persist_their_execution_audit_binding(
+        self,
+    ) -> None:
+        for action, token_accounts in (
+            ("profit_sweep", []),
+            (
+                "rent_recovery",
+                ["TokenAccount111111111111111111111111111111"],
+            ),
+        ):
+            with self.subTest(action=action):
+                authorization = self.authorize(
+                    action=action,
+                    purpose=f"{action} audit binding",
+                )
+                preview = self.preview(
+                    authorization,
+                    action=action,
+                    token_accounts=token_accounts,
+                )
+                public_receipt = self.execute(
+                    authorization,
+                    preview,
+                    action=action,
+                    idempotency_key=f"{action}-audit-binding",
+                    token_accounts=token_accounts,
+                )
+                stored = self.storage.load_mobile_action_receipt(
+                    str(public_receipt["action_id"])
+                )
+                self.assertEqual(
+                    stored.execution_audit_id if stored else "",
+                    f"audit-{action}-{public_receipt['action_id']}",
+                )
 
     def test_wallet_reads_distinguish_funds_and_redact_request_material(self) -> None:
         authorization = self.authorize()
@@ -824,6 +997,50 @@ class ProductionTreasurySafetyTests(unittest.TestCase):
             )
         self.assertEqual(transfer_calls, [])
 
+    def test_profit_audit_binding_survives_ambiguous_signing_failure(
+        self,
+    ) -> None:
+        receipt = self._receipt(
+            "profit-ambiguous-audit",
+            action="profit_sweep",
+            amount="0.02",
+        )
+        self.state.mobile_treasury_preflight = lambda **_kwargs: {  # type: ignore[method-assign]
+            "blockers": [],
+            "wallet_public_key": self.wallet,
+            "profit_sweep_policy": {"sweep_mode": "fixed_sol"},
+        }
+
+        def fail_after_audit(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError("ambiguous signer boundary")
+
+        self.state.hot_wallet.transfer_sol = fail_after_audit
+
+        with self.assertRaisesRegex(RuntimeError, "ambiguous signer boundary"):
+            self.state.execute_mobile_treasury(
+                action_id=receipt.id,
+                action="profit_sweep",
+                source_wallet_public_key=self.wallet,
+                address=self.destination,
+                asset="SOL",
+                amount=Decimal("0.02"),
+                token_accounts=[],
+            )
+
+        stored = self.state.storage.load_mobile_action_receipt(receipt.id)
+        self.assertTrue(stored.execution_audit_id if stored else "")
+        audit = self.state.storage.load_live_execution_audit(
+            stored.execution_audit_id if stored else ""
+        )
+        self.assertEqual(audit.status if audit else "", "submitting")
+        receipt.status = "verifying"
+        self.state.storage.save_mobile_action_receipt(receipt)
+        preserved = self.state.storage.load_mobile_action_receipt(receipt.id)
+        self.assertEqual(
+            preserved.execution_audit_id if preserved else "",
+            stored.execution_audit_id if stored else "",
+        )
+
     def test_rent_recovery_rechecks_wallet_after_build_before_signing(self) -> None:
         receipt = self._receipt(
             "rent-wallet-swap",
@@ -1059,6 +1276,134 @@ class ProductionTreasurySafetyTests(unittest.TestCase):
         backup_bytes = base64.b64decode(str(artifact["database_base64"]))
         self.assertNotIn(raw_marker.encode(), backup_bytes)
         self.assertNotIn(encoded.encode(), backup_bytes)
+
+    def test_confirmed_profit_receipt_terminalizes_bound_audit_and_readiness(
+        self,
+    ) -> None:
+        receipt = self._receipt(
+            "profit-confirmed-audit",
+            action="profit_sweep",
+            amount="0.02",
+        )
+        self.state.mobile_treasury_preflight = lambda **_kwargs: {  # type: ignore[method-assign]
+            "blockers": [],
+            "wallet_public_key": self.wallet,
+            "profit_sweep_policy": {"sweep_mode": "fixed_sol"},
+        }
+
+        result = self.state.execute_mobile_treasury(
+            action_id=receipt.id,
+            action="profit_sweep",
+            source_wallet_public_key=self.wallet,
+            address=self.destination,
+            asset="SOL",
+            amount=Decimal("0.02"),
+            token_accounts=[],
+        )
+        receipt.execution_audit_id = str(result["execution_audit_id"])
+        receipt.payload["transaction_signature"] = str(
+            result["transaction_signature"]
+        )
+        self.state.storage.save_mobile_action_receipt(receipt)
+        self.state._signature_status = lambda _signature: {  # type: ignore[method-assign]
+            "ok": True,
+            "err": None,
+            "confirmation_status": "confirmed",
+        }
+
+        reconciled = self.state.reconcile_mobile_treasury_action(receipt)
+
+        self.assertEqual(reconciled["status"], "confirmed")
+        audit = self.state.storage.load_live_execution_audit(
+            receipt.execution_audit_id
+        )
+        self.assertIsNotNone(audit)
+        self.assertEqual(audit.status if audit else "", "confirmed")
+        self.assertEqual(audit.final_status if audit else "", "confirmed")
+        self.assertEqual(
+            audit.reconciliation_status if audit else "",
+            "matched",
+        )
+        readiness = self.state._mobile_treasury_readiness(self.wallet)
+        self.assertNotIn(
+            "recovery debt",
+            "; ".join(str(value) for value in readiness["blockers"]),
+        )
+
+    def test_backup_preview_and_restore_include_treasury_lifecycle_tables(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            source = Storage(str(Path(directory) / "source.db"))
+            target = Storage(str(Path(directory) / "target.db"))
+            now = utc_now()
+            authorization = MobileDestinationAuthorization(
+                id="restore-treasury-authorization",
+                payload={
+                    "device_id": "restore-device",
+                    "action": "withdrawal",
+                    "address": self.destination,
+                    "asset": "SOL",
+                    "max_amount": "0.2",
+                    "purpose": "restore proof",
+                },
+                created_at=now,
+                expires_at=now + timedelta(minutes=5),
+            )
+            source.create_mobile_destination_authorization(authorization)
+            with source._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE mobile_destination_authorizations
+                    SET used_at = ?
+                    WHERE id = ?
+                    """,
+                    (now.isoformat(), authorization.id),
+                )
+            receipt = MobileActionReceipt(
+                id="restore-review-required",
+                idempotency_key_hash="restore-review-required-hash",
+                device_id="restore-device",
+                action_type="withdrawal",
+                entity_id=authorization.id,
+                payload={
+                    "source_wallet_public_key": self.wallet,
+                    "asset": "SOL",
+                    "amount": "0.2",
+                },
+                status="review_required",
+                created_at=now,
+                updated_at=now,
+            )
+            source.reserve_mobile_action_receipt(receipt)
+            artifact = source.create_backup_artifact()
+
+            preview = target.preview_restore_artifact(artifact)
+
+            self.assertEqual(preview["risk_level"], "review")
+            self.assertIn("mobile_action_receipts", preview["changed_tables"])
+            self.assertIn(
+                "mobile_destination_authorizations",
+                preview["changed_tables"],
+            )
+            self.assertEqual(
+                preview["table_deltas"]["mobile_action_receipts"]["artifact"],
+                1,
+            )
+            target.restore_backup_artifact(artifact)
+            restored_receipt = target.load_mobile_action_receipt(receipt.id)
+            restored_authorization = (
+                target.load_mobile_destination_authorization(authorization.id)
+            )
+            self.assertEqual(
+                restored_receipt.status if restored_receipt else "",
+                "review_required",
+            )
+            self.assertIsNotNone(
+                restored_authorization.used_at
+                if restored_authorization
+                else None
+            )
 
 
 if __name__ == "__main__":

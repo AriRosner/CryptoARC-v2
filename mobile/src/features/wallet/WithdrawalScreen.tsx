@@ -430,6 +430,8 @@ export function TreasuryPendingRecovery({
 }: TreasuryPendingRecoveryProps) {
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [message, setMessage] = useState("");
+  const [abandonArmed, setAbandonArmed] = useState(false);
+  const [canAbandon, setCanAbandon] = useState(false);
   const pendingAction = useRef<PendingMobileAction | null>(null);
 
   useEffect(() => {
@@ -448,16 +450,23 @@ export function TreasuryPendingRecovery({
         return;
       }
       pendingAction.current = pending;
+      const sameOwner = samePendingActionOwner(pending, pendingOwner);
+      setCanAbandon(sameOwner);
       if (
-        !samePendingActionOwner(pending, pendingOwner) ||
+        !sameOwner ||
         pending.state === "review_required"
       ) {
         const reviewMessage =
           pending.reviewMessage ||
           "Pending action belongs to a different pairing. Review it before abandoning.";
-        const reviewed = pendingActionForReview(pending, reviewMessage);
+        const reviewed =
+          pending.state === "review_required" && pending.reviewMessage
+            ? pending
+            : pendingActionForReview(pending, reviewMessage);
         pendingAction.current = reviewed;
-        void pendingActionStore.save(reviewed);
+        if (reviewed !== pending) {
+          void pendingActionStore.save(reviewed);
+        }
         setReceipt(reviewReceipt(pending.actionId, reviewMessage));
         return;
       }
@@ -518,8 +527,56 @@ export function TreasuryPendingRecovery({
     };
   }, [pendingActionStore, receipt, reconcileAction]);
 
-  if (receipt) return <ActionStatus receipt={receipt} />;
+  const confirmAbandon = async () => {
+    const current = pendingAction.current;
+    if (!current) return;
+    await pendingActionStore.clear(current.actionId);
+    pendingAction.current = null;
+    setReceipt(null);
+    setAbandonArmed(false);
+    setMessage("No pending treasury action was found.");
+  };
+
+  if (receipt) {
+    return (
+      <View style={styles.stack}>
+        <ActionStatus receipt={receipt} />
+        {receipt.status === "review_required" && canAbandon ? (
+          abandonArmed ? (
+            <>
+              <Text style={styles.warning}>
+                Abandoning removes only local recovery state. Verify the desktop
+                and chain outcome first.
+              </Text>
+              <ActionButton
+                label="Confirm abandon pending action"
+                onPress={() => void confirmAbandon()}
+              />
+            </>
+          ) : (
+            <ActionButton
+              label="Abandon pending action"
+              onPress={() => setAbandonArmed(true)}
+            />
+          )
+        ) : null}
+      </View>
+    );
+  }
   return <Text style={styles.warning}>{message}</Text>;
+}
+
+export function TreasuryPreviewError({ message }: { message: string }) {
+  if (!message) return null;
+  return (
+    <Text
+      accessibilityLiveRegion="assertive"
+      accessibilityRole="alert"
+      style={styles.error}
+    >
+      {message}
+    </Text>
+  );
 }
 
 export function WithdrawalScreen(props: GuardedTreasuryActionProps) {

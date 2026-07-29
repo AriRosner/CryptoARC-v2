@@ -3026,7 +3026,7 @@ class CoreLogicTests(unittest.TestCase):
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             self.arm_local_hot_wallet_backend(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
-            state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: {  # type: ignore[method-assign]
+            state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url, **_kwargs: {  # type: ignore[method-assign]
                 "signature": "sighot111",
                 "transaction_signature": "sighot111",
                 "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
@@ -3081,7 +3081,7 @@ class CoreLogicTests(unittest.TestCase):
             self.arm_local_hot_wallet_backend(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             submitted: list[str] = []
-            state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url: submitted.append(unsigned_transaction_base64) or {  # type: ignore[method-assign]
+            state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url, **_kwargs: submitted.append(unsigned_transaction_base64) or {  # type: ignore[method-assign]
                 "signature": "should-not-submit",
                 "transaction_signature": "should-not-submit",
                 "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
@@ -3145,7 +3145,7 @@ class CoreLogicTests(unittest.TestCase):
             )
             state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.08, "error": ""}  # type: ignore[method-assign]
             submitted: list[tuple[str, float]] = []
-            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url: submitted.append((destination, amount_sol)) or {  # type: ignore[attr-defined, method-assign]
+            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url, **_kwargs: submitted.append((destination, amount_sol)) or {  # type: ignore[attr-defined, method-assign]
                 "signature": "sigsweep111",
                 "transaction_signature": "sigsweep111",
                 "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
@@ -3189,7 +3189,7 @@ class CoreLogicTests(unittest.TestCase):
             )
             state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.025, "error": ""}  # type: ignore[method-assign]
             submitted: list[str] = []
-            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url: submitted.append(destination) or {}  # type: ignore[attr-defined, method-assign]
+            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url, **_kwargs: submitted.append(destination) or {}  # type: ignore[attr-defined, method-assign]
 
             result = state.maybe_run_profit_sweep()
 
@@ -3228,7 +3228,7 @@ class CoreLogicTests(unittest.TestCase):
             )
             state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.20, "error": ""}  # type: ignore[method-assign]
             submitted: list[str] = []
-            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url: submitted.append(destination) or {  # type: ignore[attr-defined, method-assign]
+            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url, **_kwargs: submitted.append(destination) or {  # type: ignore[attr-defined, method-assign]
                 "signature": f"sigsweep{len(submitted)}",
                 "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
             }
@@ -3273,7 +3273,7 @@ class CoreLogicTests(unittest.TestCase):
             )
             state._wallet_sol_balance = lambda wallet_public_key: {"wallet_public_key": wallet_public_key, "balance_sol": 0.20, "error": ""}  # type: ignore[method-assign]
             submitted: list[tuple[str, float]] = []
-            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url: submitted.append((destination, amount_sol)) or {  # type: ignore[attr-defined, method-assign]
+            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url, **_kwargs: submitted.append((destination, amount_sol)) or {  # type: ignore[attr-defined, method-assign]
                 "signature": "sigsweeppct",
                 "simulation": {"ok": True, "warning": "", "error": "", "result": {}},
             }
@@ -3316,7 +3316,7 @@ class CoreLogicTests(unittest.TestCase):
                 )
             )
             submitted: list[str] = []
-            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url: submitted.append(destination) or {}  # type: ignore[attr-defined, method-assign]
+            state.hot_wallet.transfer_sol = lambda destination, amount_sol, rpc_url, **_kwargs: submitted.append(destination) or {}  # type: ignore[attr-defined, method-assign]
 
             result = state.maybe_run_profit_sweep()
 

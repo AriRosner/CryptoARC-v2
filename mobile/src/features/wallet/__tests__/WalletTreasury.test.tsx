@@ -12,6 +12,7 @@ import { ProfitSweepSheet } from "../ProfitSweepSheet";
 import { RentRecoverySheet } from "../RentRecoverySheet";
 import { WalletScreen } from "../WalletScreen";
 import {
+  TreasuryPreviewError,
   TreasuryPendingRecovery,
   WithdrawalScreen,
 } from "../WithdrawalScreen";
@@ -613,5 +614,86 @@ describe("wallet analytics and guarded treasury", () => {
     await waitFor(() => expect(reconcile).toHaveBeenCalledWith(actionId));
     expect(await view.findByText("Treasury transaction confirmed")).toBeTruthy();
     expect(pending.store.clear).toHaveBeenCalledWith(actionId);
+  });
+
+  it("requires warned two-step abandonment for restart-only review state", async () => {
+    const actionId = "restart-review-required";
+    const pending = pendingStore({
+      actionId,
+      entityId: "consumed-authorization",
+      actionType: "profit_sweep",
+      owner: TEST_PENDING_ACTION_OWNER,
+      state: "review_required",
+      reviewMessage: "Signature missing; verify the chain manually.",
+    });
+    const reconcile = jest.fn();
+    const view = await render(
+      <TreasuryPendingRecovery
+        reconcileAction={reconcile}
+        pendingActionStore={pending.store}
+        pendingOwner={TEST_PENDING_ACTION_OWNER}
+      />,
+    );
+
+    expect(
+      await view.findByText("Signature missing; verify the chain manually."),
+    ).toBeTruthy();
+    expect(reconcile).not.toHaveBeenCalled();
+    await fireEvent.press(view.getByText("Abandon pending action"));
+    expect(
+      view.getByText(
+        "Abandoning removes only local recovery state. Verify the desktop and chain outcome first.",
+      ),
+    ).toBeTruthy();
+    expect(pending.store.clear).not.toHaveBeenCalled();
+    await fireEvent.press(
+      view.getByText("Confirm abandon pending action"),
+    );
+    expect(pending.store.clear).toHaveBeenCalledWith(actionId);
+    expect(pending.current()).toBeNull();
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it("keeps restart recovery from another pairing review-only", async () => {
+    const pending = pendingStore({
+      actionId: "foreign-restart-review",
+      entityId: "foreign-authorization",
+      actionType: "rent_recovery",
+      owner: {
+        apiBaseUrl: "https://old.example",
+        deviceId: "old-device",
+        sessionId: "old-session",
+      },
+      state: "review_required",
+      reviewMessage:
+        "Pending action belongs to a different pairing. Review it before abandoning.",
+    });
+    const reconcile = jest.fn();
+    const view = await render(
+      <TreasuryPendingRecovery
+        reconcileAction={reconcile}
+        pendingActionStore={pending.store}
+        pendingOwner={TEST_PENDING_ACTION_OWNER}
+      />,
+    );
+
+    expect(
+      await view.findByText(
+        "Pending action belongs to a different pairing. Review it before abandoning.",
+      ),
+    ).toBeTruthy();
+    expect(view.queryByText("Abandon pending action")).toBeNull();
+    expect(pending.store.clear).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+
+  it("renders connected treasury preview failures as visible alerts", async () => {
+    const view = await render(
+      <TreasuryPreviewError message="Daily sweep cap reached" />,
+    );
+
+    const alert = view.getByText("Daily sweep cap reached");
+    expect(alert).toBeTruthy();
+    expect(alert.props.accessibilityRole).toBe("alert");
   });
 });

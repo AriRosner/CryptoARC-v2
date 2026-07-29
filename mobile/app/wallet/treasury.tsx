@@ -30,7 +30,10 @@ import type {
   TreasuryAction,
   TreasuryExecuteInput,
 } from "@/src/features/wallet/types";
-import { TreasuryPendingRecovery } from "@/src/features/wallet/WithdrawalScreen";
+import {
+  TreasuryPendingRecovery,
+  TreasuryPreviewError,
+} from "@/src/features/wallet/WithdrawalScreen";
 import { colors, radius, spacing } from "@/src/theme";
 
 function parameter(value: string | string[] | undefined) {
@@ -204,7 +207,7 @@ export default function TreasuryRoute() {
               loading={loading}
               onPress={() => void loadPreview()}
             />
-            {error ? <View accessibilityLabel={error} /> : null}
+            <TreasuryPreviewError message={error} />
           </Section>
         )}
       </ScrollView>
