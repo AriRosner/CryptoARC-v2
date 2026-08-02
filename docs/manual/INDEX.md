@@ -20,6 +20,14 @@ This manual is the canonical documentation set for CryptoARC v2. It is written f
 4. [`11-operations-and-recovery.md`](11-operations-and-recovery.md)
 5. [`15-troubleshooting.md`](15-troubleshooting.md)
 
+### Mobile operator
+
+1. [`02-quickstart.md`](02-quickstart.md)
+2. [`08-data-safety-guide.md`](08-data-safety-guide.md)
+3. [`10-wallets-and-live-trading.md`](10-wallets-and-live-trading.md)
+4. [`15-mobile-operator-command-center.md`](15-mobile-operator-command-center.md)
+5. [`15-troubleshooting.md`](15-troubleshooting.md)
+
 ### Developer / maintainer
 
 1. [`01-overview.md`](01-overview.md)
@@ -58,6 +66,8 @@ This manual is the canonical documentation set for CryptoARC v2. It is written f
   API surfaces, payload families, storage concepts, and live data models.
 - [`14-roadmap-and-evolution.md`](14-roadmap-and-evolution.md)
   Current gaps, future-state plans, and evolution notes.
+- [`15-mobile-operator-command-center.md`](15-mobile-operator-command-center.md)
+  Private-tunnel Android setup, least-privilege pairing, guarded operation, release installation, revocation, and diagnostics.
 - [`15-troubleshooting.md`](15-troubleshooting.md)
   Symptom-driven troubleshooting for operators and developers.
 - [`../MOBILE_COCKPIT.md`](../MOBILE_COCKPIT.md)
