@@ -129,13 +129,24 @@ After isolated verification and an approved release window, start the cloud buil
 npx eas-cli@latest build --platform android --profile internal --clear-cache
 ```
 
-Task 10 does not execute that cloud build. Once an authorized build succeeds, download the APK only from the expected EAS project, record its build URL and SHA-256, and install it on an operator-owned device. Android upgrades require the same package and signing certificate and a higher `versionCode`; do not uninstall first if pairing migration is being tested. With Android platform tools, an upgrade can be installed with:
+Task 10 does not execute that cloud build. Before downloading an APK, obtain a release-owner-approved record through a channel separate from the artifact download. Record the approved commit, EAS project/build ID, package/version/versionCode, APK SHA-256, and signer certificate SHA-256 fingerprint there. A checksum or fingerprint sidecar downloaded beside the APK is not an independent trust source.
+
+After download, verify locally on Windows before any installation:
 
 ```powershell
-adb install --replace C:\approved\cryptoarc-operator-command-center.apk
+$apkPath = (Resolve-Path -LiteralPath 'C:\approved\cryptoarc-operator-command-center.apk').Path
+Get-FileHash -LiteralPath $apkPath -Algorithm SHA256 | Format-List Algorithm,Hash,Path
+apksigner verify --print-certs $apkPath
+
+apkanalyzer manifest application-id $apkPath
+apkanalyzer manifest version-name $apkPath
+apkanalyzer manifest version-code $apkPath
+# Or: aapt dump badging $apkPath
 ```
 
-After install or upgrade, open More > Device and confirm the header reads `Operator Command Center v2.0.0 (2026-07-26)` and Build reads `2.0.0 / Android 3`. If the version, package provenance, or signing identity differs, stop and remove the untrusted artifact.
+Compare the file hash and `apksigner` certificate SHA-256 digest to the independently trusted record. Require package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `3` from `apkanalyzer` or `aapt`. Resolve missing tools from the installed Android SDK; never skip a check. Only after every comparison passes may an operator run `adb install --replace $apkPath`. Android upgrades require the same package and signing certificate and a higher `versionCode`; do not uninstall first if pairing migration is being tested.
+
+After install or upgrade, open More > Device and confirm the header reads `Operator Command Center v2.0.0 (2026-07-26)` and Build reads `2.0.0 / Android 3`. If the hash, approved build identity, package metadata, or signing identity differs, stop and quarantine the artifact without installing it.
 
 ## Revocation And Diagnostics
 

@@ -67,13 +67,31 @@ cd mobile
 npx eas-cli@latest build --platform android --profile internal --clear-cache
 ```
 
-Task 10 leaves this cloud build deferred. For an approved artifact:
+Task 10 leaves this cloud build deferred. Before downloading an artifact, obtain an independently trusted release approval record from the release owner through a channel separate from the APK download. It must identify the approved commit, EAS project/build ID, expected package/version/versionCode, expected signer certificate SHA-256 fingerprint, and expected APK SHA-256. Do not trust a checksum or certificate fingerprint supplied only as a sidecar beside the same APK.
 
-1. Download it from the expected EAS project and record the build URL and SHA-256.
-2. Verify the package is `com.cryptoarc.cockpit`, the signing identity is the approved identity, version is `2.0.0`, and `versionCode` is `3`.
-3. Install only on the operator device. For an upgrade, keep the prior app installed so Android enforces matching package/signing identity and the pairing-migration test is meaningful.
-4. If using Android platform tools, run `adb install --replace C:\approved\cryptoarc-operator-command-center.apk`.
-5. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 3`.
+For an approved artifact, capture and compare local evidence before installation:
+
+```powershell
+$apkPath = (Resolve-Path -LiteralPath 'C:\approved\cryptoarc-operator-command-center.apk').Path
+Get-FileHash -LiteralPath $apkPath -Algorithm SHA256 | Format-List Algorithm,Hash,Path
+
+apksigner verify --print-certs $apkPath
+
+# Use either installed Android inspection tool.
+apkanalyzer manifest application-id $apkPath
+apkanalyzer manifest version-name $apkPath
+apkanalyzer manifest version-code $apkPath
+# Or: aapt dump badging $apkPath
+```
+
+Require the local SHA-256 to match the independently trusted release record. Require `apksigner` verification to succeed and its signer certificate SHA-256 digest to match the independently recorded fingerprint. Require the manifest to report package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `3`. If `apksigner`, `apkanalyzer`, or `aapt` is not on `PATH`, invoke it from the installed Android SDK build-tools/cmdline-tools directory; do not skip the check.
+
+Only after every comparison passes:
+
+1. Archive the command outputs with the trusted approval record.
+2. Install only on the operator device. For an upgrade, keep the prior app installed so Android enforces matching package/signing identity and the pairing-migration test is meaningful.
+3. Run `adb install --replace $apkPath`.
+4. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 3`.
 
 Stop if Android asks for an uninstall to accept an alleged upgrade, the displayed version differs, or artifact provenance cannot be established. Uninstalling deletes local app state and prevents an in-place migration check.
 
@@ -86,7 +104,8 @@ Stop if Android asks for an uninstall to accept an alleged upgrade, the displaye
 
 Recommended scope bundles:
 
-- Read-only operator: `mobile:monitor`, `mobile:portfolio:read`, `mobile:wallet:read`, `mobile:alerts`, `mobile:diagnostics`.
+- Read-only operator: `mobile:monitor`, `mobile:portfolio:read`, `mobile:wallet:read`, `mobile:diagnostics`. This bundle cannot acknowledge alerts or register/unregister notification delivery.
+- Alert-enabled observer: add `mobile:alerts`. This is not read-only: it authorizes alert acknowledgement and native notification registration/unregistration, which mutate server state.
 - Trade reviewer: add `mobile:trade:review`.
 - Guarded executor: add `mobile:trade:execute` only after an explicit operator decision.
 - Treasury requester: add `mobile:treasury:request` only for the device and period that needs it.
