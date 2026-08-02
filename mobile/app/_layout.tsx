@@ -7,14 +7,17 @@ import * as SplashScreen from "expo-splash-screen";
 import { StatusBar } from "expo-status-bar";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { useEffect } from "react";
+import type { AppStateStatus } from "react-native";
 import "react-native-reanimated";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 
-import { MobileSessionProvider } from "@/src/MobileSession";
+import { AppLock } from "@/src/components/system/AppLock";
+import { ConnectionBanner } from "@/src/components/system/ConnectionBanner";
 import { mobileQueryClient } from "@/src/core/api/queryClient";
 import { ConnectionProvider } from "@/src/core/connectivity/ConnectionProvider";
 import { NotificationBridge } from "@/src/core/notifications/notifications";
 import { SessionProvider } from "@/src/core/session/SessionProvider";
+import { hydrateSettings } from "@/src/core/settings/settingsStore";
 
 export {
   // Catch any errors thrown by the Layout component.
@@ -45,6 +48,10 @@ export default function RootLayout() {
     }
   }, [loaded]);
 
+  useEffect(() => {
+    void hydrateSettings();
+  }, []);
+
   if (!loaded) {
     return null;
   }
@@ -60,21 +67,29 @@ export function RootLayoutNav() {
           <SessionProvider>
             <NotificationBridge />
             <ConnectionProvider>
-              <MobileSessionProvider>
-                <ThemeProvider value={DarkTheme}>
-                  <StatusBar style="light" />
-                  <Stack>
-                    <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
-                    <Stack.Screen name="position/[positionId]" options={{ headerShown: false }} />
-                    <Stack.Screen name="trade/[intentId]" options={{ headerShown: false }} />
-                    <Stack.Screen name="diagnostics" options={{ headerShown: false }} />
-                  </Stack>
-                </ThemeProvider>
-              </MobileSessionProvider>
+              <AppRoot />
             </ConnectionProvider>
           </SessionProvider>
         </QueryClientProvider>
       </BottomSheetModalProvider>
     </GestureHandlerRootView>
+  );
+}
+
+export function AppRoot({ initialAppState }: { initialAppState?: AppStateStatus }) {
+  return (
+    <AppLock initialAppState={initialAppState}>
+      <ConnectionBanner />
+      <ThemeProvider value={DarkTheme}>
+        <StatusBar style="light" />
+        <Stack>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+          <Stack.Screen name="pairing" options={{ headerShown: false }} />
+          <Stack.Screen name="position/[positionId]" options={{ headerShown: false }} />
+          <Stack.Screen name="trade/[intentId]" options={{ headerShown: false }} />
+          <Stack.Screen name="diagnostics" options={{ headerShown: false }} />
+        </Stack>
+      </ThemeProvider>
+    </AppLock>
   );
 }

@@ -294,22 +294,16 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     const generation = generationRef.current;
     if (!stateRef.current.record) return false;
     try {
-      const [hasHardware, enrolled] = await Promise.all([
+      await Promise.all([
         LocalAuthentication.hasHardwareAsync(),
         LocalAuthentication.isEnrolledAsync(),
       ]);
       if (!isCurrentGeneration(generation)) return false;
-      if (!hasHardware || !enrolled) {
-        updateState((current) => ({
-          ...current,
-          error: "Device unlock is not configured for guarded controls.",
-        }));
-        return false;
-      }
       const result = await LocalAuthentication.authenticateAsync({
         promptMessage: "Unlock CryptoARC controls",
         cancelLabel: "Cancel",
         disableDeviceFallback: false,
+        biometricsSecurityLevel: "strong",
       });
       if (!isCurrentGeneration(generation)) return false;
       if (!result.success) {
