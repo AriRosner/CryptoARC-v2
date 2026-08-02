@@ -12,8 +12,8 @@ export function fetchDiagnostics(
 
 export function exportDiagnostics(
   options?: MobileGetOptions,
-): Promise<Record<string, unknown>> {
-  return mobileGet<Record<string, unknown>>(
+): Promise<MobileDiagnosticsPayload & { exported_at: string }> {
+  return mobileGet<MobileDiagnosticsPayload & { exported_at: string }>(
     "/api/mobile/diagnostics/export",
     options,
   );

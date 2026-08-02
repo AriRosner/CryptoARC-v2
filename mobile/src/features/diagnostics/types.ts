@@ -19,7 +19,7 @@ export interface MobileDiagnosticCheck {
   label: string;
   status: MobileDiagnosticStatus;
   detail: string;
-  observed_at: string;
+  observed_at: string | null;
 }
 
 export interface MobileDiagnosticsPayload {

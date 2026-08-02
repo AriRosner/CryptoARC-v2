@@ -55,3 +55,18 @@ export async function unregisterPushToken(
     idempotencyKey: `push-unregister-${Crypto.randomUUID()}`,
   });
 }
+
+export async function validateNotificationDestination(
+  route: string,
+  options: MobileGetOptions,
+): Promise<void> {
+  const match = /^\/(trade|position)\/([A-Za-z0-9][A-Za-z0-9_-]{0,119})$/.exec(
+    route,
+  );
+  if (!match) return;
+  const collection = match[1] === "trade" ? "trades" : "positions";
+  await mobileGet(
+    `/api/mobile/${collection}/${encodeURIComponent(match[2])}`,
+    options,
+  );
+}

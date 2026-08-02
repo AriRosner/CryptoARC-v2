@@ -661,6 +661,11 @@ def create_mobile_router(
             )
         except MobilePushTokenEncryptionUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail="Invalid mobile push registration request",
+            ) from exc
 
     router.add_api_route(
         "/notifications/register",

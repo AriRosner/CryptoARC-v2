@@ -1,8 +1,10 @@
 import base64
 import json
+import sqlite3
 import unittest
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -96,6 +98,29 @@ class MobileNotificationTests(unittest.TestCase):
             stop_runtime_tasks=no_op_stop,
             push_sender=sender,
         )
+
+    def save_push_device(
+        self,
+        device_id: str,
+        *,
+        scopes: list[str] | None = None,
+        expires_at: datetime | None = None,
+        revoked_at: str = "",
+    ) -> dict[str, object]:
+        now = datetime.now(timezone.utc)
+        device = {
+            "id": device_id,
+            "name": "Push test device",
+            "platform": "android",
+            "scopes": scopes or [MobileScope.ALERTS],
+            "created_at": now.isoformat(),
+            "last_seen_at": now.isoformat(),
+            "expires_at": (expires_at or now + timedelta(days=1)).isoformat(),
+            "revoked_at": revoked_at,
+            "token_hash": f"hash-{device_id}",
+        }
+        self.state.storage.save_mobile_device(device)
+        return device
 
     def save_alert(
         self,
@@ -199,6 +224,7 @@ class MobileNotificationTests(unittest.TestCase):
         sender = Mock(return_value={"status": "sent"})
         service = self.service(sender=sender)
         device = {"id": "mdev_delivery", "platform": "android"}
+        self.save_push_device("mdev_delivery")
         service.register_push_token(
             device=device,
             token=raw_token,
@@ -231,6 +257,7 @@ class MobileNotificationTests(unittest.TestCase):
             raise RuntimeError(f"provider rejected {token}")
 
         service = self.service(sender=failing_sender)
+        self.save_push_device("mdev_failure")
         service.register_push_token(
             device={"id": "mdev_failure", "platform": "android"},
             token=raw_token,
@@ -242,6 +269,157 @@ class MobileNotificationTests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
         self.assertNotIn(raw_token, json.dumps(result))
         self.assertNotIn("provider rejected", json.dumps(result))
+
+    def test_failed_and_negative_delivery_results_are_retryable(self) -> None:
+        raw_token = "ExponentPushToken[retryable-delivery]"
+        sender = Mock(
+            side_effect=[
+                RuntimeError("temporary provider failure"),
+                False,
+                {"status": "sent"},
+            ]
+        )
+        self.save_push_device("mdev_retry")
+        service = self.service(sender=sender)
+        service.register_push_token(
+            device={"id": "mdev_retry", "platform": "android"},
+            token=raw_token,
+            platform="android",
+        )
+        event = self.save_alert("evt_retryable_123").to_dict()
+
+        failed = service.deliver_push_event(event)
+        negative = service.deliver_push_event(event)
+        sent = service.deliver_push_event(event)
+
+        self.assertEqual((failed["failed"], failed["sent"]), (1, 0))
+        self.assertEqual((negative["failed"], negative["sent"]), (1, 0))
+        self.assertEqual((sent["sent"], sent["deduplicated"]), (1, 0))
+        self.assertEqual(sender.call_count, 3)
+
+    def test_delivery_claims_are_atomic_reclaimable_and_attempt_bound(self) -> None:
+        storage = self.state.storage
+        first_at = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+        first_attempt = storage.reserve_mobile_notification_delivery(
+            delivery_id="delivery-first",
+            attempt_id="attempt-first",
+            event_id="evt_claim",
+            device_id="mdev_claim",
+            channel="critical",
+            registration_id="registration-first",
+            attempted_at=first_at.isoformat(),
+            lease_seconds=30,
+        )
+        self.assertEqual(first_attempt, "attempt-first")
+
+        contenders_at = (first_at + timedelta(seconds=31)).isoformat()
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            attempts = list(
+                executor.map(
+                    lambda index: storage.reserve_mobile_notification_delivery(
+                        delivery_id=f"delivery-{index}",
+                        attempt_id=f"attempt-{index}",
+                        event_id="evt_claim",
+                        device_id="mdev_claim",
+                        channel="critical",
+                        registration_id="registration-first",
+                        attempted_at=contenders_at,
+                        lease_seconds=30,
+                    ),
+                    range(8),
+                )
+            )
+        reclaimed = [attempt for attempt in attempts if attempt]
+        self.assertEqual(len(reclaimed), 1)
+        self.assertFalse(
+            storage.finish_mobile_notification_delivery(
+                attempt_id="attempt-first",
+                status="sent",
+                updated_at=(first_at + timedelta(seconds=32)).isoformat(),
+            )
+        )
+        self.assertTrue(
+            storage.finish_mobile_notification_delivery(
+                attempt_id=reclaimed[0],
+                status="failed",
+                updated_at=(first_at + timedelta(seconds=33)).isoformat(),
+            )
+        )
+
+    def test_delivery_revalidates_device_lifecycle_and_alert_scope(self) -> None:
+        sender = Mock(return_value={"status": "sent"})
+        service = self.service(sender=sender)
+        now = datetime.now(timezone.utc)
+        cases = {
+            "expired": {
+                "scopes": [MobileScope.ALERTS],
+                "expires_at": now - timedelta(seconds=1),
+            },
+            "revoked": {
+                "scopes": [MobileScope.ALERTS],
+                "revoked_at": now.isoformat(),
+            },
+            "scope": {"scopes": [MobileScope.DIAGNOSTICS]},
+            "missing": {"scopes": [MobileScope.ALERTS]},
+        }
+        for label, overrides in cases.items():
+            device_id = f"mdev_{label}"
+            self.save_push_device(device_id)
+            service.register_push_token(
+                device={"id": device_id, "platform": "android"},
+                token=f"ExponentPushToken[{label}-lifecycle]",
+                platform="android",
+            )
+            self.save_push_device(device_id, **overrides)
+            if label == "missing":
+                connection = sqlite3.connect(self.state.storage.path)
+                try:
+                    connection.execute("DELETE FROM mobile_devices WHERE id = ?", (device_id,))
+                    connection.commit()
+                finally:
+                    connection.close()
+
+        result = service.deliver_push_event(
+            self.save_alert("evt_lifecycle_123").to_dict()
+        )
+
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["invalidated"], 4)
+        sender.assert_not_called()
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+
+    def test_delivery_revalidates_authorization_after_claim_before_send(self) -> None:
+        sender = Mock(return_value={"status": "sent"})
+        service = self.service(sender=sender)
+        self.save_push_device("mdev_claim_revoked")
+        service.register_push_token(
+            device={"id": "mdev_claim_revoked", "platform": "android"},
+            token="ExponentPushToken[claim-revoked]",
+            platform="android",
+        )
+        reserve = self.state.storage.reserve_mobile_notification_delivery
+
+        def reserve_then_revoke(**kwargs):
+            attempt = reserve(**kwargs)
+            self.state.storage.revoke_mobile_device_and_push_registrations(
+                "mdev_claim_revoked",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            return attempt
+
+        with unittest.mock.patch.object(
+            self.state.storage,
+            "reserve_mobile_notification_delivery",
+            side_effect=reserve_then_revoke,
+        ):
+            result = service.deliver_push_event(
+                self.save_alert("evt_claim_revoked").to_dict()
+            )
+
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["invalidated"], 1)
+        self.assertEqual(result["failed"], 0)
+        sender.assert_not_called()
 
     def test_acknowledgement_is_owner_scoped_and_idempotent(self) -> None:
         self.save_alert()
@@ -281,8 +459,131 @@ class MobileNotificationTests(unittest.TestCase):
             self.assertEqual(first_ack.status_code, 200)
             self.assertEqual(duplicate_ack.status_code, 200)
             self.assertEqual(first_ack.json(), duplicate_ack.json())
-            self.assertTrue(first_alerts["alerts"][0]["acknowledged"])
-            self.assertFalse(second_alerts["alerts"][0]["acknowledged"])
+            first_alert = next(
+                alert
+                for alert in first_alerts["alerts"]
+                if alert["event_id"] == "evt_critical_123"
+            )
+            second_alert = next(
+                alert
+                for alert in second_alerts["alerts"]
+                if alert["event_id"] == "evt_critical_123"
+            )
+            self.assertTrue(first_alert["acknowledged"])
+            self.assertFalse(second_alert["acknowledged"])
+
+    def test_acknowledgement_rejects_events_outside_exact_alert_predicate(self) -> None:
+        info_event = TradeEvent(
+            id="evt_info_ordinary",
+            created_at=datetime.now(timezone.utc),
+            level="info",
+            message="Routine status",
+            subsystem="system",
+            operator_action="",
+            context={},
+        )
+        self.state.storage.save_event(info_event)
+        with self.mobile_client() as (client, desktop_headers):
+            claim = self.claim_device(
+                client,
+                desktop_headers,
+                name="Predicate Pixel",
+                scopes=[MobileScope.ALERTS],
+            )
+            headers = {"Authorization": f"Bearer {claim['token']}"}
+
+            response = client.post(
+                "/api/mobile/alerts/evt_info_ordinary/acknowledge",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            self.state.storage.load_mobile_alert_acknowledgements(
+                device_id=str(claim["device"]["id"])
+            ),
+            [],
+        )
+
+    def test_push_registration_rejects_blank_and_malformed_tokens_generically(self) -> None:
+        malformed = [
+            "   ",
+            "not-an-expo-token",
+            "ExponentPushToken[]",
+            "ExponentPushToken[malicious-secret!]",
+        ]
+        with self.mobile_client() as (client, desktop_headers):
+            claim = self.claim_device(
+                client,
+                desktop_headers,
+                name="Validation Pixel",
+                scopes=[MobileScope.ALERTS],
+            )
+            headers = {"Authorization": f"Bearer {claim['token']}"}
+            for token in malformed:
+                with self.subTest(token=token):
+                    response = client.post(
+                        "/api/mobile/notifications/register",
+                        json={"token": token, "platform": "android"},
+                        headers=headers,
+                    )
+                    self.assertEqual(response.status_code, 422)
+                    self.assertEqual(
+                        response.json(),
+                        {"detail": "Invalid mobile push registration request"},
+                    )
+                    if token.strip():
+                        self.assertNotIn(token.strip(), response.text)
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+
+    def test_restore_preview_accounts_for_notifications_and_restore_revokes_destinations(self) -> None:
+        self.save_push_device("mdev_restore")
+        service = self.service(sender=Mock(return_value={"status": "sent"}))
+        service.register_push_token(
+            device={"id": "mdev_restore", "platform": "android"},
+            token="ExponentPushToken[restore-destination]",
+            platform="android",
+        )
+        self.save_alert("evt_restore_alert")
+        self.state.storage.acknowledge_mobile_alert(
+            acknowledgement_id="ack_restore",
+            device_id="mdev_restore",
+            event_id="evt_restore_alert",
+            acknowledged_at=datetime.now(timezone.utc).isoformat(),
+        )
+        service.deliver_push_event(
+            self.save_alert("evt_restore_delivery").to_dict()
+        )
+        artifact = self.state.storage.create_backup_artifact()
+        self.state.storage.revoke_mobile_device_and_push_registrations(
+            "mdev_restore",
+            datetime.now(timezone.utc).isoformat(),
+        )
+
+        preview = self.state.storage.preview_restore_artifact(artifact)
+        result = self.state.storage.restore_backup_artifact(artifact)
+
+        for table in (
+            "mobile_push_registrations",
+            "mobile_alert_acknowledgements",
+            "mobile_notification_deliveries",
+        ):
+            self.assertIn(table, preview["table_deltas"])
+        restored_device = self.state.storage.load_mobile_device("mdev_restore")
+        self.assertTrue(restored_device["revoked_at"])
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+        self.assertEqual(
+            self.state.storage.count_mobile_notification_deliveries(), 1
+        )
+        self.assertEqual(
+            len(
+                self.state.storage.load_mobile_alert_acknowledgements(
+                    device_id="mdev_restore"
+                )
+            ),
+            1,
+        )
+        self.assertTrue(result["mobile_credentials_revoked"])
 
     def test_diagnostics_are_bounded_freshness_aware_and_status_only(self) -> None:
         telegram_sender = Mock(side_effect=AssertionError("Telegram must not send"))
@@ -324,6 +625,21 @@ class MobileNotificationTests(unittest.TestCase):
         encoded = json.dumps(payload).lower()
         self.assertNotIn("telegram-secret", encoded)
         self.assertNotIn("chat-secret", encoded)
+
+    def test_diagnostics_do_not_invent_transport_or_snapshot_observations(self) -> None:
+        device = {
+            "id": "mdev_diagnostic_provenance",
+            "scopes": [MobileScope.DIAGNOSTICS],
+        }
+        payload = self.service().diagnostics(device=device)
+        checks = {check["id"]: check for check in payload["checks"]}
+
+        self.assertEqual(payload["freshness"]["status"], "unavailable")
+        for check_id in ("tunnel", "websocket", "clock_drift", "snapshot_age"):
+            self.assertEqual(checks[check_id]["status"], "unavailable")
+            self.assertIsNone(checks[check_id]["observed_at"])
+        self.assertEqual(checks["api"]["status"], "healthy")
+        self.assertIsNotNone(checks["api"]["observed_at"])
 
     def test_diagnostic_export_recursively_redacts_sensitive_material(self) -> None:
         service = self.service()

@@ -80,7 +80,7 @@ class MobileDiagnosticCheck(BaseModel):
     label: str
     status: Literal["healthy", "warning", "blocked", "unavailable"]
     detail: str
-    observed_at: datetime
+    observed_at: datetime | None = None
 
 
 class MobileRecoveryAction(BaseModel):

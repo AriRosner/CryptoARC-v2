@@ -11,6 +11,7 @@ import React, {
 import { AppState, type AppStateStatus } from "react-native";
 
 import type { MobileDevice } from "../../types";
+import { unregisterPushToken } from "../../features/alerts/api";
 import { mobileQueryClient } from "../api/queryClient";
 import {
   SecureSessionRollbackError,
@@ -21,6 +22,18 @@ import type { SecureSessionRecord, SessionState } from "./types";
 const SESSION_LOAD_FAILED = "Secure session could not be loaded. Pair this device again.";
 const SESSION_SAVE_FAILED = "Secure session could not be saved. The previous session remains active.";
 const SESSION_CLEAR_FAILED = "Disconnect failed. Session remains active.";
+
+async function bestEffortUnregister(record: SecureSessionRecord | null): Promise<void> {
+  if (!record) return;
+  try {
+    await unregisterPushToken({
+      apiBaseUrl: record.apiBaseUrl,
+      token: record.token,
+    });
+  } catch {
+    // Server-side device expiry/revocation remains authoritative while offline.
+  }
+}
 
 export interface SessionContextValue extends SessionState {
   apiBaseUrl: string;
@@ -144,6 +157,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         device,
         savedAt: new Date().toISOString(),
       };
+      const previousRecord = stateRef.current.record;
       const generation = nextGeneration();
       updateState((current) => ({
         ...current,
@@ -154,6 +168,13 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       try {
         await enqueueMutation(() => secureSessionStorage.save(record));
         if (!isCurrentGeneration(generation)) return false;
+        if (
+          previousRecord &&
+          (previousRecord.apiBaseUrl !== record.apiBaseUrl ||
+            previousRecord.token !== record.token)
+        ) {
+          await bestEffortUnregister(previousRecord);
+        }
         updateState(() => ({
           record,
           generation,
@@ -192,6 +213,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   );
 
   const clearSession = useCallback(async (): Promise<boolean> => {
+    const previousRecord = stateRef.current.record;
     const generation = nextGeneration();
     updateState((current) => ({
       ...current,
@@ -199,6 +221,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       loading: true,
     }));
     try {
+      await bestEffortUnregister(previousRecord);
       await enqueueMutation(() => secureSessionStorage.clear());
       if (isCurrentGeneration(generation)) {
         updateState(() => ({

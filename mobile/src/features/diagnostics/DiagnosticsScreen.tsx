@@ -3,7 +3,6 @@ import { Download, RefreshCw, Stethoscope } from "lucide-react-native";
 import React, { useState } from "react";
 import {
   ScrollView,
-  Share,
   StyleSheet,
   Text,
   View,
@@ -21,10 +20,14 @@ import {
   type Tone,
 } from "../../components/ui";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
+import { useConnection } from "../../core/connectivity/ConnectionProvider";
 import { useSession } from "../../core/session/SessionProvider";
+import { loadVerifiedSnapshot } from "../../core/storage/snapshot";
 import { colors, radius, spacing } from "../../theme";
 import { exportDiagnostics, fetchDiagnostics } from "./api";
 import { redactDiagnosticPayload } from "./redaction";
+import { shareDiagnosticArtifact } from "./artifact";
+import { applyClientDiagnosticObservations } from "./observations";
 import type {
   MobileDiagnosticsPayload,
   MobileDiagnosticStatus,
@@ -139,35 +142,71 @@ export function DiagnosticsScreen({
 
 export function DiagnosticsFeatureScreen() {
   const session = useSession();
+  const connection = useConnection();
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
   const query = useQuery({
     queryKey: ["mobile", "diagnostics", session.generation],
     enabled: Boolean(session.token && session.apiBaseUrl),
-    queryFn: () =>
-      authenticatedRead(session, () =>
+    queryFn: async () => {
+      const apiStartedAt = new Date().toISOString();
+      const payload = await authenticatedRead(session, () =>
         fetchDiagnostics({
           apiBaseUrl: session.apiBaseUrl,
           token: session.token,
         }),
-      ),
+      );
+      const apiReceivedAt = new Date().toISOString();
+      let verifiedSnapshot = null;
+      try {
+        verifiedSnapshot = await loadVerifiedSnapshot();
+      } catch {
+        verifiedSnapshot = null;
+      }
+      return applyClientDiagnosticObservations(payload, {
+        apiBaseUrl: session.apiBaseUrl,
+        apiStartedAt,
+        apiReceivedAt,
+        now: apiReceivedAt,
+        online: connection.online,
+        realtime: connection.realtime,
+        verifiedSnapshot,
+      });
+    },
   });
 
   const exportReport = async () => {
     setExporting(true);
     setExportError("");
     try {
+      const apiStartedAt = new Date().toISOString();
       const payload = await authenticatedRead(session, () =>
         exportDiagnostics({
           apiBaseUrl: session.apiBaseUrl,
           token: session.token,
         }),
       );
-      const redacted = redactDiagnosticPayload(payload);
-      await Share.share({
-        title: "CryptoARC redacted diagnostics",
-        message: JSON.stringify(redacted, null, 2),
+      const apiReceivedAt = new Date().toISOString();
+      let verifiedSnapshot = null;
+      try {
+        verifiedSnapshot = await loadVerifiedSnapshot();
+      } catch {
+        verifiedSnapshot = null;
+      }
+      const observed = applyClientDiagnosticObservations(payload, {
+        apiBaseUrl: session.apiBaseUrl,
+        apiStartedAt,
+        apiReceivedAt,
+        now: apiReceivedAt,
+        online: connection.online,
+        realtime: connection.realtime,
+        verifiedSnapshot,
       });
+      const redacted = redactDiagnosticPayload({
+        ...observed,
+        exported_at: payload.exported_at,
+      });
+      await shareDiagnosticArtifact(redacted);
     } catch {
       setExportError("Redacted diagnostic export failed.");
     } finally {

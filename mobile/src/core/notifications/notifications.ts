@@ -6,7 +6,10 @@ import React, { useEffect } from "react";
 
 import { MobileApiError } from "../api/errors";
 import { useSession } from "../session/SessionProvider";
-import { registerPushToken } from "../../features/alerts/api";
+import {
+  registerPushToken,
+  validateNotificationDestination,
+} from "../../features/alerts/api";
 import type {
   MobileAlertSeverity,
   PushRegistrationContext,
@@ -28,12 +31,19 @@ const ROUTES = [
 ];
 
 interface NotificationNavigationSession {
+  apiBaseUrl: string;
+  token: string;
   generation: number;
   locked: boolean;
   isCurrentGeneration(generation: number): boolean;
   revokeSession(expectedGeneration?: number): Promise<boolean>;
   unlockControls(): Promise<boolean>;
 }
+
+type DestinationValidator = (
+  route: string,
+  options: { apiBaseUrl: string; token: string },
+) => Promise<void | boolean>;
 
 interface RegistrationSession {
   apiBaseUrl: string;
@@ -86,6 +96,7 @@ export async function processNotificationResponse(
   session: NotificationNavigationSession,
   navigate: (route: string) => void,
   quarantine: (reason: string) => void = () => undefined,
+  validateDestination: DestinationValidator = validateNotificationDestination,
 ): Promise<"navigated" | "quarantined" | "locked" | "stale"> {
   const data = validatePushData(value);
   if (!data) {
@@ -96,6 +107,26 @@ export async function processNotificationResponse(
   if (session.locked) {
     const unlocked = await session.unlockControls();
     if (!unlocked) return "locked";
+  }
+  if (!session.isCurrentGeneration(generation)) return "stale";
+  try {
+    const valid = await validateDestination(data.route, {
+      apiBaseUrl: session.apiBaseUrl,
+      token: session.token,
+    });
+    if (valid === false) {
+      quarantine("notification_destination_unavailable");
+      return "quarantined";
+    }
+  } catch (error) {
+    if (error instanceof MobileApiError && error.status === 401) {
+      if (session.isCurrentGeneration(generation)) {
+        await session.revokeSession(generation);
+      }
+      return "stale";
+    }
+    quarantine("notification_destination_unavailable");
+    return "quarantined";
   }
   if (!session.isCurrentGeneration(generation)) return "stale";
   navigate(data.route);
@@ -122,6 +153,7 @@ export async function startNativePushRegistration({
   let active = true;
   let online = false;
   let needsRegistration = true;
+  let registrationTail: Promise<void> = Promise.resolve();
   const context: PushRegistrationContext = {
     apiBaseUrl: session.apiBaseUrl,
     token: session.token,
@@ -164,6 +196,14 @@ export async function startNativePushRegistration({
     }
   };
 
+  const queueRegistration = (): Promise<void> => {
+    registrationTail = registrationTail.then(
+      registerCurrentToken,
+      registerCurrentToken,
+    );
+    return registrationTail;
+  };
+
   await configureAndroidChannels();
   const currentPermission = await Notifications.getPermissionsAsync();
   const permission = currentPermission.granted
@@ -174,17 +214,17 @@ export async function startNativePushRegistration({
   const connectivitySubscription = NetInfo.addEventListener((state) => {
     online =
       state.isConnected === true && state.isInternetReachable !== false;
-    if (online) void registerCurrentToken();
+    if (online) void queueRegistration();
   });
   const rotationSubscription = Notifications.addPushTokenListener(() => {
     needsRegistration = true;
-    if (online) void registerCurrentToken();
+    if (online) void queueRegistration();
   });
   const currentNetwork = await NetInfo.fetch();
   online =
     currentNetwork.isConnected === true &&
     currentNetwork.isInternetReachable !== false;
-  if (online) await registerCurrentToken();
+  if (online) await queueRegistration();
 
   return () => {
     active = false;
@@ -252,6 +292,8 @@ export function NotificationBridge() {
         void processNotificationResponse(
           response.notification.request.content.data,
           {
+            apiBaseUrl: session.apiBaseUrl,
+            token: session.token ?? "",
             generation: session.generation,
             locked: session.locked,
             isCurrentGeneration: session.isCurrentGeneration,

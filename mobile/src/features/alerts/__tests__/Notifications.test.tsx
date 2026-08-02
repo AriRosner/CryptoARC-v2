@@ -8,6 +8,7 @@ import {
   processNotificationResponse,
   startNativePushRegistration,
 } from "../../../core/notifications/notifications";
+import { MobileApiError } from "../../../core/api/errors";
 import { AlertsScreen } from "../AlertsScreen";
 import type { MobileAlert } from "../types";
 
@@ -22,6 +23,19 @@ const alert: MobileAlert = {
   acknowledged: false,
   acknowledged_at: null,
 };
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve(value: T): void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 describe("native notifications and alerts", () => {
   afterEach(() => {
@@ -45,7 +59,11 @@ describe("native notifications and alerts", () => {
         }),
     );
     const navigate = jest.fn();
+    const destination = deferred<boolean>();
+    const validateDestination = jest.fn(() => destination.promise);
     const session = {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      token: "mobile-session-secret",
       generation: 7,
       locked: true,
       isCurrentGeneration: jest.fn(() => true),
@@ -62,11 +80,16 @@ describe("native notifications and alerts", () => {
       },
       session,
       navigate,
+      undefined,
+      validateDestination,
     );
 
     expect(unlockControls).toHaveBeenCalledTimes(1);
     expect(navigate).not.toHaveBeenCalled();
     releaseUnlock?.(true);
+    await waitFor(() => expect(validateDestination).toHaveBeenCalledTimes(1));
+    expect(navigate).not.toHaveBeenCalled();
+    destination.resolve(true);
     await pending;
     expect(navigate).toHaveBeenCalledWith("/trade/intent_abc123");
   });
@@ -75,6 +98,8 @@ describe("native notifications and alerts", () => {
     const navigate = jest.fn();
     const quarantine = jest.fn();
     const session = {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      token: "mobile-session-secret",
       generation: 8,
       locked: true,
       isCurrentGeneration: jest.fn(() => false),
@@ -107,6 +132,73 @@ describe("native notifications and alerts", () => {
 
     expect(navigate).not.toHaveBeenCalled();
     expect(quarantine).toHaveBeenCalledWith("invalid_notification_route");
+  });
+
+  it("handles deep-link 401 generation-safely and quarantines 403/404 destinations", async () => {
+    const navigate = jest.fn();
+    const quarantine = jest.fn();
+    const session = {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      token: "mobile-session-secret",
+      generation: 19,
+      locked: false,
+      isCurrentGeneration: jest.fn(() => true),
+      revokeSession: jest.fn(async () => true),
+      unlockControls: jest.fn(async () => true),
+    };
+    const denied = jest.fn(async () => {
+      throw new MobileApiError("not visible", "authorization", 403, false);
+    });
+    const missing = jest.fn(async () => {
+      throw new MobileApiError("missing", "validation", 404, false);
+    });
+    const unauthorized = jest.fn(async () => {
+      throw new MobileApiError("expired", "authentication", 401, false);
+    });
+
+    await processNotificationResponse(
+      {
+        event_id: alert.event_id,
+        severity: alert.severity,
+        subsystem: alert.subsystem,
+        route: "/trade/intent_forbidden",
+      },
+      session,
+      navigate,
+      quarantine,
+      denied,
+    );
+    await processNotificationResponse(
+      {
+        event_id: alert.event_id,
+        severity: alert.severity,
+        subsystem: alert.subsystem,
+        route: "/position/position_missing",
+      },
+      session,
+      navigate,
+      quarantine,
+      missing,
+    );
+    await processNotificationResponse(
+      {
+        event_id: alert.event_id,
+        severity: alert.severity,
+        subsystem: alert.subsystem,
+        route: "/trade/intent_expired",
+      },
+      session,
+      navigate,
+      quarantine,
+      unauthorized,
+    );
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(quarantine).toHaveBeenCalledTimes(2);
+    expect(quarantine).toHaveBeenCalledWith(
+      "notification_destination_unavailable",
+    );
+    expect(session.revokeSession).toHaveBeenCalledWith(19);
   });
 
   it("retries registration when connectivity returns and handles token rotation", async () => {
@@ -170,6 +262,60 @@ describe("native notifications and alerts", () => {
       ),
     );
     cleanup();
+  });
+
+  it("serializes reversed token rotation attempts and cleans up listeners", async () => {
+    (NetInfo.fetch as jest.Mock).mockResolvedValue({
+      isConnected: true,
+      isInternetReachable: true,
+    });
+    const connectivityCleanup = jest.fn();
+    (NetInfo.addEventListener as jest.Mock).mockReturnValue(connectivityCleanup);
+    (Notifications.getExpoPushTokenAsync as jest.Mock)
+      .mockResolvedValueOnce({ data: "ExponentPushToken[old-transient]" })
+      .mockResolvedValueOnce({ data: "ExponentPushToken[new-transient]" });
+    let rotationListener: (() => void) | undefined;
+    const rotationCleanup = jest.fn();
+    (Notifications.addPushTokenListener as unknown as jest.Mock).mockImplementation(
+      (listener) => {
+        rotationListener = listener;
+        return { remove: rotationCleanup };
+      },
+    );
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const register = jest
+      .fn()
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise);
+    const session = {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      token: "mobile-session-secret",
+      generation: 23,
+      isCurrentGeneration: jest.fn(() => true),
+      revokeSession: jest.fn(async () => true),
+    };
+
+    const starting = startNativePushRegistration({
+      projectId: "project-id",
+      session,
+      register,
+    });
+    await waitFor(() => expect(register).toHaveBeenCalledTimes(1));
+    rotationListener?.();
+    await Promise.resolve();
+    expect(register).toHaveBeenCalledTimes(1);
+    first.resolve(undefined);
+    await waitFor(() => expect(register).toHaveBeenCalledTimes(2));
+    expect(register.mock.calls[1][0]).toBe(
+      "ExponentPushToken[new-transient]",
+    );
+    second.resolve(undefined);
+    const cleanup = await starting;
+    cleanup();
+
+    expect(connectivityCleanup).toHaveBeenCalledTimes(1);
+    expect(rotationCleanup).toHaveBeenCalledTimes(1);
   });
 
   it("renders duplicate event IDs once and exposes accessible acknowledgement", async () => {

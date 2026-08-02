@@ -15,6 +15,7 @@ import {
 import { MobileSessionProvider, useMobileSession } from "../../MobileSession";
 import { sampleCockpit } from "../../testPayloads";
 import type { MobileDevice, MobileFeedPayload } from "../../types";
+import { unregisterPushToken } from "../../features/alerts/api";
 import { ConnectionProvider } from "../connectivity/ConnectionProvider";
 import {
   LEGACY_DEVICE_KEY,
@@ -32,6 +33,10 @@ jest.mock("../../api", () => ({
   fetchMobileFeed: jest.fn(),
   requestMobileWebSocketTicket: jest.fn(),
   startMobileBot: jest.fn(),
+}));
+
+jest.mock("../../features/alerts/api", () => ({
+  unregisterPushToken: jest.fn(async () => undefined),
 }));
 
 type Deferred<T> = {
@@ -135,6 +140,7 @@ describe("modern provider lifecycle guards", () => {
   const ticketMock = jest.mocked(requestMobileWebSocketTicket);
   const startMock = jest.mocked(startMobileBot);
   const authMock = jest.mocked(LocalAuthentication.authenticateAsync);
+  const unregisterMock = jest.mocked(unregisterPushToken);
   const values = new Map<string, string>();
   const sockets: FakeSocket[] = [];
   const appStateListeners: Array<(state: AppStateStatus) => void> = [];
@@ -196,6 +202,16 @@ describe("modern provider lifecycle guards", () => {
     return { get session() { return session!; }, view };
   }
 
+  async function mountCoreStack() {
+    let session: CoreSessionValue | undefined;
+    const view = await render(
+      <CoreProviderStack onValue={(value) => (session = value)} />,
+    );
+    await waitFor(() => expect(session?.loading).toBe(false));
+    await waitFor(() => expect(session?.token).toBe("old-long-lived-token"));
+    return { get session() { return session!; }, view };
+  }
+
   it("does not publish or reconnect a stale initial session after clear begins", async () => {
     const initialDeviceRead = deferred<string | null>();
     let initialDeviceReadStarted = false;
@@ -230,6 +246,33 @@ describe("modern provider lifecycle guards", () => {
     expect(ticketMock).not.toHaveBeenCalled();
     expect(values.get(SESSION_CONTROL_KEY)).toContain('"status":"cleared"');
     view.unmount();
+  });
+
+  it("best-effort unregisters push on explicit clear and backend replacement", async () => {
+    const mounted = await mountCoreStack();
+
+    await act(async () => {
+      await mounted.session.replaceSession(
+        "https://cryptoarc-new.test",
+        "new-long-lived-token",
+        newDevice,
+      );
+    });
+    expect(unregisterMock).toHaveBeenCalledWith({
+      apiBaseUrl: "https://cryptoarc-old.test",
+      token: "old-long-lived-token",
+    });
+
+    unregisterMock.mockRejectedValueOnce(new Error("offline"));
+    await act(async () => {
+      await expect(mounted.session.clearSession()).resolves.toBe(true);
+    });
+    expect(unregisterMock).toHaveBeenLastCalledWith({
+      apiBaseUrl: "https://cryptoarc-new.test",
+      token: "new-long-lived-token",
+    });
+    expect(mounted.session.token).toBeNull();
+    mounted.view.unmount();
   });
 
   it("does not let a stale initial load replace a newer session or acquire its ticket", async () => {

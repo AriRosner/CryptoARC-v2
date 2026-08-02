@@ -37,6 +37,7 @@ class _MobileWebSocketTicket:
 
 class MobileCommandCenterService:
     WEBSOCKET_TICKET_TTL_SECONDS = 30
+    PUSH_DELIVERY_LEASE_SECONDS = 60
     MAX_WEBSOCKET_TICKETS = 512
     REQUIRED_PREFLIGHT_CHECKS = frozenset(
         {
@@ -65,6 +66,9 @@ class MobileCommandCenterService:
     )
     MOBILE_IDENTIFIER_PATTERN = re.compile(
         r"^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$"
+    )
+    EXPO_PUSH_TOKEN_PATTERN = re.compile(
+        r"^(?:ExponentPushToken|ExpoPushToken)\[[A-Za-z0-9_-]{1,512}\]$"
     )
     DIAGNOSTIC_SENSITIVE_KEY = re.compile(
         r"token|secret|seed|private|signature|pairing|authorization|"
@@ -1752,8 +1756,7 @@ class MobileCommandCenterService:
         alert_events = [
             event
             for event in self.state.storage.load_all_events(bounded_limit * 3)
-            if str(event.level).lower() in {"warning", "danger", "error"}
-            or bool(event.operator_action)
+            if self._is_mobile_alert_event(event)
         ][:bounded_limit]
         return {
             "artifact_type": "cryptoarc_mobile_alerts",
@@ -1783,7 +1786,7 @@ class MobileCommandCenterService:
             ),
             None,
         )
-        if event is None:
+        if event is None or not self._is_mobile_alert_event(event):
             raise LookupError("Mobile alert not found")
         acknowledgement = self.state.storage.acknowledge_mobile_alert(
             acknowledgement_id=new_id("malertack"),
@@ -1841,6 +1844,7 @@ class MobileCommandCenterService:
             "sent": 0,
             "failed": 0,
             "deduplicated": 0,
+            "invalidated": 0,
             "unavailable": self._push_sender is None,
         }
         if self._push_sender is None:
@@ -1852,37 +1856,54 @@ class MobileCommandCenterService:
         for registration in registrations:
             device_id = str(registration.get("device_id") or "")
             registration_id = str(registration.get("id") or "")
-            reserved = self.state.storage.reserve_mobile_notification_delivery(
+            if self._current_mobile_device(device_id, MobileScope.ALERTS) is None:
+                self.state.storage.revoke_mobile_push_registrations(
+                    device_id=device_id,
+                    revoked_at=utc_now().isoformat(),
+                )
+                result["invalidated"] += 1
+                continue
+            attempt_id = new_id("mpushattempt")
+            reserved_attempt = self.state.storage.reserve_mobile_notification_delivery(
                 delivery_id=new_id("mpushdelivery"),
+                attempt_id=attempt_id,
                 event_id=event_id,
                 device_id=device_id,
                 channel=channel,
                 registration_id=registration_id,
                 attempted_at=utc_now().isoformat(),
+                lease_seconds=self.PUSH_DELIVERY_LEASE_SECONDS,
             )
-            if not reserved:
+            if not reserved_attempt:
                 result["deduplicated"] += 1
                 continue
             status = "failed"
             raw_token: str | None = None
             try:
+                if self._current_mobile_device(device_id, MobileScope.ALERTS) is None:
+                    self.state.storage.revoke_mobile_push_registrations(
+                        device_id=device_id,
+                        revoked_at=utc_now().isoformat(),
+                    )
+                    result["invalidated"] += 1
+                    continue
                 raw_token = fernet.decrypt(
                     str(registration.get("token_ciphertext") or "").encode("ascii")
                 ).decode("utf-8")
-                self._push_sender(raw_token, payload)
+                sender_result = self._push_sender(raw_token, payload)
+                if not self._push_sender_succeeded(sender_result):
+                    raise RuntimeError("Push sender did not confirm delivery")
                 result["sent"] += 1
                 status = "sent"
             except Exception:
                 result["failed"] += 1
             finally:
                 raw_token = None
-            self.state.storage.finish_mobile_notification_delivery(
-                event_id=event_id,
-                device_id=device_id,
-                channel=channel,
-                status=status,
-                updated_at=utc_now().isoformat(),
-            )
+                self.state.storage.finish_mobile_notification_delivery(
+                    attempt_id=attempt_id,
+                    status=status,
+                    updated_at=utc_now().isoformat(),
+                )
         return result
 
     def unregister_push_token(
@@ -1913,31 +1934,19 @@ class MobileCommandCenterService:
         ]
         telegram = self.state.alerts.status()
         runtime_status = self.state.mobile_diagnostic_runtime_status()
-        latest_event_value = runtime_status.get("latest_event_at")
-        latest_event_at = (
-            datetime.fromisoformat(
-                str(latest_event_value).replace("Z", "+00:00")
-            )
-            if latest_event_value
-            else None
-        )
-        age_seconds = (
-            max(0, int((now - latest_event_at).total_seconds()))
-            if latest_event_at
-            else None
-        )
+        age_seconds = None
         stale_after_seconds = 60
-        freshness_status = (
-            "unavailable"
-            if age_seconds is None
-            else "fresh"
-            if age_seconds <= stale_after_seconds
-            else "stale"
-        )
+        freshness_status = "unavailable"
         source_status = str(
             runtime_status.get("source_status") or "unknown"
         ).lower()
         rpc_healthy = source_status in {"healthy", "connected", "ok", "live"}
+        source_observed_value = runtime_status.get("source_observed_at")
+        source_observed_at = (
+            datetime.fromisoformat(str(source_observed_value).replace("Z", "+00:00"))
+            if source_observed_value
+            else None
+        )
         signer_configured = bool(
             runtime_status.get("signer_mode_configured")
         )
@@ -1945,9 +1954,9 @@ class MobileCommandCenterService:
             self._diagnostic_check(
                 "tunnel",
                 "Private tunnel",
-                "healthy",
-                "Private-tunnel transport is required.",
-                now,
+                "unavailable",
+                "Private-tunnel state must be observed on-device.",
+                None,
             ),
             self._diagnostic_check(
                 "api", "API", "healthy", "Authenticated API is responding.", now
@@ -1955,9 +1964,9 @@ class MobileCommandCenterService:
             self._diagnostic_check(
                 "websocket",
                 "WebSocket",
-                "healthy",
-                "Mobile WebSocket endpoint is available.",
-                now,
+                "unavailable",
+                "WebSocket state must be observed on-device.",
+                None,
             ),
             self._diagnostic_check(
                 "token_scope",
@@ -1975,7 +1984,9 @@ class MobileCommandCenterService:
                 "An active push registration exists."
                 if registrations
                 else "No active push registration exists.",
-                now,
+                self._parse_optional_datetime(
+                    registrations[0].get("updated_at") if registrations else None
+                ),
             ),
             self._diagnostic_check(
                 "telegram",
@@ -1997,7 +2008,7 @@ class MobileCommandCenterService:
                 "Clock drift",
                 "unavailable",
                 "Calculated on-device from server time.",
-                now,
+                None,
             ),
             self._diagnostic_check(
                 "snapshot_age",
@@ -2009,17 +2020,19 @@ class MobileCommandCenterService:
                 else "warning",
                 "No stored event timestamp is available."
                 if age_seconds is None
-                else f"Latest stored event is {age_seconds} seconds old.",
-                now,
+                else f"Latest verified snapshot is {age_seconds} seconds old.",
+                None,
             ),
             self._diagnostic_check(
                 "rpc",
                 "RPC",
-                "healthy" if rpc_healthy else "warning",
+                "healthy" if rpc_healthy and source_observed_at else "warning" if source_observed_at else "unavailable",
                 "In-memory source state is healthy."
-                if rpc_healthy
-                else "In-memory source state is not healthy.",
-                now,
+                if rpc_healthy and source_observed_at
+                else "In-memory source state is not healthy."
+                if source_observed_at
+                else "No source transport observation is available.",
+                source_observed_at,
             ),
             self._diagnostic_check(
                 "signer",
@@ -2149,6 +2162,32 @@ class MobileCommandCenterService:
             raise ValueError("Push route is invalid")
         return route
 
+    @staticmethod
+    def _is_mobile_alert_event(event: Any) -> bool:
+        return (
+            str(getattr(event, "level", "")).lower()
+            in {"warning", "danger", "error"}
+            or bool(getattr(event, "operator_action", ""))
+        )
+
+    @staticmethod
+    def _push_sender_succeeded(result: object) -> bool:
+        if result is True:
+            return True
+        if not isinstance(result, dict):
+            return False
+        return str(result.get("status") or "").strip().lower() == "sent"
+
+    @staticmethod
+    def _parse_optional_datetime(value: object) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc)
+
     @classmethod
     def _public_mobile_alert(
         cls,
@@ -2199,14 +2238,14 @@ class MobileCommandCenterService:
         label: str,
         status: str,
         detail: str,
-        observed_at: datetime,
+        observed_at: datetime | None,
     ) -> dict[str, object]:
         return {
             "id": check_id,
             "label": label,
             "status": status,
             "detail": detail,
-            "observed_at": observed_at.isoformat(),
+            "observed_at": observed_at.isoformat() if observed_at else None,
         }
 
     @staticmethod
@@ -2278,6 +2317,8 @@ class MobileCommandCenterService:
     ) -> dict[str, object]:
         fernet = self._push_token_fernet()
         raw_token = token.strip()
+        if not self.EXPO_PUSH_TOKEN_PATTERN.fullmatch(raw_token):
+            raise ValueError("Invalid mobile push registration request")
         now = utc_now()
         registration = MobilePushRegistration(
             id=new_id("mpush"),

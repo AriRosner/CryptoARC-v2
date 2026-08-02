@@ -10,6 +10,8 @@ import type {
   MobileDiagnosticCheck,
   MobileDiagnosticsPayload,
 } from "../types";
+import { shareDiagnosticArtifact } from "../artifact";
+import { applyClientDiagnosticObservations } from "../observations";
 
 const diagnosticChecks: Array<
   [
@@ -143,5 +145,104 @@ describe("Diagnostics and Recovery Center", () => {
     expect(encoded).not.toContain("C:\\Users");
     expect(encoded).not.toContain("9xSensitiveWalletAddress");
     expect(encoded).not.toContain("twelve words");
+  });
+
+  it("shares a stable application/json diagnostic artifact", async () => {
+    const write = jest.fn(async () => undefined);
+    const share = jest.fn(async () => undefined);
+
+    await shareDiagnosticArtifact(
+      { artifact_type: "cryptoarc_mobile_diagnostics", safe: "visible" },
+      {
+        cacheDirectory: "file:///cache/",
+        write,
+        share,
+      },
+    );
+
+    expect(write).toHaveBeenCalledWith(
+      "file:///cache/cryptoarc-mobile-diagnostics.json",
+      expect.stringContaining('"safe": "visible"'),
+    );
+    expect(share).toHaveBeenCalledWith(
+      "file:///cache/cryptoarc-mobile-diagnostics.json",
+      expect.objectContaining({
+        dialogTitle: "CryptoARC redacted diagnostics",
+        mimeType: "application/json",
+      }),
+    );
+  });
+
+  it("uses real client observations for transports, snapshot age, and bounded clock drift", () => {
+    const payload: MobileDiagnosticsPayload = {
+      ...diagnostics,
+      generated_at: "2026-07-29T12:00:02.000Z",
+      freshness: {
+        status: "unavailable",
+        age_seconds: null,
+        stale_after_seconds: 60,
+      },
+      checks: diagnostics.checks.map((check) =>
+        ["tunnel", "websocket", "clock_drift", "snapshot_age"].includes(
+          check.id,
+        )
+          ? { ...check, status: "unavailable", observed_at: null }
+          : check,
+      ),
+    };
+
+    const observed = applyClientDiagnosticObservations(payload, {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      apiStartedAt: "2026-07-29T12:00:00.000Z",
+      apiReceivedAt: "2026-07-29T12:00:04.000Z",
+      now: "2026-07-29T12:00:04.000Z",
+      online: true,
+      realtime: {
+        status: "connected",
+        lastServerTime: "2026-07-29T12:00:03.000Z",
+      },
+      verifiedSnapshot: {
+        verifiedAt: "2026-07-29T12:00:03.000Z",
+        serverTime: "2026-07-29T12:00:03.000Z",
+      },
+    });
+    const checks = Object.fromEntries(
+      observed.checks.map((check) => [check.id, check]),
+    );
+
+    expect(checks.tunnel.status).toBe("healthy");
+    expect(checks.api.observed_at).toBe("2026-07-29T12:00:04.000Z");
+    expect(checks.websocket.status).toBe("healthy");
+    expect(checks.clock_drift.status).toBe("healthy");
+    expect(checks.snapshot_age.status).toBe("healthy");
+    expect(observed.freshness).toEqual({
+      status: "fresh",
+      age_seconds: 1,
+      stale_after_seconds: 60,
+    });
+  });
+
+  it("reports stale or disconnected observations without false green states", () => {
+    const observed = applyClientDiagnosticObservations(diagnostics, {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      apiStartedAt: "2026-07-29T11:59:40.000Z",
+      apiReceivedAt: "2026-07-29T12:00:00.000Z",
+      now: "2026-07-29T12:00:00.000Z",
+      online: false,
+      realtime: { status: "offline", lastServerTime: "" },
+      verifiedSnapshot: {
+        verifiedAt: "2026-07-29T11:58:00.000Z",
+        serverTime: "2026-07-29T11:58:00.000Z",
+      },
+    });
+    const checks = Object.fromEntries(
+      observed.checks.map((check) => [check.id, check]),
+    );
+
+    expect(checks.tunnel.status).toBe("warning");
+    expect(checks.websocket.status).toBe("warning");
+    expect(checks.clock_drift.status).toBe("unavailable");
+    expect(checks.snapshot_age.status).toBe("warning");
+    expect(observed.freshness.status).toBe("stale");
   });
 });

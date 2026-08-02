@@ -398,17 +398,20 @@ class BotState:
 
     def mobile_diagnostic_runtime_status(self) -> dict[str, object]:
         """Return bounded, in-memory status without probing RPC or signer transports."""
-        events = self.storage.load_all_events(1)
-        latest_event_at = events[0].created_at if events else None
         source_status = getattr(self.source_status, "status", "")
+        source_observed_at = (
+            self.source_status.last_event_at
+            or self.source_status.connected_at
+            or self.source_status.connection_requested_at
+        )
         return {
-            "latest_event_at": (
-                latest_event_at.isoformat() if latest_event_at else None
-            ),
             "source_status": (
                 source_status.value
                 if hasattr(source_status, "value")
                 else str(source_status or "unknown")
+            ),
+            "source_observed_at": (
+                source_observed_at.isoformat() if source_observed_at else None
             ),
             "signer_mode_configured": bool(
                 str(self.settings.live_signer_mode or "").strip()

@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
@@ -90,6 +90,9 @@ class Storage:
         "mobile_devices",
         "mobile_action_receipts",
         "mobile_destination_authorizations",
+        "mobile_push_registrations",
+        "mobile_alert_acknowledgements",
+        "mobile_notification_deliveries",
     )
 
     def __init__(self, path: str = "data/cryptoarc.db") -> None:
@@ -486,13 +489,35 @@ class Storage:
                 device_id TEXT NOT NULL,
                 channel TEXT NOT NULL,
                 registration_id TEXT NOT NULL,
+                attempt_id TEXT NOT NULL,
                 status TEXT NOT NULL,
                 attempted_at TEXT NOT NULL,
+                lease_expires_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE(event_id, device_id, channel)
             )
             """
         )
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(mobile_notification_deliveries)"
+            ).fetchall()
+        }
+        if "attempt_id" not in columns:
+            connection.execute(
+                "ALTER TABLE mobile_notification_deliveries ADD COLUMN attempt_id TEXT"
+            )
+            connection.execute(
+                "UPDATE mobile_notification_deliveries SET attempt_id = id WHERE attempt_id IS NULL OR attempt_id = ''"
+            )
+        if "lease_expires_at" not in columns:
+            connection.execute(
+                "ALTER TABLE mobile_notification_deliveries ADD COLUMN lease_expires_at TEXT"
+            )
+            connection.execute(
+                "UPDATE mobile_notification_deliveries SET lease_expires_at = updated_at WHERE lease_expires_at IS NULL OR lease_expires_at = ''"
+            )
 
     def _migration_011_mobile_guarded_execution_claims(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -719,6 +744,9 @@ class Storage:
             staged_settings.live_active_backend_armed = False
             staged_settings.kill_switch_enabled = True
             staged_storage.save_settings(staged_settings)
+            revoked_mobile = staged_storage.revoke_all_mobile_credentials_and_push_registrations(
+                datetime.now(timezone.utc).isoformat()
+            )
             persisted_settings = staged_storage.load_settings()
             if persisted_settings.live_active_backend_armed or not persisted_settings.kill_switch_enabled:
                 raise ValueError("Restore staging failed to persist fail-closed live settings")
@@ -750,7 +778,14 @@ class Storage:
                 "operator_action": "Review migration, runtime, and wallet state after restore before trading.",
             }
             self.save_backup_restore_history(history_entry)
-            return {**preview, "status": "restored", "backup_path": backup_path}
+            return {
+                **preview,
+                "status": "restored",
+                "backup_path": backup_path,
+                "mobile_credentials_revoked": True,
+                "mobile_devices_revoked": revoked_mobile["devices"],
+                "mobile_push_registrations_revoked": revoked_mobile["registrations"],
+            }
         except Exception as exc:
             if swapped:
                 try:
@@ -1067,55 +1102,132 @@ class Storage:
             )
         return int(cursor.rowcount)
 
+    def revoke_all_mobile_credentials_and_push_registrations(
+        self,
+        revoked_at: str,
+    ) -> dict[str, int]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT id, payload, revoked_at FROM mobile_devices"
+            ).fetchall()
+            revoked_devices = 0
+            for row in rows:
+                payload = json.loads(row["payload"])
+                if str(row["revoked_at"] or payload.get("revoked_at") or ""):
+                    continue
+                payload["revoked_at"] = revoked_at
+                connection.execute(
+                    "UPDATE mobile_devices SET payload = ?, revoked_at = ? WHERE id = ?",
+                    (json.dumps(payload), revoked_at, row["id"]),
+                )
+                revoked_devices += 1
+            cursor = connection.execute(
+                """
+                UPDATE mobile_push_registrations
+                SET revoked_at = ?, updated_at = ?
+                WHERE revoked_at IS NULL OR revoked_at = ''
+                """,
+                (revoked_at, revoked_at),
+            )
+        return {"devices": revoked_devices, "registrations": int(cursor.rowcount)}
+
     def reserve_mobile_notification_delivery(
         self,
         *,
         delivery_id: str,
+        attempt_id: str,
         event_id: str,
         device_id: str,
         channel: str,
         registration_id: str,
         attempted_at: str,
-    ) -> bool:
+        lease_seconds: int,
+    ) -> str | None:
+        attempted = datetime.fromisoformat(attempted_at.replace("Z", "+00:00"))
+        if attempted.tzinfo is None:
+            attempted = attempted.replace(tzinfo=timezone.utc)
+        lease_expires_at = (
+            attempted + timedelta(seconds=max(1, int(lease_seconds)))
+        ).isoformat()
         with self._connect() as connection:
-            cursor = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
                 """
-                INSERT OR IGNORE INTO mobile_notification_deliveries (
-                    id, event_id, device_id, channel, registration_id,
-                    status, attempted_at, updated_at
+                SELECT status, lease_expires_at
+                FROM mobile_notification_deliveries
+                WHERE event_id = ? AND device_id = ? AND channel = ?
+                """,
+                (event_id, device_id, channel),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO mobile_notification_deliveries (
+                        id, event_id, device_id, channel, registration_id,
+                        attempt_id, status, attempted_at, lease_expires_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    """,
+                    (
+                        delivery_id,
+                        event_id,
+                        device_id,
+                        channel,
+                        registration_id,
+                        attempt_id,
+                        attempted_at,
+                        lease_expires_at,
+                        attempted_at,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                return attempt_id
+            status = str(row["status"] or "")
+            current_lease = str(row["lease_expires_at"] or "")
+            reclaimable = status == "failed" or (
+                status == "pending" and current_lease <= attempted_at
+            )
+            if not reclaimable:
+                return None
+            connection.execute(
+                """
+                UPDATE mobile_notification_deliveries
+                SET registration_id = ?, attempt_id = ?, status = 'pending',
+                    attempted_at = ?, lease_expires_at = ?, updated_at = ?
+                WHERE event_id = ? AND device_id = ? AND channel = ?
                 """,
                 (
-                    delivery_id,
+                    registration_id,
+                    attempt_id,
+                    attempted_at,
+                    lease_expires_at,
+                    attempted_at,
                     event_id,
                     device_id,
                     channel,
-                    registration_id,
-                    attempted_at,
-                    attempted_at,
                 ),
             )
-        return int(cursor.rowcount) == 1
+            return attempt_id
 
     def finish_mobile_notification_delivery(
         self,
         *,
-        event_id: str,
-        device_id: str,
-        channel: str,
+        attempt_id: str,
         status: str,
         updated_at: str,
-    ) -> None:
+    ) -> bool:
+        if status not in {"sent", "failed"}:
+            raise ValueError("Mobile notification delivery status is invalid")
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE mobile_notification_deliveries
                 SET status = ?, updated_at = ?
-                WHERE event_id = ? AND device_id = ? AND channel = ?
+                WHERE attempt_id = ? AND status = 'pending'
                 """,
-                (status, updated_at, event_id, device_id, channel),
+                (status, updated_at, attempt_id),
             )
+        return int(cursor.rowcount) == 1
 
     def acknowledge_mobile_alert(
         self,
