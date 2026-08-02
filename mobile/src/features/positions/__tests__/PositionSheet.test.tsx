@@ -1,6 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import React from "react";
+import { Animated } from "react-native";
 
 import { fetchPositionDetail } from "../api";
 import { PositionSheet } from "../PositionSheet";
@@ -167,6 +168,39 @@ describe("PositionSheet", () => {
       "layout",
     );
     await minimal.unmount();
+  });
+
+  it("bounds row choreography to eight positions and renders the remainder statically", async () => {
+    const stop = jest.fn();
+    const timing = jest.spyOn(Animated, "timing").mockReturnValue({
+      reset: jest.fn(),
+      start: jest.fn(),
+      stop,
+    } as ReturnType<typeof Animated.timing>);
+    const positions = Array.from({ length: 10 }, (_, index) => ({
+      ...detail,
+      id: `live-position-${index}`,
+      symbol: `ARC-${index}`,
+    }));
+
+    useSettingsStore.setState({ motion: "expressive" });
+    const view = await render(
+      <PositionList positions={positions} onPress={jest.fn()} />,
+    );
+    const choreographed = positions.slice(0, 8).map((position) =>
+      Boolean(view.getByTestId(`position-transition-${position.id}`).props.layout),
+    );
+    const staticRows = positions.slice(8).map((position) =>
+      view.getByTestId(`position-transition-${position.id}`).props.layout,
+    );
+    const timingCalls = timing.mock.calls.length;
+    await view.unmount();
+    timing.mockRestore();
+
+    expect(choreographed).toEqual(Array(8).fill(true));
+    expect(staticRows).toEqual([undefined, undefined]);
+    expect(timingCalls).toBe(8);
+    expect(stop).toHaveBeenCalledTimes(8);
   });
 
   it("shows summary fields, guarded actions, and opens full details", async () => {

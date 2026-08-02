@@ -9,6 +9,8 @@ import { listTransitionDelay } from "../../components/motion/transitions";
 import { colors, radius, spacing } from "../../theme";
 import type { PositionSummary } from "./types";
 
+const MAX_CHOREOGRAPHED_ROWS = 8;
+
 export function PositionList({
   positions,
   onPress,
@@ -38,36 +40,45 @@ export function PositionList({
     <View style={styles.list}>
       {positions.map((position, index) => {
         const pnl = position.realized_pnl_sol + position.unrealized_pnl_sol;
-        return (
+        const row = (
+          <Pressable
+            accessibilityLabel={`Open ${position.symbol} position, ${position.mode}, ${position.mark_fresh ? "fresh" : "stale"} mark`}
+            accessibilityRole="button"
+            onPress={() => onPress(position.id)}
+            style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
+            <View style={styles.identity}>
+              <View style={styles.symbolLine}>
+                <Text style={styles.symbol}>{position.symbol}</Text>
+                <StatusBadge label={position.mode} tone={position.mode === "live" ? "warning" : "neutral"} />
+              </View>
+              <Text style={styles.meta}>
+                {position.mark_fresh ? "Fresh mark" : "Stale mark"} | {position.mark_source || "No mark source"}
+              </Text>
+            </View>
+            <View style={styles.pnl}>
+              <Text style={[styles.pnlValue, { color: pnl >= 0 ? colors.emerald : colors.rose }]}>
+                {pnl >= 0 ? "+" : ""}{pnl.toFixed(4)}
+              </Text>
+              <Text style={styles.pnlPct}>{position.pnl_pct.toFixed(1)}%</Text>
+            </View>
+            <ChevronRight size={18} color={colors.faint} />
+          </Pressable>
+        );
+        const choreographed =
+          index < MAX_CHOREOGRAPHED_ROWS && motionPolicy.duration.normal > 0;
+        return choreographed ? (
           <Animated.View
             key={position.id}
             testID={`position-transition-${position.id}`}
             layout={layoutTransition}>
             <AnimatedPanel delay={listTransitionDelay(motionPolicy, index)}>
-              <Pressable
-                accessibilityLabel={`Open ${position.symbol} position, ${position.mode}, ${position.mark_fresh ? "fresh" : "stale"} mark`}
-                accessibilityRole="button"
-                onPress={() => onPress(position.id)}
-                style={({ pressed }) => [styles.row, pressed && styles.pressed]}>
-                <View style={styles.identity}>
-                  <View style={styles.symbolLine}>
-                    <Text style={styles.symbol}>{position.symbol}</Text>
-                    <StatusBadge label={position.mode} tone={position.mode === "live" ? "warning" : "neutral"} />
-                  </View>
-                  <Text style={styles.meta}>
-                    {position.mark_fresh ? "Fresh mark" : "Stale mark"} | {position.mark_source || "No mark source"}
-                  </Text>
-                </View>
-                <View style={styles.pnl}>
-                  <Text style={[styles.pnlValue, { color: pnl >= 0 ? colors.emerald : colors.rose }]}>
-                    {pnl >= 0 ? "+" : ""}{pnl.toFixed(4)}
-                  </Text>
-                  <Text style={styles.pnlPct}>{position.pnl_pct.toFixed(1)}%</Text>
-                </View>
-                <ChevronRight size={18} color={colors.faint} />
-              </Pressable>
+              {row}
             </AnimatedPanel>
           </Animated.View>
+        ) : (
+          <View key={position.id} testID={`position-transition-${position.id}`}>
+            {row}
+          </View>
         );
       })}
     </View>

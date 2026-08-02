@@ -35,19 +35,36 @@ export function TradesScreen() {
         />
         {query.isLoading ? (
           <TradeSkeleton />
+        ) : query.isError && !query.data ? (
+          <View style={styles.errorRegion}>
+            <Text accessibilityRole="alert" style={styles.errorTitle}>
+              Trade list unavailable
+            </Text>
+            <Text style={styles.errorBody}>
+              Prepared intents could not be loaded from the trusted backend.
+            </Text>
+            <ActionButton label="Retry" onPress={() => void query.refetch()} />
+          </View>
         ) : trades.length === 0 ? (
-          <>
-            <EmptyState
-              title="No prepared intents"
-              body="Prepare, quote, and simulate a trade on the trusted backend before reviewing it here."
-            />
-            {query.isError ? (
-              <ActionButton label="Retry" onPress={() => void query.refetch()} />
-            ) : null}
-          </>
+          <EmptyState
+            title="No prepared intents"
+            body="Prepare, quote, and simulate a trade on the trusted backend before reviewing it here."
+          />
         ) : (
-          <View style={styles.stack}>
-            {trades.map((trade) => (
+          <>
+            {query.isError ? (
+              <View style={styles.errorRegion}>
+                <Text accessibilityRole="alert" style={styles.errorTitle}>
+                  Trade list refresh failed
+                </Text>
+                <Text style={styles.errorBody}>
+                  Showing the last prepared intents received successfully.
+                </Text>
+                <ActionButton label="Retry" onPress={() => void query.refetch()} />
+              </View>
+            ) : null}
+            <View style={styles.stack}>
+              {trades.map((trade) => (
               <Pressable
                 key={trade.id}
                 accessibilityLabel={`Review ${trade.action} ${trade.symbol || trade.mint}`}
@@ -86,8 +103,9 @@ export function TradesScreen() {
                   <ArrowRight color={colors.muted} size={18} />
                 </View>
               </Pressable>
-            ))}
-          </View>
+              ))}
+            </View>
+          </>
         )}
       </ScrollView>
     </SafeAreaView>
@@ -148,5 +166,23 @@ const styles = StyleSheet.create({
   rowState: {
     alignItems: "flex-end",
     gap: spacing.md,
+  },
+  errorRegion: {
+    gap: spacing.sm,
+    padding: spacing.md,
+    backgroundColor: colors.roseSoft,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    borderWidth: 1,
+  },
+  errorTitle: {
+    color: colors.rose,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  errorBody: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 17,
   },
 });

@@ -590,6 +590,16 @@ export function TradeDetailScreen({
         </Pressable>
         {query.isLoading ? (
           <TradeDetailSkeleton />
+        ) : query.isError && !trade ? (
+          <View style={styles.errorRegion}>
+            <Text accessibilityRole="alert" style={styles.errorTitle}>
+              Trade details unavailable
+            </Text>
+            <Text style={styles.errorBody}>
+              This prepared intent could not be loaded from the trusted backend.
+            </Text>
+            <ActionButton label="Retry" onPress={() => void query.refetch()} />
+          </View>
         ) : !trade || !initialDraft ? (
           <>
             <EmptyState
@@ -600,6 +610,17 @@ export function TradeDetailScreen({
           </>
         ) : (
           <>
+            {query.isError ? (
+              <View style={styles.errorRegion}>
+                <Text accessibilityRole="alert" style={styles.errorTitle}>
+                  Trade detail refresh failed
+                </Text>
+                <Text style={styles.errorBody}>
+                  Showing the last prepared trade received successfully.
+                </Text>
+                <ActionButton label="Retry" onPress={() => void query.refetch()} />
+              </View>
+            ) : null}
             <PageHeader
               eyebrow="Prepared trade"
               title={`${trade.action.toUpperCase()} ${trade.symbol || "token"}`}
@@ -720,5 +741,23 @@ const styles = StyleSheet.create({
     color: colors.rose,
     fontSize: 11,
     lineHeight: 16,
+  },
+  errorRegion: {
+    gap: spacing.sm,
+    padding: spacing.md,
+    backgroundColor: colors.roseSoft,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    borderWidth: 1,
+  },
+  errorTitle: {
+    color: colors.rose,
+    fontSize: 13,
+    fontWeight: "900",
+  },
+  errorBody: {
+    color: colors.muted,
+    fontSize: 11,
+    lineHeight: 17,
   },
 });

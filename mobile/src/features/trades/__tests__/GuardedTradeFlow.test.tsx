@@ -16,7 +16,9 @@ import { GuardedPositionActions } from "../../positions/GuardedPositionActions";
 import type { PositionDetail } from "../../positions/types";
 import { ActionStatus } from "../ActionStatus";
 import { BoundedTradeForm } from "../BoundedTradeForm";
-import { GuardedTradeApproval } from "../TradeDetailScreen";
+import { GuardedTradeApproval, TradeDetailScreen } from "../TradeDetailScreen";
+import { TradesScreen } from "../TradesScreen";
+import { useTradeQuery, useTradesQuery } from "../queries";
 import {
   pendingActionRoute,
   type PendingActionOwner,
@@ -24,6 +26,11 @@ import {
   type PendingMobileAction,
 } from "../pendingAction";
 import type { MobileActionReceipt, MobileTradeDetail, MobileTradeDraft } from "../types";
+
+jest.mock("../queries", () => ({
+  useTradeQuery: jest.fn(),
+  useTradesQuery: jest.fn(),
+}));
 
 const routineTrade: MobileTradeDetail = {
   id: "intent-routine",
@@ -172,6 +179,91 @@ describe("guarded mobile trade flow", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     authenticate.mockResolvedValue({ success: true });
+  });
+
+  const queryResult = <T,>(input: {
+    data?: T;
+    isError?: boolean;
+    isLoading?: boolean;
+    refetch?: jest.Mock;
+  }) => ({
+    data: input.data,
+    isError: input.isError ?? false,
+    isLoading: input.isLoading ?? false,
+    refetch: input.refetch ?? jest.fn(),
+  });
+
+  const tradeList = {
+    artifact_type: "cryptoarc_mobile_trades" as const,
+    format_version: 1 as const,
+    generated_at: "2026-08-02T12:00:00Z",
+    trades: [routineTrade],
+  };
+
+  it("distinguishes an initial trade-list failure from a true empty list", async () => {
+    const retry = jest.fn();
+    jest.mocked(useTradesQuery).mockReturnValue(
+      queryResult({ isError: true, refetch: retry }) as unknown as ReturnType<typeof useTradesQuery>,
+    );
+    const failed = await render(<TradesScreen />);
+    expect(failed.getByRole("alert")).toHaveTextContent("Trade list unavailable");
+    expect(failed.queryByText("No prepared intents")).toBeNull();
+    await fireEvent.press(failed.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    await failed.unmount();
+
+    jest.mocked(useTradesQuery).mockReturnValue(
+      queryResult({ data: { ...tradeList, trades: [] } }) as unknown as ReturnType<typeof useTradesQuery>,
+    );
+    const empty = await render(<TradesScreen />);
+    expect(empty.getByText("No prepared intents")).toBeTruthy();
+    expect(empty.queryByRole("alert")).toBeNull();
+    await empty.unmount();
+  });
+
+  it("keeps cached trade-list content visible with a refetch error and retry", async () => {
+    const retry = jest.fn();
+    jest.mocked(useTradesQuery).mockReturnValue(
+      queryResult({ data: tradeList, isError: true, refetch: retry }) as unknown as ReturnType<typeof useTradesQuery>,
+    );
+    const view = await render(<TradesScreen />);
+
+    expect(view.getByText("ARC")).toBeTruthy();
+    expect(view.getByRole("alert")).toHaveTextContent("Trade list refresh failed");
+    await fireEvent.press(view.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+
+  it("renders an explicit initial trade-detail failure with retry", async () => {
+    const retry = jest.fn();
+    jest.mocked(useTradeQuery).mockReturnValue(
+      queryResult({ isError: true, refetch: retry }) as unknown as ReturnType<typeof useTradeQuery>,
+    );
+    const view = await render(
+      <TradeDetailScreen intentId={routineTrade.id} onBack={jest.fn()} />,
+    );
+
+    expect(view.getByRole("alert")).toHaveTextContent("Trade details unavailable");
+    await fireEvent.press(view.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+
+  it("keeps cached trade-detail content visible with a refetch error and retry", async () => {
+    const retry = jest.fn();
+    jest.mocked(useTradeQuery).mockReturnValue(
+      queryResult({ data: routineTrade, isError: true, refetch: retry }) as unknown as ReturnType<typeof useTradeQuery>,
+    );
+    const view = await render(
+      <TradeDetailScreen intentId={routineTrade.id} onBack={jest.fn()} />,
+    );
+
+    expect(view.getByText("Prepared evidence")).toBeTruthy();
+    expect(view.getByRole("alert")).toHaveTextContent("Trade detail refresh failed");
+    await fireEvent.press(view.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    await view.unmount();
   });
 
   afterEach(() => {
