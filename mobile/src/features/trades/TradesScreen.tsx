@@ -16,6 +16,7 @@ import {
   PageHeader,
   StatusBadge,
 } from "../../components/ui";
+import { TradeSkeleton } from "../../components/skeletons/TradeSkeleton";
 import { colors, radius, spacing } from "../../theme";
 import { useTradesQuery } from "./queries";
 
@@ -33,10 +34,7 @@ export function TradesScreen() {
           right={<ShieldCheck color={colors.emerald} size={24} />}
         />
         {query.isLoading ? (
-          <View accessibilityLabel="Loading prepared trades" style={styles.stack}>
-            <View style={[styles.skeleton, { height: 112 }]} />
-            <View style={[styles.skeleton, { height: 112 }]} />
-          </View>
+          <TradeSkeleton />
         ) : trades.length === 0 ? (
           <>
             <EmptyState
@@ -150,9 +148,5 @@ const styles = StyleSheet.create({
   rowState: {
     alignItems: "flex-end",
     gap: spacing.md,
-  },
-  skeleton: {
-    backgroundColor: colors.panelRaised,
-    borderRadius: radius.md,
   },
 });

@@ -19,6 +19,7 @@ import {
 } from "react-native";
 
 import { ActionButton, DetailRow, StatusBadge } from "../../components/ui";
+import { PositionSkeleton } from "../../components/skeletons/PositionSkeleton";
 import { authenticatedRead, mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -110,7 +111,7 @@ export function PositionSheet({
         importantForAccessibility="yes"
         contentContainerStyle={styles.content}>
         {session?.loading ? (
-          <PositionSheetSkeleton />
+          <PositionSkeleton />
         ) : needsPairing ? (
           <View style={styles.message}>
             <Text
@@ -129,7 +130,7 @@ export function PositionSheet({
             />
           </View>
         ) : query.isLoading ? (
-          <PositionSheetSkeleton />
+          <PositionSkeleton />
         ) : !position ? (
           <View style={styles.message}>
             <Text ref={titleRef} accessibilityRole="header" style={styles.messageTitle}>
@@ -154,7 +155,7 @@ export function PositionSheet({
                 </View>
                 <Text style={styles.mint} numberOfLines={1}>{position.mint}</Text>
               </View>
-              <Pressable accessibilityLabel="Close position sheet" hitSlop={10} onPress={onDismiss} style={styles.iconButton}>
+              <Pressable accessibilityLabel="Close position sheet" accessibilityRole="button" hitSlop={10} onPress={onDismiss} style={styles.iconButton}>
                 <X size={20} color={colors.muted} />
               </Pressable>
             </View>
@@ -189,6 +190,7 @@ export function PositionSheet({
             </View>
             <View style={styles.actions}>
               <ActionButton
+                accessibilityHint="Reviews stop and target changes before any submission"
                 label="Adjust exit"
                 disabled={!position.allowed_actions.adjust_exit}
                 onPress={() => onAdjustExit(position.id)}
@@ -196,6 +198,7 @@ export function PositionSheet({
                 buttonStyle={styles.action}
               />
               <ActionButton
+                accessibilityHint="Opens guarded full-position close review before any submission"
                 label="Close position"
                 tone="danger"
                 disabled={!position.allowed_actions.close}
@@ -213,18 +216,6 @@ export function PositionSheet({
         )}
       </BottomSheetScrollView>
     </BottomSheetModal>
-  );
-}
-
-function PositionSheetSkeleton() {
-  return (
-    <View accessibilityLabel="Loading position" style={styles.skeletonStack}>
-      <View style={[styles.skeleton, styles.skeletonTitle]} />
-      <View style={[styles.skeleton, styles.skeletonHero]} />
-      <View style={[styles.skeleton, styles.skeletonRow]} />
-      <View style={[styles.skeleton, styles.skeletonRow]} />
-      <View style={[styles.skeleton, styles.skeletonButton]} />
-    </View>
   );
 }
 
@@ -342,25 +333,5 @@ const styles = StyleSheet.create({
     color: colors.rose,
     fontSize: 11,
     lineHeight: 16,
-  },
-  skeletonStack: {
-    gap: spacing.md,
-  },
-  skeleton: {
-    backgroundColor: colors.panelRaised,
-    borderRadius: radius.sm,
-  },
-  skeletonTitle: {
-    height: 28,
-    width: "44%",
-  },
-  skeletonHero: {
-    height: 96,
-  },
-  skeletonRow: {
-    height: 38,
-  },
-  skeletonButton: {
-    height: 48,
   },
 });

@@ -351,6 +351,22 @@ describe("native notifications and alerts", () => {
     expect(loading.getByLabelText("Loading alerts")).toBeTruthy();
   });
 
+  it("preserves alert content during a background refresh", async () => {
+    const view = await render(
+      <AlertsScreen
+        alerts={[alert]}
+        loading
+        error=""
+        onRefresh={jest.fn()}
+        onAcknowledge={jest.fn()}
+      />,
+    );
+
+    expect(view.getByText("Critical trade alert")).toBeTruthy();
+    expect(view.getByLabelText("Syncing alerts")).toBeTruthy();
+    expect(view.queryByTestId("alerts-initial-skeleton")).toBeNull();
+  });
+
   it("renders the alert error and empty state", async () => {
     const empty = await render(
       <AlertsScreen

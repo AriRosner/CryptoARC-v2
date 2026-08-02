@@ -19,6 +19,7 @@ import {
   StatusBadge,
   type Tone,
 } from "../../components/ui";
+import { DiagnosticsSkeleton } from "../../components/skeletons/DiagnosticsSkeleton";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { useConnection } from "../../core/connectivity/ConnectionProvider";
 import { useSession } from "../../core/session/SessionProvider";
@@ -64,14 +65,18 @@ export function DiagnosticsScreen({
           eyebrow="Read-only recovery"
           title="Diagnostics"
           subtitle="Freshness-aware operator checks"
-          right={<Stethoscope color={colors.amber} size={24} />}
+          right={
+            <View style={styles.headerStatus}>
+              <Stethoscope color={colors.amber} size={24} />
+              {loading && diagnostics ? (
+                <Text accessibilityLabel="Syncing diagnostics" style={styles.syncing}>Syncing</Text>
+              ) : null}
+            </View>
+          }
         />
         <ErrorBanner message={error} />
-        {loading ? (
-          <View accessibilityLabel="Loading diagnostics" style={styles.stack}>
-            <View style={styles.skeleton} />
-            <View style={styles.skeleton} />
-          </View>
+        {loading && !diagnostics ? (
+          <DiagnosticsSkeleton />
         ) : diagnostics ? (
           <>
             <Section
@@ -242,10 +247,14 @@ const styles = StyleSheet.create({
   stack: {
     gap: spacing.sm,
   },
-  skeleton: {
-    height: 220,
-    borderRadius: radius.md,
-    backgroundColor: colors.panelRaised,
+  headerStatus: {
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  syncing: {
+    color: colors.amber,
+    fontSize: 10,
+    fontWeight: "800",
   },
   check: {
     minHeight: 68,

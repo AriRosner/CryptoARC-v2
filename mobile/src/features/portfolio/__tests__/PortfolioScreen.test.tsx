@@ -205,6 +205,24 @@ describe("PortfolioScreen", () => {
     await cleanupPortfolio(client, view);
   });
 
+  it("preserves portfolio content and announces a background refresh", async () => {
+    fetchPortfolioMock
+      .mockResolvedValueOnce(payload)
+      .mockReturnValueOnce(new Promise(() => undefined));
+    const { client, view } = await renderPortfolio();
+    expect(await view.findByText("Current tracked value")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.press(view.getByText("1W"));
+      await Promise.resolve();
+    });
+
+    expect(view.getByText("Current tracked value")).toBeTruthy();
+    expect(view.getByLabelText("Syncing portfolio")).toBeTruthy();
+    expect(view.queryByTestId("portfolio-initial-skeleton")).toBeNull();
+    await cleanupPortfolio(client, view);
+  });
+
   it("matches all four loaded metric tiles in the initial skeleton", async () => {
     fetchPortfolioMock.mockReturnValue(new Promise(() => undefined));
     const { client, view } = await renderPortfolio();

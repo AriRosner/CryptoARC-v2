@@ -221,6 +221,22 @@ describe("wallet analytics and guarded treasury", () => {
     expect(onRentRecovery).toHaveBeenCalledTimes(1);
   });
 
+  it("preserves wallet content during a background refresh", async () => {
+    const view = await render(
+      <WalletScreen
+        wallet={wallet}
+        transactions={transactions}
+        destinations={destinations}
+        loading
+        onRefresh={jest.fn()}
+      />,
+    );
+
+    expect(view.getByText("0.400000 SOL")).toBeTruthy();
+    expect(view.getByLabelText("Syncing wallet")).toBeTruthy();
+    expect(view.queryByTestId("wallet-initial-skeleton")).toBeNull();
+  });
+
   it("keeps every treasury execute disabled offline", async () => {
     const execute = jest.fn();
     const props = {

@@ -7,6 +7,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { ActionButton, DetailRow, EmptyState, PageHeader, Section, StatusBadge } from "../../components/ui";
+import { PositionSkeleton } from "../../components/skeletons/PositionSkeleton";
 import { authenticatedRead, mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -55,15 +56,11 @@ export function PositionDetailScreen({
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>
-        <Pressable accessibilityLabel="Back to portfolio" onPress={onBack} style={styles.back}>
+        <Pressable accessibilityLabel="Back to portfolio" accessibilityRole="button" onPress={onBack} style={styles.back}>
           <ArrowLeft size={20} color={colors.text} />
         </Pressable>
         {session?.loading ? (
-          <View accessibilityLabel="Loading position details" style={styles.skeletonStack}>
-            <View style={[styles.skeleton, { height: 36, width: "48%" }]} />
-            <View style={[styles.skeleton, { height: 128 }]} />
-            <View style={[styles.skeleton, { height: 220 }]} />
-          </View>
+          <PositionSkeleton />
         ) : needsPairing ? (
           <>
             <EmptyState
@@ -77,11 +74,7 @@ export function PositionDetailScreen({
             />
           </>
         ) : query.isLoading ? (
-          <View accessibilityLabel="Loading position details" style={styles.skeletonStack}>
-            <View style={[styles.skeleton, { height: 36, width: "48%" }]} />
-            <View style={[styles.skeleton, { height: 128 }]} />
-            <View style={[styles.skeleton, { height: 220 }]} />
-          </View>
+          <PositionSkeleton />
         ) : !position ? (
           <>
             <EmptyState
@@ -237,13 +230,6 @@ const styles = StyleSheet.create({
     flex: 1,
     fontSize: 11,
     lineHeight: 17,
-  },
-  skeletonStack: {
-    gap: spacing.md,
-  },
-  skeleton: {
-    backgroundColor: colors.panelRaised,
-    borderRadius: radius.sm,
   },
   retryBand: {
     borderColor: colors.rose,

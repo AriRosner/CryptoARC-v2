@@ -17,6 +17,7 @@ import {
   PageHeader,
   StatusBadge,
 } from "../../components/ui";
+import { AlertsSkeleton } from "../../components/skeletons/AlertsSkeleton";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { useSession } from "../../core/session/SessionProvider";
 import { colors, radius, spacing } from "../../theme";
@@ -59,14 +60,18 @@ export function AlertsScreen({
           eyebrow="Operator attention"
           title="Alerts"
           subtitle="Critical events and acknowledgements"
-          right={<BellRing color={colors.amber} size={24} />}
+          right={
+            <View style={styles.headerStatus}>
+              <BellRing color={colors.amber} size={24} />
+              {loading && uniqueAlerts.length > 0 ? (
+                <Text accessibilityLabel="Syncing alerts" style={styles.syncing}>Syncing</Text>
+              ) : null}
+            </View>
+          }
         />
         <ErrorBanner message={error} />
-        {loading ? (
-          <View accessibilityLabel="Loading alerts" style={styles.stack}>
-            <View style={styles.skeleton} />
-            <View style={styles.skeleton} />
-          </View>
+        {loading && uniqueAlerts.length === 0 ? (
+          <AlertsSkeleton />
         ) : uniqueAlerts.length === 0 ? (
           <EmptyState
             title="No active alerts"
@@ -180,10 +185,14 @@ const styles = StyleSheet.create({
   stack: {
     gap: spacing.sm,
   },
-  skeleton: {
-    height: 150,
-    borderRadius: radius.md,
-    backgroundColor: colors.panelRaised,
+  headerStatus: {
+    alignItems: "center",
+    gap: spacing.xs,
+  },
+  syncing: {
+    color: colors.amber,
+    fontSize: 10,
+    fontWeight: "800",
   },
   alert: {
     minHeight: 150,

@@ -12,6 +12,8 @@ import {
 } from "react-native";
 
 import { colors, radius, shadow, spacing } from "../theme";
+import { triggerHaptic } from "./motion/haptics";
+import { useMotionPolicy } from "./motion/policy";
 
 export type Tone = "success" | "danger" | "warning" | "info" | "neutral";
 
@@ -38,16 +40,23 @@ export function AnimatedPanel({
   delay?: number;
   style?: ViewStyle;
 }) {
+  const policy = useMotionPolicy();
   const progress = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    Animated.timing(progress, {
+    if (policy.duration.normal === 0) {
+      progress.setValue(1);
+      return;
+    }
+    const animation = Animated.timing(progress, {
       toValue: 1,
-      duration: 240,
-      delay,
+      duration: policy.duration.normal,
+      delay: Math.min(delay, policy.duration.slow),
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
-    }).start();
-  }, [delay, progress]);
+    });
+    animation.start();
+    return () => animation.stop();
+  }, [delay, policy.duration.normal, policy.duration.slow, progress]);
 
   const animatedStyle = {
     opacity: progress,
@@ -103,8 +112,8 @@ export function Section({ title, children, right, delay = 0 }: { title: string; 
 export function StatusBadge({ label, tone = "neutral" }: { label: string; tone?: Tone }) {
   const toneStyles = toneColor(tone);
   return (
-    <View style={[styles.badge, { backgroundColor: toneStyles.backgroundColor, borderColor: toneStyles.borderColor }]}>
-      <Text style={[styles.badgeText, { color: toneStyles.color }]} numberOfLines={1}>
+    <View accessibilityLabel={`Status: ${label}`} style={[styles.badge, { backgroundColor: toneStyles.backgroundColor, borderColor: toneStyles.borderColor }]}>
+      <Text style={[styles.badgeText, { color: toneStyles.color }]}>
         {label}
       </Text>
     </View>
@@ -174,10 +183,10 @@ export function MetricTile({
   return (
     <View style={styles.metric}>
       <Text style={styles.metricLabel}>{label}</Text>
-      <Text style={[styles.metricValue, { color: valueColor }]} numberOfLines={1}>
+      <Text style={[styles.metricValue, { color: valueColor }]}>
         {value}
       </Text>
-      {detail ? <Text style={styles.metricDetail} numberOfLines={1}>{detail}</Text> : null}
+      {detail ? <Text style={styles.metricDetail}>{detail}</Text> : null}
     </View>
   );
 }
@@ -203,6 +212,7 @@ export function SegmentedControl({
   value: string;
   onChange: (value: string) => void;
 }) {
+  const policy = useMotionPolicy();
   return (
     <View style={styles.segmented}>
       {options.map((option) => {
@@ -211,7 +221,13 @@ export function SegmentedControl({
         return (
           <Pressable
             key={option.value}
-            onPress={() => onChange(option.value)}
+            accessibilityLabel={option.label}
+            accessibilityRole="button"
+            accessibilityState={{ selected }}
+            onPress={() => {
+              void triggerHaptic("selection", policy.haptics);
+              onChange(option.value);
+            }}
             style={({ pressed }) => [
               styles.segment,
               selected && { backgroundColor: tone.backgroundColor, borderColor: tone.borderColor },
@@ -239,19 +255,27 @@ export function ActionButton({
   icon?: React.ReactNode;
   buttonStyle?: ViewStyle;
 }) {
+  const policy = useMotionPolicy();
   const toneStyle = tone === "primary" ? styles.primaryButton : tone === "danger" ? styles.dangerButton : styles.secondaryButton;
   const scale = useRef(new Animated.Value(1)).current;
   const animatedStyle = useMemo(() => ({ transform: [{ scale }] }), [scale]);
   return (
     <Pressable
       {...props}
+      accessibilityLabel={props.accessibilityLabel ?? label}
       accessibilityRole={props.accessibilityRole ?? "button"}
+      accessibilityState={{
+        ...props.accessibilityState,
+        busy: Boolean(loading),
+        disabled: Boolean(props.disabled || loading),
+      }}
+      disabled={props.disabled || loading}
       onPressIn={(event) => {
-        Animated.timing(scale, { toValue: 0.98, duration: 80, useNativeDriver: true }).start();
+        if (policy.duration.fast > 0) Animated.timing(scale, { toValue: 0.98, duration: policy.duration.fast, useNativeDriver: true }).start();
         props.onPressIn?.(event);
       }}
       onPressOut={(event) => {
-        Animated.timing(scale, { toValue: 1, duration: 120, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
+        if (policy.duration.fast > 0) Animated.timing(scale, { toValue: 1, duration: policy.duration.fast, easing: Easing.out(Easing.cubic), useNativeDriver: true }).start();
         props.onPressOut?.(event);
       }}>
       {({ pressed }) => (

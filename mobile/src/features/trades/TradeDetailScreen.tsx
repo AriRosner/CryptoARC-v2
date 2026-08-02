@@ -21,6 +21,7 @@ import {
   Section,
   StatusBadge,
 } from "../../components/ui";
+import { TradeSkeleton } from "../../components/skeletons/TradeSkeleton";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -478,6 +479,7 @@ export function GuardedTradeApproval({
       ) : (
         <ActionButton
           accessibilityLabel="Approve trade"
+          accessibilityHint="Approves this prepared trade after fresh biometric authentication"
           accessibilityRole="button"
           label="Approve trade"
           tone="danger"
@@ -488,6 +490,7 @@ export function GuardedTradeApproval({
       )}
       {submitRejection ? (
         <ActionButton
+          accessibilityHint="Rejects this prepared trade intent without approving execution"
           label="Reject trade"
           disabled={
             !online ||
@@ -567,10 +570,7 @@ export function TradeDetailScreen({
           <ArrowLeft color={colors.text} size={20} />
         </Pressable>
         {query.isLoading ? (
-          <View accessibilityLabel="Loading trade review" style={styles.loading}>
-            <View style={[styles.skeleton, { width: "52%", height: 32 }]} />
-            <View style={[styles.skeleton, { height: 180 }]} />
-          </View>
+          <TradeSkeleton />
         ) : !trade || !initialDraft ? (
           <>
             <EmptyState
@@ -701,12 +701,5 @@ const styles = StyleSheet.create({
     color: colors.rose,
     fontSize: 11,
     lineHeight: 16,
-  },
-  loading: {
-    gap: spacing.md,
-  },
-  skeleton: {
-    backgroundColor: colors.panelRaised,
-    borderRadius: radius.sm,
   },
 });

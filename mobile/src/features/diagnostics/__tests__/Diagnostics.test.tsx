@@ -108,6 +108,23 @@ describe("Diagnostics and Recovery Center", () => {
     expect(loading.getByLabelText("Loading diagnostics")).toBeTruthy();
   });
 
+  it("preserves diagnostics during a background refresh", async () => {
+    const view = await render(
+      <DiagnosticsScreen
+        diagnostics={diagnostics}
+        loading
+        error=""
+        exporting={false}
+        onRefresh={jest.fn()}
+        onExport={jest.fn()}
+      />,
+    );
+
+    expect(view.getByText("Private tunnel")).toBeTruthy();
+    expect(view.getByLabelText("Syncing diagnostics")).toBeTruthy();
+    expect(view.queryByTestId("diagnostics-initial-skeleton")).toBeNull();
+  });
+
   it("renders diagnostics error and unavailable states", async () => {
     const unavailable = await render(
       <DiagnosticsScreen

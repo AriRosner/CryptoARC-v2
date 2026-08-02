@@ -1,12 +1,11 @@
 import { CartesianChart, Line } from "victory-native";
 import { Circle } from "@shopify/react-native-skia";
-import React, { useEffect, useMemo, useState } from "react";
-import { AccessibilityInfo, StyleSheet, Text, View } from "react-native";
+import React, { useMemo } from "react";
+import { StyleSheet, Text, View } from "react-native";
 
-import {
-  type MotionPreference,
-  useSettingsStore,
-} from "../../core/settings/settingsStore";
+import type { MotionPreference } from "../../core/settings/settingsStore";
+import { resolveMotionPolicy, useMotionPolicy } from "../../components/motion/policy";
+import { chartTransition } from "../../components/motion/transitions";
 import { colors, spacing } from "../../theme";
 import type {
   CurrentPortfolioSnapshot,
@@ -48,13 +47,7 @@ export function performanceChartAnimation(
   motion: MotionPreference,
   systemReducedMotion: boolean,
 ) {
-  if (motion === "minimal" || (motion === "system" && systemReducedMotion)) {
-    return undefined;
-  }
-  return {
-    type: "timing" as const,
-    duration: motion === "expressive" ? 220 : 160,
-  };
+  return chartTransition(resolveMotionPolicy(motion, systemReducedMotion, true));
 }
 
 export function PerformanceChart({
@@ -64,29 +57,13 @@ export function PerformanceChart({
   currentSnapshot?: CurrentPortfolioSnapshot;
   series: PortfolioPoint[];
 }) {
-  const motion = useSettingsStore((state) => state.motion);
-  const [systemReducedMotion, setSystemReducedMotion] = useState(true);
-  useEffect(() => {
-    if (motion !== "system") return;
-    let active = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
-      if (active) setSystemReducedMotion(enabled);
-    });
-    const subscription = AccessibilityInfo.addEventListener(
-      "reduceMotionChanged",
-      setSystemReducedMotion,
-    );
-    return () => {
-      active = false;
-      subscription.remove();
-    };
-  }, [motion]);
+  const motionPolicy = useMotionPolicy();
 
   const data = useMemo(
     () => buildPerformanceChartData(series, currentSnapshot),
     [currentSnapshot, series],
   );
-  const animation = performanceChartAnimation(motion, systemReducedMotion);
+  const animation = chartTransition(motionPolicy);
   const legacySnapshot = series.find((point) => point.current_snapshot);
   const snapshot = currentSnapshot
     ? {

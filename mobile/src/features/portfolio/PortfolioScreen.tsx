@@ -1,7 +1,7 @@
 import { router } from "expo-router";
 import { RefreshCw } from "lucide-react-native";
 import React, { useRef, useState } from "react";
-import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
+import { RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
@@ -13,6 +13,7 @@ import {
   SegmentedControl,
   StatusBadge,
 } from "../../components/ui";
+import { PortfolioSkeleton } from "../../components/skeletons/PortfolioSkeleton";
 import { mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -90,7 +91,7 @@ export function PortfolioScreen() {
           subtitle="Tracked positions and performance evidence. Account equity is not available in this view."
           right={
             query.isFetching && payload ? (
-              <View style={styles.syncing}>
+              <View accessibilityLabel="Syncing portfolio" style={styles.syncing}>
                 <RefreshCw size={13} color={colors.amber} />
                 <Text style={styles.syncingText}>Syncing</Text>
               </View>
@@ -186,25 +187,6 @@ export function PortfolioScreen() {
   );
 }
 
-function PortfolioSkeleton() {
-  return (
-    <View accessibilityLabel="Loading portfolio" style={styles.skeletonStack}>
-      <View style={styles.skeletonMetrics}>
-        {Array.from({ length: 4 }, (_, index) => (
-          <View
-            key={index}
-            testID="portfolio-metric-skeleton"
-            style={[styles.skeleton, styles.skeletonMetric]}
-          />
-        ))}
-      </View>
-      <View style={[styles.skeleton, styles.skeletonChart]} />
-      <View style={[styles.skeleton, styles.skeletonRow]} />
-      <View style={[styles.skeleton, styles.skeletonRow]} />
-    </View>
-  );
-}
-
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
@@ -231,30 +213,7 @@ const styles = StyleSheet.create({
     fontSize: 10,
     fontWeight: "800",
   },
-  skeletonStack: {
-    gap: spacing.md,
-  },
   pairing: {
     gap: spacing.md,
-  },
-  skeletonMetrics: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.sm,
-  },
-  skeleton: {
-    backgroundColor: colors.panelRaised,
-    borderRadius: radius.md,
-  },
-  skeletonMetric: {
-    flexBasis: "47%",
-    flexGrow: 1,
-    height: 92,
-  },
-  skeletonChart: {
-    height: 220,
-  },
-  skeletonRow: {
-    height: 64,
   },
 });

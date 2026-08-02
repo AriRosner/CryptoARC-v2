@@ -23,6 +23,7 @@ export function PositionList({
         return (
           <Pressable
             key={position.id}
+            accessibilityLabel={`Open ${position.symbol} position, ${position.mode}, ${position.mark_fresh ? "fresh" : "stale"} mark`}
             accessibilityRole="button"
             onPress={() => onPress(position.id)}
             style={({ pressed }) => [styles.row, pressed && styles.pressed]}>

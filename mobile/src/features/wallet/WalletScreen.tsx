@@ -2,7 +2,6 @@ import { router } from "expo-router";
 import {
   ArrowUpRight,
   BadgeDollarSign,
-  RefreshCw,
   RotateCcw,
 } from "lucide-react-native";
 import React from "react";
@@ -24,6 +23,7 @@ import {
   Section,
   StatusBadge,
 } from "../../components/ui";
+import { WalletSkeleton } from "../../components/skeletons/WalletSkeleton";
 import { colors, spacing } from "../../theme";
 import { useDestinationsQuery, useWalletQuery, useWalletTransactionsQuery } from "./queries";
 import { TransactionList } from "./TransactionList";
@@ -84,12 +84,13 @@ function WalletView({
           subtitle="Public wallet state, allocation, costs, reconciliation, and guarded treasury actions."
           right={
             wallet ? (
-              <StatusBadge
-                label={wallet.freshness.approximate ? "Approximate" : "Exact"}
-                tone={
-                  wallet.freshness.status === "fresh" ? "success" : "warning"
-                }
-              />
+              <View style={styles.headerStatus}>
+                {loading ? <Text accessibilityLabel="Syncing wallet" style={styles.syncing}>Syncing</Text> : null}
+                <StatusBadge
+                  label={wallet.freshness.approximate ? "Approximate" : "Exact"}
+                  tone={wallet.freshness.status === "fresh" ? "success" : "warning"}
+                />
+              </View>
             ) : null
           }
         />
@@ -190,18 +191,21 @@ function WalletView({
             </Section>
             <Section title="Authorized treasury">
               <ActionButton
+                accessibilityHint="Reviews the authorized destination, amount, limits, and fees before submission"
                 label="Review withdrawal"
                 icon={<ArrowUpRight color={colors.text} size={16} />}
                 disabled={!hasAuthorization("withdrawal")}
                 onPress={onWithdraw}
               />
               <ActionButton
+                accessibilityHint="Reviews the authorized profit sweep destination, amount, and limits before submission"
                 label="Review profit sweep"
                 icon={<BadgeDollarSign color={colors.text} size={16} />}
                 disabled={!hasAuthorization("profit_sweep")}
                 onPress={onProfitSweep}
               />
               <ActionButton
+                accessibilityHint="Reviews eligible accounts, authorization, and expected rent recovery before submission"
                 label="Review rent recovery"
                 icon={<RotateCcw color={colors.text} size={16} />}
                 disabled={
@@ -224,9 +228,7 @@ function WalletView({
             </Section>
           </>
         ) : (
-          <View accessibilityLabel="Loading wallet" style={styles.loading}>
-            <RefreshCw color={colors.amber} size={20} />
-          </View>
+          <WalletSkeleton />
         )}
       </ScrollView>
     </SafeAreaView>
@@ -358,9 +360,13 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 17,
   },
-  loading: {
-    alignItems: "center",
-    justifyContent: "center",
-    minHeight: 220,
+  headerStatus: {
+    alignItems: "flex-end",
+    gap: spacing.xs,
+  },
+  syncing: {
+    color: colors.amber,
+    fontSize: 10,
+    fontWeight: "800",
   },
 });
