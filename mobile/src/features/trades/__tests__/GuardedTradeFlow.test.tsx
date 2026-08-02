@@ -235,6 +235,24 @@ describe("guarded mobile trade flow", () => {
     await view.unmount();
   });
 
+  it("keeps cached empty trade-list copy visible with a refetch error and retry", async () => {
+    const retry = jest.fn();
+    jest.mocked(useTradesQuery).mockReturnValue(
+      queryResult({
+        data: { ...tradeList, trades: [] },
+        isError: true,
+        refetch: retry,
+      }) as unknown as ReturnType<typeof useTradesQuery>,
+    );
+    const view = await render(<TradesScreen />);
+
+    expect(view.getByText("No prepared intents")).toBeTruthy();
+    expect(view.getByRole("alert")).toHaveTextContent("Trade list refresh failed");
+    await fireEvent.press(view.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledTimes(1);
+    await view.unmount();
+  });
+
   it("renders an explicit initial trade-detail failure with retry", async () => {
     const retry = jest.fn();
     jest.mocked(useTradeQuery).mockReturnValue(

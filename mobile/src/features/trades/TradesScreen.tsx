@@ -45,11 +45,6 @@ export function TradesScreen() {
             </Text>
             <ActionButton label="Retry" onPress={() => void query.refetch()} />
           </View>
-        ) : trades.length === 0 ? (
-          <EmptyState
-            title="No prepared intents"
-            body="Prepare, quote, and simulate a trade on the trusted backend before reviewing it here."
-          />
         ) : (
           <>
             {query.isError ? (
@@ -63,48 +58,55 @@ export function TradesScreen() {
                 <ActionButton label="Retry" onPress={() => void query.refetch()} />
               </View>
             ) : null}
-            <View style={styles.stack}>
-              {trades.map((trade) => (
-              <Pressable
-                key={trade.id}
-                accessibilityLabel={`Review ${trade.action} ${trade.symbol || trade.mint}`}
-                accessibilityRole="button"
-                onPress={() =>
-                  router.push(`/trade/${encodeURIComponent(trade.id)}`)
-                }
-                style={({ pressed }) => [
-                  styles.row,
-                  pressed && styles.pressed,
-                ]}>
-                <View style={styles.rowCopy}>
-                  <View style={styles.rowHeader}>
-                    <Text style={styles.symbol}>
-                      {trade.symbol || trade.mint.slice(0, 8)}
-                    </Text>
-                    <StatusBadge
-                      label={trade.action}
-                      tone={trade.action === "sell" ? "warning" : "info"}
-                    />
-                  </View>
-                  <Text style={styles.amount}>
-                    {trade.amount} {trade.limits.amount.unit}
-                  </Text>
-                  <Text style={styles.reason}>
-                    {trade.blockers[0] || trade.reason}
-                  </Text>
-                </View>
-                <View style={styles.rowState}>
-                  <StatusBadge
-                    label={trade.status}
-                    tone={
-                      trade.allowed_actions.approve ? "success" : "warning"
+            {trades.length === 0 ? (
+              <EmptyState
+                title="No prepared intents"
+                body="Prepare, quote, and simulate a trade on the trusted backend before reviewing it here."
+              />
+            ) : (
+              <View style={styles.stack}>
+                {trades.map((trade) => (
+                  <Pressable
+                    key={trade.id}
+                    accessibilityLabel={`Review ${trade.action} ${trade.symbol || trade.mint}`}
+                    accessibilityRole="button"
+                    onPress={() =>
+                      router.push(`/trade/${encodeURIComponent(trade.id)}`)
                     }
-                  />
-                  <ArrowRight color={colors.muted} size={18} />
-                </View>
-              </Pressable>
-              ))}
-            </View>
+                    style={({ pressed }) => [
+                      styles.row,
+                      pressed && styles.pressed,
+                    ]}>
+                    <View style={styles.rowCopy}>
+                      <View style={styles.rowHeader}>
+                        <Text style={styles.symbol}>
+                          {trade.symbol || trade.mint.slice(0, 8)}
+                        </Text>
+                        <StatusBadge
+                          label={trade.action}
+                          tone={trade.action === "sell" ? "warning" : "info"}
+                        />
+                      </View>
+                      <Text style={styles.amount}>
+                        {trade.amount} {trade.limits.amount.unit}
+                      </Text>
+                      <Text style={styles.reason}>
+                        {trade.blockers[0] || trade.reason}
+                      </Text>
+                    </View>
+                    <View style={styles.rowState}>
+                      <StatusBadge
+                        label={trade.status}
+                        tone={
+                          trade.allowed_actions.approve ? "success" : "warning"
+                        }
+                      />
+                      <ArrowRight color={colors.muted} size={18} />
+                    </View>
+                  </Pressable>
+                ))}
+              </View>
+            )}
           </>
         )}
       </ScrollView>
