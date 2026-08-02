@@ -89,9 +89,10 @@ Require the local SHA-256 to match the independently trusted release record. Req
 Only after every comparison passes:
 
 1. Archive the command outputs with the trusted approval record.
-2. Install only on the operator device. For an upgrade, keep the prior app installed so Android enforces matching package/signing identity and the pairing-migration test is meaningful.
-3. Run `adb install --replace $apkPath`.
-4. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 3`.
+2. Choose exactly one installation path:
+   - First install, when `com.cryptoarc.cockpit` is not installed: run `adb install $apkPath`.
+   - In-place upgrade: keep the approved prior app installed so Android enforces the matching package and signing certificate, then run `adb install -r $apkPath`. This also preserves app data for the pairing-migration test.
+3. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 3`.
 
 Stop if Android asks for an uninstall to accept an alleged upgrade, the displayed version differs, or artifact provenance cannot be established. Uninstalling deletes local app state and prevents an in-place migration check.
 

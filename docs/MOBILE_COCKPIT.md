@@ -144,7 +144,19 @@ apkanalyzer manifest version-code $apkPath
 # Or: aapt dump badging $apkPath
 ```
 
-Compare the file hash and `apksigner` certificate SHA-256 digest to the independently trusted record. Require package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `3` from `apkanalyzer` or `aapt`. Resolve missing tools from the installed Android SDK; never skip a check. Only after every comparison passes may an operator run `adb install --replace $apkPath`. Android upgrades require the same package and signing certificate and a higher `versionCode`; do not uninstall first if pairing migration is being tested.
+Compare the file hash and `apksigner` certificate SHA-256 digest to the independently trusted record. Require package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `3` from `apkanalyzer` or `aapt`. Resolve missing tools from the installed Android SDK; never skip a check.
+
+Only after every provenance comparison passes, choose one command:
+
+```powershell
+# First install, only when com.cryptoarc.cockpit is not installed.
+adb install $apkPath
+
+# In-place upgrade; keep the approved prior app and its data installed.
+adb install -r $apkPath
+```
+
+An in-place upgrade requires the same package and approved signing certificate and a higher `versionCode`. Do not uninstall first if pairing migration is being tested; Android must enforce the signing match and preserve the prior app data.
 
 After install or upgrade, open More > Device and confirm the header reads `Operator Command Center v2.0.0 (2026-07-26)` and Build reads `2.0.0 / Android 3`. If the hash, approved build identity, package metadata, or signing identity differs, stop and quarantine the artifact without installing it.
 
