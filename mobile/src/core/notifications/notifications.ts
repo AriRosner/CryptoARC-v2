@@ -37,7 +37,7 @@ interface NotificationNavigationSession {
   locked: boolean;
   isCurrentGeneration(generation: number): boolean;
   revokeSession(expectedGeneration?: number): Promise<boolean>;
-  unlockControls(): Promise<boolean>;
+  authenticateControl(): Promise<boolean>;
 }
 
 type DestinationValidator = (
@@ -105,7 +105,7 @@ export async function processNotificationResponse(
   }
   const generation = session.generation;
   if (session.locked) {
-    const unlocked = await session.unlockControls();
+    const unlocked = await session.authenticateControl();
     if (!unlocked) return "locked";
   }
   if (!session.isCurrentGeneration(generation)) return "stale";
@@ -298,7 +298,7 @@ export function NotificationBridge() {
             locked: session.locked,
             isCurrentGeneration: session.isCurrentGeneration,
             revokeSession: session.revokeSession,
-            unlockControls: session.unlockControls,
+            authenticateControl: session.authenticateControl,
           },
           (route) => router.push(route as Href),
           () => session.setError("Push link was rejected."),
@@ -312,7 +312,7 @@ export function NotificationBridge() {
     session.locked,
     session.revokeSession,
     session.setError,
-    session.unlockControls,
+    session.authenticateControl,
   ]);
 
   return null;

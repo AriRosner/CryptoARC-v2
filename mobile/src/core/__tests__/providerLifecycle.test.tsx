@@ -254,23 +254,28 @@ describe("core provider lifecycle guards", () => {
     await act(async () => view.unmount());
   });
 
-  it("does not unlock controls when authentication resolves after clear", async () => {
-    const authentication = deferred<{ success: true }>();
-    authMock.mockReturnValue(authentication.promise);
-    const mounted = await mountStack();
-    let unlocking!: Promise<boolean>;
-    await act(async () => {
-      unlocking = mounted.session.unlockControls();
-      await Promise.resolve();
-      await mounted.session.clearSession();
-    });
-    authentication.resolve({ success: true });
-    await act(async () => {
-      await expect(unlocking).resolves.toBe(false);
-    });
-    expect(mounted.session.locked).toBe(true);
-    mounted.view.unmount();
-  });
+  it.each(["authenticateView", "authenticateControl"] as const)(
+    "rejects late %s results after clear",
+    async (method) => {
+      const authentication = deferred<{ success: true }>();
+      authMock.mockReturnValue(authentication.promise);
+      const mounted = await mountStack();
+      expect(method in mounted.session).toBe(true);
+      if (!(method in mounted.session)) return;
+      let unlocking!: Promise<boolean>;
+      await act(async () => {
+        unlocking = (mounted.session[method] as () => Promise<boolean>)();
+        await Promise.resolve();
+        await mounted.session.clearSession();
+      });
+      authentication.resolve({ success: true });
+      await act(async () => {
+        await expect(unlocking).resolves.toBe(false);
+      });
+      expect(mounted.session.locked).toBe(true);
+      mounted.view.unmount();
+    },
+  );
 
   it("quarantines a revoked persisted session before foreground can reconnect it", async () => {
     const mounted = await mountStack();

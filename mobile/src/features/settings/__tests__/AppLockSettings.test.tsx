@@ -1,13 +1,14 @@
 ﻿import * as SecureStore from "expo-secure-store";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react-native";
 import React from "react";
-import { AppState, Text } from "react-native";
+import { AppState, Text, View } from "react-native";
 
 import { FINAL_TABS } from "../../../../app/(tabs)/_layout";
 import DeviceRedirect from "../../../../app/device";
 import FeedRedirect from "../../../../app/feed";
 import RiskRedirect from "../../../../app/risk";
 import { AppLock, useAppLock } from "../../../components/system/AppLock";
+import { ActionButton } from "../../../components/ui";
 import {
   SETTINGS_STORAGE_KEY,
   flushSettingsPersistence,
@@ -38,14 +39,16 @@ jest.mock("expo-router", () => {
   };
 });
 
-const unlockControls = jest.fn(async () => true);
+const authenticateView = jest.fn(async () => true);
+const authenticateControl = jest.fn(async () => true);
 const lockControls = jest.fn();
 const session = {
   record: { token: "mobile-token" },
   generation: 4,
   loading: false,
   locked: true,
-  unlockControls,
+  authenticateView,
+  authenticateControl,
   lock: lockControls,
   isCurrentGeneration: (generation: number) => generation === 4,
 };
@@ -69,9 +72,11 @@ describe("AppLock and persisted settings", () => {
 
   beforeEach(async () => {
     jest.clearAllMocks();
-    session.unlockControls = unlockControls;
+    session.authenticateView = authenticateView;
+    session.authenticateControl = authenticateControl;
     session.lock = lockControls;
-    unlockControls.mockReset().mockResolvedValue(true);
+    authenticateView.mockReset().mockResolvedValue(true);
+    authenticateControl.mockReset().mockResolvedValue(true);
     lockControls.mockReset();
     now = 1_000;
     appStateListener = undefined;
@@ -108,13 +113,16 @@ describe("AppLock and persisted settings", () => {
       </AppLock>,
     );
 
-    expect(screen.getByText("Total portfolio")).toBeTruthy();
+    expect(
+      screen.getByText("Total portfolio", { includeHiddenElements: true }),
+    ).toBeTruthy();
     expect(screen.getByText("Controls locked")).toBeTruthy();
-    expect(unlockControls).not.toHaveBeenCalled();
+    expect(authenticateView).not.toHaveBeenCalled();
+    expect(authenticateControl).not.toHaveBeenCalled();
   });
 
   it("keeps cancellation locked", async () => {
-    unlockControls.mockResolvedValueOnce(false);
+    authenticateView.mockResolvedValueOnce(false);
     const screen = await render(
       <AppLock initialAppState="active" now={() => now}>
         <Text>Total portfolio</Text>
@@ -125,6 +133,21 @@ describe("AppLock and persisted settings", () => {
 
     expect(screen.getByText("Unlock CryptoARC")).toBeTruthy();
     expect(screen.queryByText("Total portfolio")).toBeNull();
+  });
+
+  it("authenticates app-open viewing without invoking or unlocking shared controls", async () => {
+    const screen = await render(
+      <AppLock initialAppState="active" now={() => now}>
+        <Text>Total portfolio</Text>
+      </AppLock>,
+    );
+
+    await fireEvent.press(screen.getByText("Unlock CryptoARC"));
+
+    expect(screen.getByText("Total portfolio")).toBeTruthy();
+    expect(authenticateView).toHaveBeenCalledTimes(1);
+    expect(authenticateControl).not.toHaveBeenCalled();
+    expect(session.locked).toBe(true);
   });
 
   it("covers content with an app-switcher privacy shield", async () => {
@@ -186,17 +209,19 @@ describe("AppLock and persisted settings", () => {
     );
     await fireEvent.press(screen.getByText("Unlock CryptoARC"));
     expect(screen.getByText("Guarded action")).toBeTruthy();
-    unlockControls.mockClear();
+    authenticateView.mockClear();
+    authenticateControl.mockClear();
 
     await fireEvent.press(screen.getByText("Guarded action"));
     await fireEvent.press(screen.getByText("Guarded action"));
 
-    expect(unlockControls).toHaveBeenCalledTimes(2);
+    expect(authenticateControl).toHaveBeenCalledTimes(2);
+    expect(authenticateView).not.toHaveBeenCalled();
   });
 
   it("rejects an app-open unlock that resolves after a background-resume cycle", async () => {
     let resolveAuthentication!: (success: boolean) => void;
-    unlockControls.mockReturnValueOnce(
+    authenticateView.mockReturnValueOnce(
       new Promise<boolean>((resolve) => {
         resolveAuthentication = resolve;
       }),
@@ -216,6 +241,48 @@ describe("AppLock and persisted settings", () => {
 
     expect(screen.getByText("Unlock CryptoARC")).toBeTruthy();
     expect(screen.queryByText("Total portfolio")).toBeNull();
+  });
+
+  it("blocks settings, navigation, device, system, and financial interactions while view-locked", async () => {
+    await setPrivacyMode("read_only_before_unlock");
+    const deviceAction = jest.fn();
+    const systemAction = jest.fn();
+    const financialAction = jest.fn();
+    const { router } = jest.requireMock("expo-router") as {
+      router: { push: jest.Mock };
+    };
+    const screen = await render(
+      <AppLock initialAppState="active" now={() => now}>
+        <View>
+          <SettingsScreen />
+          <MoreScreen />
+          <ActionButton label="Disconnect device now" onPress={deviceAction} />
+          <ActionButton label="Enable system kill switch" onPress={systemAction} />
+          <ActionButton label="Submit financial action" onPress={financialAction} />
+        </View>
+      </AppLock>,
+    );
+
+    const hidden = { includeHiddenElements: true };
+    await fireEvent.press(screen.getByText("Minimal", hidden));
+    await fireEvent.press(screen.getByText("Pair Device", hidden));
+    await fireEvent.press(screen.getByText("Disconnect device now", hidden));
+    await fireEvent.press(screen.getByText("Enable system kill switch", hidden));
+    await fireEvent.press(screen.getByText("Submit financial action", hidden));
+
+    expect(useSettingsStore.getState().motion).toBe("expressive");
+    expect(router.push).not.toHaveBeenCalled();
+    expect(deviceAction).not.toHaveBeenCalled();
+    expect(systemAction).not.toHaveBeenCalled();
+    expect(financialAction).not.toHaveBeenCalled();
+    const lockedBoundary = screen.getByTestId("locked-read-only-boundary", {
+      includeHiddenElements: true,
+    });
+    expect(lockedBoundary).toHaveProp("pointerEvents", "none");
+    expect(lockedBoundary).toHaveProp(
+      "importantForAccessibility",
+      "no-hide-descendants",
+    );
   });
 
   it("persists and hydrates every privacy, motion, refresh, feedback, and timeout setting", async () => {

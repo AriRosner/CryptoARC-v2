@@ -65,7 +65,10 @@ export function AppLock({
       const generation = session.generation;
       const lifecycle = lifecycleGeneration.current;
       if (!session.record) return reason === "app_open";
-      const authenticated = await session.unlockControls();
+      const authenticated =
+        reason === "app_open"
+          ? await session.authenticateView()
+          : await session.authenticateControl();
       if (
         !authenticated ||
         !session.isCurrentGeneration(generation) ||
@@ -140,7 +143,14 @@ export function AppLock({
         </View>
       ) : (
         <View style={styles.content}>
-          {children}
+          <View
+            accessibilityElementsHidden={locked}
+            importantForAccessibility={locked ? "no-hide-descendants" : "auto"}
+            pointerEvents={locked ? "none" : "auto"}
+            style={styles.protectedContent}
+            testID="locked-read-only-boundary">
+            {children}
+          </View>
           {locked ? (
             <View accessibilityRole="summary" style={styles.controlsBanner}>
               <LockKeyhole color={colors.amber} size={16} />
@@ -167,6 +177,7 @@ export function useAppLock(): AppLockState {
 
 const styles = StyleSheet.create({
   content: { flex: 1 },
+  protectedContent: { flex: 1 },
   shield: {
     alignItems: "center",
     flex: 1,

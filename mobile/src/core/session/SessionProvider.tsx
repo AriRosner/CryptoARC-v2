@@ -49,7 +49,8 @@ export interface SessionContextValue extends SessionState {
   revokeSession(expectedGeneration?: number): Promise<boolean>;
   isCurrentGeneration(generation: number): boolean;
   lock(): void;
-  unlockControls(): Promise<boolean>;
+  authenticateView(): Promise<boolean>;
+  authenticateControl(): Promise<boolean>;
   setError(value: string): void;
 }
 
@@ -290,35 +291,65 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     updateState((current) => ({ ...current, locked: Boolean(current.record) }));
   }, [updateState]);
 
-  const unlockControls = useCallback(async (): Promise<boolean> => {
-    const generation = generationRef.current;
-    if (!stateRef.current.record) return false;
-    try {
-      await Promise.all([
-        LocalAuthentication.hasHardwareAsync(),
-        LocalAuthentication.isEnrolledAsync(),
-      ]);
-      if (!isCurrentGeneration(generation)) return false;
-      const result = await LocalAuthentication.authenticateAsync({
-        promptMessage: "Unlock CryptoARC controls",
-        cancelLabel: "Cancel",
-        disableDeviceFallback: false,
-        biometricsSecurityLevel: "strong",
-      });
-      if (!isCurrentGeneration(generation)) return false;
-      if (!result.success) {
-        updateState((current) => ({ ...current, error: "Controls remain locked." }));
+  const authenticateLocally = useCallback(
+    async (purpose: "view" | "control"): Promise<boolean> => {
+      const generation = generationRef.current;
+      if (!stateRef.current.record) return false;
+      try {
+        await Promise.all([
+          LocalAuthentication.hasHardwareAsync(),
+          LocalAuthentication.isEnrolledAsync(),
+        ]);
+        if (!isCurrentGeneration(generation)) return false;
+        const result = await LocalAuthentication.authenticateAsync({
+          promptMessage:
+            purpose === "view"
+              ? "Unlock CryptoARC"
+              : "Authorize CryptoARC action",
+          cancelLabel: "Cancel",
+          disableDeviceFallback: false,
+          biometricsSecurityLevel: "strong",
+        });
+        if (!isCurrentGeneration(generation)) return false;
+        if (!result.success) {
+          updateState((current) => ({
+            ...current,
+            locked: Boolean(current.record),
+            error:
+              purpose === "view"
+                ? "CryptoARC remains locked."
+                : "Controls remain locked.",
+          }));
+          return false;
+        }
+        updateState((current) => ({
+          ...current,
+          locked: Boolean(current.record),
+          error: "",
+        }));
+        return true;
+      } catch {
+        if (isCurrentGeneration(generation)) {
+          updateState((current) => ({
+            ...current,
+            locked: Boolean(current.record),
+            error: "Local authentication failed.",
+          }));
+        }
         return false;
       }
-      updateState((current) => ({ ...current, locked: false, error: "" }));
-      return true;
-    } catch {
-      if (isCurrentGeneration(generation)) {
-        updateState((current) => ({ ...current, error: "Local unlock failed." }));
-      }
-      return false;
-    }
-  }, [isCurrentGeneration, updateState]);
+    },
+    [isCurrentGeneration, updateState],
+  );
+
+  const authenticateView = useCallback(
+    () => authenticateLocally("view"),
+    [authenticateLocally],
+  );
+  const authenticateControl = useCallback(
+    () => authenticateLocally("control"),
+    [authenticateLocally],
+  );
 
   const setError = useCallback((error: string) => {
     updateState((current) => ({ ...current, error }));
@@ -333,20 +364,22 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
       clearSession,
       isCurrentGeneration,
       lock,
+      authenticateControl,
+      authenticateView,
       replaceSession,
       revokeSession,
       setError,
-      unlockControls,
     }),
     [
       clearSession,
+      authenticateControl,
+      authenticateView,
       isCurrentGeneration,
       lock,
       replaceSession,
       revokeSession,
       setError,
       state,
-      unlockControls,
     ],
   );
 

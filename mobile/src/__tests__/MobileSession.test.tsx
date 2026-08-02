@@ -67,7 +67,7 @@ describe("core session authentication after legacy adapter removal", () => {
 
     let unlocked = false;
     await act(async () => {
-      unlocked = await session!.unlockControls();
+      unlocked = await session!.authenticateControl();
     });
 
     expect(unlocked).toBe(true);
@@ -80,6 +80,36 @@ describe("core session authentication after legacy adapter removal", () => {
     await act(async () => view.unmount());
   });
 
+  it("keeps shared controls locked after successful view authentication", async () => {
+    const view = await mountPairedSession();
+    expect("authenticateView" in session!).toBe(true);
+    if (!("authenticateView" in session!)) return;
+
+    const authenticateView = session!.authenticateView as () => Promise<boolean>;
+    await act(async () => {
+      await expect(authenticateView()).resolves.toBe(true);
+    });
+
+    expect(session?.locked).toBe(true);
+    await act(async () => view.unmount());
+  });
+
+  it("freshly authenticates every control request without persisting unlocked state", async () => {
+    const view = await mountPairedSession();
+    expect("authenticateControl" in session!).toBe(true);
+    if (!("authenticateControl" in session!)) return;
+
+    const authenticateControl = session!.authenticateControl as () => Promise<boolean>;
+    await act(async () => {
+      await expect(authenticateControl()).resolves.toBe(true);
+      await expect(authenticateControl()).resolves.toBe(true);
+    });
+
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(2);
+    expect(session?.locked).toBe(true);
+    await act(async () => view.unmount());
+  });
+
   it("stays locked when authentication is cancelled", async () => {
     jest.mocked(LocalAuthentication.authenticateAsync).mockResolvedValue({
       success: false,
@@ -89,7 +119,7 @@ describe("core session authentication after legacy adapter removal", () => {
     const view = await mountPairedSession();
 
     await act(async () => {
-      await expect(session!.unlockControls()).resolves.toBe(false);
+      await expect(session!.authenticateControl()).resolves.toBe(false);
     });
 
     expect(session?.locked).toBe(true);

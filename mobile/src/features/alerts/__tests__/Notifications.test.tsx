@@ -52,7 +52,7 @@ describe("native notifications and alerts", () => {
 
   it("waits for app unlock before navigating a validated trade route", async () => {
     let releaseUnlock: ((value: boolean) => void) | undefined;
-    const unlockControls = jest.fn(
+    const authenticateControl = jest.fn(
       () =>
         new Promise<boolean>((resolve) => {
           releaseUnlock = resolve;
@@ -68,7 +68,7 @@ describe("native notifications and alerts", () => {
       locked: true,
       isCurrentGeneration: jest.fn(() => true),
       revokeSession: jest.fn(async () => true),
-      unlockControls,
+      authenticateControl,
     };
 
     const pending = processNotificationResponse(
@@ -84,7 +84,7 @@ describe("native notifications and alerts", () => {
       validateDestination,
     );
 
-    expect(unlockControls).toHaveBeenCalledTimes(1);
+    expect(authenticateControl).toHaveBeenCalledTimes(1);
     expect(navigate).not.toHaveBeenCalled();
     releaseUnlock?.(true);
     await waitFor(() => expect(validateDestination).toHaveBeenCalledTimes(1));
@@ -104,7 +104,7 @@ describe("native notifications and alerts", () => {
       locked: true,
       isCurrentGeneration: jest.fn(() => false),
       revokeSession: jest.fn(async () => true),
-      unlockControls: jest.fn(async () => true),
+      authenticateControl: jest.fn(async () => true),
     };
 
     await processNotificationResponse(
@@ -144,7 +144,7 @@ describe("native notifications and alerts", () => {
       locked: false,
       isCurrentGeneration: jest.fn(() => true),
       revokeSession: jest.fn(async () => true),
-      unlockControls: jest.fn(async () => true),
+      authenticateControl: jest.fn(async () => true),
     };
     const denied = jest.fn(async () => {
       throw new MobileApiError("not visible", "authorization", 403, false);
