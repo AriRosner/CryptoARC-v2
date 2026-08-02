@@ -175,7 +175,7 @@ export function MetricTile({
   detail,
 }: {
   label: string;
-  value: string | number;
+  value: React.ReactNode;
   tone?: "success" | "danger" | "warning" | "neutral";
   detail?: string;
 }) {
@@ -183,9 +183,11 @@ export function MetricTile({
   return (
     <View style={styles.metric}>
       <Text style={styles.metricLabel}>{label}</Text>
-      <Text style={[styles.metricValue, { color: valueColor }]}>
-        {value}
-      </Text>
+      {React.isValidElement(value) ? (
+        value
+      ) : (
+        <Text style={[styles.metricValue, { color: valueColor }]}>{value}</Text>
+      )}
       {detail ? <Text style={styles.metricDetail}>{detail}</Text> : null}
     </View>
   );
@@ -196,7 +198,7 @@ export function DetailRow({ label, value, tone = "neutral" }: { label: string; v
   return (
     <View style={styles.detailRow}>
       <Text style={styles.detailLabel}>{label}</Text>
-      <Text style={[styles.detailValue, { color: tone === "neutral" ? colors.text : toneStyles.color }]} numberOfLines={2}>
+      <Text style={[styles.detailValue, { color: tone === "neutral" ? colors.text : toneStyles.color }]}>
         {value}
       </Text>
     </View>

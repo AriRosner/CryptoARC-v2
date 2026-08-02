@@ -42,6 +42,10 @@ export function AnimatedNumber({
   return (
     <Text
       accessibilityLabel={accessibilityLabel ?? format(value)}
+      accessibilityValue={{
+        text: policy.duration.normal === 0 ? "Static value" : "Animated value",
+      }}
+      testID="animated-number"
       style={[styles.value, style]}>
       {format(displayed)}
     </Text>

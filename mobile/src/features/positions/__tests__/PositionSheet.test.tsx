@@ -1,11 +1,13 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import React from "react";
 
 import { fetchPositionDetail } from "../api";
 import { PositionSheet } from "../PositionSheet";
+import { PositionList } from "../PositionList";
 import type { PositionDetail } from "../types";
 import { MobileApiError } from "../../../core/api/errors";
+import { useSettingsStore } from "../../../core/settings/settingsStore";
 
 const mockBackdrop = jest.fn();
 const mockModal = jest.fn();
@@ -109,7 +111,62 @@ describe("PositionSheet", () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    useSettingsStore.setState({ motion: "expressive" });
     fetchPositionDetailMock.mockResolvedValue(detail);
+  });
+
+  it("renders sheet and shared position motion from every motion mode", async () => {
+    const expected = {
+      expressive: { damping: 18, stiffness: 180 },
+      balanced: { damping: 22, stiffness: 220 },
+      minimal: { duration: 0 },
+      system: { damping: 22, stiffness: 220 },
+    } as const;
+
+    for (const mode of ["expressive", "balanced", "minimal", "system"] as const) {
+      await act(async () => useSettingsStore.setState({ motion: mode }));
+      mockModal.mockClear();
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const view = await render(
+        <QueryClientProvider client={client}>
+          <PositionSheet
+            positionId={null}
+            onDismiss={jest.fn()}
+            onOpenDetails={jest.fn()}
+            onAdjustExit={jest.fn()}
+            onClose={jest.fn()}
+          />
+        </QueryClientProvider>,
+      );
+      await waitFor(() =>
+        expect(mockModal).toHaveBeenCalledWith(
+          expect.objectContaining({ animationConfigs: expect.objectContaining(expected[mode]) }),
+        ),
+      );
+      await view.unmount();
+      client.clear();
+    }
+  });
+
+  it("enables shared position layout transitions only for expressive motion", async () => {
+    useSettingsStore.setState({ motion: "expressive" });
+    const expressive = await render(
+      <PositionList positions={[detail]} onPress={jest.fn()} />,
+    );
+    expect(expressive.getByTestId("position-transition-live-position-1")).toHaveProp(
+      "layout",
+      expect.anything(),
+    );
+    await expressive.unmount();
+
+    useSettingsStore.setState({ motion: "minimal" });
+    const minimal = await render(
+      <PositionList positions={[detail]} onPress={jest.fn()} />,
+    );
+    expect(minimal.getByTestId("position-transition-live-position-1")).not.toHaveProp(
+      "layout",
+    );
+    await minimal.unmount();
   });
 
   it("shows summary fields, guarded actions, and opens full details", async () => {

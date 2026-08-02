@@ -237,6 +237,45 @@ describe("wallet analytics and guarded treasury", () => {
     expect(view.queryByTestId("wallet-initial-skeleton")).toBeNull();
   });
 
+  it("isolates transaction and destination initial loading from wallet content", async () => {
+    const view = await render(
+      <WalletScreen
+        wallet={wallet}
+        loading={false}
+        transactionsLoading
+        destinationsLoading
+        onRefresh={jest.fn()}
+      />,
+    );
+
+    expect(view.getByText("0.400000 SOL")).toBeTruthy();
+    expect(view.getByTestId("wallet-transactions-region-skeleton")).toBeTruthy();
+    expect(view.getByTestId("wallet-destinations-region-skeleton")).toBeTruthy();
+    expect(view.queryByTestId("wallet-initial-skeleton")).toBeNull();
+  });
+
+  it("isolates transaction and destination errors from wallet content", async () => {
+    const view = await render(
+      <WalletScreen
+        wallet={wallet}
+        loading={false}
+        transactionsError="Transaction history unavailable"
+        destinationsError="Destination authorizations unavailable"
+        onRefresh={jest.fn()}
+      />,
+    );
+
+    expect(view.getByText("0.400000 SOL")).toBeTruthy();
+    expect(view.getByText("Transaction history unavailable")).toHaveProp(
+      "accessibilityRole",
+      "alert",
+    );
+    expect(view.getByText("Destination authorizations unavailable")).toHaveProp(
+      "accessibilityRole",
+      "alert",
+    );
+  });
+
   it("keeps every treasury execute disabled offline", async () => {
     const execute = jest.fn();
     const props = {

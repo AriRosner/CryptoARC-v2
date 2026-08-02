@@ -24,6 +24,7 @@ import {
   StatusBadge,
 } from "../../components/ui";
 import { WalletSkeleton } from "../../components/skeletons/WalletSkeleton";
+import { Skeleton } from "../../components/skeletons/Skeleton";
 import { colors, spacing } from "../../theme";
 import { useDestinationsQuery, useWalletQuery, useWalletTransactionsQuery } from "./queries";
 import { TransactionList } from "./TransactionList";
@@ -38,6 +39,10 @@ export interface WalletScreenProps {
   wallet?: MobileWalletPayload;
   transactions?: MobileWalletTransaction[];
   destinations?: MobileDestinationAuthorization[];
+  transactionsLoading?: boolean;
+  transactionsError?: string;
+  destinationsLoading?: boolean;
+  destinationsError?: string;
   loading?: boolean;
   error?: string;
   onRefresh?(): void;
@@ -54,6 +59,10 @@ function WalletView({
   wallet,
   transactions = [],
   destinations = [],
+  transactionsLoading = false,
+  transactionsError = "",
+  destinationsLoading = false,
+  destinationsError = "",
   loading = false,
   error = "",
   onRefresh = () => undefined,
@@ -190,41 +199,56 @@ function WalletView({
               <WalletHealth health={wallet.health} />
             </Section>
             <Section title="Authorized treasury">
-              <ActionButton
-                accessibilityHint="Reviews the authorized destination, amount, limits, and fees before submission"
-                label="Review withdrawal"
-                icon={<ArrowUpRight color={colors.text} size={16} />}
-                disabled={!hasAuthorization("withdrawal")}
-                onPress={onWithdraw}
-              />
-              <ActionButton
-                accessibilityHint="Reviews the authorized profit sweep destination, amount, and limits before submission"
-                label="Review profit sweep"
-                icon={<BadgeDollarSign color={colors.text} size={16} />}
-                disabled={!hasAuthorization("profit_sweep")}
-                onPress={onProfitSweep}
-              />
-              <ActionButton
-                accessibilityHint="Reviews eligible accounts, authorization, and expected rent recovery before submission"
-                label="Review rent recovery"
-                icon={<RotateCcw color={colors.text} size={16} />}
-                disabled={
-                  !hasAuthorization("rent_recovery") ||
-                  wallet.rent.eligible_token_accounts.length === 0
-                }
-                onPress={onRentRecovery}
-              />
-              {!destinations.some(
-                (destination) => destination.status === "active",
-              ) ? (
-                <Text style={styles.note}>
-                  Issue a short-lived destination authorization from the
-                  desktop before reviewing a treasury action.
-                </Text>
-              ) : null}
+              {destinationsLoading && destinations.length === 0 ? (
+                <WalletRegionSkeleton testID="wallet-destinations-region-skeleton" />
+              ) : destinationsError && destinations.length === 0 ? (
+                <WalletRegionError message={destinationsError} />
+              ) : (
+                <>
+                  {destinationsError ? <WalletRegionError message={destinationsError} /> : null}
+                  <ActionButton
+                    accessibilityHint="Reviews the authorized destination, amount, limits, and fees before submission"
+                    label="Review withdrawal"
+                    icon={<ArrowUpRight color={colors.text} size={16} />}
+                    disabled={!hasAuthorization("withdrawal")}
+                    onPress={onWithdraw}
+                  />
+                  <ActionButton
+                    accessibilityHint="Reviews the authorized profit sweep destination, amount, and limits before submission"
+                    label="Review profit sweep"
+                    icon={<BadgeDollarSign color={colors.text} size={16} />}
+                    disabled={!hasAuthorization("profit_sweep")}
+                    onPress={onProfitSweep}
+                  />
+                  <ActionButton
+                    accessibilityHint="Reviews eligible accounts, authorization, and expected rent recovery before submission"
+                    label="Review rent recovery"
+                    icon={<RotateCcw color={colors.text} size={16} />}
+                    disabled={
+                      !hasAuthorization("rent_recovery") ||
+                      wallet.rent.eligible_token_accounts.length === 0
+                    }
+                    onPress={onRentRecovery}
+                  />
+                  {!destinations.some((destination) => destination.status === "active") ? (
+                    <Text style={styles.note}>
+                      Issue a short-lived destination authorization from the desktop before reviewing a treasury action.
+                    </Text>
+                  ) : null}
+                </>
+              )}
             </Section>
             <Section title="Transactions">
-              <TransactionList transactions={transactions} />
+              {transactionsLoading && transactions.length === 0 ? (
+                <WalletRegionSkeleton testID="wallet-transactions-region-skeleton" />
+              ) : transactionsError && transactions.length === 0 ? (
+                <WalletRegionError message={transactionsError} />
+              ) : (
+                <>
+                  {transactionsError ? <WalletRegionError message={transactionsError} /> : null}
+                  <TransactionList transactions={transactions} />
+                </>
+              )}
             </Section>
           </>
         ) : (
@@ -232,6 +256,23 @@ function WalletView({
         )}
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+function WalletRegionSkeleton({ testID }: { testID: string }) {
+  return (
+    <View testID={testID} style={styles.regionStack}>
+      <Skeleton height={48} />
+      <Skeleton height={48} />
+    </View>
+  );
+}
+
+function WalletRegionError({ message }: { message: string }) {
+  return (
+    <Text accessibilityRole="alert" style={styles.regionError}>
+      {message}
+    </Text>
   );
 }
 
@@ -270,12 +311,11 @@ function ConnectedWalletScreen() {
       wallet={walletQuery.data}
       transactions={transactionsQuery.data?.transactions}
       destinations={destinations}
-      loading={
-        walletQuery.isLoading ||
-        walletQuery.isRefetching ||
-        transactionsQuery.isRefetching ||
-        destinationsQuery.isRefetching
-      }
+      loading={walletQuery.isLoading || walletQuery.isRefetching}
+      transactionsLoading={transactionsQuery.isLoading}
+      transactionsError={transactionsQuery.isError ? "Transaction history unavailable" : ""}
+      destinationsLoading={destinationsQuery.isLoading}
+      destinationsError={destinationsQuery.isError ? "Destination authorizations unavailable" : ""}
       error={
         walletQuery.isError
           ? "Wallet data is unavailable over the private mobile connection."
@@ -368,5 +408,14 @@ const styles = StyleSheet.create({
     color: colors.amber,
     fontSize: 10,
     fontWeight: "800",
+  },
+  regionStack: {
+    gap: spacing.sm,
+  },
+  regionError: {
+    color: colors.rose,
+    fontSize: 12,
+    fontWeight: "700",
+    lineHeight: 18,
   },
 });

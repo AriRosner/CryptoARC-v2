@@ -1,7 +1,9 @@
 import React from "react";
-import { fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
-import { DiagnosticsScreen } from "../DiagnosticsScreen";
+import { DiagnosticsFeatureScreen, DiagnosticsScreen } from "../DiagnosticsScreen";
+import { fetchDiagnostics } from "../api";
 import {
   redactDiagnosticPayload,
   redactDiagnosticValue,
@@ -57,6 +59,27 @@ const diagnostics: MobileDiagnosticsPayload = {
     },
   ],
 };
+
+jest.mock("../../../core/session/SessionProvider", () => ({
+  useSession: () => ({
+    apiBaseUrl: "https://cryptoarc.test",
+    token: "mobile-token",
+    generation: 11,
+  }),
+}));
+
+jest.mock("../../../core/connectivity/ConnectionProvider", () => ({
+  useConnection: () => ({ online: true, realtime: { status: "connected", lastServerTime: "" } }),
+}));
+
+jest.mock("../../../core/storage/snapshot", () => ({
+  loadVerifiedSnapshot: jest.fn(async () => null),
+}));
+
+jest.mock("../api", () => ({
+  exportDiagnostics: jest.fn(),
+  fetchDiagnostics: jest.fn(),
+}));
 
 describe("Diagnostics and Recovery Center", () => {
   it("renders every required diagnostic status and recovery action", async () => {
@@ -123,6 +146,36 @@ describe("Diagnostics and Recovery Center", () => {
     expect(view.getByText("Private tunnel")).toBeTruthy();
     expect(view.getByLabelText("Syncing diagnostics")).toBeTruthy();
     expect(view.queryByTestId("diagnostics-initial-skeleton")).toBeNull();
+  });
+
+  it("announces real connected diagnostics refetch state", async () => {
+    let resolveRefresh!: (value: MobileDiagnosticsPayload) => void;
+    const refresh = new Promise<MobileDiagnosticsPayload>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    jest.mocked(fetchDiagnostics)
+      .mockResolvedValueOnce(diagnostics)
+      .mockReturnValueOnce(refresh);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={client}>
+        <DiagnosticsFeatureScreen />
+      </QueryClientProvider>,
+    );
+    expect(await view.findByText("Private tunnel")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.press(view.getByRole("button", { name: "Refresh diagnostics" }));
+    });
+    await waitFor(() => expect(fetchDiagnostics).toHaveBeenCalledTimes(2));
+    expect(await view.findByLabelText("Syncing diagnostics")).toBeTruthy();
+    expect(view.getByText("Private tunnel")).toBeTruthy();
+    resolveRefresh(diagnostics);
+    await waitFor(() =>
+      expect(view.queryByLabelText("Syncing diagnostics")).toBeNull(),
+    );
+    await view.unmount();
+    client.clear();
   });
 
   it("renders diagnostics error and unavailable states", async () => {

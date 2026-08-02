@@ -150,6 +150,8 @@ describe("PortfolioScreen", () => {
     const { client, view } = await renderPortfolio();
 
     expect(await view.findByText("Current tracked value")).toBeTruthy();
+    expect(view.getAllByTestId("animated-number")).toHaveLength(4);
+    expect(view.getByLabelText("Current tracked value: 0.4200 SOL")).toBeTruthy();
     expect(view.getByText("Period realized")).toBeTruthy();
     expect(view.getByText("Win rate")).toBeTruthy();
     expect(view.getByText("Health")).toBeTruthy();

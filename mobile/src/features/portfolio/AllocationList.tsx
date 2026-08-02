@@ -14,7 +14,7 @@ export function AllocationList({ allocation }: { allocation: PortfolioAllocation
       {allocation.map((item) => (
         <View key={item.key} style={styles.row}>
           <View style={styles.labelBlock}>
-            <Text style={styles.label} numberOfLines={1}>{item.label}</Text>
+            <Text style={styles.label}>{item.label}</Text>
             <StatusBadge label={item.mode} tone={item.mode === "live" ? "warning" : "neutral"} />
           </View>
           <View style={styles.valueBlock}>

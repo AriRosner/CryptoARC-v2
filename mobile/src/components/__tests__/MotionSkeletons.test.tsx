@@ -1,8 +1,10 @@
 import * as Haptics from "expo-haptics";
 import React from "react";
-import { fireEvent, render } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import { Animated } from "react-native";
 
 import { ActionButton } from "../ui";
+import { AnimatedNumber } from "../motion/AnimatedNumber";
 import { triggerHaptic } from "../motion/haptics";
 import { resolveMotionPolicy } from "../motion/policy";
 import { runEmergencyAction } from "../motion/transitions";
@@ -10,12 +12,56 @@ import { Skeleton } from "../skeletons/Skeleton";
 import { PortfolioSkeleton } from "../skeletons/PortfolioSkeleton";
 import { PositionSkeleton } from "../skeletons/PositionSkeleton";
 import { TradeSkeleton } from "../skeletons/TradeSkeleton";
+import { TradeDetailSkeleton } from "../skeletons/TradeDetailSkeleton";
 import { WalletSkeleton } from "../skeletons/WalletSkeleton";
 import { AlertsSkeleton } from "../skeletons/AlertsSkeleton";
 import { DiagnosticsSkeleton } from "../skeletons/DiagnosticsSkeleton";
+import { useSettingsStore } from "../../core/settings/settingsStore";
 
 describe("motion, haptics, and loading contracts", () => {
   beforeEach(() => jest.clearAllMocks());
+
+  afterEach(() => {
+    jest.useRealTimers();
+    useSettingsStore.setState({ motion: "expressive" });
+  });
+
+  it("renders animated values by policy and cleans animation listeners", async () => {
+    const stop = jest.fn();
+    jest.spyOn(Animated, "timing").mockReturnValue({
+      reset: jest.fn(),
+      start: jest.fn(),
+      stop,
+    } as ReturnType<typeof Animated.timing>);
+    useSettingsStore.setState({ motion: "expressive" });
+    const view = await render(
+      <AnimatedNumber value={1} format={(value) => value.toFixed(0)} />,
+    );
+    expect(view.getByTestId("animated-number")).toHaveProp(
+      "accessibilityValue",
+      { text: "Animated value" },
+    );
+    await view.rerender(
+      <AnimatedNumber value={9} format={(value) => value.toFixed(0)} />,
+    );
+    await view.unmount();
+    expect(stop).toHaveBeenCalled();
+
+    await act(async () => useSettingsStore.setState({ motion: "minimal" }));
+    const minimal = await render(
+      <AnimatedNumber value={1} format={(value) => value.toFixed(0)} />,
+    );
+    await minimal.rerender(
+      <AnimatedNumber value={9} format={(value) => value.toFixed(0)} />,
+    );
+    await waitFor(() => expect(minimal.getByText("9")).toBeTruthy());
+    expect(minimal.getByTestId("animated-number")).toHaveProp(
+      "accessibilityValue",
+      { text: "Static value" },
+    );
+    await minimal.unmount();
+    jest.restoreAllMocks();
+  });
 
   it("uses full expressive motion and removes nonessential minimal motion", () => {
     expect(resolveMotionPolicy("expressive", false, true)).toMatchObject({
@@ -38,7 +84,11 @@ describe("motion, haptics, and loading contracts", () => {
     const view = await render(
       <Skeleton width={120} height={20} motionMode="system" reduceMotion />,
     );
-    expect(view.getByTestId("skeleton-shimmer")).toHaveProp("animated", false);
+    expect(view.getByTestId("skeleton-shimmer")).toHaveProp(
+      "accessibilityValue",
+      { text: "Static loading placeholder" },
+    );
+    expect(view.getByTestId("skeleton-shimmer")).not.toHaveProp("animated");
   });
 
   it("provides a distinct layout-matched skeleton for every content route", async () => {
@@ -62,6 +112,15 @@ describe("motion, haptics, and loading contracts", () => {
     ]) {
       expect(view.getByTestId(id)).toBeTruthy();
     }
+  });
+
+  it("matches trade detail header, evidence, form, and authentication regions", async () => {
+    const view = await render(<TradeDetailSkeleton />);
+    expect(view.getByTestId("trade-detail-header-skeleton")).toHaveStyle({ height: 48 });
+    expect(view.getByTestId("trade-detail-evidence-skeleton")).toHaveStyle({ height: 180 });
+    expect(view.getByTestId("trade-detail-form-skeleton")).toHaveStyle({ height: 260 });
+    expect(view.getByTestId("trade-detail-auth-skeleton")).toHaveStyle({ height: 64 });
+    expect(view.queryByTestId("trade-initial-skeleton")).toBeNull();
   });
 
   it("retains stable action dimensions and pending text in place", async () => {

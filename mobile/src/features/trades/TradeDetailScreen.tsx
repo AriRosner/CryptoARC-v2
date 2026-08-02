@@ -21,7 +21,9 @@ import {
   Section,
   StatusBadge,
 } from "../../components/ui";
-import { TradeSkeleton } from "../../components/skeletons/TradeSkeleton";
+import { TradeDetailSkeleton } from "../../components/skeletons/TradeDetailSkeleton";
+import { triggerHaptic } from "../../components/motion/haptics";
+import { useMotionPolicy } from "../../components/motion/policy";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -111,6 +113,14 @@ function isDefinitivePreReceiptFailure(caught: unknown): boolean {
   );
 }
 
+function emitReceiptHaptic(receipt: MobileActionReceipt, enabled: boolean): void {
+  if (["confirmed", "cancelled"].includes(receipt.status)) {
+    void triggerHaptic("confirmation", enabled);
+  } else if (["failed", "expired"].includes(receipt.status)) {
+    void triggerHaptic("rejection", enabled);
+  }
+}
+
 export function GuardedTradeApproval({
   trade,
   initialDraft,
@@ -124,6 +134,7 @@ export function GuardedTradeApproval({
   pendingOwner = TEST_PENDING_ACTION_OWNER,
   onOpenPendingAction,
 }: GuardedTradeApprovalProps) {
+  const motionPolicy = useMotionPolicy();
   const [draft, setDraft] = useState(initialDraft);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
@@ -230,6 +241,7 @@ export function GuardedTradeApproval({
             setReceipt(next);
             if (["pending", "verifying"].includes(next.status)) poll();
             else {
+              emitReceiptHaptic(next, motionPolicy.haptics);
               pendingAction.current = null;
               void pendingActionStore.clear(next.action_id);
             }
@@ -264,7 +276,7 @@ export function GuardedTradeApproval({
       active = false;
       if (timer) clearTimeout(timer);
     };
-  }, [pendingActionStore, receipt, reconcileAction]);
+  }, [motionPolicy.haptics, pendingActionStore, receipt, reconcileAction]);
 
   const blockers = liveValidation?.blockers ?? trade.blockers;
   const escalationReasons =
@@ -284,6 +296,7 @@ export function GuardedTradeApproval({
 
   const authorize = async (escalationAcknowledged: boolean) => {
     if (disabled || inFlight.current) return;
+    void triggerHaptic("warning", motionPolicy.haptics);
     inFlight.current = true;
     setBusy(true);
     setError("");
@@ -294,6 +307,7 @@ export function GuardedTradeApproval({
         disableDeviceFallback: true,
       });
       if (!biometric.success) {
+        void triggerHaptic("rejection", motionPolicy.haptics);
         idempotencyKey.current = "";
         return;
       }
@@ -326,6 +340,7 @@ export function GuardedTradeApproval({
         idempotencyKey: idempotencyKey.current,
       });
       setReceipt(next);
+      emitReceiptHaptic(next, motionPolicy.haptics);
       if (!["pending", "verifying"].includes(next.status)) {
         await pendingActionStore.clear(next.action_id);
         pendingAction.current = null;
@@ -337,6 +352,7 @@ export function GuardedTradeApproval({
       ) {
         setReceipt(ambiguousReceipt(idempotencyKey.current));
       } else if (isDefinitivePreReceiptFailure(caught)) {
+        void triggerHaptic("rejection", motionPolicy.haptics);
         await pendingActionStore.clear(idempotencyKey.current);
         pendingAction.current = null;
         setReceipt(null);
@@ -371,6 +387,7 @@ export function GuardedTradeApproval({
       return;
     }
     inFlight.current = true;
+    void triggerHaptic("warning", motionPolicy.haptics);
     setBusy(true);
     setError("");
     const actionId = createIdempotencyKey();
@@ -396,6 +413,7 @@ export function GuardedTradeApproval({
         idempotencyKey: actionId,
       });
       setReceipt(next);
+      emitReceiptHaptic(next, motionPolicy.haptics);
       if (!["pending", "verifying"].includes(next.status)) {
         await pendingActionStore.clear(next.action_id);
         pendingAction.current = null;
@@ -407,6 +425,7 @@ export function GuardedTradeApproval({
       ) {
         setReceipt(ambiguousReceipt(actionId));
       } else if (isDefinitivePreReceiptFailure(caught)) {
+        void triggerHaptic("rejection", motionPolicy.haptics);
         await pendingActionStore.clear(actionId);
         pendingAction.current = null;
         setReceipt(null);
@@ -570,7 +589,7 @@ export function TradeDetailScreen({
           <ArrowLeft color={colors.text} size={20} />
         </Pressable>
         {query.isLoading ? (
-          <TradeSkeleton />
+          <TradeDetailSkeleton />
         ) : !trade || !initialDraft ? (
           <>
             <EmptyState

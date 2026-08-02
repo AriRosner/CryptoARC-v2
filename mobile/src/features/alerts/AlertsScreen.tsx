@@ -162,7 +162,7 @@ export function AlertsFeatureScreen() {
   return (
     <AlertsScreen
       alerts={query.data?.alerts ?? []}
-      loading={query.isLoading}
+      loading={query.isFetching}
       error={
         mutationError || (query.isError ? "Unable to load alerts." : "")
       }

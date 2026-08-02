@@ -222,7 +222,7 @@ export function DiagnosticsFeatureScreen() {
   return (
     <DiagnosticsScreen
       diagnostics={query.data ?? null}
-      loading={query.isLoading}
+      loading={query.isFetching}
       error={
         exportError ||
         (query.isError ? "Diagnostics unavailable" : "")

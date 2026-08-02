@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { router } from "expo-router";
 import { ExternalLink, ShieldAlert, SlidersHorizontal, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef } from "react";
+import { ReduceMotion } from "react-native-reanimated";
 import {
   AccessibilityInfo,
   findNodeHandle,
@@ -20,6 +21,8 @@ import {
 
 import { ActionButton, DetailRow, StatusBadge } from "../../components/ui";
 import { PositionSkeleton } from "../../components/skeletons/PositionSkeleton";
+import { useMotionPolicy } from "../../components/motion/policy";
+import { sheetAnimationConfig } from "../../components/motion/transitions";
 import { authenticatedRead, mobileReadErrorMessage } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
@@ -44,7 +47,12 @@ export function PositionSheet({
   const modalRef = useRef<BottomSheetModalType>(null);
   const titleRef = useRef<Text>(null);
   const session = useOptionalSession();
+  const motionPolicy = useMotionPolicy();
   const snapPoints = useMemo(() => ["60%", "88%"], []);
+  const animationConfigs = useMemo(
+    () => sheetAnimationConfig(motionPolicy),
+    [motionPolicy.duration.normal, motionPolicy.spring.damping, motionPolicy.spring.stiffness],
+  );
   const query = useQuery({
     queryKey: ["mobile", "position", positionId, session?.generation ?? "test"],
     queryFn: () =>
@@ -100,6 +108,12 @@ export function PositionSheet({
     <BottomSheetModal
       ref={modalRef}
       snapPoints={snapPoints}
+      animationConfigs={animationConfigs}
+      overrideReduceMotion={
+        motionPolicy.duration.normal === 0
+          ? ReduceMotion.Always
+          : ReduceMotion.Never
+      }
       enablePanDownToClose
       backdropComponent={renderBackdrop}
       onChange={focusSheet}
@@ -153,7 +167,7 @@ export function PositionSheet({
                   <Text ref={titleRef} accessibilityRole="header" style={styles.title}>{position.symbol}</Text>
                   <StatusBadge label={position.mode} tone={position.mode === "live" ? "warning" : "neutral"} />
                 </View>
-                <Text style={styles.mint} numberOfLines={1}>{position.mint}</Text>
+                <Text style={styles.mint}>{position.mint}</Text>
               </View>
               <Pressable accessibilityLabel="Close position sheet" accessibilityRole="button" hitSlop={10} onPress={onDismiss} style={styles.iconButton}>
                 <X size={20} color={colors.muted} />

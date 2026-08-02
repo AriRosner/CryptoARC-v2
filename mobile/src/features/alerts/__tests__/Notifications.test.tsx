@@ -1,7 +1,8 @@
 import NetInfo from "@react-native-community/netinfo";
 import * as Notifications from "expo-notifications";
 import React from "react";
-import { fireEvent, render, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
   NOTIFICATION_CHANNELS,
@@ -9,7 +10,8 @@ import {
   startNativePushRegistration,
 } from "../../../core/notifications/notifications";
 import { MobileApiError } from "../../../core/api/errors";
-import { AlertsScreen } from "../AlertsScreen";
+import { AlertsFeatureScreen, AlertsScreen } from "../AlertsScreen";
+import { fetchAlerts } from "../api";
 import type { MobileAlert } from "../types";
 
 const alert: MobileAlert = {
@@ -23,6 +25,19 @@ const alert: MobileAlert = {
   acknowledged: false,
   acknowledged_at: null,
 };
+
+jest.mock("../../../core/session/SessionProvider", () => ({
+  useSession: () => ({
+    apiBaseUrl: "https://cryptoarc.test",
+    token: "mobile-token",
+    generation: 9,
+  }),
+}));
+
+jest.mock("../api", () => ({
+  acknowledgeAlert: jest.fn(async () => undefined),
+  fetchAlerts: jest.fn(),
+}));
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -365,6 +380,37 @@ describe("native notifications and alerts", () => {
     expect(view.getByText("Critical trade alert")).toBeTruthy();
     expect(view.getByLabelText("Syncing alerts")).toBeTruthy();
     expect(view.queryByTestId("alerts-initial-skeleton")).toBeNull();
+  });
+
+  it("announces real connected alert refetch state", async () => {
+    const refreshed = {
+      artifact_type: "cryptoarc_mobile_alerts" as const,
+      format_version: 1 as const,
+      generated_at: "2026-08-02T00:00:00Z",
+      alerts: [alert],
+    };
+    const refresh = deferred<typeof refreshed>();
+    jest.mocked(fetchAlerts)
+      .mockResolvedValueOnce(refreshed)
+      .mockReturnValueOnce(refresh.promise);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={client}>
+        <AlertsFeatureScreen />
+      </QueryClientProvider>,
+    );
+    expect(await view.findByText("Critical trade alert")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.press(view.getByRole("button", { name: "Refresh alerts" }));
+    });
+    await waitFor(() => expect(fetchAlerts).toHaveBeenCalledTimes(2));
+    expect(await view.findByLabelText("Syncing alerts")).toBeTruthy();
+    expect(view.getByText("Critical trade alert")).toBeTruthy();
+    refresh.resolve(refreshed);
+    await waitFor(() => expect(view.queryByLabelText("Syncing alerts")).toBeNull());
+    await view.unmount();
+    client.clear();
   });
 
   it("renders the alert error and empty state", async () => {

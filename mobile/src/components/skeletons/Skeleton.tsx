@@ -58,7 +58,11 @@ export function Skeleton({
   return (
     <View style={[styles.track, { width, height }]}>
       <Animated.View
-        {...({ animated: shouldAnimate } as object)}
+        accessibilityValue={{
+          text: shouldAnimate
+            ? "Animated loading placeholder"
+            : "Static loading placeholder",
+        }}
         testID="skeleton-shimmer"
         style={[StyleSheet.absoluteFill, styles.shimmer, { opacity }]}
       />

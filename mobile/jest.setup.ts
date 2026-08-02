@@ -80,6 +80,30 @@ jest.mock("@shopify/react-native-skia", () => ({
   useSharedValue: jest.fn((value: unknown) => ({ current: value })),
 }));
 
+jest.mock("react-native-reanimated", () => {
+  const React = jest.requireActual("react");
+  const { View } = jest.requireActual("react-native");
+
+  const transition = (config: Record<string, unknown> = {}) => ({
+    ...config,
+    damping: (value: number) => transition({ ...config, damping: value }),
+    duration: (value: number) => transition({ ...config, duration: value }),
+    springify: () => transition({ ...config, spring: true }),
+    stiffness: (value: number) => transition({ ...config, stiffness: value }),
+    reduceMotion: (value: string) => transition({ ...config, reduceMotion: value }),
+  });
+
+  return {
+    __esModule: true,
+    default: {
+      View: ({ children, ...props }: { children?: React.ReactNode }) =>
+        React.createElement(View, props, children),
+    },
+    LinearTransition: transition({ type: "linear" }),
+    ReduceMotion: { Always: "always", Never: "never", System: "system" },
+  };
+});
+
 jest.mock("@gorhom/bottom-sheet", () => ({
   BottomSheetBackdrop: () => null,
   BottomSheetModal: () => null,

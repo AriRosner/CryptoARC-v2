@@ -30,7 +30,7 @@ export function TransactionList({
             <Text style={styles.amount}>
               {transaction.amount} {transaction.asset}
             </Text>
-            <Text style={styles.destination} numberOfLines={1}>
+            <Text style={styles.destination}>
               {transaction.destination}
             </Text>
           </View>

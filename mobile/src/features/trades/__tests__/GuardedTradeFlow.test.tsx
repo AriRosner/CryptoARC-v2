@@ -1,4 +1,5 @@
 import * as LocalAuthentication from "expo-local-authentication";
+import * as Haptics from "expo-haptics";
 import React from "react";
 import {
   act,
@@ -200,6 +201,80 @@ describe("guarded mobile trade flow", () => {
       expect.objectContaining({ idempotencyKey: "routine-key" }),
     );
     expect(await screen.findByText("No automatic resubmission")).toBeTruthy();
+  });
+
+  it("fires warning haptics without awaiting or blocking the operator action", async () => {
+    jest.mocked(Haptics.notificationAsync).mockRejectedValueOnce(
+      new Error("haptics unavailable"),
+    );
+    const submit = jest.fn(async () => verifyingReceipt());
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        createIdempotencyKey={() => "haptic-fire-and-forget"}
+      />,
+    );
+
+    await fireEvent.press(screen.getByRole("button", { name: "Approve trade" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(1));
+    expect(Haptics.notificationAsync).toHaveBeenCalledWith(
+      Haptics.NotificationFeedbackType.Warning,
+    );
+    expect(await screen.findByText("No automatic resubmission")).toBeTruthy();
+    screen.unmount();
+  });
+
+  it("signals confirmation at a confirmed action outcome", async () => {
+    const confirmed = jest.fn(async () => ({
+      ...verifyingReceipt(),
+      status: "confirmed" as const,
+      operator_message: "Trade confirmed",
+    }));
+    const success = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={confirmed}
+        createIdempotencyKey={() => "haptic-confirmed"}
+      />,
+    );
+    await fireEvent.press(success.getByRole("button", { name: "Approve trade" }));
+    await waitFor(() =>
+      expect(Haptics.notificationAsync).toHaveBeenCalledWith(
+        Haptics.NotificationFeedbackType.Success,
+      ),
+    );
+    expect(await success.findByText("Confirmed")).toBeTruthy();
+    success.unmount();
+  });
+
+  it("signals rejection at a definitive action failure", async () => {
+    const denied = jest.fn(async () => {
+      throw new MobileApiError("denied", "authorization", 403, false);
+    });
+    const failure = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={denied}
+        createIdempotencyKey={() => "haptic-rejected"}
+      />,
+    );
+    await fireEvent.press(failure.getByRole("button", { name: "Approve trade" }));
+    await waitFor(() =>
+      expect(Haptics.notificationAsync).toHaveBeenCalledWith(
+        Haptics.NotificationFeedbackType.Error,
+      ),
+    );
+    expect(
+      await failure.findByText("This device does not have trade execution access."),
+    ).toBeTruthy();
+    failure.unmount();
   });
 
   it("requires biometric plus a 1400ms hold for elevated risk", async () => {

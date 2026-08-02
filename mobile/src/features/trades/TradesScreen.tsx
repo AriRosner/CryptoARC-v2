@@ -72,7 +72,7 @@ export function TradesScreen() {
                   <Text style={styles.amount}>
                     {trade.amount} {trade.limits.amount.unit}
                   </Text>
-                  <Text style={styles.reason} numberOfLines={2}>
+                  <Text style={styles.reason}>
                     {trade.blockers[0] || trade.reason}
                   </Text>
                 </View>
