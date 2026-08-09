@@ -32,6 +32,6 @@ describe("Device release marker", () => {
     expect(
       screen.getByText("Operator Command Center v2.0.0 (2026-07-26)"),
     ).toBeTruthy();
-    expect(screen.getByText("2.0.0 / Android 3")).toBeTruthy();
+    expect(screen.getByText("2.0.0 / Android 4")).toBeTruthy();
   });
 });
