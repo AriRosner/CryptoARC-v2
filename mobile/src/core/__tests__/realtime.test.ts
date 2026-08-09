@@ -266,6 +266,70 @@ describe("MobileRealtimeClient", () => {
     jest.useRealTimers();
   });
 
+  it("waits for and accepts a lower-sequence full baseline after backend restart", async () => {
+    const socket = new FakeSocket();
+    const invalidateQueries = jest.fn(async () => undefined);
+    const client = new MobileRealtimeClient({
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=after-restart",
+      initialState: { ...initialRealtimeState, lastSequence: 42 },
+      webSocketFactory: () => socket,
+      queryClient: { invalidateQueries },
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    });
+
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.emitOpen();
+    expect(client.getState().status).toBe("connecting");
+
+    socket.emitMessage(envelope({
+      sequence: 1,
+      event_type: "cockpit",
+      payload: {
+        artifact_type: "cryptoarc_mobile_cockpit",
+        format_version: 1,
+        server_time: "2026-07-28T12:00:00.000Z",
+      },
+    }));
+
+    expect(client.getState()).toMatchObject({
+      lastSequence: 1,
+      requiresSnapshot: false,
+      status: "connected",
+    });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile", "cockpit"] });
+  });
+
+  it("accepts an equal-sequence full baseline on a newly ticketed reconnect", async () => {
+    const socket = new FakeSocket();
+    const invalidateQueries = jest.fn(async () => undefined);
+    const client = new MobileRealtimeClient({
+      urlFactory: async () => "wss://cryptoarc.test/ws/mobile?ticket=reconnect",
+      initialState: { ...initialRealtimeState, lastSequence: 8 },
+      webSocketFactory: () => socket,
+      queryClient: { invalidateQueries },
+      now: () => Date.parse("2026-07-28T12:00:00.000Z"),
+    });
+
+    client.connect();
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.emitOpen();
+    socket.emitMessage(envelope({
+      sequence: 8,
+      event_type: "cockpit",
+      payload: {
+        artifact_type: "cryptoarc_mobile_cockpit",
+        format_version: 1,
+        server_time: "2026-07-28T12:00:00.000Z",
+      },
+    }));
+
+    expect(client.getState()).toMatchObject({ lastSequence: 8, status: "connected" });
+    expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile", "cockpit"] });
+  });
+
   it("does not create duplicate sockets and invalidates affected queries", async () => {
     const sockets: FakeSocket[] = [];
     const invalidateQueries = jest.fn(async () => undefined);
@@ -288,11 +352,19 @@ describe("MobileRealtimeClient", () => {
     expect(sockets).toHaveLength(1);
 
     sockets[0].emitOpen();
-    sockets[0].emitMessage(envelope());
+    sockets[0].emitMessage(envelope({
+      event_type: "cockpit",
+      payload: {
+        artifact_type: "cryptoarc_mobile_cockpit",
+        format_version: 1,
+        server_time: "2026-07-28T12:00:00.000Z",
+      },
+    }));
     expect(client.getState()).toMatchObject({ lastSequence: 9, status: "connected" });
+    sockets[0].emitMessage(envelope({ sequence: 10, event_type: "portfolio" }));
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile", "portfolio"] });
 
-    sockets[0].emitMessage(envelope({ sequence: 11 }));
+    sockets[0].emitMessage(envelope({ sequence: 12 }));
     expect(client.getState()).toMatchObject({ requiresSnapshot: true, reason: "sequence_gap" });
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: ["mobile"] });
   });
@@ -311,7 +383,15 @@ describe("MobileRealtimeClient", () => {
     client.connect();
     await Promise.resolve();
     await Promise.resolve();
-    socket.emitMessage(envelope({ sequence: 9 }));
+    socket.emitMessage(envelope({
+      sequence: 9,
+      event_type: "cockpit",
+      payload: {
+        artifact_type: "cryptoarc_mobile_cockpit",
+        format_version: 1,
+        server_time: "2026-07-28T12:00:00.000Z",
+      },
+    }));
     invalidateQueries.mockClear();
 
     socket.emitMessage(envelope({ sequence: 9 }));

@@ -58,6 +58,7 @@ export function reduceRealtime(
   state: MobileRealtimeState,
   envelope: MobileRealtimeEnvelope,
   nowMs = Date.now(),
+  authoritativeBaseline = false,
 ): MobileRealtimeState {
   if (envelope.schema_version !== 1) return invalidState(state, "compatibility", "schema_mismatch");
   if (!Number.isInteger(envelope.sequence) || envelope.sequence < 1) {
@@ -80,6 +81,23 @@ export function reduceRealtime(
     });
   }
   if (state.revoked) return state;
+  if (authoritativeBaseline) {
+    if (!isCurrentCockpitSnapshot(envelope, nowMs)) {
+      return invalidState(state, "stale", "baseline_required", {
+        clockDriftMs,
+        lastServerTime: envelope.server_time,
+      });
+    }
+    return {
+      ...state,
+      clockDriftMs,
+      lastSequence: envelope.sequence,
+      lastServerTime: envelope.server_time,
+      reason: "",
+      requiresSnapshot: false,
+      status: "connected",
+    };
+  }
   if (state.requiresSnapshot) {
     if (
       envelope.sequence >= state.lastSequence &&
@@ -249,16 +267,16 @@ export class MobileRealtimeClient {
 
   private attachSocket(socket: RealtimeSocket): void {
     this.socket = socket;
+    let awaitingBaseline = true;
     socket.onopen = () => {
       if (this.socket !== socket || this.stopped) return;
       this.reconnectAttempt = 0;
-      if (!this.state.requiresSnapshot) {
-        this.updateState({ ...this.state, status: "connected", reason: "" });
-      }
     };
     socket.onmessage = (event) => {
       if (this.socket !== socket || this.stopped) return;
-      this.onMessage(event.data);
+      if (this.onMessage(event.data, awaitingBaseline)) {
+        awaitingBaseline = false;
+      }
     };
     socket.onerror = () => {
       if (this.socket === socket && !this.stopped) {
@@ -296,32 +314,38 @@ export class MobileRealtimeClient {
     }
   }
 
-  private onMessage(data: unknown): void {
+  private onMessage(data: unknown, authoritativeBaseline = false): boolean {
     let value: unknown;
     try {
       value = JSON.parse(String(data));
     } catch {
       this.updateState(invalidState(this.state, "compatibility", "invalid_payload"));
       this.invalidateAll();
-      return;
+      return false;
     }
     if (!isEnvelope(value)) {
       this.updateState(invalidState(this.state, "compatibility", "invalid_payload"));
       this.invalidateAll();
-      return;
+      return false;
     }
-    const next = reduceRealtime(this.state, value, this.now());
+    const next = reduceRealtime(this.state, value, this.now(), authoritativeBaseline);
     const stateAdvanced = next !== this.state;
     this.updateState(next);
     if (next.revoked) {
       this.revoke();
-      return;
+      return false;
     }
     if (next.requiresSnapshot) {
       this.invalidateAll();
     } else if (stateAdvanced && value.event_type !== "invalidate") {
       void this.queryClient?.invalidateQueries({ queryKey: eventQueryKeys[value.event_type] });
     }
+    return (
+      authoritativeBaseline &&
+      value.event_type === "cockpit" &&
+      next.status === "connected" &&
+      !next.requiresSnapshot
+    );
   }
 
   private invalidateAll(): void {

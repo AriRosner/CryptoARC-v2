@@ -33,10 +33,13 @@ Root cause: `/ws/mobile` sent a raw cockpit object while the client reducer requ
 
 Architecture: the backend now serializes Pydantic `MobileRealtimeEnvelope` objects with schema version 1, event type, UTC server time, one process-global monotonic broadcast sequence, and payload. All recipients of one logical broadcast share one sequence. A new authenticated ticket connection gets the current full cockpit sequence. The client quarantines unsupported schemas/delta gaps, accepts only a current v1 `cryptoarc_mobile_cockpit` full snapshot for recovery, rebases immediately when a reconnect gap itself carries that authenticated full snapshot, resumes from its sequence, and ignores stale envelopes.
 
+Re-review correction: backend sequence is intentionally process-local and can restart below a value retained by the client. Each newly ticketed socket now has its own `awaitingBaseline` state. Socket open remains `connecting` (so polling remains enabled); the first accepted message must be a current authenticated full cockpit and is authoritative even when its sequence is lower than or equal to the prior stream. After that baseline, the reducer again rejects normal duplicate/stale envelopes and quarantines gaps.
+
 TDD evidence:
 
 - RED: websocket tests could not find `event_type`/`payload`; gap/schema tests remained permanently quarantined.
 - GREEN: backend websocket shape/sequence tests and the client realtime suite cover gaps, schema mismatch, recovery, reconnect ticket rotation, duplicates, stale envelopes, and revocation.
+- Re-review RED: socket open reported `connected` before any payload; a sequence-1 cockpit after retained sequence 42 was ignored, and an equal-sequence reconnect caused no query refresh. Re-review GREEN: explicit lower-sequence backend-restart and equal-sequence reconnect tests accept and invalidate the cockpit query while proving status stays `connecting` until baseline acceptance.
 - Cross-layer contract: `mobile-realtime-envelope-v1.json` is validated by backend Pydantic and consumed by the TypeScript reducer.
 
 Files: `backend/app/main.py`, `mobile/src/core/connectivity/realtime.ts`, fixture and tests.
@@ -89,13 +92,13 @@ TDD evidence: the new kill-switch suite covers immediate empty-reason enable, ca
 ## Verification
 
 - Backend focused: `tests.test_mobile_api tests.test_mobile_command_center tests.test_mobile_notifications tests.test_mobile_treasury` — 86/86 passed.
-- Mobile focused/full Jest — 26 suites, 227/227 passed.
+- Mobile focused/full Jest after re-review — 26 suites, 229/229 passed.
 - TypeScript: `tsc --noEmit` passed.
 - Expo Doctor: 20/20 passed after SDK 57 patch alignment.
 - Android export: succeeded; 4,574 modules bundled to `dist-android`.
 - `git diff --check`: passed (only configured LF/CRLF notices).
 - Production source scan: no direct feature-level LocalAuthentication; `LIVE_TRADING_ENABLED=false` unchanged.
-- `scripts/verify-mobile.ps1`: typecheck and 227/227 tests passed, then the audit step stopped the script. Audit is reduced to the single transitive `image-size@1.2.1` root cause, reported as a ten-package Metro/Expo cascade. GitHub advisories `GHSA-w3rx-r6r6-pgpr` and `GHSA-5p2g-fcmc-qvqq` currently mark every published `image-size` version (`<=2.0.2`) vulnerable; npm latest is 2.0.2, upstream main has no fix commit/release, and npm proposes an unsafe Expo/React Native downgrade. Patchable `brace-expansion` and `nanoid` advisories were resolved. No audit suppression or forced downgrade was used.
+- `scripts/verify-mobile.ps1`: the pre-re-review run passed typecheck and 227/227 tests, then the audit step stopped the script. The post-re-review equivalent direct stages passed typecheck, 229/229 tests, Doctor 20/20, and Android export. Audit remains reduced to the single transitive `image-size@1.2.1` root cause, reported as a ten-package Metro/Expo cascade. GitHub advisories `GHSA-w3rx-r6r6-pgpr` and `GHSA-5p2g-fcmc-qvqq` currently mark every published `image-size` version (`<=2.0.2`) vulnerable; npm latest is 2.0.2, upstream main has no fix commit/release, and npm proposes an unsafe Expo/React Native downgrade. Patchable `brace-expansion` and `nanoid` advisories were resolved. No audit suppression or forced downgrade was used.
 
 ## Self-review and deferred evidence
 
