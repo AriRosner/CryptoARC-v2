@@ -1,10 +1,14 @@
-import * as LocalAuthentication from "expo-local-authentication";
 import React, { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, TextInput, View } from "react-native";
 
 import { HoldToConfirm } from "../../components/actions/HoldToConfirm";
 import { ActionButton } from "../../components/ui";
 import { MobileApiError } from "../../core/api/errors";
+import {
+  useOptionalAppLock,
+  type ControlAuthorizationBinding,
+  type ControlAuthorizationProof,
+} from "../../components/system/AppLock";
 import { colors, radius, spacing } from "../../theme";
 import { ActionStatus } from "../trades/ActionStatus";
 import {
@@ -101,6 +105,7 @@ export function GuardedPositionActions({
   onOpenPendingAction,
   onCompleted,
 }: GuardedPositionActionsProps) {
+  const controlAuthorization = useOptionalAppLock();
   const [stopPct, setStopPct] = useState(String(position.stop_pct));
   const [targetPct, setTargetPct] = useState(String(position.target_pct));
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
@@ -110,6 +115,20 @@ export function GuardedPositionActions({
   const [abandonArmed, setAbandonArmed] = useState(false);
   const inFlight = useRef(false);
   const pendingAction = useRef<PendingMobileAction | null>(null);
+  const active = useRef(true);
+  const currentReview = useRef({
+    position,
+    stopPct,
+    targetPct,
+  });
+  currentReview.current = { position, stopPct, targetPct };
+
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     setStopPct(String(position.stop_pct));
@@ -212,17 +231,44 @@ export function GuardedPositionActions({
     };
   }, [pendingActionStore, receipt, reconcileAction]);
 
-  const authenticate = async (promptMessage: string) => {
-    const result = await LocalAuthentication.authenticateAsync({
-      promptMessage,
-      cancelLabel: "Cancel",
-      disableDeviceFallback: true,
-    });
-    return result.success;
+  const bindingFor = (
+    actionType: "position_adjust_exit" | "position_close",
+  ): ControlAuthorizationBinding => {
+    const review = currentReview.current;
+    return {
+      actionType,
+      entityId: review.position.id,
+      reviewKey: JSON.stringify(
+        actionType === "position_adjust_exit"
+          ? {
+              positionVersion: review.position.version,
+              stopPct: review.stopPct,
+              targetPct: review.targetPct,
+            }
+          : {
+              positionVersion: review.position.version,
+              preparedClose: review.position.prepared_close,
+            },
+      ),
+    };
   };
+
+  const proofIsCurrent = (
+    proof: ControlAuthorizationProof | null,
+    actionType: "position_adjust_exit" | "position_close",
+  ): proof is ControlAuthorizationProof =>
+    Boolean(
+      active.current &&
+      proof &&
+      controlAuthorization?.isControlAuthorizationCurrent(
+        proof,
+        bindingFor(actionType),
+      ),
+    );
 
   const run = async (
     actionType: "position_adjust_exit" | "position_close",
+    proof: ControlAuthorizationProof,
     operation: (actionId: string) => Promise<MobileActionReceipt>,
   ) => {
     if (!online || busy || inFlight.current) return;
@@ -232,6 +278,7 @@ export function GuardedPositionActions({
     const actionId = createIdempotencyKey();
     try {
       const pending = await pendingActionStore.load();
+      if (!proofIsCurrent(proof, actionType)) return;
       if (pending && pending.actionId !== actionId) {
         setError(
           "Reconcile the pending financial action before starting another.",
@@ -246,6 +293,11 @@ export function GuardedPositionActions({
       );
       pendingAction.current = durableAction;
       await pendingActionStore.save(durableAction);
+      if (!proofIsCurrent(proof, actionType)) {
+        await pendingActionStore.clear(durableAction.actionId);
+        pendingAction.current = null;
+        return;
+      }
       const next = await operation(actionId);
       setReceipt(next);
       if (!["pending", "verifying"].includes(next.status)) {
@@ -276,7 +328,7 @@ export function GuardedPositionActions({
       }
     } finally {
       inFlight.current = false;
-      setBusy(false);
+      if (active.current) setBusy(false);
     }
   };
 
@@ -304,8 +356,11 @@ export function GuardedPositionActions({
 
   const adjust = async () => {
     if (!position.allowed_actions.adjust_exit) return;
-    if (!(await authenticate("Update CryptoARC exit controls"))) return;
-    await run("position_adjust_exit", (actionId) =>
+    const proof = (await controlAuthorization?.authorizeControl(
+      bindingFor("position_adjust_exit"),
+    )) ?? null;
+    if (!proofIsCurrent(proof, "position_adjust_exit")) return;
+    await run("position_adjust_exit", proof, (actionId) =>
       submitAdjustment({
         expectedVersion: position.version,
         stopPct,
@@ -319,8 +374,11 @@ export function GuardedPositionActions({
   const close = async () => {
     const prepared = position.prepared_close;
     if (!position.allowed_actions.close || !prepared) return;
-    if (!(await authenticate("Close the full CryptoARC position"))) return;
-    await run("position_close", (actionId) =>
+    const proof = (await controlAuthorization?.authorizeControl(
+      bindingFor("position_close"),
+    )) ?? null;
+    if (!proofIsCurrent(proof, "position_close")) return;
+    await run("position_close", proof, (actionId) =>
       submitClose({
         expectedVersion: prepared.intent_version,
         positionVersion: prepared.position_version,

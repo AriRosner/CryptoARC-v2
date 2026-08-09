@@ -1,10 +1,14 @@
-import * as LocalAuthentication from "expo-local-authentication";
 import React, { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 
 import { HoldToConfirm } from "../../components/actions/HoldToConfirm";
 import { ActionButton, DetailRow, StatusBadge } from "../../components/ui";
 import { MobileApiError } from "../../core/api/errors";
+import {
+  useOptionalAppLock,
+  type ControlAuthorizationBinding,
+  type ControlAuthorizationProof,
+} from "../../components/system/AppLock";
 import { colors, spacing } from "../../theme";
 import { createMobileIdempotencyKey } from "../trades/api";
 import { ActionStatus } from "../trades/ActionStatus";
@@ -87,7 +91,8 @@ export function GuardedTreasuryAction({
   pendingOwner = TEST_PENDING_ACTION_OWNER,
   onOpenPendingAction,
 }: GuardedTreasuryActionProps) {
-  const [authenticatedAt, setAuthenticatedAt] = useState(0);
+  const controlAuthorization = useOptionalAppLock();
+  const [authorized, setAuthorized] = useState(false);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -96,9 +101,21 @@ export function GuardedTreasuryAction({
   const inFlight = useRef(false);
   const pendingAction = useRef<PendingMobileAction | null>(null);
   const actionId = useRef("");
+  const authorizationProof = useRef<ControlAuthorizationProof | null>(null);
+  const active = useRef(true);
+  const currentPreview = useRef(preview);
+  currentPreview.current = preview;
 
   useEffect(() => {
-    setAuthenticatedAt(0);
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    authorizationProof.current = null;
+    setAuthorized(false);
     setReceipt(null);
     setError("");
     setAbandonArmed(false);
@@ -215,27 +232,55 @@ export function GuardedTreasuryAction({
   const authenticate = async () => {
     if (!online || busy || receipt) return;
     setError("");
-    const result = await LocalAuthentication.authenticateAsync({
-      promptMessage: "Authorize CryptoARC treasury action",
-      cancelLabel: "Cancel",
-      disableDeviceFallback: true,
-    });
-    if (result.success) {
-      setAuthenticatedAt(Date.now());
-    } else {
-      setAuthenticatedAt(0);
-    }
+    const binding = treasuryBinding(currentPreview.current);
+    const proof = await controlAuthorization?.authorizeControl(binding);
+    if (
+      !active.current ||
+      !proof ||
+      !controlAuthorization?.isControlAuthorizationCurrent(
+        proof,
+        treasuryBinding(currentPreview.current),
+      )
+    ) return;
+    authorizationProof.current = proof;
+    setAuthorized(true);
   };
+
+  const treasuryBinding = (
+    value: MobileTreasuryPreview,
+  ): ControlAuthorizationBinding => ({
+    actionType: value.action,
+    entityId: value.authorization_id,
+    reviewKey: JSON.stringify({
+      address: value.destination,
+      amount: value.amount,
+      asset: value.asset,
+      previewId: value.preview_id,
+      sourceWallet: value.source_wallet_public_key,
+      tokenAccounts: value.token_accounts,
+    }),
+  });
+
+  const proofIsCurrent = (): boolean =>
+    Boolean(
+      active.current &&
+      authorizationProof.current &&
+      controlAuthorization?.isControlAuthorizationCurrent(
+        authorizationProof.current,
+        treasuryBinding(currentPreview.current),
+      ),
+    );
 
   const submit = async () => {
     if (
       !online ||
       busy ||
       inFlight.current ||
-      !authenticatedAt ||
-      Date.now() - authenticatedAt > 30000
+      !authorized ||
+      !proofIsCurrent()
     ) {
-      setAuthenticatedAt(0);
+      authorizationProof.current = null;
+      setAuthorized(false);
       return;
     }
     inFlight.current = true;
@@ -246,6 +291,7 @@ export function GuardedTreasuryAction({
     }
     try {
       const existing = await pendingActionStore.load();
+      if (!proofIsCurrent()) return;
       if (existing && existing.actionId !== actionId.current) {
         actionId.current = "";
         setError(
@@ -261,6 +307,12 @@ export function GuardedTreasuryAction({
       );
       pendingAction.current = durable;
       await pendingActionStore.save(durable);
+      if (!proofIsCurrent()) {
+        await pendingActionStore.clear(durable.actionId);
+        pendingAction.current = null;
+        actionId.current = "";
+        return;
+      }
       const next = await execute({
         authorizationId: preview.authorization_id,
         previewId: preview.preview_id,
@@ -300,8 +352,11 @@ export function GuardedTreasuryAction({
         );
       }
     } finally {
-      setAuthenticatedAt(0);
-      setBusy(false);
+      authorizationProof.current = null;
+      if (active.current) {
+        setAuthorized(false);
+        setBusy(false);
+      }
       inFlight.current = false;
     }
   };
@@ -368,7 +423,7 @@ export function GuardedTreasuryAction({
       ))}
       {!online ? (
         <Text style={styles.offline}>Unavailable offline</Text>
-      ) : !authenticatedAt ? (
+      ) : !authorized ? (
         <ActionButton
           label="Authenticate treasury action"
           tone="danger"

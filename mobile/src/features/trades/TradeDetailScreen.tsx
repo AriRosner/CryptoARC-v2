@@ -1,5 +1,4 @@
 import { useNetInfo } from "@react-native-community/netinfo";
-import * as LocalAuthentication from "expo-local-authentication";
 import { router } from "expo-router";
 import { ArrowLeft } from "lucide-react-native";
 import React, { useEffect, useRef, useState } from "react";
@@ -27,6 +26,11 @@ import { useMotionPolicy } from "../../components/motion/policy";
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { MobileApiError } from "../../core/api/errors";
 import { useOptionalSession } from "../../core/session/SessionProvider";
+import {
+  useOptionalAppLock,
+  type ControlAuthorizationBinding,
+  type ControlAuthorizationProof,
+} from "../../components/system/AppLock";
 import { colors, radius, spacing } from "../../theme";
 import {
   approveTrade,
@@ -135,6 +139,7 @@ export function GuardedTradeApproval({
   onOpenPendingAction,
 }: GuardedTradeApprovalProps) {
   const motionPolicy = useMotionPolicy();
+  const controlAuthorization = useOptionalAppLock();
   const [draft, setDraft] = useState(initialDraft);
   const [receipt, setReceipt] = useState<MobileActionReceipt | null>(null);
   const [error, setError] = useState("");
@@ -146,6 +151,16 @@ export function GuardedTradeApproval({
   const inFlight = useRef(false);
   const idempotencyKey = useRef("");
   const pendingAction = useRef<PendingMobileAction | null>(null);
+  const active = useRef(true);
+  const currentReview = useRef({ draft, tradeId: trade.id, tradeVersion: trade.version });
+  currentReview.current = { draft, tradeId: trade.id, tradeVersion: trade.version };
+
+  useEffect(() => {
+    active.current = true;
+    return () => {
+      active.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     setDraft(initialDraft);
@@ -294,6 +309,37 @@ export function GuardedTradeApproval({
         ["pending", "verifying", "review_required"].includes(receipt.status),
     );
 
+  const approvalBinding = (
+    escalationAcknowledged: boolean,
+  ): ControlAuthorizationBinding => ({
+    actionType: "trade_approve",
+    entityId: currentReview.current.tradeId,
+    reviewKey: JSON.stringify({
+      draft: currentReview.current.draft,
+      escalationAcknowledged,
+      version: currentReview.current.tradeVersion,
+    }),
+  });
+
+  const rejectionBinding = (): ControlAuthorizationBinding => ({
+    actionType: "trade_reject",
+    entityId: currentReview.current.tradeId,
+    reviewKey: JSON.stringify({
+      reason: "Rejected from mobile review",
+      version: currentReview.current.tradeVersion,
+    }),
+  });
+
+  const proofIsCurrent = (
+    proof: ControlAuthorizationProof | null,
+    binding: ControlAuthorizationBinding,
+  ): proof is ControlAuthorizationProof =>
+    Boolean(
+      active.current &&
+      proof &&
+      controlAuthorization?.isControlAuthorizationCurrent(proof, binding),
+    );
+
   const authorize = async (escalationAcknowledged: boolean) => {
     if (disabled || inFlight.current) return;
     void triggerHaptic("warning", motionPolicy.haptics);
@@ -301,12 +347,9 @@ export function GuardedTradeApproval({
     setBusy(true);
     setError("");
     try {
-      const biometric = await LocalAuthentication.authenticateAsync({
-        promptMessage: "Approve prepared CryptoARC trade",
-        cancelLabel: "Cancel",
-        disableDeviceFallback: true,
-      });
-      if (!biometric.success) {
+      const binding = approvalBinding(escalationAcknowledged);
+      const proof = (await controlAuthorization?.authorizeControl(binding)) ?? null;
+      if (!proofIsCurrent(proof, approvalBinding(escalationAcknowledged))) {
         void triggerHaptic("rejection", motionPolicy.haptics);
         idempotencyKey.current = "";
         return;
@@ -315,6 +358,10 @@ export function GuardedTradeApproval({
         idempotencyKey.current = createIdempotencyKey();
       }
       const pending = await pendingActionStore.load();
+      if (!proofIsCurrent(proof, approvalBinding(escalationAcknowledged))) {
+        idempotencyKey.current = "";
+        return;
+      }
       if (
         pending &&
         pending.actionId !== idempotencyKey.current
@@ -333,6 +380,12 @@ export function GuardedTradeApproval({
       );
       pendingAction.current = durableAction;
       await pendingActionStore.save(durableAction);
+      if (!proofIsCurrent(proof, approvalBinding(escalationAcknowledged))) {
+        await pendingActionStore.clear(durableAction.actionId);
+        pendingAction.current = null;
+        idempotencyKey.current = "";
+        return;
+      }
       const next = await submitApproval({
         expectedVersion: trade.version,
         draft,
@@ -372,7 +425,7 @@ export function GuardedTradeApproval({
       }
     } finally {
       inFlight.current = false;
-      setBusy(false);
+      if (active.current) setBusy(false);
     }
   };
 
@@ -392,7 +445,11 @@ export function GuardedTradeApproval({
     setError("");
     const actionId = createIdempotencyKey();
     try {
+      const binding = rejectionBinding();
+      const proof = (await controlAuthorization?.authorizeControl(binding)) ?? null;
+      if (!proofIsCurrent(proof, rejectionBinding())) return;
       const pending = await pendingActionStore.load();
+      if (!proofIsCurrent(proof, rejectionBinding())) return;
       if (pending && pending.actionId !== actionId) {
         setError(
           "Reconcile the pending financial action before starting another.",
@@ -407,6 +464,11 @@ export function GuardedTradeApproval({
       );
       pendingAction.current = durableAction;
       await pendingActionStore.save(durableAction);
+      if (!proofIsCurrent(proof, rejectionBinding())) {
+        await pendingActionStore.clear(durableAction.actionId);
+        pendingAction.current = null;
+        return;
+      }
       const next = await submitRejection({
         expectedVersion: trade.version,
         reason: "Rejected from mobile review",
@@ -442,7 +504,7 @@ export function GuardedTradeApproval({
       }
     } finally {
       inFlight.current = false;
-      setBusy(false);
+      if (active.current) setBusy(false);
     }
   };
 

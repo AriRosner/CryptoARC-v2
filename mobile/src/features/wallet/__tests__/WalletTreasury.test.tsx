@@ -23,6 +23,15 @@ import type {
   MobileWalletTransaction,
 } from "../types";
 
+let mockControlBoundary = {
+  authorizeControl: jest.fn(),
+  isControlAuthorizationCurrent: jest.fn(),
+};
+
+jest.mock("../../../components/system/AppLock", () => ({
+  useOptionalAppLock: () => mockControlBoundary,
+}));
+
 const authenticate = LocalAuthentication.authenticateAsync as jest.Mock;
 
 const wallet: MobileWalletPayload = {
@@ -174,6 +183,18 @@ describe("wallet analytics and guarded treasury", () => {
   beforeEach(() => {
     jest.useFakeTimers();
     authenticate.mockResolvedValue({ success: true });
+    mockControlBoundary = {
+      authorizeControl: jest.fn(async (binding) => {
+        const result = await authenticate({ promptMessage: "central-control" });
+        return result.success
+          ? { binding, authorizedAt: Date.now(), lifecycleGeneration: 1, sessionGeneration: 1 }
+          : null;
+      }),
+      isControlAuthorizationCurrent: jest.fn(
+        (proof, binding) =>
+          JSON.stringify(proof.binding) === JSON.stringify(binding),
+      ),
+    };
   });
 
   afterEach(() => {
@@ -358,6 +379,56 @@ describe("wallet analytics and guarded treasury", () => {
       );
     },
   );
+
+  it("rejects a late authorization after the reviewed treasury preview changes", async () => {
+    let resolveAuthentication!: (result: { success: true }) => void;
+    authenticate.mockReturnValueOnce(
+      new Promise<{ success: true }>((resolve) => {
+        resolveAuthentication = resolve;
+      }),
+    );
+    const execute = jest.fn();
+    const pending = pendingStore();
+    const firstPreview = preview();
+    const view = await render(
+      <WithdrawalScreen
+        preview={firstPreview}
+        online
+        execute={execute}
+        reconcileAction={jest.fn()}
+        pendingActionStore={pending.store}
+      />,
+    );
+
+    let authorizing!: Promise<void>;
+    await act(() => {
+      authorizing = view
+        .getByRole("button", { name: "Authenticate treasury action" })
+        .props.onClick();
+    });
+    await act(async () => Promise.resolve());
+    expect(mockControlBoundary.authorizeControl).toHaveBeenCalledTimes(1);
+    await view.rerender(
+      <WithdrawalScreen
+        preview={{
+          ...firstPreview,
+          preview_id: "preview-replaced",
+          authorization_id: "authorization-replaced",
+          amount: "0.25",
+        }}
+        online
+        execute={execute}
+        reconcileAction={jest.fn()}
+        pendingActionStore={pending.store}
+      />,
+    );
+    resolveAuthentication({ success: true });
+    await act(async () => authorizing);
+
+    expect(view.queryByTestId("hold-to-confirm-1400")).toBeNull();
+    expect(pending.store.save).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
 
   it("persists an ambiguous request and reconciles after restart without resubmitting", async () => {
     const actionId = "restart-withdrawal";

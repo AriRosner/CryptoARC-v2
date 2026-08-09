@@ -23,7 +23,7 @@ import { DiagnosticsSkeleton } from "../../components/skeletons/DiagnosticsSkele
 import { authenticatedRead } from "../../core/api/authenticatedRead";
 import { useConnection } from "../../core/connectivity/ConnectionProvider";
 import { useSession } from "../../core/session/SessionProvider";
-import { loadVerifiedSnapshot } from "../../core/storage/snapshot";
+import { createSnapshotBinding, loadVerifiedSnapshot } from "../../core/storage/snapshot";
 import { colors, radius, spacing } from "../../theme";
 import { exportDiagnostics, fetchDiagnostics } from "./api";
 import { redactDiagnosticPayload } from "./redaction";
@@ -164,7 +164,15 @@ export function DiagnosticsFeatureScreen() {
       const apiReceivedAt = new Date().toISOString();
       let verifiedSnapshot = null;
       try {
-        verifiedSnapshot = await loadVerifiedSnapshot();
+        if (session.token && session.device) {
+          verifiedSnapshot = await loadVerifiedSnapshot(
+            await createSnapshotBinding({
+              apiBaseUrl: session.apiBaseUrl,
+              token: session.token,
+              deviceId: session.device.id,
+            }),
+          );
+        }
       } catch {
         verifiedSnapshot = null;
       }
@@ -194,7 +202,15 @@ export function DiagnosticsFeatureScreen() {
       const apiReceivedAt = new Date().toISOString();
       let verifiedSnapshot = null;
       try {
-        verifiedSnapshot = await loadVerifiedSnapshot();
+        if (session.token && session.device) {
+          verifiedSnapshot = await loadVerifiedSnapshot(
+            await createSnapshotBinding({
+              apiBaseUrl: session.apiBaseUrl,
+              token: session.token,
+              deviceId: session.device.id,
+            }),
+          );
+        }
       } catch {
         verifiedSnapshot = null;
       }

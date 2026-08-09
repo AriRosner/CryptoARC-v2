@@ -18,6 +18,7 @@ import {
   secureSessionStorage,
 } from "./storage";
 import type { SecureSessionRecord, SessionState } from "./types";
+import { clearVerifiedSnapshot } from "../storage/snapshot";
 
 const SESSION_LOAD_FAILED = "Secure session could not be loaded. Pair this device again.";
 const SESSION_SAVE_FAILED = "Secure session could not be saved. The previous session remains active.";
@@ -32,6 +33,14 @@ async function bestEffortUnregister(record: SecureSessionRecord | null): Promise
     });
   } catch {
     // Server-side device expiry/revocation remains authoritative while offline.
+  }
+}
+
+async function bestEffortClearVerifiedSnapshot(): Promise<void> {
+  try {
+    await clearVerifiedSnapshot();
+  } catch {
+    // Binding validation still prevents a stale snapshot from crossing sessions.
   }
 }
 
@@ -172,8 +181,10 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
         if (
           previousRecord &&
           (previousRecord.apiBaseUrl !== record.apiBaseUrl ||
-            previousRecord.token !== record.token)
+            previousRecord.token !== record.token ||
+            previousRecord.device.id !== record.device.id)
         ) {
+          await bestEffortClearVerifiedSnapshot();
           await bestEffortUnregister(previousRecord);
         }
         updateState(() => ({
@@ -223,6 +234,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     }));
     try {
       await bestEffortUnregister(previousRecord);
+      await bestEffortClearVerifiedSnapshot();
       await enqueueMutation(() => secureSessionStorage.clear());
       if (isCurrentGeneration(generation)) {
         updateState(() => ({
@@ -270,6 +282,7 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
     }));
     mobileQueryClient.removeQueries({ queryKey: ["mobile"] });
     try {
+      await bestEffortClearVerifiedSnapshot();
       await enqueueMutation(() => secureSessionStorage.clear());
     } catch {
       if (isCurrentGeneration(generation)) {

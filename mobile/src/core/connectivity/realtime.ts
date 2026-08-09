@@ -32,6 +32,28 @@ function invalidState(
   return { ...state, requiresSnapshot: true, status, reason, ...extra };
 }
 
+function isCurrentCockpitSnapshot(
+  envelope: MobileRealtimeEnvelope,
+  nowMs: number,
+): boolean {
+  if (envelope.event_type !== "cockpit") return false;
+  const artifactType = envelope.payload.artifact_type;
+  const formatVersion = envelope.payload.format_version;
+  const snapshotServerTime = envelope.payload.server_time;
+  if (
+    artifactType !== "cryptoarc_mobile_cockpit" ||
+    formatVersion !== 1 ||
+    typeof snapshotServerTime !== "string"
+  ) {
+    return false;
+  }
+  const snapshotServerTimeMs = Date.parse(snapshotServerTime);
+  return (
+    Number.isFinite(snapshotServerTimeMs) &&
+    Math.abs(nowMs - snapshotServerTimeMs) <= MAX_CLOCK_DRIFT_MS
+  );
+}
+
 export function reduceRealtime(
   state: MobileRealtimeState,
   envelope: MobileRealtimeEnvelope,
@@ -57,8 +79,36 @@ export function reduceRealtime(
       revoked: true,
     });
   }
-  if (state.revoked || state.requiresSnapshot) return state;
+  if (state.revoked) return state;
+  if (state.requiresSnapshot) {
+    if (
+      envelope.sequence >= state.lastSequence &&
+      isCurrentCockpitSnapshot(envelope, nowMs)
+    ) {
+      return {
+        ...state,
+        clockDriftMs,
+        lastSequence: envelope.sequence,
+        lastServerTime: envelope.server_time,
+        reason: "",
+        requiresSnapshot: false,
+        status: "connected",
+      };
+    }
+    return state;
+  }
   if (state.lastSequence > 0 && envelope.sequence > state.lastSequence + 1) {
+    if (isCurrentCockpitSnapshot(envelope, nowMs)) {
+      return {
+        ...state,
+        clockDriftMs,
+        lastSequence: envelope.sequence,
+        lastServerTime: envelope.server_time,
+        reason: "",
+        requiresSnapshot: false,
+        status: "connected",
+      };
+    }
     return invalidState(state, "stale", "sequence_gap", {
       clockDriftMs,
       lastServerTime: envelope.server_time,

@@ -27,6 +27,15 @@ import {
 } from "../pendingAction";
 import type { MobileActionReceipt, MobileTradeDetail, MobileTradeDraft } from "../types";
 
+let mockControlBoundary = {
+  authorizeControl: jest.fn(),
+  isControlAuthorizationCurrent: jest.fn(),
+};
+
+jest.mock("../../../components/system/AppLock", () => ({
+  useOptionalAppLock: () => mockControlBoundary,
+}));
+
 jest.mock("../queries", () => ({
   useTradeQuery: jest.fn(),
   useTradesQuery: jest.fn(),
@@ -179,6 +188,18 @@ describe("guarded mobile trade flow", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     authenticate.mockResolvedValue({ success: true });
+    mockControlBoundary = {
+      authorizeControl: jest.fn(async (binding) => {
+        const result = await authenticate({ promptMessage: "central-control" });
+        return result.success
+          ? { binding, authorizedAt: Date.now(), lifecycleGeneration: 1, sessionGeneration: 1 }
+          : null;
+      }),
+      isControlAuthorizationCurrent: jest.fn(
+        (proof, binding) =>
+          JSON.stringify(proof.binding) === JSON.stringify(binding),
+      ),
+    };
   });
 
   const queryResult = <T,>(input: {
@@ -311,6 +332,87 @@ describe("guarded mobile trade flow", () => {
       expect.objectContaining({ idempotencyKey: "routine-key" }),
     );
     expect(await screen.findByText("No automatic resubmission")).toBeTruthy();
+  });
+
+  it("does not persist or dispatch when a centralized authorization resolves after re-pair", async () => {
+    let resolveAuthorization!: (proof: Record<string, unknown>) => void;
+    const authorization = new Promise<Record<string, unknown>>((resolve) => {
+      resolveAuthorization = resolve;
+    });
+    let current = true;
+    mockControlBoundary.authorizeControl.mockReturnValueOnce(authorization);
+    mockControlBoundary.isControlAuthorizationCurrent.mockImplementation(() => current);
+    const store = createPendingStore();
+    const submit = jest.fn(async () => verifyingReceipt());
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        pendingActionStore={store}
+        pendingOwner={ownerA}
+      />,
+    );
+
+    let authorizing!: Promise<void>;
+    await act(() => {
+      authorizing = screen
+        .getByRole("button", { name: "Approve trade" })
+        .props.onClick();
+    });
+    await act(async () => Promise.resolve());
+    expect(mockControlBoundary.authorizeControl).toHaveBeenCalledTimes(1);
+    current = false;
+    resolveAuthorization({
+      binding: mockControlBoundary.authorizeControl.mock.calls[0][0],
+      authorizedAt: Date.now(),
+      lifecycleGeneration: 1,
+      sessionGeneration: 1,
+    });
+    await act(async () => authorizing);
+
+    expect(store.save).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("does not persist or dispatch when authorization finishes after unmount", async () => {
+    let resolveAuthorization!: (proof: Record<string, unknown>) => void;
+    mockControlBoundary.authorizeControl.mockReturnValueOnce(
+      new Promise<Record<string, unknown>>((resolve) => {
+        resolveAuthorization = resolve;
+      }),
+    );
+    const store = createPendingStore();
+    const submit = jest.fn(async () => verifyingReceipt());
+    const screen = await render(
+      <GuardedTradeApproval
+        trade={routineTrade}
+        initialDraft={validDraft}
+        online
+        submitApproval={submit}
+        pendingActionStore={store}
+      />,
+    );
+    let authorizing!: Promise<void>;
+    await act(() => {
+      authorizing = screen
+        .getByRole("button", { name: "Approve trade" })
+        .props.onClick();
+    });
+    await act(async () => Promise.resolve());
+    expect(mockControlBoundary.authorizeControl).toHaveBeenCalledTimes(1);
+    await screen.unmount();
+    resolveAuthorization({
+      binding: mockControlBoundary.authorizeControl.mock.calls[0][0],
+      authorizedAt: Date.now(),
+      lifecycleGeneration: 1,
+      sessionGeneration: 1,
+    });
+    await act(async () => authorizing);
+
+    expect(store.save).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
   });
 
   it("fires warning haptics without awaiting or blocking the operator action", async () => {

@@ -1,6 +1,6 @@
 import { router, useLocalSearchParams } from "expo-router";
 import { Activity, BellRing, Link2, ServerCog, Settings, Smartphone, Stethoscope } from "lucide-react-native";
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Alert, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -14,6 +14,8 @@ import { colors, spacing } from "../../theme";
 import type { MobileCockpitPayload } from "../../types";
 import { DeviceScreen } from "./DeviceScreen";
 import { SettingsScreen } from "./SettingsScreen";
+
+const EMERGENCY_ENABLE_REASON = "Emergency mobile kill-switch enable";
 
 function MoreMenu() {
   return (
@@ -43,6 +45,12 @@ function SystemScreen() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [reason, setReason] = useState("");
+  const activeRef = useRef(true);
+  const reviewRef = useRef({ enabled: false, reason: "" });
+
+  useEffect(() => () => {
+    activeRef.current = false;
+  }, []);
 
   const refresh = useCallback(async () => {
     if (!session.token || !session.apiBaseUrl || !connection.online) return;
@@ -64,34 +72,59 @@ function SystemScreen() {
     void refresh();
   }, [refresh]);
 
+  const killEnabled = Boolean(cockpit?.live.kill_switch_enabled);
+  const sanitizedReason = sanitizeReason(reason);
+  reviewRef.current = { enabled: killEnabled, reason: sanitizedReason };
+
   const changeKillSwitch = async (enabled: boolean) => {
     if (!session.token || !session.apiBaseUrl || !connection.online || loading) return;
-    if (enabled && !reason.trim()) {
-      Alert.alert("Reason required", "Enter a short reason before enabling the kill switch.");
+    const auditReason = enabled
+      ? sanitizedReason || EMERGENCY_ENABLE_REASON
+      : sanitizedReason;
+    if (!enabled && !auditReason) {
+      Alert.alert("Reason required", "Enter a short reason before clearing the kill switch.");
       return;
     }
     const generation = session.generation;
-    if (!(await appLock.unlock("financial_action"))) return;
-    if (!session.isCurrentGeneration(generation)) return;
+    const binding = {
+      actionType: enabled ? "kill_switch.enable" : "kill_switch.clear",
+      entityId: "system-kill-switch",
+      reviewKey: JSON.stringify([killEnabled, auditReason]),
+    };
+    const proof = await appLock.authorizeControl(binding);
+    const currentReason = enabled
+      ? reviewRef.current.reason || EMERGENCY_ENABLE_REASON
+      : reviewRef.current.reason;
+    if (
+      !proof ||
+      !activeRef.current ||
+      !session.isCurrentGeneration(generation) ||
+      reviewRef.current.enabled !== killEnabled ||
+      currentReason !== auditReason ||
+      !appLock.isControlAuthorizationCurrent(proof, binding)
+    ) return;
     setLoading(true);
     try {
+      if (
+        !activeRef.current ||
+        !session.isCurrentGeneration(generation) ||
+        !appLock.isControlAuthorizationCurrent(proof, binding)
+      ) return;
       const payload = await setMobileKillSwitch(
         session.apiBaseUrl,
         session.token,
         enabled,
-        sanitizeReason(reason),
+        auditReason,
       );
-      if (!session.isCurrentGeneration(generation)) return;
+      if (!activeRef.current || !session.isCurrentGeneration(generation)) return;
       setCockpit(payload);
       setError("");
     } catch {
-      if (session.isCurrentGeneration(generation)) setError("Kill-switch update failed.");
+      if (activeRef.current && session.isCurrentGeneration(generation)) setError("Kill-switch update failed.");
     } finally {
-      if (session.isCurrentGeneration(generation)) setLoading(false);
+      if (activeRef.current && session.isCurrentGeneration(generation)) setLoading(false);
     }
   };
-
-  const killEnabled = Boolean(cockpit?.live.kill_switch_enabled);
   return (
     <SafeAreaView style={styles.safeArea}>
       <ScrollView contentContainerStyle={styles.content}>

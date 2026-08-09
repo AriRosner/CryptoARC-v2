@@ -66,6 +66,27 @@ function FinancialActionProbe() {
   );
 }
 
+function ControlAuthorizationProbe({
+  onResult,
+}: {
+  onResult(value: Awaited<ReturnType<ReturnType<typeof useAppLock>["authorizeControl"]>>): void;
+}) {
+  const appLock = useAppLock();
+  return (
+    <Text
+      accessibilityRole="button"
+      onPress={() => {
+        void appLock.authorizeControl({
+          actionType: "trade.approve",
+          entityId: "trade-1",
+          reviewKey: "version-4",
+        }).then(onResult);
+      }}>
+      Authorize bound control
+    </Text>
+  );
+}
+
 describe("AppLock and persisted settings", () => {
   let appStateListener: ((state: "active" | "background" | "inactive") => void) | undefined;
   let now = 1_000;
@@ -241,6 +262,33 @@ describe("AppLock and persisted settings", () => {
 
     expect(screen.getByText("Unlock CryptoARC")).toBeTruthy();
     expect(screen.queryByText("Total portfolio")).toBeNull();
+  });
+
+  it("rejects a centralized control authorization that resolves after a lifecycle change", async () => {
+    let resolveAuthentication!: (success: boolean) => void;
+    const onResult = jest.fn();
+    const screen = await render(
+      <AppLock initialAppState="active" now={() => now}>
+        <ControlAuthorizationProbe onResult={onResult} />
+      </AppLock>,
+    );
+    await fireEvent.press(screen.getByText("Unlock CryptoARC"));
+    authenticateControl.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveAuthentication = resolve;
+      }),
+    );
+
+    await fireEvent.press(screen.getByText("Authorize bound control"));
+    await act(async () => {
+      appStateListener?.("background");
+      appStateListener?.("active");
+      resolveAuthentication(true);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(onResult).toHaveBeenCalledWith(null));
+    expect(lockControls).toHaveBeenCalled();
   });
 
   it("blocks settings, navigation, device, system, and financial interactions while view-locked", async () => {

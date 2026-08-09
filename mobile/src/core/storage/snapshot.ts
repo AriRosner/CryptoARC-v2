@@ -93,10 +93,32 @@ export type SnapshotReadModel =
 
 export interface VerifiedSnapshot {
   schemaVersion: 1;
+  ownerId: string;
+  deviceId: string;
+  sessionId: string;
   verifiedAt: string;
   serverTime: string;
   sequence: number;
   payload: SnapshotReadModel;
+}
+
+export type SnapshotBinding = Pick<VerifiedSnapshot, "ownerId" | "deviceId" | "sessionId">;
+
+export async function createSnapshotBinding(input: {
+  apiBaseUrl: string;
+  token: string;
+  deviceId: string;
+}): Promise<SnapshotBinding> {
+  const owner = input.apiBaseUrl.trim().replace(/\/+$/, "").toLowerCase();
+  if (!owner || !input.token || !input.deviceId) {
+    throw new Error("Authenticated snapshot binding is unavailable");
+  }
+  const ownerId = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, owner);
+  const sessionId = await Crypto.digestStringAsync(
+    Crypto.CryptoDigestAlgorithm.SHA256,
+    `${owner}\u0000${input.deviceId}\u0000${input.token}`,
+  );
+  return { ownerId, deviceId: input.deviceId, sessionId };
 }
 
 const SNAPSHOT_KEY_STORAGE_KEY = "cryptoarc.mobile.snapshot.sqlcipher-key.v1";
@@ -310,8 +332,22 @@ function assertReadModel(value: unknown): asserts value is SnapshotReadModel {
 }
 
 function assertSnapshot(snapshot: VerifiedSnapshot): void {
+  const metadata = plainObject(snapshot);
+  exactKeys(metadata, [
+    "schemaVersion",
+    "ownerId",
+    "deviceId",
+    "sessionId",
+    "verifiedAt",
+    "serverTime",
+    "sequence",
+    "payload",
+  ]);
   if (
     snapshot.schemaVersion !== 1 ||
+    !/^[a-f0-9]{64}$/.test(snapshot.ownerId) ||
+    !snapshot.deviceId ||
+    !/^[a-f0-9]{64}$/.test(snapshot.sessionId) ||
     !Number.isFinite(Date.parse(snapshot.verifiedAt)) ||
     !Number.isFinite(Date.parse(snapshot.serverTime)) ||
     !Number.isInteger(snapshot.sequence) ||
@@ -386,24 +422,39 @@ export function createSnapshotStorage(dependencies: SnapshotDependencies = {
     if (persisted?.value !== serialized) throw new Error("Verified snapshot persistence failed");
   };
 
-  const loadVerifiedSnapshot = async (): Promise<VerifiedSnapshot | null> => {
+  const clearVerifiedSnapshot = async (): Promise<void> => {
+    const database = await getDatabase();
+    await database.runAsync("DELETE FROM verified_snapshot WHERE id = 1");
+  };
+
+  const loadVerifiedSnapshot = async (binding: SnapshotBinding): Promise<VerifiedSnapshot | null> => {
     const database = await getDatabase();
     const row = await database.getFirstAsync("SELECT value FROM verified_snapshot WHERE id = 1");
     if (row === null) return null;
     let snapshot: VerifiedSnapshot;
     try {
       snapshot = JSON.parse(row.value) as VerifiedSnapshot;
+      assertSnapshot(snapshot);
     } catch {
-      throw new Error("Verified snapshot is invalid");
+      await database.runAsync("DELETE FROM verified_snapshot WHERE id = 1");
+      return null;
     }
-    assertSnapshot(snapshot);
+    if (
+      snapshot.ownerId !== binding.ownerId ||
+      snapshot.deviceId !== binding.deviceId ||
+      snapshot.sessionId !== binding.sessionId
+    ) {
+      await database.runAsync("DELETE FROM verified_snapshot WHERE id = 1");
+      return null;
+    }
     return snapshot;
   };
 
-  return { loadVerifiedSnapshot, saveVerifiedSnapshot };
+  return { clearVerifiedSnapshot, loadVerifiedSnapshot, saveVerifiedSnapshot };
 }
 
 const snapshotStorage = createSnapshotStorage();
 
 export const loadVerifiedSnapshot = snapshotStorage.loadVerifiedSnapshot;
 export const saveVerifiedSnapshot = snapshotStorage.saveVerifiedSnapshot;
+export const clearVerifiedSnapshot = snapshotStorage.clearVerifiedSnapshot;

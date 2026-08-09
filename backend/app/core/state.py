@@ -292,43 +292,29 @@ class BotState:
         }
 
     def claim_mobile_pairing(self, pairing_id: str, code: str, device_name: str, platform: str = "android") -> dict[str, object]:
-        pairing = self.storage.load_mobile_pairing_request(pairing_id.strip())
         now = utc_now()
-        if not pairing:
-            raise ValueError("Invalid or expired mobile pairing code")
-        if str(pairing.get("claimed_at") or ""):
-            raise ValueError("Mobile pairing code has already been claimed")
-        if self._parse_mobile_time(pairing.get("expires_at")) <= now:
-            raise ValueError("Mobile pairing code has expired")
-        failed_attempts = int(pairing.get("failed_attempts") or 0)
-        max_failed_attempts = int(pairing.get("max_failed_attempts") or self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS)
-        if failed_attempts >= max_failed_attempts:
-            raise ValueError("Mobile pairing code has too many failed attempts")
-        if not secrets.compare_digest(self._hash_mobile_secret(code.strip()), str(pairing.get("code_hash") or "")):
-            pairing["failed_attempts"] = failed_attempts + 1
-            self.storage.save_mobile_pairing_request(pairing)
-            raise ValueError("Invalid or expired mobile pairing code")
-
         token = secrets.token_urlsafe(32)
         device_id = new_id("mdev")
         token_expires_at = now + timedelta(days=self.MOBILE_TOKEN_TTL_DAYS)
-        scopes = self._normalize_mobile_scopes(list(pairing.get("scopes") or []))
         device: dict[str, object] = {
             "id": device_id,
             "name": self._clean_mobile_label(device_name, "Mobile device", 80),
             "platform": self._clean_mobile_label(platform, "unknown", 40).lower(),
-            "scopes": scopes,
             "created_at": now.isoformat(),
             "last_seen_at": now.isoformat(),
             "expires_at": token_expires_at.isoformat(),
             "revoked_at": "",
             "token_hash": self._hash_mobile_secret(token),
-            "paired_from_pairing_id": pairing["id"],
+            "paired_from_pairing_id": pairing_id.strip(),
         }
-        pairing["claimed_at"] = now.isoformat()
-        pairing["claimed_device_id"] = device_id
-        self.storage.save_mobile_device(device)
-        self.storage.save_mobile_pairing_request(pairing)
+        _pairing, device = self.storage.claim_mobile_pairing_request(
+            pairing_id=pairing_id.strip(),
+            presented_code_hash=self._hash_mobile_secret(code.strip()),
+            device=device,
+            claimed_at=now.isoformat(),
+            default_max_failed_attempts=self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS,
+        )
+        scopes = self._normalize_mobile_scopes(list(device.get("scopes") or []))
         self.add_event(
             "warning",
             f"Mobile device paired: {device['name']}",

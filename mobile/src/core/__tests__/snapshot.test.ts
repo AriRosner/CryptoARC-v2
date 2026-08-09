@@ -19,9 +19,9 @@ function snapshotFixture() {
       calls.push("get");
       return row;
     }),
-    runAsync: jest.fn(async (_sql: string, value: string) => {
+    runAsync: jest.fn(async (sql: string, value?: string) => {
       calls.push("run");
-      row = { value };
+      row = sql.startsWith("DELETE") ? null : { value: value! };
       return { changes: 1, lastInsertRowId: 1 };
     }),
   };
@@ -46,11 +46,28 @@ function snapshotFixture() {
     }),
   };
 
-  return { calls, crypto, database, secureStore, secureValues, sqlite };
+  return {
+    calls,
+    crypto,
+    database,
+    secureStore,
+    secureValues,
+    setRow(value: string | null) {
+      row = value === null ? null : { value };
+    },
+    sqlite,
+  };
 }
+
+const snapshotBinding = {
+  ownerId: "a".repeat(64),
+  deviceId: "device-a",
+  sessionId: "b".repeat(64),
+};
 
 const verifiedSnapshot: VerifiedSnapshot = {
   schemaVersion: 1,
+  ...snapshotBinding,
   verifiedAt: "2026-07-28T12:00:00.000Z",
   serverTime: "2026-07-28T12:00:00.000Z",
   sequence: 42,
@@ -74,7 +91,7 @@ describe("SQLCipher verified snapshots", () => {
     });
 
     await storage.saveVerifiedSnapshot(verifiedSnapshot);
-    await storage.loadVerifiedSnapshot();
+    await storage.loadVerifiedSnapshot(snapshotBinding);
 
     expect(fixture.crypto.getRandomBytesAsync).toHaveBeenCalledTimes(1);
     const storedKeys = [...fixture.secureValues.values()];
@@ -100,7 +117,7 @@ describe("SQLCipher verified snapshots", () => {
 
     await storage.saveVerifiedSnapshot(verifiedSnapshot);
 
-    await expect(storage.loadVerifiedSnapshot()).resolves.toEqual(verifiedSnapshot);
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).resolves.toEqual(verifiedSnapshot);
   });
 
   it("rejects secret-bearing or non-read-model payloads", async () => {
@@ -122,6 +139,13 @@ describe("SQLCipher verified snapshots", () => {
       }),
     ).rejects.toThrow("Snapshot read model is invalid");
     expect(fixture.database.runAsync).not.toHaveBeenCalled();
+
+    await expect(
+      storage.saveVerifiedSnapshot({
+        ...verifiedSnapshot,
+        token: "must-not-persist",
+      } as VerifiedSnapshot),
+    ).rejects.toThrow("Snapshot read model is invalid");
   });
 
   it.each([
@@ -263,8 +287,38 @@ describe("SQLCipher verified snapshots", () => {
       sqlite: fixture.sqlite,
     });
 
-    await expect(storage.loadVerifiedSnapshot()).rejects.toThrow("SQLCipher key is invalid");
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).rejects.toThrow("SQLCipher key is invalid");
     expect(fixture.crypto.getRandomBytesAsync).not.toHaveBeenCalled();
     expect(fixture.sqlite.openDatabaseAsync).not.toHaveBeenCalled();
+  });
+
+  it("invalidates owner, device, or session mismatches", async () => {
+    const fixture = snapshotFixture();
+    const storage = createSnapshotStorage({
+      crypto: fixture.crypto,
+      secureStore: fixture.secureStore,
+      sqlite: fixture.sqlite,
+    });
+    await storage.saveVerifiedSnapshot(verifiedSnapshot);
+
+    await expect(
+      storage.loadVerifiedSnapshot({ ...snapshotBinding, sessionId: "c".repeat(64) }),
+    ).resolves.toBeNull();
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).resolves.toBeNull();
+  });
+
+  it("invalidates corruption and schema mismatch", async () => {
+    const fixture = snapshotFixture();
+    const storage = createSnapshotStorage({
+      crypto: fixture.crypto,
+      secureStore: fixture.secureStore,
+      sqlite: fixture.sqlite,
+    });
+    fixture.setRow("not-json");
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).resolves.toBeNull();
+
+    fixture.setRow(JSON.stringify({ ...verifiedSnapshot, schemaVersion: 2 }));
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).resolves.toBeNull();
+    await expect(storage.loadVerifiedSnapshot(snapshotBinding)).resolves.toBeNull();
   });
 });

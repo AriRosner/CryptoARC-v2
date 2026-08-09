@@ -94,6 +94,7 @@ class MobileCommandCenterService:
         broadcast_snapshot: Callable[[], Awaitable[None]],
         broadcast_mobile_cockpit: Callable[[], Awaitable[None]],
         stop_runtime_tasks: Callable[[], Awaitable[dict[str, object]]],
+        invalidate_mobile_connections: Callable[[str, str], Awaitable[None]] | None = None,
         push_sender: Callable[
             [str, dict[str, object]], dict[str, object] | bool
         ]
@@ -105,6 +106,7 @@ class MobileCommandCenterService:
         self.require_dashboard_auth = require_dashboard_auth
         self._broadcast_snapshot = broadcast_snapshot
         self._broadcast_mobile_cockpit = broadcast_mobile_cockpit
+        self._invalidate_mobile_connections = invalidate_mobile_connections
         self._stop_runtime_tasks = stop_runtime_tasks
         self._monotonic = time.monotonic
         self._ws_ticket_lock = threading.Lock()
@@ -178,6 +180,8 @@ class MobileCommandCenterService:
 
     async def revoke_device(self, device_id: str) -> dict[str, object]:
         device = self.state.revoke_mobile_device(device_id)
+        if self._invalidate_mobile_connections is not None:
+            await self._invalidate_mobile_connections(device_id, "token_revoked")
         await self._broadcast_mobile_cockpit()
         return {"revoked": True, "device": device}
 
@@ -1706,6 +1710,29 @@ class MobileCommandCenterService:
                 return None
             return device
         return None
+
+    def websocket_device_status(
+        self,
+        device_id: str,
+    ) -> tuple[dict[str, object] | None, str]:
+        for device in self.state.mobile_devices(include_revoked=True):
+            if str(device.get("id") or "") != device_id:
+                continue
+            if str(device.get("revoked_at") or ""):
+                return None, "token_revoked"
+            if MobileScope.MONITOR not in [str(scope) for scope in device.get("scopes") or []]:
+                return None, "device_scope_changed"
+            expires_at = str(device.get("expires_at") or "")
+            try:
+                parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None, "token_expired"
+            if parsed_expiry.tzinfo is None:
+                parsed_expiry = parsed_expiry.replace(tzinfo=timezone.utc)
+            if parsed_expiry <= datetime.now(timezone.utc):
+                return None, "token_expired"
+            return device, ""
+        return None, "device_removed"
 
     def feed(
         self,

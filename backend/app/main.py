@@ -21,7 +21,7 @@ from app.core.alerts import AlertRouter
 from app.core.models import SourceStatus, utc_now
 from app.core.sources import LaunchEvent, SolanaLogsSource, make_source
 from app.core.state import BotState
-from app.mobile.contracts import MobileScope
+from app.mobile.contracts import MobileRealtimeEnvelope, MobileScope
 from app.mobile.router import create_mobile_router
 from app.mobile.service import MobileCommandCenterService
 
@@ -377,7 +377,8 @@ state = BotState(
 )
 state.MOBILE_TOKEN_TTL_DAYS = max(1, min(365, int(config.mobile_token_ttl_days or state.MOBILE_TOKEN_TTL_DAYS)))
 clients: set[WebSocket] = set()
-mobile_clients: dict[WebSocket, dict[str, object]] = {}
+mobile_clients: dict[WebSocket, str] = {}
+mobile_realtime_sequence = 0
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
@@ -421,19 +422,117 @@ async def broadcast_snapshot(force: bool = False) -> None:
         clients.discard(websocket)
 
 
+def _next_mobile_realtime_sequence() -> int:
+    global mobile_realtime_sequence
+    mobile_realtime_sequence += 1
+    return mobile_realtime_sequence
+
+
+def _current_mobile_realtime_sequence() -> int:
+    if mobile_realtime_sequence < 1:
+        return _next_mobile_realtime_sequence()
+    return mobile_realtime_sequence
+
+
+def _mobile_realtime_envelope(
+    *,
+    event_type: Literal["cockpit", "invalidate"],
+    sequence: int,
+    payload: dict[str, object],
+) -> dict[str, object]:
+    return MobileRealtimeEnvelope(
+        event_type=event_type,
+        server_time=utc_now(),
+        sequence=sequence,
+        payload=payload,
+    ).model_dump(mode="json")
+
+
+async def _send_mobile_client_update(
+    websocket: WebSocket,
+    device_id: str,
+    sequence: int,
+    *,
+    forced_invalidation_reason: str = "",
+) -> bool:
+    device, invalidation_reason = mobile_service.websocket_device_status(device_id)
+    reason = forced_invalidation_reason or invalidation_reason
+    if not device or reason:
+        try:
+            await websocket.send_json(
+                _mobile_realtime_envelope(
+                    event_type="invalidate",
+                    sequence=sequence,
+                    payload={"reason": reason or "device_invalidated"},
+                )
+            )
+        finally:
+            await websocket.close(code=4003)
+        return False
+    await websocket.send_json(
+        _mobile_realtime_envelope(
+            event_type="cockpit",
+            sequence=sequence,
+            payload=state.mobile_cockpit(
+                config.live_trading_enabled,
+                local_auth_enabled=auth.enabled,
+                device=device,
+            ),
+        )
+    )
+    return True
+
+
+async def invalidate_mobile_device_connections(device_id: str, reason: str) -> None:
+    if not mobile_clients:
+        return
+    sequence = _next_mobile_realtime_sequence()
+    disconnected: list[WebSocket] = []
+    for websocket, connected_device_id in list(mobile_clients.items()):
+        try:
+            keep = await _send_mobile_client_update(
+                websocket,
+                connected_device_id,
+                sequence,
+                forced_invalidation_reason=reason if connected_device_id == device_id else "",
+            )
+            if not keep:
+                disconnected.append(websocket)
+        except Exception:
+            disconnected.append(websocket)
+    for websocket in disconnected:
+        mobile_clients.pop(websocket, None)
+
+
+async def invalidate_all_mobile_connections(reason: str) -> None:
+    if not mobile_clients:
+        return
+    sequence = _next_mobile_realtime_sequence()
+    for websocket in list(mobile_clients):
+        try:
+            await websocket.send_json(
+                _mobile_realtime_envelope(
+                    event_type="invalidate",
+                    sequence=sequence,
+                    payload={"reason": reason},
+                )
+            )
+            await websocket.close(code=4003)
+        except Exception:
+            pass
+        finally:
+            mobile_clients.pop(websocket, None)
+
+
 async def broadcast_mobile_cockpit() -> None:
     if not mobile_clients:
         return
+    sequence = _next_mobile_realtime_sequence()
     disconnected: list[WebSocket] = []
-    for websocket, device in list(mobile_clients.items()):
+    for websocket, device_id in list(mobile_clients.items()):
         try:
-            await websocket.send_json(
-                state.mobile_cockpit(
-                    config.live_trading_enabled,
-                    local_auth_enabled=auth.enabled,
-                    device=device,
-                )
-            )
+            if not await _send_mobile_client_update(websocket, device_id, sequence):
+                disconnected.append(websocket)
         except Exception:
             disconnected.append(websocket)
 
@@ -855,6 +954,7 @@ mobile_service = MobileCommandCenterService(
     require_dashboard_auth=require_auth,
     broadcast_snapshot=broadcast_snapshot,
     broadcast_mobile_cockpit=broadcast_mobile_cockpit,
+    invalidate_mobile_connections=invalidate_mobile_device_connections,
     stop_runtime_tasks=stop_runtime_tasks,
 )
 app.include_router(create_mobile_router(mobile_service, require_mobile_scope))
@@ -1768,6 +1868,7 @@ async def confirm_restore_artifact(payload: RestoreArtifactPayload) -> dict:
         result = state.confirm_restore_artifact(payload.artifact)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await invalidate_all_mobile_connections("credentials_replaced")
     await broadcast_snapshot()
     return result
 
@@ -1830,15 +1931,16 @@ async def mobile_websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    mobile_clients[websocket] = device
+    device_id = str(device.get("id") or "")
+    mobile_clients[websocket] = device_id
     try:
-        await websocket.send_json(
-            state.mobile_cockpit(
-                config.live_trading_enabled,
-                local_auth_enabled=auth.enabled,
-                device=device,
-            )
-        )
+        if not await _send_mobile_client_update(
+            websocket,
+            device_id,
+            _current_mobile_realtime_sequence(),
+        ):
+            mobile_clients.pop(websocket, None)
+            return
     except WebSocketDisconnect:
         mobile_clients.pop(websocket, None)
         return

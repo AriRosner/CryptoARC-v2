@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import os
 import shutil
@@ -890,6 +891,94 @@ class Storage:
                 (pairing_id,),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def claim_mobile_pairing_request(
+        self,
+        *,
+        pairing_id: str,
+        presented_code_hash: str,
+        device: dict[str, Any],
+        claimed_at: str,
+        default_max_failed_attempts: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Validate and consume a one-time pairing request in one write transaction."""
+        rejection = ""
+        claimed_pairing: dict[str, Any] | None = None
+        claimed_device: dict[str, Any] | None = None
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payload, expires_at, claimed_at FROM mobile_pairing_requests WHERE id = ?",
+                (pairing_id,),
+            ).fetchone()
+            if not row:
+                rejection = "Invalid or expired mobile pairing code"
+            else:
+                pairing = json.loads(row["payload"])
+                existing_claimed_at = str(row["claimed_at"] or pairing.get("claimed_at") or "")
+                try:
+                    expires_at = datetime.fromisoformat(
+                        str(row["expires_at"] or pairing.get("expires_at") or "").replace("Z", "+00:00")
+                    )
+                    now = datetime.fromisoformat(claimed_at.replace("Z", "+00:00"))
+                except ValueError:
+                    expires_at = datetime.min.replace(tzinfo=timezone.utc)
+                    now = datetime.max.replace(tzinfo=timezone.utc)
+                failed_attempts = int(pairing.get("failed_attempts") or 0)
+                max_failed_attempts = int(
+                    pairing.get("max_failed_attempts") or default_max_failed_attempts
+                )
+                if existing_claimed_at:
+                    rejection = "Mobile pairing code has already been claimed"
+                elif expires_at <= now:
+                    rejection = "Mobile pairing code has expired"
+                elif failed_attempts >= max_failed_attempts:
+                    rejection = "Mobile pairing code has too many failed attempts"
+                elif not hmac.compare_digest(
+                    presented_code_hash,
+                    str(pairing.get("code_hash") or ""),
+                ):
+                    pairing["failed_attempts"] = failed_attempts + 1
+                    connection.execute(
+                        "UPDATE mobile_pairing_requests SET payload = ? WHERE id = ?",
+                        (json.dumps(pairing), pairing_id),
+                    )
+                    rejection = "Invalid or expired mobile pairing code"
+                else:
+                    claimed_device = dict(device)
+                    claimed_device["scopes"] = list(pairing.get("scopes") or [])
+                    pairing["claimed_at"] = claimed_at
+                    pairing["claimed_device_id"] = str(claimed_device["id"])
+                    cursor = connection.execute(
+                        """
+                        UPDATE mobile_pairing_requests
+                        SET payload = ?, claimed_at = ?
+                        WHERE id = ? AND (claimed_at IS NULL OR claimed_at = '')
+                        """,
+                        (json.dumps(pairing), claimed_at, pairing_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError("Mobile pairing claim lost its conditional update")
+                    connection.execute(
+                        """
+                        INSERT INTO mobile_devices (id, payload, created_at, last_seen_at, revoked_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(claimed_device["id"]),
+                            json.dumps(claimed_device),
+                            str(claimed_device.get("created_at") or claimed_at),
+                            str(claimed_device.get("last_seen_at") or ""),
+                            str(claimed_device.get("revoked_at") or ""),
+                        ),
+                    )
+                    claimed_pairing = pairing
+
+        if rejection:
+            raise ValueError(rejection)
+        if claimed_pairing is None or claimed_device is None:
+            raise RuntimeError("Mobile pairing claim did not produce a device")
+        return claimed_pairing, claimed_device
 
     def load_mobile_pairing_requests(self, include_claimed: bool = False, limit: int = 50) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(500, int(limit or 50)))

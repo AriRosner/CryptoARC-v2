@@ -24,6 +24,11 @@ import { fetchPositionDetail } from "../../features/positions/api";
 import { PositionDetailScreen } from "../../features/positions/PositionDetailScreen";
 import type { PositionDetail } from "../../features/positions/types";
 import type { MobileDevice } from "../../types";
+import {
+  clearVerifiedSnapshot,
+  loadVerifiedSnapshot,
+  saveVerifiedSnapshot,
+} from "../storage/snapshot";
 
 const mockRouterPush = jest.fn();
 
@@ -39,6 +44,17 @@ jest.mock("../../features/portfolio/api", () => ({
 
 jest.mock("../../features/positions/api", () => ({
   fetchPositionDetail: jest.fn(),
+}));
+
+jest.mock("../storage/snapshot", () => ({
+  clearVerifiedSnapshot: jest.fn(async () => undefined),
+  createSnapshotBinding: jest.fn(async ({ deviceId }: { deviceId: string }) => ({
+    ownerId: "a".repeat(64),
+    deviceId,
+    sessionId: "b".repeat(64),
+  })),
+  loadVerifiedSnapshot: jest.fn(async () => null),
+  saveVerifiedSnapshot: jest.fn(async () => undefined),
 }));
 
 jest.mock("victory-native", () => {
@@ -293,6 +309,7 @@ describe("authenticated mobile read lifecycle", () => {
     secureValues.set(LEGACY_API_BASE_KEY, "https://device-a.test");
     secureValues.set(LEGACY_TOKEN_KEY, "token-a");
     secureValues.set(LEGACY_DEVICE_KEY, JSON.stringify(deviceA));
+    jest.mocked(loadVerifiedSnapshot).mockResolvedValue(null);
     jest.mocked(SecureStore.getItemAsync).mockImplementation(
       async (key) => secureValues.get(key) ?? null,
     );
@@ -441,7 +458,7 @@ describe("authenticated mobile read lifecycle", () => {
       </TestStack>,
     );
     await waitFor(() => expect(session?.token).toBe("token-a"));
-    expect(await view.findByText("AAA")).toBeTruthy();
+    expect((await view.findAllByText("AAA")).length).toBeGreaterThan(0);
 
     await act(async () => {
       await mobileQueryClient.invalidateQueries({
@@ -469,5 +486,92 @@ describe("authenticated mobile read lifecycle", () => {
 
     expect(operation).not.toHaveBeenCalled();
     expect(revokeSession).not.toHaveBeenCalled();
+  });
+
+  it("persists a verified production portfolio read after authenticated success", async () => {
+    fetchPortfolioMock.mockResolvedValue(portfolioPayload("AAA", 0.42));
+    let session!: SessionContextValue;
+    const view = await render(
+      <TestStack onSession={(value) => (session = value)}>
+        <PortfolioScreen />
+      </TestStack>,
+    );
+
+    expect((await view.findAllByText("AAA")).length).toBeGreaterThan(0);
+    await waitFor(() => expect(saveVerifiedSnapshot).toHaveBeenCalledTimes(1));
+    expect(jest.mocked(saveVerifiedSnapshot).mock.calls[0][0]).toMatchObject({
+      schemaVersion: 1,
+      deviceId: "device-a",
+      payload: {
+        kind: "portfolio",
+        data: { totalValueSol: 0.42 },
+      },
+    });
+    expect(session.token).toBe("token-a");
+    await view.unmount();
+  });
+
+  it("loads only an explicitly stale read-only snapshot after restart and replaces it with fresh data", async () => {
+    jest.mocked(loadVerifiedSnapshot).mockResolvedValue({
+      schemaVersion: 1,
+      ownerId: "a".repeat(64),
+      deviceId: "device-a",
+      sessionId: "b".repeat(64),
+      verifiedAt: "2026-07-28T12:00:00.000Z",
+      serverTime: "2026-07-28T12:00:00.000Z",
+      sequence: 0,
+      payload: {
+        kind: "portfolio",
+        version: 1,
+        data: {
+          totalValueSol: 0.42,
+          assets: [{
+            assetIdentifier: { kind: "public_asset", chain: "solana", value: "paper:AAA" },
+            assetMetadata: { symbol: "AAA" },
+            balance: 0,
+            valueSol: 0.42,
+          }],
+        },
+      },
+    });
+    fetchPortfolioMock.mockRejectedValueOnce(new Error("offline"));
+    let session!: SessionContextValue;
+    const offline = await render(
+      <TestStack onSession={(value) => (session = value)}>
+        <PortfolioScreen />
+      </TestStack>,
+    );
+    expect(await offline.findByText("Stale offline snapshot")).toBeTruthy();
+    expect(offline.getByText("Read-only")).toBeTruthy();
+    expect(offline.queryByText("Adjust exits")).toBeNull();
+    await offline.unmount();
+
+    mobileQueryClient.clear();
+    fetchPortfolioMock.mockResolvedValueOnce(portfolioPayload("BBB", 0.84));
+    const fresh = await render(
+      <TestStack onSession={() => undefined}>
+        <PortfolioScreen />
+      </TestStack>,
+    );
+    expect((await fresh.findAllByText("BBB")).length).toBeGreaterThan(0);
+    expect(fresh.queryByText("Stale offline snapshot")).toBeNull();
+    await waitFor(() => expect(saveVerifiedSnapshot).toHaveBeenCalled());
+    await fresh.unmount();
+  });
+
+  it("invalidates the encrypted snapshot on revocation", async () => {
+    fetchPortfolioMock.mockRejectedValue(
+      new MobileApiError("revoked", "authentication", 401, false),
+    );
+    let session!: SessionContextValue;
+    const view = await render(
+      <TestStack onSession={(value) => (session = value)}>
+        <PortfolioScreen />
+      </TestStack>,
+    );
+    await waitFor(() => expect(session.token).toBeNull());
+    await waitFor(() => expect(clearVerifiedSnapshot).toHaveBeenCalled());
+    expect(view.queryByText("Stale offline snapshot")).toBeNull();
+    await view.unmount();
   });
 });

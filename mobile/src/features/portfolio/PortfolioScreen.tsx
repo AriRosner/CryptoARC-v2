@@ -1,11 +1,12 @@
 import { router } from "expo-router";
 import { RefreshCw } from "lucide-react-native";
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { RefreshControl, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import {
   ActionButton,
+  DetailRow,
   EmptyState,
   ErrorBanner,
   PageHeader,
@@ -26,6 +27,11 @@ import { PortfolioMetrics } from "./PortfolioMetrics";
 import { usePortfolioQuery } from "./queries";
 import type { PortfolioTimeframe } from "./types";
 import type { PortfolioPayload } from "./types";
+import {
+  loadVerifiedPortfolioSnapshot,
+  saveVerifiedPortfolioSnapshot,
+} from "./offlineSnapshot";
+import type { VerifiedSnapshot } from "../../core/storage/snapshot";
 
 const timeframes = [
   { label: "1D", value: "1d" },
@@ -39,6 +45,9 @@ export function PortfolioScreen() {
   const [selectedPositionId, setSelectedPositionId] = useState<string | null>(null);
   const query = usePortfolioQuery(timeframe);
   const session = useOptionalSession();
+  const [offlineSnapshot, setOfflineSnapshot] = useState<VerifiedSnapshot | null>(null);
+  const hasFreshDataRef = useRef(Boolean(query.data));
+  hasFreshDataRef.current = Boolean(query.data);
   const canRead = session === null || Boolean(session.token);
   const needsPairing =
     session !== null && !session.loading && !session.token;
@@ -69,6 +78,46 @@ export function PortfolioScreen() {
   const timeframeMismatch = Boolean(
     displayedTimeframe && displayedTimeframe !== timeframe,
   );
+
+  useEffect(() => {
+    let active = true;
+    if (!session || session.loading || !session.token || !session.device) {
+      setOfflineSnapshot(null);
+      return () => {
+        active = false;
+      };
+    }
+    void loadVerifiedPortfolioSnapshot(session).then(
+      (snapshot) => {
+        if (active && !hasFreshDataRef.current) setOfflineSnapshot(snapshot);
+      },
+      () => {
+        if (active) setOfflineSnapshot(null);
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [session?.device?.id, session?.generation, session?.loading, session?.token]);
+
+  useEffect(() => {
+    if (!session || !query.data || accessDenied || !session.token || !session.device) return;
+    let active = true;
+    void saveVerifiedPortfolioSnapshot(session, query.data).then(
+      () => {
+        if (active) setOfflineSnapshot(null);
+      },
+      () => undefined,
+    );
+    return () => {
+      active = false;
+    };
+  }, [accessDenied, query.data, session?.device?.id, session?.generation, session?.token]);
+
+  const stalePortfolio =
+    query.isError && !accessDenied && offlineSnapshot?.payload.kind === "portfolio"
+      ? offlineSnapshot.payload.data
+      : null;
 
   const setSelectedTimeframe = (value: string) => {
     setTimeframe(value as PortfolioTimeframe);
@@ -161,6 +210,20 @@ export function PortfolioScreen() {
               <AllocationList allocation={payload.allocation} />
             </Section>
           </>
+        ) : stalePortfolio ? (
+          <Section title="Stale offline snapshot" right={<StatusBadge label="Read-only" tone="warning" />}>
+            <Text style={styles.staleNotice}>
+              Verified {offlineSnapshot!.verifiedAt}. Reconnect for current data and all controls.
+            </Text>
+            <DetailRow label="Tracked value" value={`${stalePortfolio.totalValueSol.toFixed(4)} SOL`} />
+            {stalePortfolio.assets.map((asset) => (
+              <DetailRow
+                key={`${asset.assetIdentifier.chain}:${asset.assetIdentifier.value}`}
+                label={asset.assetMetadata?.symbol ?? asset.assetIdentifier.value}
+                value={`${(asset.valueSol ?? 0).toFixed(4)} SOL`}
+              />
+            ))}
+          </Section>
         ) : null}
       </ScrollView>
       <PositionSheet
@@ -215,5 +278,10 @@ const styles = StyleSheet.create({
   },
   pairing: {
     gap: spacing.md,
+  },
+  staleNotice: {
+    color: colors.muted,
+    fontSize: 12,
+    lineHeight: 18,
   },
 });

@@ -5,6 +5,7 @@ import {
   reduceRealtime,
 } from "../connectivity/realtime";
 import type { MobileRealtimeEnvelope } from "../connectivity/types";
+import serverEnvelopeFixture from "../__fixtures__/mobile-realtime-envelope-v1.json";
 
 function envelope(overrides: Partial<MobileRealtimeEnvelope> = {}): MobileRealtimeEnvelope {
   return {
@@ -50,6 +51,20 @@ class FakeSocket {
 }
 
 describe("realtime reducer", () => {
+  it("accepts the backend v1 cockpit envelope contract fixture", () => {
+    const state = reduceRealtime(
+      initialRealtimeState,
+      serverEnvelopeFixture as MobileRealtimeEnvelope,
+      Date.parse(serverEnvelopeFixture.server_time),
+    );
+
+    expect(state).toMatchObject({
+      lastSequence: 42,
+      requiresSnapshot: false,
+      status: "connected",
+      reason: "",
+    });
+  });
   it("invalidates on a sequence gap", () => {
     const state = reduceRealtime(
       { ...initialRealtimeState, lastSequence: 8 },
@@ -62,6 +77,29 @@ describe("realtime reducer", () => {
       requiresSnapshot: true,
       status: "stale",
       reason: "sequence_gap",
+    });
+  });
+
+  it("rebases a reconnect gap directly from the authenticated full cockpit snapshot", () => {
+    const state = reduceRealtime(
+      { ...initialRealtimeState, lastSequence: 8 },
+      envelope({
+        sequence: 12,
+        event_type: "cockpit",
+        payload: {
+          artifact_type: "cryptoarc_mobile_cockpit",
+          format_version: 1,
+          server_time: "2026-07-28T12:00:00.000Z",
+        },
+      }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+
+    expect(state).toMatchObject({
+      lastSequence: 12,
+      requiresSnapshot: false,
+      status: "connected",
+      reason: "",
     });
   });
 
@@ -148,6 +186,67 @@ describe("realtime reducer", () => {
       requiresSnapshot: true,
       reason: "sequence_gap",
     });
+  });
+
+  it("recovers a quarantined stream only from a current full cockpit snapshot", () => {
+    const quarantined = reduceRealtime(
+      { ...initialRealtimeState, lastSequence: 8 },
+      envelope({ sequence: 10, event_type: "portfolio" }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+
+    const unsupportedRecovery = reduceRealtime(
+      quarantined,
+      envelope({
+        sequence: 10,
+        event_type: "cockpit",
+        schema_version: 2,
+        payload: {
+          artifact_type: "cryptoarc_mobile_cockpit",
+          format_version: 1,
+          server_time: "2026-07-28T12:00:00.000Z",
+        },
+      }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+    expect(unsupportedRecovery).toMatchObject({
+      lastSequence: 8,
+      requiresSnapshot: true,
+      status: "compatibility",
+    });
+
+    const recovered = reduceRealtime(
+      quarantined,
+      envelope({
+        sequence: 10,
+        event_type: "cockpit",
+        payload: {
+          artifact_type: "cryptoarc_mobile_cockpit",
+          format_version: 1,
+          server_time: "2026-07-28T12:00:00.000Z",
+        },
+      }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+    expect(recovered).toMatchObject({
+      lastSequence: 10,
+      requiresSnapshot: false,
+      status: "connected",
+      reason: "",
+    });
+
+    const resumed = reduceRealtime(
+      recovered,
+      envelope({ sequence: 11, event_type: "portfolio" }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+    const staleEnvelope = reduceRealtime(
+      resumed,
+      envelope({ sequence: 10, event_type: "portfolio" }),
+      Date.parse("2026-07-28T12:00:00.000Z"),
+    );
+    expect(resumed.lastSequence).toBe(11);
+    expect(staleEnvelope).toEqual(resumed);
   });
 
   it("uses capped full-jitter reconnect delays", () => {

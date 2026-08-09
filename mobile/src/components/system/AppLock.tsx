@@ -28,7 +28,33 @@ export interface AppLockState {
   locked: boolean;
   privacyMode: PrivacyMode;
   unlock(reason: "app_open" | "financial_action"): Promise<boolean>;
+  authorizeControl(
+    binding: ControlAuthorizationBinding,
+  ): Promise<ControlAuthorizationProof | null>;
+  isControlAuthorizationCurrent(
+    proof: ControlAuthorizationProof,
+    binding: ControlAuthorizationBinding,
+  ): boolean;
   lock(): void;
+}
+
+export interface ControlAuthorizationBinding {
+  actionType: string;
+  entityId: string;
+  reviewKey: string;
+}
+
+export interface ControlAuthorizationProof {
+  bindingKey: string;
+  authorizedAt: number;
+  lifecycleGeneration: number;
+  sessionGeneration: number;
+}
+
+const CONTROL_AUTHORIZATION_TTL_MS = 30_000;
+
+function controlBindingKey(binding: ControlAuthorizationBinding): string {
+  return JSON.stringify([binding.actionType, binding.entityId, binding.reviewKey]);
 }
 
 const AppLockContext = createContext<AppLockState | null>(null);
@@ -84,6 +110,42 @@ export function AppLock({
     [session],
   );
 
+  const isControlAuthorizationCurrent = useCallback(
+    (
+      proof: ControlAuthorizationProof,
+      binding: ControlAuthorizationBinding,
+    ): boolean =>
+      appStateRef.current === "active" &&
+      session.isCurrentGeneration(proof.sessionGeneration) &&
+      lifecycleGeneration.current === proof.lifecycleGeneration &&
+      proof.bindingKey === controlBindingKey(binding) &&
+      now() - proof.authorizedAt <= CONTROL_AUTHORIZATION_TTL_MS,
+    [now, session.isCurrentGeneration],
+  );
+
+  const authorizeControl = useCallback(
+    async (
+      binding: ControlAuthorizationBinding,
+    ): Promise<ControlAuthorizationProof | null> => {
+      const sessionGeneration = session.generation;
+      const lifecycle = lifecycleGeneration.current;
+      if (!session.record || appStateRef.current !== "active") return null;
+      const authenticated = await session.authenticateControl();
+      const proof: ControlAuthorizationProof = {
+        bindingKey: controlBindingKey(binding),
+        authorizedAt: now(),
+        lifecycleGeneration: lifecycle,
+        sessionGeneration,
+      };
+      if (!authenticated || !isControlAuthorizationCurrent(proof, binding)) {
+        session.lock();
+        return null;
+      }
+      return proof;
+    },
+    [isControlAuthorizationCurrent, now, session],
+  );
+
   useEffect(() => {
     const onAppStateChange = (nextState: AppStateStatus) => {
       if (nextState !== "active") {
@@ -108,8 +170,15 @@ export function AppLock({
   }, [hasSession, session.generation]);
 
   const value = useMemo<AppLockState>(
-    () => ({ locked, privacyMode, unlock, lock }),
-    [lock, locked, privacyMode, unlock],
+    () => ({
+      authorizeControl,
+      isControlAuthorizationCurrent,
+      locked,
+      privacyMode,
+      unlock,
+      lock,
+    }),
+    [authorizeControl, isControlAuthorizationCurrent, lock, locked, privacyMode, unlock],
   );
 
   if (session.loading) {
@@ -173,6 +242,10 @@ export function useAppLock(): AppLockState {
   const value = useContext(AppLockContext);
   if (!value) throw new Error("useAppLock must be used inside AppLock");
   return value;
+}
+
+export function useOptionalAppLock(): AppLockState | null {
+  return useContext(AppLockContext);
 }
 
 const styles = StyleSheet.create({

@@ -53,7 +53,8 @@
         {
           "useSQLCipher": true
         }
-      ]
+      ],
+      "expo-sharing"
     ],
     "experiments": {
       "typedRoutes": true
