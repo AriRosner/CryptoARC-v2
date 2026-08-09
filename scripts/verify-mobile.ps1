@@ -35,7 +35,10 @@ try {
   Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("test")
 
   Write-Host "Running mobile production dependency audit"
-  Invoke-CryptoArcNative -FilePath $packageManager.FilePath -Arguments @("audit", "--omit=dev", "--audit-level=high")
+  & (Join-Path $PSScriptRoot "audit-mobile.ps1") -Strict
+  if ($LASTEXITCODE -ne 0) {
+    throw "Mobile dependency audit policy failed."
+  }
 
   if (-not $SkipDiagnostics) {
     Write-Host "Running Expo diagnostics"
