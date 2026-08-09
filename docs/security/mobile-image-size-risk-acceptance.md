@@ -1,7 +1,9 @@
 # Mobile `image-size` Risk Acceptance
 
-**Decision date:** 2026-08-09  
-**Expires:** 2026-11-07T23:59:59Z  
+**Decision date:** 2026-08-09
+
+**Expires:** 2026-11-07T23:59:59Z
+
 **Tracking:** [GitHub issue #3](https://github.com/AriRosner/CryptoARC-v2/issues/3)
 
 CryptoARC temporarily accepts GHSA-w3rx-r6r6-pgpr and
