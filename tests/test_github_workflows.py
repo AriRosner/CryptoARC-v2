@@ -8,6 +8,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class GitHubWorkflowContractTests(unittest.TestCase):
+    def test_workflows_use_current_checkout_runtime(self) -> None:
+        workflows = ROOT / ".github" / "workflows"
+        workflow_text = "\n".join(
+            path.read_text(encoding="utf-8") for path in workflows.glob("*.yml")
+        )
+
+        self.assertNotIn("actions/checkout@v4", workflow_text)
+        self.assertEqual(workflow_text.count("actions/checkout@v7"), 6)
+
     def test_code_line_badge_updates_main_through_a_pull_request(self) -> None:
         workflow = (
             ROOT / ".github" / "workflows" / "update-code-lines.yml"
