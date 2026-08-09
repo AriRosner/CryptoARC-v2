@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose a focused improvement to CryptoARC.
+title: '[Feature]: '
+labels: ['enhancement', 'triage']
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Explain the user or operator problem, not only the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the smallest useful outcome and how it would be used.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk area
+      options:
+        - No trading or security impact
+        - Paper-trading or research behavior
+        - Live-trading, wallet, signing, or security behavior
+    validations:
+      required: true
