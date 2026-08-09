@@ -5,13 +5,27 @@ import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   build: {
-    rollupOptions: {
+    rolldownOptions: {
       output: {
-        manualChunks: {
-          "chart-vendor": ["recharts"],
-          "solana-vendor": ["@solana/web3.js"],
-          "motion-vendor": ["framer-motion"],
-          "icon-vendor": ["lucide-react"],
+        codeSplitting: {
+          groups: [
+            {
+              name: "chart-vendor",
+              test: /node_modules[\\/]recharts/,
+            },
+            {
+              name: "solana-vendor",
+              test: /node_modules[\\/]@solana[\\/]web3\.js/,
+            },
+            {
+              name: "motion-vendor",
+              test: /node_modules[\\/]framer-motion/,
+            },
+            {
+              name: "icon-vendor",
+              test: /node_modules[\\/]lucide-react/,
+            },
+          ],
         },
       },
     },
