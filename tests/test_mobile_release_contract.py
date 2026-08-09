@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_APP_VERSION = "2.0.0"
-EXPECTED_ANDROID_VERSION_CODE = 4
+EXPECTED_ANDROID_VERSION_CODE = 5
 EXPECTED_ANDROID_PACKAGE = "com.cryptoarc.cockpit"
 EXPECTED_BUILD_INFO = {
     "version": EXPECTED_APP_VERSION,
@@ -84,11 +84,11 @@ class MobileReleaseContractTests(unittest.TestCase):
 
         self.assert_release_metadata(app, build_info)
 
-    def test_version_code_three_cannot_satisfy_release_contract(self) -> None:
-        app = release_app(version_code=3)
+    def test_version_code_four_cannot_satisfy_release_contract(self) -> None:
+        app = release_app(version_code=4)
         build_info = """export const buildInfo = {
   version: "2.0.0",
-  androidVersionCode: 3,
+  androidVersionCode: 4,
   label: "Operator Command Center",
   date: "2026-07-26",
 } as const;

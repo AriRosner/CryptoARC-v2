@@ -1,6 +1,6 @@
 # 15 Mobile Operator Command Center
 
-Use this runbook to install, pair, operate, upgrade, and revoke the internal Android Operator Command Center. Release `2.0.0` uses Android package `com.cryptoarc.cockpit` and `versionCode` `4`.
+Use this runbook to install, pair, operate, upgrade, and revoke the internal Android Operator Command Center. Release `2.0.0` uses Android package `com.cryptoarc.cockpit` and `versionCode` `5`.
 
 ## Before You Begin
 
@@ -84,7 +84,7 @@ apkanalyzer manifest version-code $apkPath
 # Or: aapt dump badging $apkPath
 ```
 
-Require the local SHA-256 to match the independently trusted release record. Require `apksigner` verification to succeed and its signer certificate SHA-256 digest to match the independently recorded fingerprint. Require the manifest to report package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `4`. If `apksigner`, `apkanalyzer`, or `aapt` is not on `PATH`, invoke it from the installed Android SDK build-tools/cmdline-tools directory; do not skip the check.
+Require the local SHA-256 to match the independently trusted release record. Require `apksigner` verification to succeed and its signer certificate SHA-256 digest to match the independently recorded fingerprint. Require the manifest to report package `com.cryptoarc.cockpit`, version `2.0.0`, and `versionCode` `5`. If `apksigner`, `apkanalyzer`, or `aapt` is not on `PATH`, invoke it from the installed Android SDK build-tools/cmdline-tools directory; do not skip the check.
 
 Only after every comparison passes:
 
@@ -92,7 +92,7 @@ Only after every comparison passes:
 2. Choose exactly one installation path:
    - First install, when `com.cryptoarc.cockpit` is not installed: run `adb install $apkPath`.
    - In-place upgrade: keep the approved prior app installed so Android enforces the matching package and signing certificate, then run `adb install -r $apkPath`. This also preserves app data for the pairing-migration test.
-3. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 4`.
+3. Open More > Device and require `Operator Command Center v2.0.0 (2026-07-26)` and `2.0.0 / Android 5`.
 
 Stop if Android asks for an uninstall to accept an alleged upgrade, the displayed version differs, or artifact provenance cannot be established. Uninstalling deletes local app state and prevents an in-place migration check.
 

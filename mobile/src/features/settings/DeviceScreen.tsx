@@ -39,6 +39,9 @@ export function DeviceScreen() {
           subtitle={`${buildInfo.label} v${buildInfo.version} (${buildInfo.date})`}
           right={<StatusBadge label={connection.online ? "Online" : "Offline"} tone={connection.online ? "success" : "warning"} />}
         />
+        <Section title="Release">
+          <DetailRow label="Build" value={`${buildInfo.version} / Android ${buildInfo.androidVersionCode}`} />
+        </Section>
         <ErrorBanner message={session.error} />
         {!session.token ? (
           <>
@@ -53,7 +56,6 @@ export function DeviceScreen() {
               <DetailRow label="Last seen" value={formatTime(session.device?.last_seen_at)} />
               <DetailRow label="Expires" value={formatTime(session.device?.expires_at)} />
               <DetailRow label="Scopes" value={(session.device?.scopes ?? []).join(", ") || "monitor"} />
-              <DetailRow label="Build" value={`${buildInfo.version} / Android ${buildInfo.androidVersionCode}`} />
             </Section>
             <Section title="Session actions">
               <ActionButton label="Open Diagnostics" onPress={() => router.push("/diagnostics")} icon={<Stethoscope color={colors.text} size={16} />} />
