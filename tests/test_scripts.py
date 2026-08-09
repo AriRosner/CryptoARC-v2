@@ -19,6 +19,16 @@ class ScriptSafetyTests(unittest.TestCase):
             listener.bind(("127.0.0.1", 0))
             return listener.getsockname()[1]
 
+    def test_markdown_link_checker_enumerates_only_tracked_markdown(self) -> None:
+        script = (ROOT / "scripts" / "check-doc-links.ps1").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('git -C $root ls-files -- "*.md"', script)
+        self.assertNotIn(
+            'Get-ChildItem -LiteralPath $root -Recurse -Filter "*.md"', script
+        )
+
     def run_stop_dev_selection_fixture(
         self,
         *,
