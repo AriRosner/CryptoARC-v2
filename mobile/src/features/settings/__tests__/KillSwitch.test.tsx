@@ -120,4 +120,17 @@ describe("emergency kill switch", () => {
     expect(mockAuthorizeControl).not.toHaveBeenCalled();
     expect(setMobileKillSwitch).not.toHaveBeenCalled();
   });
+
+  it("shows entries as blocked whenever the kill switch is enabled", async () => {
+    jest.mocked(fetchMobileCockpit).mockResolvedValueOnce({
+      ...cockpit,
+      live: { kill_switch_enabled: true },
+      readiness: { ...cockpit.readiness, entries_allowed: true },
+    } as never);
+
+    const screen = await render(<MoreScreen />);
+
+    expect(await screen.findByText("Blocked")).toBeTruthy();
+    expect(screen.queryByText("Allowed")).toBeNull();
+  });
 });

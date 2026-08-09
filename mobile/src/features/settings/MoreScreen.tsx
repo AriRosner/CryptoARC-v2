@@ -73,6 +73,7 @@ function SystemScreen() {
   }, [refresh]);
 
   const killEnabled = Boolean(cockpit?.live.kill_switch_enabled);
+  const entriesAllowed = Boolean(cockpit?.readiness.entries_allowed) && !killEnabled;
   const sanitizedReason = sanitizeReason(reason);
   reviewRef.current = { enabled: killEnabled, reason: sanitizedReason };
 
@@ -142,7 +143,7 @@ function SystemScreen() {
                 <MetricTile label="Source" value={cockpit.source.health_score ?? 0} />
                 <MetricTile label="Live open" value={cockpit.open_risk.live_open_positions} />
               </View>
-              <DetailRow label="Entries" value={cockpit.readiness.entries_allowed ? "Allowed" : "Blocked"} tone={cockpit.readiness.entries_allowed ? "success" : "danger"} />
+              <DetailRow label="Entries" value={entriesAllowed ? "Allowed" : "Blocked"} tone={entriesAllowed ? "success" : "danger"} />
             </Section>
             <Section title="Kill switch" right={<Activity color={killEnabled ? colors.rose : colors.emerald} size={18} />}>
               <Text style={styles.body}>Every change requires a fresh local unlock. Offline changes are never queued.</Text>
