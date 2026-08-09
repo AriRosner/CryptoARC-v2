@@ -7,10 +7,11 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: update-code-line-badge-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   update-code-lines:
@@ -19,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: main
 
       - name: Count source lines
         shell: pwsh
@@ -129,17 +130,45 @@ jobs:
             )
           }
 
-      - name: Commit badge update
+      - name: Publish badge update branch
+        id: publish
         shell: pwsh
+        env:
+          BADGE_BRANCH: automation/code-line-badge-${{ github.run_id }}
         run: |
           $ErrorActionPreference = "Stop"
           if (-not (git status --short -- badges/code-lines.json README.md)) {
             Write-Host "Code line badge is already current."
+            "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             exit 0
           }
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c $env:BADGE_BRANCH
           git add badges/code-lines.json README.md
-          git commit -m "Update code line badge"
-          git push origin HEAD:${{ github.ref_name }}
+          git commit -m "Update code line badge [skip ci]"
+          git push origin "HEAD:refs/heads/$env:BADGE_BRANCH"
+          "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Merge badge update through a pull request
+        if: steps.publish.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          BADGE_BRANCH: automation/code-line-badge-${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $body = @'
+          Automated source-line badge refresh from workflow run ${{ github.run_id }}.
+
+          The generated commit uses `[skip ci]` because this pull request changes only
+          `README.md` and `badges/code-lines.json`.
+          '@
+          $prUrl = gh pr create `
+            --base main `
+            --head $env:BADGE_BRANCH `
+            --title "Update code line badge" `
+            --body $body
+          $prNumber = gh pr view $prUrl --json number --jq '.number'
+          gh pr merge $prNumber --squash --delete-branch
