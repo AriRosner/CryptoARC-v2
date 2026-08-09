@@ -12,13 +12,13 @@ if (-not $readme.Contains($expectedBadge)) {
   $errors += "README.md -> source-lines badge must match badges/code-lines.json and avoid private raw endpoints."
 }
 
-$markdownFiles = Get-ChildItem -LiteralPath $root -Recurse -Filter "*.md" |
-  Where-Object {
-    $_.FullName -notmatch "\\node_modules\\" -and
-    $_.FullName -notmatch "\\.venv\\" -and
-    $_.FullName -notmatch "\\dist\\" -and
-    $_.FullName -notmatch "\\build\\"
-  }
+$trackedMarkdown = @(& git -C $root ls-files -- "*.md")
+if ($LASTEXITCODE -ne 0) {
+  throw "Unable to enumerate tracked Markdown files."
+}
+$markdownFiles = $trackedMarkdown | ForEach-Object {
+  Get-Item -LiteralPath (Join-Path $root $_)
+}
 
 foreach ($file in $markdownFiles) {
   $matches = Select-String -LiteralPath $file.FullName -Pattern "\[[^\]]+\]\(([^)]+)\)" -AllMatches
