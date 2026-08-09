@@ -11,7 +11,7 @@ class LatestLiveMarkTests(unittest.TestCase):
     def test_uses_newest_accepted_observation_beyond_oldest_storage_page(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
-            observed_at = utc_now()
+            observed_at = utc_now() - timedelta(minutes=5)
             for index in range(1, 102):
                 state.storage.save_price_observation(
                     PriceObservation(
@@ -34,7 +34,7 @@ class LatestLiveMarkTests(unittest.TestCase):
     def test_uses_newest_accepted_observation_after_rejected_newest_observation(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
-            observed_at = utc_now()
+            observed_at = utc_now() - timedelta(minutes=5)
             observations = (
                 PriceObservation(
                     id="px_old_accepted",
