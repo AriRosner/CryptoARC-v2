@@ -15,7 +15,7 @@ class GitHubWorkflowContractTests(unittest.TestCase):
         )
 
         self.assertNotIn("actions/checkout@v4", workflow_text)
-        self.assertEqual(workflow_text.count("actions/checkout@v7"), 6)
+        self.assertEqual(workflow_text.count("actions/checkout@v7"), 7)
 
     def test_code_line_badge_updates_main_through_a_pull_request(self) -> None:
         workflow = (
@@ -27,6 +27,16 @@ class GitHubWorkflowContractTests(unittest.TestCase):
         self.assertIn("gh pr merge", workflow)
         self.assertIn("automation/code-line-badge-${{ github.run_id }}", workflow)
         self.assertNotIn("git push origin HEAD:${{ github.ref_name }}", workflow)
+
+    def test_mobile_audit_exception_is_checked_weekly(self) -> None:
+        workflow_path = ROOT / ".github" / "workflows" / "mobile-audit-exception.yml"
+        self.assertTrue(workflow_path.exists())
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        self.assertIn("schedule:", workflow)
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("scripts/audit-mobile.ps1 -Strict", workflow)
+        self.assertIn("scripts/check-mobile-audit-upstream.ps1", workflow)
 
 
 if __name__ == "__main__":

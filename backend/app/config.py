@@ -30,6 +30,7 @@ class AppConfig(BaseSettings):
     mobile_public_api_base_url: str = Field(default="", alias="MOBILE_PUBLIC_API_BASE_URL")
     mobile_pairing_ttl_seconds: int = Field(default=300, alias="MOBILE_PAIRING_TTL_SECONDS")
     mobile_token_ttl_days: int = Field(default=30, alias="MOBILE_TOKEN_TTL_DAYS")
+    mobile_push_token_encryption_key: str = Field(default="", alias="MOBILE_PUSH_TOKEN_ENCRYPTION_KEY")
 
 
 @lru_cache

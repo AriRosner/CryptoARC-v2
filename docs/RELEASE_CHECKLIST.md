@@ -8,6 +8,9 @@ Use this checklist before tagging a local release, starting a live-testing sessi
 - Run `powershell -ExecutionPolicy Bypass -File scripts\bootstrap.ps1` on fresh or changed environments.
 - Run `powershell -ExecutionPolicy Bypass -File scripts\doctor.ps1 -Strict`.
 - Run `powershell -ExecutionPolicy Bypass -File scripts\verify.ps1`.
+- Confirm `scripts\audit-mobile.ps1 -Strict` is `ready` or reports only the
+  unexpired exception documented in
+  `docs/security/mobile-image-size-risk-acceptance.md`.
 - Run `powershell -ExecutionPolicy Bypass -File scripts\audit-frontend.ps1 -Strict`.
 - Record `/api/reports/release-readiness/verification` after verification, git diff review, and release-doc review so the release-readiness manual gate has local evidence.
 - Confirm GitHub Actions CI is green for backend tests, frontend build, frontend dependency audit policy, and docs links.

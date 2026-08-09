@@ -395,6 +395,11 @@ class LiveExecutionIntent:
     operator_recommendation: str = ""
     priority_reason: str = ""
     generated_from_position: bool = False
+    generated_position_id: str = ""
+    generated_position_version: int = 0
+    generated_position_token_balance: float = 0.0
+    last_mobile_action_id: str = ""
+    version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -479,12 +484,16 @@ class LiveExecutionAudit:
     recommended_action: str = ""
     shadow_comparison: dict[str, Any] = field(default_factory=dict)
     execution_timing: dict[str, Any] = field(default_factory=dict)
+    guarded_action_id: str = ""
+    guarded_authorization: dict[str, Any] = field(default_factory=dict)
+    dispatch_started_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
         payload["updated_at"] = self.updated_at.isoformat()
         payload["confirmation_checked_at"] = self.confirmation_checked_at.isoformat() if self.confirmation_checked_at else None
+        payload["dispatch_started_at"] = self.dispatch_started_at.isoformat() if self.dispatch_started_at else None
         return payload
 
 
@@ -543,6 +552,10 @@ class LiveLedgerPosition:
     realized_pnl_confidence: str = "unknown"
     unrealized_pnl_confidence: str = "unknown"
     pnl_confidence_notes: list[str] = field(default_factory=list)
+    stop_pct: float | None = None
+    target_pct: float | None = None
+    last_mobile_action_id: str = ""
+    version: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -830,6 +843,105 @@ class StrategyPreset:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class MobileActionReceipt:
+    id: str
+    idempotency_key_hash: str
+    device_id: str
+    action_type: str
+    entity_id: str
+    payload: dict[str, Any]
+    status: str
+    created_at: datetime
+    updated_at: datetime
+    execution_audit_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class MobileDestinationAuthorization:
+    id: str
+    payload: dict[str, Any]
+    created_at: datetime
+    expires_at: datetime
+    used_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat()
+        payload["used_at"] = self.used_at.isoformat() if self.used_at else None
+        return payload
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "device_id": str(self.payload.get("device_id") or ""),
+            "action": str(self.payload.get("action") or ""),
+            "address": str(self.payload.get("address") or ""),
+            "asset": str(self.payload.get("asset") or ""),
+            "max_amount": str(self.payload.get("max_amount") or ""),
+            "purpose": str(self.payload.get("purpose") or ""),
+            "created_at": self.created_at.isoformat(),
+            "expires_at": self.expires_at.isoformat(),
+            "used_at": self.used_at.isoformat() if self.used_at else None,
+            "status": (
+                "used"
+                if self.used_at
+                else "expired"
+                if self.expires_at <= utc_now()
+                else "active"
+            ),
+        }
+
+
+@dataclass(slots=True)
+class MobilePushRegistration:
+    id: str
+    device_id: str
+    token_ciphertext: str
+    token_fingerprint: str
+    platform: str
+    created_at: datetime
+    updated_at: datetime
+    revoked_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["updated_at"] = self.updated_at.isoformat()
+        payload["revoked_at"] = self.revoked_at.isoformat() if self.revoked_at else None
+        return payload
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "device_id": self.device_id,
+            "platform": self.platform,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+        }
+
+
+@dataclass(slots=True)
+class MobileAlertAcknowledgement:
+    id: str
+    device_id: str
+    event_id: str
+    acknowledged_at: datetime
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["acknowledged_at"] = self.acknowledged_at.isoformat()
         return payload
 
 

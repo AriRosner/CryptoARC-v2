@@ -13,6 +13,7 @@ import urllib.request
 from collections import Counter, deque
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -66,6 +67,7 @@ from app.core.simulator import LaunchSimulator
 from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, normalize_pumpportal_new_token
+from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
 SOLANA_SIGNATURE_BASE_FEE_LAMPORTS = 5_000
@@ -80,9 +82,22 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BotState:
-    MOBILE_MONITOR_SCOPE = "mobile:monitor"
-    MOBILE_CONTROL_SCOPE = "mobile:control"
+    MOBILE_MONITOR_SCOPE = MobileScope.MONITOR
+    MOBILE_CONTROL_SCOPE = MobileScope.CONTROL
     MOBILE_DEFAULT_SCOPES = (MOBILE_MONITOR_SCOPE, MOBILE_CONTROL_SCOPE)
+    MOBILE_ALLOWED_SCOPES = frozenset(
+        {
+            MobileScope.MONITOR,
+            MobileScope.CONTROL,
+            MobileScope.PORTFOLIO_READ,
+            MobileScope.TRADE_REVIEW,
+            MobileScope.TRADE_EXECUTE,
+            MobileScope.WALLET_READ,
+            MobileScope.TREASURY_REQUEST,
+            MobileScope.ALERTS,
+            MobileScope.DIAGNOSTICS,
+        }
+    )
     MOBILE_PAIRING_TTL_SECONDS = 300
     MOBILE_PAIRING_MAX_FAILED_ATTEMPTS = 5
     MOBILE_TOKEN_TTL_DAYS = 30
@@ -277,43 +292,29 @@ class BotState:
         }
 
     def claim_mobile_pairing(self, pairing_id: str, code: str, device_name: str, platform: str = "android") -> dict[str, object]:
-        pairing = self.storage.load_mobile_pairing_request(pairing_id.strip())
         now = utc_now()
-        if not pairing:
-            raise ValueError("Invalid or expired mobile pairing code")
-        if str(pairing.get("claimed_at") or ""):
-            raise ValueError("Mobile pairing code has already been claimed")
-        if self._parse_mobile_time(pairing.get("expires_at")) <= now:
-            raise ValueError("Mobile pairing code has expired")
-        failed_attempts = int(pairing.get("failed_attempts") or 0)
-        max_failed_attempts = int(pairing.get("max_failed_attempts") or self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS)
-        if failed_attempts >= max_failed_attempts:
-            raise ValueError("Mobile pairing code has too many failed attempts")
-        if not secrets.compare_digest(self._hash_mobile_secret(code.strip()), str(pairing.get("code_hash") or "")):
-            pairing["failed_attempts"] = failed_attempts + 1
-            self.storage.save_mobile_pairing_request(pairing)
-            raise ValueError("Invalid or expired mobile pairing code")
-
         token = secrets.token_urlsafe(32)
         device_id = new_id("mdev")
         token_expires_at = now + timedelta(days=self.MOBILE_TOKEN_TTL_DAYS)
-        scopes = self._normalize_mobile_scopes(list(pairing.get("scopes") or []))
         device: dict[str, object] = {
             "id": device_id,
             "name": self._clean_mobile_label(device_name, "Mobile device", 80),
             "platform": self._clean_mobile_label(platform, "unknown", 40).lower(),
-            "scopes": scopes,
             "created_at": now.isoformat(),
             "last_seen_at": now.isoformat(),
             "expires_at": token_expires_at.isoformat(),
             "revoked_at": "",
             "token_hash": self._hash_mobile_secret(token),
-            "paired_from_pairing_id": pairing["id"],
+            "paired_from_pairing_id": pairing_id.strip(),
         }
-        pairing["claimed_at"] = now.isoformat()
-        pairing["claimed_device_id"] = device_id
-        self.storage.save_mobile_device(device)
-        self.storage.save_mobile_pairing_request(pairing)
+        _pairing, device = self.storage.claim_mobile_pairing_request(
+            pairing_id=pairing_id.strip(),
+            presented_code_hash=self._hash_mobile_secret(code.strip()),
+            device=device,
+            claimed_at=now.isoformat(),
+            default_max_failed_attempts=self.MOBILE_PAIRING_MAX_FAILED_ATTEMPTS,
+        )
+        scopes = self._normalize_mobile_scopes(list(device.get("scopes") or []))
         self.add_event(
             "warning",
             f"Mobile device paired: {device['name']}",
@@ -350,12 +351,14 @@ class BotState:
         return self._public_mobile_device(device)
 
     def revoke_mobile_device(self, device_id: str) -> dict[str, object]:
-        device = self.storage.load_mobile_device(device_id.strip())
-        if not device:
+        result = self.storage.revoke_mobile_device_and_push_registrations(
+            device_id.strip(),
+            utc_now().isoformat(),
+        )
+        if not result:
             raise ValueError("Mobile device was not found")
-        if not str(device.get("revoked_at") or ""):
-            device["revoked_at"] = utc_now().isoformat()
-            self.storage.save_mobile_device(device)
+        device, newly_revoked = result
+        if newly_revoked:
             self.add_event(
                 "warning",
                 f"Mobile device revoked: {device.get('name') or device_id}",
@@ -377,6 +380,28 @@ class BotState:
             "summary": report.get("summary", {}),
             "events": report.get("events", []),
             "action_items": report.get("action_items", []),
+        }
+
+    def mobile_diagnostic_runtime_status(self) -> dict[str, object]:
+        """Return bounded, in-memory status without probing RPC or signer transports."""
+        source_status = getattr(self.source_status, "status", "")
+        source_observed_at = (
+            self.source_status.last_event_at
+            or self.source_status.connected_at
+            or self.source_status.connection_requested_at
+        )
+        return {
+            "source_status": (
+                source_status.value
+                if hasattr(source_status, "value")
+                else str(source_status or "unknown")
+            ),
+            "source_observed_at": (
+                source_observed_at.isoformat() if source_observed_at else None
+            ),
+            "signer_mode_configured": bool(
+                str(self.settings.live_signer_mode or "").strip()
+            ),
         }
 
     def mobile_cockpit(
@@ -502,6 +527,1526 @@ class BotState:
             "next_operator_action": next_operator_action,
         }
 
+    def mobile_portfolio(self, timeframe: str) -> dict[str, object]:
+        timeframe_windows = {
+            "1d": timedelta(days=1),
+            "1w": timedelta(weeks=1),
+            "1m": timedelta(days=30),
+            "all": None,
+        }
+        if timeframe not in timeframe_windows:
+            raise ValueError("Unsupported portfolio timeframe")
+        now = utc_now()
+        cutoff = now - timeframe_windows[timeframe] if timeframe_windows[timeframe] else None
+        closed = [
+            trade
+            for trade in self.storage.load_trades(5000)
+            if trade.closed_at
+            and trade.pnl_sol is not None
+            and (cutoff is None or trade.closed_at >= cutoff)
+        ]
+        paper_performance = self._performance_group(timeframe, closed)
+        paper_curve = self._pnl_curve(closed)
+        live_positions = self._live_ledger_positions("")
+        positions = self._mobile_position_summaries(now, live_positions=live_positions)
+        open_live_positions = [
+            position for position in live_positions if position.status == "open"
+        ]
+        live_realized = round(
+            sum(position.realized_pnl_sol for position in open_live_positions),
+            9,
+        )
+        live_unrealized = round(
+            sum(position.unrealized_pnl_sol for position in open_live_positions),
+            9,
+        )
+        paper_positions = [position for position in positions if position["mode"] == "paper"]
+        selected_period_realized = round(
+            float(paper_performance["pnl_sol"]),
+            9,
+        )
+        current_paper_realized = round(
+            sum(float(position["realized_pnl_sol"]) for position in paper_positions),
+            9,
+        )
+        paper_unrealized = round(
+            sum(float(position["unrealized_pnl_sol"]) for position in paper_positions),
+            9,
+        )
+        open_positions = [position for position in positions if position["status"] == "open"]
+        cost_basis = round(sum(float(position["cost_basis_sol"]) for position in open_positions), 9)
+        allocation = self._mobile_allocation(open_positions)
+        tracked_value = round(
+            sum(float(item["value_sol"]) for item in allocation),
+            9,
+        )
+        live_net = round(live_realized + live_unrealized, 9)
+        paper_net = round(current_paper_realized + paper_unrealized, 9)
+        current_net = round(paper_net + live_net, 9)
+        series = [
+            {
+                "at": point["at"],
+                "paper_pnl_sol": float(point["pnl_sol"]),
+                "live_pnl_sol": 0.0,
+                "net_pnl_sol": float(point["pnl_sol"]),
+                "current_snapshot": False,
+                "approximate": False,
+            }
+            for point in paper_curve
+        ]
+        freshness = self._mobile_positions_freshness(positions, now)
+        source = self.source_health()
+        return {
+            "artifact_type": "cryptoarc_mobile_portfolio",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "timeframe": timeframe,
+            "freshness": freshness,
+            "summary": {
+                "equity_sol": None,
+                "tracked_value_sol": tracked_value,
+                "cost_basis_sol": cost_basis,
+                "net_pnl_sol": selected_period_realized,
+                "realized_pnl_sol": selected_period_realized,
+                "unrealized_pnl_sol": 0.0,
+                "selected_period_realized_pnl_sol": selected_period_realized,
+                "win_rate_pct": int(paper_performance["win_rate_pct"]),
+                "health_score": int(source.get("health_score", 0) or 0),
+                "open_positions": len(open_positions),
+                "closed_trades": len(closed),
+            },
+            "current_snapshot": {
+                "generated_at": now.isoformat(),
+                "tracked_value_sol": tracked_value,
+                "cost_basis_sol": cost_basis,
+                "realized_pnl_sol": round(current_paper_realized + live_realized, 9),
+                "unrealized_pnl_sol": round(paper_unrealized + live_unrealized, 9),
+                "net_pnl_sol": current_net,
+                "paper_pnl_sol": paper_net,
+                "live_pnl_sol": live_net,
+                "open_positions": len(open_positions),
+                "approximate": any(
+                    bool(position["pnl_approximate"]) for position in open_positions
+                ),
+            },
+            "series": series,
+            "allocation": allocation,
+            "positions": positions,
+        }
+
+    def mobile_positions(self) -> dict[str, object]:
+        now = utc_now()
+        positions = self._mobile_position_summaries(now)
+        return {
+            "artifact_type": "cryptoarc_mobile_positions",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "freshness": self._mobile_positions_freshness(positions, now),
+            "positions": positions,
+        }
+
+    def _pending_mobile_treasury_reservation(
+        self,
+        wallet_public_key: str,
+        asset: str,
+        *,
+        exclude_action_id: str = "",
+    ) -> Decimal:
+        reserved = Decimal("0")
+        for receipt in self.storage.load_pending_mobile_treasury_receipts(
+            wallet_public_key=wallet_public_key,
+            asset=asset,
+            exclude_action_id=exclude_action_id,
+        ):
+            try:
+                if receipt.action_type != "rent_recovery":
+                    reserved += Decimal(
+                        str(receipt.payload.get("amount") or "0")
+                    )
+                reserved += Decimal(
+                    str(receipt.payload.get("expected_fee_sol") or "0")
+                )
+            except (ArithmeticError, ValueError):
+                return Decimal("Infinity")
+        return reserved
+
+    def mobile_wallet(self) -> dict[str, object]:
+        now = utc_now()
+        wallet = (
+            self.settings.live_active_wallet_public_key.strip()
+            or self.settings.live_hot_wallet_public_key.strip()
+        )
+        balance = (
+            self.live_wallet_balance(wallet)
+            if wallet
+            else {
+                "wallet_public_key": "",
+                "balance_sol": 0.0,
+                "error": "armed wallet public key is required",
+            }
+        )
+        balance_sol = float(balance.get("balance_sol") or 0.0)
+        balance_error = str(balance.get("error") or "")
+        positions = [
+            position
+            for position in self.storage.load_live_ledger_positions(500)
+            if position.wallet_public_key == wallet and position.status == "open"
+        ]
+        pending_reserved = self._pending_mobile_treasury_reservation(
+            wallet,
+            "SOL",
+        )
+        configured_reserve = Decimal(
+            str(self.settings.profit_sweep_min_reserve_sol or "0")
+        )
+        total_reserved = pending_reserved + configured_reserve
+        reserved_sol = min(
+            Decimal(str(max(0.0, balance_sol))),
+            max(Decimal("0"), total_reserved),
+        )
+        available_sol = max(
+            Decimal("0"),
+            Decimal(str(balance_sol)) - reserved_sol,
+        )
+        committed_rows = []
+        for position in positions:
+            value_sol = max(
+                0.0,
+                float(position.cost_basis_sol or 0.0)
+                + float(position.unrealized_pnl_sol or 0.0),
+            )
+            committed_rows.append(
+                {
+                    "asset": position.symbol or position.mint[:8] or "TOKEN",
+                    "total": round(value_sol, 9),
+                    "committed": round(value_sol, 9),
+                    "available": 0.0,
+                    "reserved": 0.0,
+                    "approximate": True,
+                }
+            )
+        balances = [
+            {
+                "asset": "SOL",
+                "total": round(balance_sol, 9),
+                "committed": 0.0,
+                "available": round(float(available_sol), 9),
+                "reserved": round(float(reserved_sol), 9),
+                "approximate": bool(balance_error),
+            },
+            *committed_rows,
+        ]
+        total_value_sol = sum(float(row["total"]) for row in balances)
+        allocation = [
+            {
+                "asset": str(row["asset"]),
+                "value_sol": float(row["total"]),
+                "percentage": round(
+                    (float(row["total"]) / total_value_sol) * 100, 1
+                )
+                if total_value_sol > 0
+                else 0.0,
+            }
+            for row in balances
+            if float(row["total"]) > 0
+        ]
+        fees = sum(float(position.total_fees_sol or 0.0) for position in positions)
+        priority_fees = sum(
+            float(position.total_priority_fees_sol or 0.0)
+            for position in positions
+        )
+        realized = sum(
+            float(position.realized_pnl_sol or 0.0) for position in positions
+        )
+        unrealized = sum(
+            float(position.unrealized_pnl_sol or 0.0) for position in positions
+        )
+        reconciliation_statuses = [
+            str(position.reconciliation_status or "pending")
+            for position in positions
+        ]
+        reconciliation_status = (
+            "matched"
+            if reconciliation_statuses
+            and all(status == "matched" for status in reconciliation_statuses)
+            else "pending"
+            if not reconciliation_statuses
+            else "needs_review"
+        )
+        reconciled_at = max(
+            (
+                position.balance_verified_at or position.updated_at
+                for position in positions
+            ),
+            default=None,
+        )
+        try:
+            rent = self.live_rent_recovery_scan(wallet) if wallet else {}
+            rent_status = "ready" if rent.get("eligible_count") else "clear"
+            rent_error = ""
+        except Exception as exc:
+            rent = {}
+            rent_status = "unavailable"
+            rent_error = f"{exc.__class__.__name__}: {exc}"
+        signer = self.signer_status(
+            self.settings.live_signer_mode,
+            wallet,
+        )
+        readiness = self._recent_readiness_status()
+        approximate = bool(
+            balance_error
+            or reconciliation_status != "matched"
+            or committed_rows
+        )
+        return {
+            "artifact_type": "cryptoarc_mobile_wallet",
+            "format_version": 1,
+            "generated_at": now.isoformat(),
+            "wallet_public_key": wallet,
+            "total_value_sol": round(total_value_sol, 9),
+            "freshness": {
+                "status": "unavailable" if balance_error else "fresh",
+                "generated_at": now.isoformat(),
+                "age_seconds": 0,
+                "stale_after_seconds": 30,
+                "approximate": approximate,
+            },
+            "balances": balances,
+            "allocation": allocation,
+            "pnl": {
+                "realized_sol": round(realized, 9),
+                "unrealized_sol": round(unrealized, 9),
+                "approximate": True,
+            },
+            "fees": {
+                "network_sol": round(max(0.0, fees - priority_fees), 9),
+                "priority_sol": round(priority_fees, 9),
+                "total_sol": round(fees, 9),
+                "approximate": reconciliation_status != "matched",
+            },
+            "rent": {
+                "recoverable_sol": round(
+                    float(rent.get("recoverable_rent_sol") or 0.0), 9
+                ),
+                "eligible_accounts": int(rent.get("eligible_count") or 0),
+                "eligible_token_accounts": [
+                    str(row.get("token_account") or "")
+                    for row in rent.get("eligible_accounts", [])
+                    if isinstance(row, dict)
+                    and str(row.get("token_account") or "")
+                ],
+                "status": rent_status,
+                "approximate": bool(rent_error),
+            },
+            "reconciliation": {
+                "status": reconciliation_status,
+                "last_reconciled_at": (
+                    reconciled_at.isoformat() if reconciled_at else None
+                ),
+                "approximate": reconciliation_status != "matched",
+            },
+            "health": {
+                "rpc": "unavailable" if balance_error else "healthy",
+                "signer": (
+                    "healthy"
+                    if signer.get("connected")
+                    and signer.get("healthy")
+                    and signer.get("can_sign")
+                    else "unavailable"
+                ),
+                "backend": (
+                    "armed"
+                    if self.settings.live_active_backend_armed
+                    else "disarmed"
+                ),
+                "readiness": str(readiness.get("status") or "unknown"),
+                "kill_switch": (
+                    "enabled"
+                    if self.settings.kill_switch_enabled
+                    else "clear"
+                ),
+            },
+        }
+
+    def mobile_wallet_transactions(self) -> dict[str, object]:
+        receipts = [
+            receipt
+            for receipt in self.storage.load_mobile_action_receipts(limit=500)
+            if receipt.action_type
+            in {"withdrawal", "profit_sweep", "rent_recovery"}
+        ]
+        return {
+            "artifact_type": "cryptoarc_mobile_wallet_transactions",
+            "format_version": 1,
+            "generated_at": utc_now().isoformat(),
+            "transactions": [
+                {
+                    "id": receipt.id,
+                    "action": receipt.action_type,
+                    "asset": str(receipt.payload.get("asset") or ""),
+                    "amount": str(receipt.payload.get("amount") or ""),
+                    "destination": str(
+                        receipt.payload.get("address") or ""
+                    ),
+                    "status": receipt.status,
+                    "created_at": receipt.created_at.isoformat(),
+                    "transaction_signature": str(
+                        receipt.payload.get("transaction_signature") or ""
+                    ),
+                }
+                for receipt in receipts
+            ],
+        }
+
+    def _mobile_treasury_signer_blockers(
+        self,
+        wallet_public_key: str,
+    ) -> list[str]:
+        blockers: list[str] = []
+        signer = self.signer_status("local_hot_wallet", wallet_public_key)
+        hot_wallet = self.hot_wallet.status()
+        signer_wallet = str(signer.get("wallet_public_key") or "")
+        unlocked_wallet = str(hot_wallet.get("wallet_public_key") or "")
+        if not hot_wallet.get("imported"):
+            blockers.append("no local hot wallet is imported")
+        if not hot_wallet.get("unlocked"):
+            blockers.append("local hot wallet is locked")
+        if not (
+            signer.get("connected")
+            and signer.get("healthy")
+            and signer.get("can_sign")
+        ):
+            blockers.append(
+                str(signer.get("disabled_reason") or "signer is unhealthy")
+            )
+        if (
+            not wallet_public_key
+            or signer_wallet != wallet_public_key
+            or unlocked_wallet != wallet_public_key
+        ):
+            blockers.append(
+                "armed wallet does not match unlocked local hot wallet"
+            )
+        return list(dict.fromkeys(blockers))
+
+    def _require_mobile_treasury_signer(
+        self,
+        wallet_public_key: str,
+    ) -> None:
+        blockers = self._mobile_treasury_signer_blockers(
+            wallet_public_key
+        )
+        if blockers:
+            raise ValueError("; ".join(blockers))
+
+    def _mobile_treasury_readiness(
+        self,
+        wallet_public_key: str,
+    ) -> dict[str, object]:
+        readiness = self._recent_readiness_status()
+        strategy = (
+            readiness.get("strategy_promotion")
+            if isinstance(readiness.get("strategy_promotion"), dict)
+            else {}
+        )
+        execution = self._execution_readiness_status(
+            source=self.source_health(),
+            strategy_promotion=strategy,
+            env_live_enabled=True,
+            wallet_public_key=wallet_public_key,
+            signer_mode="local_hot_wallet",
+        )
+        all_audits = self._normalize_live_audits(
+            self.storage.load_live_execution_audits(None)
+        )
+        unresolved = [
+            audit for audit in all_audits if self._is_unresolved_live_audit(audit)
+        ]
+        backup = self._pre_run_backup_status()
+        manual = self._manual_live_verification_status(
+            wallet_public_key,
+            "local_hot_wallet",
+        )
+        blockers: list[str] = []
+        if not execution.get("can_live_submit"):
+            detail = "; ".join(
+                str(value)
+                for value in execution.get("blockers", [])
+                if value
+            )
+            blockers.append(
+                "live execution readiness is blocked"
+                + (f": {detail}" if detail else "")
+            )
+        if unresolved:
+            blockers.append(
+                f"unresolved live audit recovery debt: {len(unresolved)}"
+            )
+        if not backup.get("fresh"):
+            blockers.append(
+                str(
+                    backup.get("blocker")
+                    or "fresh pre-run backup is required"
+                )
+            )
+        if not manual.get("verified"):
+            blockers.append(
+                str(
+                    manual.get("blocker")
+                    or "recent manual live proof is required"
+                )
+            )
+        return {
+            "blockers": list(dict.fromkeys(blockers)),
+            "execution_readiness": execution,
+            "unresolved_audits": len(unresolved),
+            "pre_run_backup": backup,
+            "manual_live_verification": manual,
+        }
+
+    def _profit_sweep_policy_evaluation(
+        self,
+        *,
+        wallet_public_key: str,
+        destination: str,
+        balance_sol: Decimal,
+        pending_reserved_sol: Decimal = Decimal("0"),
+        expected_fee_sol: Decimal = Decimal("0"),
+    ) -> dict[str, object]:
+        blockers: list[str] = []
+        if not self.settings.profit_sweep_enabled:
+            blockers.append("profit sweep is disabled")
+        configured_destination = (
+            self.settings.profit_sweep_destination_wallet.strip()
+        )
+        if destination != configured_destination:
+            blockers.append(
+                "profit sweep destination does not match desktop settings"
+            )
+        mode = (
+            self.settings.profit_sweep_mode
+            if self.settings.profit_sweep_mode
+            in {"fixed_sol", "percentage"}
+            else "fixed_sol"
+        )
+        minimum_profit = Decimal(
+            str(self.settings.profit_sweep_min_profit_sol or "0")
+        )
+        legacy_threshold = Decimal(
+            str(self.settings.profit_sweep_threshold_sol or "0")
+        )
+        threshold = (
+            minimum_profit if minimum_profit > 0 else legacy_threshold
+        )
+        fixed_amount = Decimal(
+            str(self.settings.profit_sweep_amount_sol or "0")
+        )
+        percentage = Decimal(
+            str(self.settings.profit_sweep_percentage or "0")
+        )
+        if threshold <= 0:
+            blockers.append(
+                "minimum profit to sweep must be greater than zero"
+            )
+        if mode == "fixed_sol" and fixed_amount <= 0:
+            blockers.append("profit sweep amount must be greater than zero")
+        if mode == "percentage" and not (
+            Decimal("0") < percentage <= Decimal("100")
+        ):
+            blockers.append(
+                "profit sweep percentage must be greater than zero and no more than 100"
+            )
+        ledger = self.live_ledger(wallet_public_key)
+        summary = ledger.get("summary", {}) if isinstance(ledger, dict) else {}
+        realized = Decimal(
+            str(
+                summary.get("realized_pnl_sol", "0")
+                if isinstance(summary, dict)
+                else "0"
+            )
+        )
+        if realized < threshold:
+            blockers.append(
+                "realized live profit is below minimum profit to sweep"
+            )
+        expected_amount = fixed_amount
+        if mode == "percentage":
+            expected_amount = (
+                realized * percentage / Decimal("100")
+            ).quantize(Decimal("0.000000001"))
+            if expected_amount <= 0:
+                blockers.append("percentage sweep amount resolved to zero")
+        now = utc_now()
+        sweeps = [
+            audit
+            for audit in self.storage.load_live_execution_audits(None)
+            if audit.action == "profit_sweep"
+            and audit.wallet_public_key == wallet_public_key
+            and audit.final_status
+            in {"submitted", "confirmed", "reconciled"}
+        ]
+        recent_sweeps = [
+            audit
+            for audit in sweeps
+            if (now - audit.created_at).total_seconds() < 86400
+        ]
+        max_per_day = int(self.settings.profit_sweep_max_per_day or 0)
+        if max_per_day > 0 and len(recent_sweeps) >= max_per_day:
+            blockers.append("daily sweep cap reached")
+        cooldown_seconds = int(
+            self.settings.profit_sweep_cooldown_seconds or 0
+        )
+        last_sweep = max(
+            sweeps,
+            key=lambda audit: audit.created_at,
+            default=None,
+        )
+        cooldown_age_seconds: int | None = None
+        if last_sweep and cooldown_seconds > 0:
+            cooldown_age_seconds = int(
+                (now - last_sweep.created_at).total_seconds()
+            )
+            if cooldown_age_seconds < cooldown_seconds:
+                blockers.append("profit sweep cooldown active")
+        reserve = Decimal(
+            str(self.settings.profit_sweep_min_reserve_sol or "0")
+        )
+        remaining = (
+            balance_sol
+            - pending_reserved_sol
+            - expected_amount
+            - expected_fee_sol
+        )
+        if remaining < reserve:
+            blockers.append("profit sweep would breach minimum reserve")
+        return {
+            "blockers": list(dict.fromkeys(blockers)),
+            "expected_amount_sol": expected_amount,
+            "realized_pnl_sol": realized,
+            "minimum_profit_sol": threshold,
+            "sweep_mode": mode,
+            "sweep_percentage": percentage,
+            "minimum_reserve_sol": reserve,
+            "remaining_balance_sol": remaining,
+            "sweeps_today": len(recent_sweeps),
+            "max_per_day": max_per_day,
+            "cooldown_seconds": cooldown_seconds,
+            "cooldown_age_seconds": cooldown_age_seconds,
+        }
+
+    def mobile_treasury_preflight(
+        self,
+        *,
+        action: str,
+        address: str,
+        asset: str,
+        amount: Decimal,
+        token_accounts: list[str],
+        exclude_action_id: str = "",
+    ) -> dict[str, object]:
+        blockers: list[str] = []
+        wallet = self.settings.live_active_wallet_public_key.strip()
+        if action not in {"withdrawal", "profit_sweep", "rent_recovery"}:
+            blockers.append("treasury action is not supported")
+        if self.settings.kill_switch_enabled:
+            blockers.append("kill switch is enabled")
+        if not self.settings.live_active_backend_armed:
+            blockers.append("treasury backend is not armed")
+        if self.settings.live_signer_mode != "local_hot_wallet":
+            blockers.append("treasury requires the local hot wallet signer")
+        if not wallet:
+            blockers.append("armed wallet public key is required")
+        if asset != "SOL":
+            blockers.append("treasury executor currently supports SOL only")
+        blockers.extend(self._mobile_treasury_signer_blockers(wallet))
+        readiness = self._mobile_treasury_readiness(wallet)
+        blockers.extend(
+            str(value) for value in readiness.get("blockers", [])
+        )
+        balance = self.live_wallet_balance(wallet)
+        balance_error = str(balance.get("error") or "")
+        if balance_error:
+            blockers.append(
+                f"RPC wallet health is unavailable: {balance_error}"
+            )
+        balance_sol = Decimal(str(balance.get("balance_sol") or "0"))
+        expected_fee = Decimal(SOLANA_SIGNATURE_BASE_FEE_LAMPORTS) / Decimal(
+            LAMPORTS_PER_SOL
+        )
+        pending_reserved = self._pending_mobile_treasury_reservation(
+            wallet,
+            asset,
+            exclude_action_id=exclude_action_id,
+        )
+        if not pending_reserved.is_finite():
+            blockers.append("pending treasury reservation is invalid")
+            pending_reserved = balance_sol
+        configured_reserve = Decimal(
+            str(self.settings.profit_sweep_min_reserve_sol or "0")
+        )
+        available = balance_sol - pending_reserved
+        warnings = [
+            "Treasury movement requires fresh biometric authentication and a deliberate hold."
+        ]
+        profit_sweep_policy: dict[str, object] = {}
+        if action == "rent_recovery":
+            if address != wallet:
+                blockers.append(
+                    "rent recovery destination must be the armed wallet"
+                )
+            try:
+                scan = self.live_rent_recovery_scan(wallet) if wallet else {}
+            except Exception as exc:
+                scan = {}
+                blockers.append(
+                    f"rent recovery RPC scan failed: {exc.__class__.__name__}: {exc}"
+                )
+            eligible = {
+                str(row.get("token_account") or ""): row
+                for row in scan.get("eligible_accounts", [])
+                if isinstance(row, dict)
+            }
+            if not token_accounts:
+                blockers.append("rent recovery requires eligible token accounts")
+            if any(account not in eligible for account in token_accounts):
+                blockers.append(
+                    "rent recovery contains an ineligible token account"
+                )
+            recoverable = sum(
+                Decimal(str(eligible[account].get("rent_sol") or "0"))
+                for account in token_accounts
+                if account in eligible
+            )
+            if recoverable != amount:
+                blockers.append(
+                    "rent recovery amount does not match eligible rent"
+                )
+            if available < expected_fee:
+                blockers.append(
+                    "insufficient available balance for rent recovery fees"
+                )
+            remaining = balance_sol + recoverable - expected_fee
+        elif action == "profit_sweep":
+            if address == wallet:
+                blockers.append(
+                    "treasury destination must differ from the armed wallet"
+                )
+            profit_sweep_policy = self._profit_sweep_policy_evaluation(
+                wallet_public_key=wallet,
+                destination=address,
+                balance_sol=balance_sol,
+                pending_reserved_sol=pending_reserved,
+                expected_fee_sol=expected_fee,
+            )
+            blockers.extend(
+                str(value)
+                for value in profit_sweep_policy.get("blockers", [])
+            )
+            expected_amount = Decimal(
+                str(profit_sweep_policy.get("expected_amount_sol") or "0")
+            )
+            if amount != expected_amount:
+                blockers.append(
+                    "profit sweep amount does not match configured policy"
+                )
+            remaining = available - amount - expected_fee
+        else:
+            if address == wallet:
+                blockers.append(
+                    "treasury destination must differ from the armed wallet"
+                )
+            remaining = available - amount - expected_fee
+            if remaining < configured_reserve:
+                blockers.append(
+                    "insufficient available balance after reserves and fees"
+                )
+        return {
+            "blockers": list(dict.fromkeys(blockers)),
+            "expected_fee_sol": expected_fee,
+            "remaining_balance_sol": remaining,
+            "warnings": warnings,
+            "wallet_public_key": wallet,
+            "token_accounts": list(token_accounts),
+            "readiness": readiness,
+            "profit_sweep_policy": profit_sweep_policy,
+        }
+
+    def execute_mobile_treasury(
+        self,
+        *,
+        action_id: str,
+        action: str,
+        source_wallet_public_key: str,
+        address: str,
+        asset: str,
+        amount: Decimal,
+        token_accounts: list[str],
+    ) -> dict[str, object]:
+        receipt = self.storage.load_mobile_action_receipt(action_id)
+        if receipt is None or receipt.action_type != action:
+            raise ValueError("Durable treasury action receipt is required")
+        bound_source = str(
+            receipt.payload.get("source_wallet_public_key") or ""
+        )
+        if (
+            not source_wallet_public_key
+            or bound_source != source_wallet_public_key
+            or self.settings.live_active_wallet_public_key.strip()
+            != source_wallet_public_key
+        ):
+            raise ValueError(
+                "Treasury source wallet binding does not match armed wallet"
+            )
+        preflight = self.mobile_treasury_preflight(
+            action=action,
+            address=address,
+            asset=asset,
+            amount=amount,
+            token_accounts=token_accounts,
+            exclude_action_id=action_id,
+        )
+        blockers = [str(value) for value in preflight.get("blockers", [])]
+        if blockers:
+            raise ValueError("; ".join(blockers))
+        if action == "withdrawal":
+            self._require_mobile_treasury_signer(
+                source_wallet_public_key
+            )
+            result = self.hot_wallet.transfer_sol(
+                address,
+                float(amount),
+                self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
+            )
+        elif action == "profit_sweep":
+            policy = preflight.get("profit_sweep_policy", {})
+            audit = self._mobile_treasury_audit(
+                action_id=action_id,
+                action=action,
+                source_wallet_public_key=source_wallet_public_key,
+                amount=amount,
+                destination=address,
+                summary={
+                    "provider": "local_hot_wallet_profit_sweep",
+                    "policy_enforced": True,
+                    "sweep_mode": (
+                        policy.get("sweep_mode")
+                        if isinstance(policy, dict)
+                        else ""
+                    ),
+                    "realized_pnl_sol": (
+                        policy.get("realized_pnl_sol")
+                        if isinstance(policy, dict)
+                        else "0"
+                    ),
+                    "minimum_profit_sol": (
+                        policy.get("minimum_profit_sol")
+                        if isinstance(policy, dict)
+                        else "0"
+                    ),
+                },
+            )
+            self._require_mobile_treasury_signer(
+                source_wallet_public_key
+            )
+            result = self.hot_wallet.transfer_sol(
+                address,
+                float(amount),
+                self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
+            )
+            self._complete_mobile_treasury_audit(audit, result)
+        else:
+            generated = self._build_mobile_rent_recovery_transaction(
+                source_wallet_public_key,
+                token_accounts,
+            )
+            unsigned = str(generated.get("unsigned_transaction_base64") or "")
+            if not unsigned:
+                raise ValueError(
+                    "rent recovery transaction generation failed"
+                )
+            audit = self._mobile_treasury_audit(
+                action_id=action_id,
+                action=action,
+                source_wallet_public_key=source_wallet_public_key,
+                amount=amount,
+                destination=address,
+                summary={
+                    "provider": "local_hot_wallet_rent_recovery",
+                    "selected_count": int(
+                        generated.get("selected_count") or 0
+                    ),
+                    "recoverable_rent_sol": str(
+                        generated.get("recoverable_rent_sol") or amount
+                    ),
+                    "transaction_material_persisted": False,
+                },
+            )
+            self._require_mobile_treasury_signer(
+                source_wallet_public_key
+            )
+            result = self.hot_wallet.simulate_and_submit(
+                unsigned,
+                self.settings.solana_rpc_url,
+                expected_public_key=source_wallet_public_key,
+            )
+            self._complete_mobile_treasury_audit(audit, result)
+        return {
+            "status": "submitted",
+            "operator_message": "Treasury transaction submitted; verifying outcome",
+            "transaction_signature": str(
+                result.get("signature")
+                or result.get("transaction_signature")
+                or ""
+            ),
+            "execution_audit_id": (
+                audit.id
+                if action in {"profit_sweep", "rent_recovery"}
+                else ""
+            ),
+        }
+
+    def _mobile_treasury_audit(
+        self,
+        *,
+        action_id: str,
+        action: str,
+        source_wallet_public_key: str,
+        amount: Decimal,
+        destination: str,
+        summary: dict[str, object],
+    ) -> LiveExecutionAudit:
+        now = utc_now()
+        audit = LiveExecutionAudit(
+            id=new_id("treasuryaudit"),
+            created_at=now,
+            updated_at=now,
+            action=action,
+            mint="SOL" if action == "profit_sweep" else "rent_recovery",
+            amount=str(amount),
+            status="submitting",
+            signer_mode="local_hot_wallet",
+            wallet_public_key=source_wallet_public_key,
+            quote={
+                **summary,
+                "destination_wallet": destination,
+                "source_wallet_public_key": source_wallet_public_key,
+            },
+            request={
+                "source": "mobile_treasury",
+                "mobile_action_id": action_id,
+                "signer_mode": "local_hot_wallet",
+            },
+            final_status="submitting",
+            recommended_action=(
+                "Reconcile the public transaction signature; do not resubmit "
+                "while the outcome is unknown."
+            ),
+        )
+        self.storage.bind_mobile_treasury_execution_audit(
+            action_id,
+            audit,
+        )
+        return audit
+
+    def _complete_mobile_treasury_audit(
+        self,
+        audit: LiveExecutionAudit,
+        result: dict[str, object],
+    ) -> None:
+        audit.transaction_signature = str(
+            result.get("signature")
+            or result.get("transaction_signature")
+            or ""
+        )
+        audit.status = "submitted"
+        audit.final_status = "submitted"
+        audit.updated_at = utc_now()
+        simulation = result.get("simulation")
+        if isinstance(simulation, dict):
+            audit.simulation = {
+                "source": "local_hot_wallet",
+                "status": (
+                    "ok"
+                    if simulation.get("ok")
+                    else "warning"
+                    if simulation.get("warning")
+                    else "error"
+                ),
+                "ok": bool(simulation.get("ok")),
+                "warning": str(simulation.get("warning") or ""),
+                "error": str(simulation.get("error") or ""),
+            }
+        self.storage.save_live_execution_audit(audit)
+
+    def _build_mobile_rent_recovery_transaction(
+        self,
+        wallet_public_key: str,
+        token_accounts: list[str],
+    ) -> dict[str, object]:
+        wallet = wallet_public_key.strip()
+        selected = [
+            account.strip() for account in token_accounts if account.strip()
+        ]
+        scan = self.live_rent_recovery_scan(wallet)
+        eligible_by_account = {
+            str(item["token_account"]): item
+            for item in scan["eligible_accounts"]
+        }
+        missing = [
+            account for account in selected if account not in eligible_by_account
+        ]
+        if missing:
+            raise ValueError(
+                "selected token accounts are not eligible: "
+                + ", ".join(missing[:5])
+            )
+        blockhash = SolanaReadOnlyClient(
+            self.settings.solana_rpc_url
+        ).latest_blockhash()
+        payer = Pubkey.from_string(wallet)
+        instructions = [
+            self._close_token_account_instruction(
+                token_account=account,
+                destination_wallet=wallet,
+                owner_wallet=wallet,
+                program_id=str(eligible_by_account[account]["program_id"]),
+            )
+            for account in selected
+        ]
+        message = MessageV0.try_compile(
+            payer,
+            instructions,
+            [],
+            Hash.from_string(blockhash),
+        )
+        transaction = VersionedTransaction.populate(message, [])
+        recoverable = sum(
+            Decimal(str(eligible_by_account[account].get("rent_sol") or "0"))
+            for account in selected
+        )
+        return {
+            "unsigned_transaction_base64": base64.b64encode(
+                bytes(transaction)
+            ).decode("utf-8"),
+            "selected_count": len(selected),
+            "recoverable_rent_sol": str(recoverable),
+        }
+
+    def reconcile_mobile_treasury_action(
+        self,
+        receipt: object,
+    ) -> dict[str, object]:
+        payload = getattr(receipt, "payload", {})
+        signature = (
+            str(payload.get("transaction_signature") or "")
+            if isinstance(payload, dict)
+            else ""
+        )
+        action_type = str(getattr(receipt, "action_type", "") or "")
+        audit_id = str(
+            getattr(receipt, "execution_audit_id", "") or ""
+        )
+        audit = (
+            self.storage.load_live_execution_audit(audit_id)
+            if audit_id
+            else None
+        )
+        if action_type in {"profit_sweep", "rent_recovery"}:
+            if (
+                audit is None
+                or audit.action != action_type
+                or str(audit.request.get("mobile_action_id") or "")
+                != str(getattr(receipt, "id", "") or "")
+            ):
+                return {
+                    "status": "review_required",
+                    "operator_message": (
+                        "Treasury execution audit binding is missing or invalid; "
+                        "review locally and do not resubmit."
+                    ),
+                }
+        if not signature:
+            return {
+                "status": "review_required",
+                "operator_message": (
+                    "Treasury dispatch has no transaction signature; review locally "
+                    "and do not resubmit."
+                ),
+            }
+        status = self._signature_status(signature)
+        if not status.get("ok"):
+            return {
+                "status": "review_required",
+                "operator_message": "RPC reconciliation failed; review locally",
+            }
+        if status.get("err"):
+            if audit is not None:
+                receipt.status = "failed"
+                receipt.updated_at = utc_now()
+                receipt.payload["operator_message"] = (
+                    "Treasury transaction failed on chain"
+                )
+                self.storage.finalize_mobile_treasury_reconciliation(
+                    receipt,
+                    terminal_status="failed",
+                    confirmation=status,
+                )
+            return {
+                "status": "failed",
+                "operator_message": "Treasury transaction failed on chain",
+                "audit_terminal_status": "failed",
+                "confirmation": status,
+            }
+        confirmation = str(status.get("confirmation_status") or "")
+        if confirmation in {"confirmed", "finalized"}:
+            if audit is not None:
+                receipt.status = "confirmed"
+                receipt.updated_at = utc_now()
+                receipt.payload["operator_message"] = (
+                    "Treasury transaction confirmed"
+                )
+                self.storage.finalize_mobile_treasury_reconciliation(
+                    receipt,
+                    terminal_status="confirmed",
+                    confirmation=status,
+                )
+            return {
+                "status": "confirmed",
+                "operator_message": "Treasury transaction confirmed",
+                "audit_terminal_status": "confirmed",
+                "confirmation": status,
+            }
+        return {
+            "status": "verifying",
+            "operator_message": "Verifying treasury outcome",
+        }
+
+    def mobile_position(self, position_id: str) -> dict[str, object] | None:
+        now = utc_now()
+        if position_id.startswith("paper:"):
+            token_id = position_id.removeprefix("paper:")
+            token = next(
+                (item for item in self.storage.load_all_tokens(5000) if item.id == token_id),
+                None,
+            )
+            return self._mobile_paper_position_detail(token, now) if token else None
+        position = self.storage.load_live_ledger_position(position_id)
+        if position is None:
+            return None
+        previous_status = position.status
+        self._normalize_live_position_status(position)
+        if position.status != previous_status:
+            position.version += 1
+            position.updated_at = utc_now()
+        self._refresh_live_position_estimate(position)
+        self.storage.save_live_ledger_position(position)
+        return self._mobile_live_position_detail(position, now)
+
+    def mobile_adjust_position_exit(
+        self,
+        *,
+        position_id: str,
+        expected_version: int,
+        stop_pct: float,
+        target_pct: float,
+        mobile_action_id: str = "",
+    ) -> dict[str, object]:
+        position = self.storage.load_live_ledger_position(position_id)
+        if position is None:
+            raise LookupError("Mobile live position not found")
+        if int(position.version) != int(expected_version):
+            raise ValueError("Position version conflict")
+        if position.status != "open" or position.token_balance <= 0:
+            raise ValueError("Only an open live position can change exit controls")
+        if not (0 < float(stop_pct) <= 100) or not (0 < float(target_pct) <= 100):
+            raise ValueError("Exit controls are outside backend bounds")
+        position.stop_pct = round(float(stop_pct), 4)
+        position.target_pct = round(float(target_pct), 4)
+        position.last_mobile_action_id = mobile_action_id
+        position.version += 1
+        position.updated_at = utc_now()
+        self.storage.save_live_ledger_position(position)
+        self.add_event(
+            "warning",
+            f"Mobile exit controls updated for {position.symbol or position.mint[:8]}",
+            subsystem="mobile",
+            operator_action="Review the position and live exit signals after changing its bounds.",
+        )
+        return self._mobile_live_position_detail(position, utc_now())
+
+    def mobile_live_execution_blockers(
+        self,
+        intent: LiveExecutionIntent,
+    ) -> list[str]:
+        blockers = self._live_execution_blockers(
+            True,
+            intent.action,
+            intent.wallet_public_key,
+            intent.signer_mode,
+            autonomous=False,
+        )
+        readiness_halt = self.readiness_halt_reason()
+        if readiness_halt:
+            blockers.append(readiness_halt)
+        if intent.action == "buy":
+            backup = self._pre_run_backup_status()
+            if backup.get("blocks_live_entries"):
+                blockers.append(
+                    str(
+                        backup.get("blocker")
+                        or "pre-run backup is required before live entries"
+                    )
+                )
+        return list(dict.fromkeys(blockers))
+
+    def _mobile_position_summaries(
+        self,
+        now: datetime,
+        *,
+        live_positions: list[LiveLedgerPosition] | None = None,
+    ) -> list[dict[str, object]]:
+        paper = [
+            self._mobile_paper_position_summary(token, now)
+            for token in self.storage.load_all_tokens(5000)
+            if token.status
+            in {
+                TokenStatus.PAPER_BOUGHT,
+                TokenStatus.MONITORING,
+            }
+        ]
+        live = [
+            self._mobile_live_position_summary(position, now)
+            for position in (
+                live_positions
+                if live_positions is not None
+                else self._live_ledger_positions("")
+            )
+        ]
+        return sorted(
+            [*paper, *live],
+            key=lambda position: str(position["updated_at"]),
+            reverse=True,
+        )
+
+    def _mobile_paper_position_summary(
+        self,
+        token: TokenSignal,
+        now: datetime,
+    ) -> dict[str, object]:
+        observed_at = token.last_observed_trade_at or token.detected_at
+        age = self._mobile_mark_age(observed_at, now)
+        cost_basis = float(token.amount_sol or 0.0) * float(token.remaining_fraction)
+        realized = float(token.realized_pnl_sol or 0.0)
+        unrealized = float(token.pnl_sol or 0.0) - realized
+        return {
+            "id": f"paper:{token.id}",
+            "mode": "paper",
+            "symbol": token.symbol or token.name or "Unknown",
+            "mint": token.mint,
+            "status": "open",
+            "opened_at": (token.opened_at or token.detected_at).isoformat(),
+            "updated_at": observed_at.isoformat(),
+            "cost_basis_sol": cost_basis,
+            "value_sol": round(cost_basis + unrealized, 9),
+            "realized_pnl_sol": realized,
+            "unrealized_pnl_sol": unrealized,
+            "pnl_pct": round((unrealized / cost_basis) * 100, 2)
+            if cost_basis
+            else 0.0,
+            "pnl_approximate": True,
+            "mark_fresh": age is not None
+            and age <= self.settings.source_stale_seconds,
+            "mark_age_seconds": age,
+            "mark_source": token.price_source or "paper_model",
+        }
+
+    def _mobile_live_position_summary(
+        self,
+        position: LiveLedgerPosition,
+        now: datetime,
+    ) -> dict[str, object]:
+        age = self._mobile_mark_age(position.mark_price_at, now)
+        cost_basis = float(position.cost_basis_sol)
+        return {
+            "id": position.id,
+            "mode": "live",
+            "symbol": position.symbol or "Unknown",
+            "mint": position.mint,
+            "status": position.status,
+            "opened_at": position.created_at.isoformat(),
+            "updated_at": position.updated_at.isoformat(),
+            "cost_basis_sol": cost_basis,
+            "value_sol": round(cost_basis + float(position.unrealized_pnl_sol), 9),
+            "realized_pnl_sol": float(position.realized_pnl_sol),
+            "unrealized_pnl_sol": float(position.unrealized_pnl_sol),
+            "pnl_pct": round(
+                (float(position.unrealized_pnl_sol) / cost_basis) * 100,
+                2,
+            )
+            if cost_basis
+            else 0.0,
+            "pnl_approximate": position.realized_pnl_confidence != "audited"
+            or position.unrealized_pnl_confidence not in {"none", "audited"},
+            "mark_fresh": age is not None
+            and age <= self.settings.source_stale_seconds,
+            "mark_age_seconds": age,
+            "mark_source": position.mark_price_source,
+        }
+
+    def _mobile_paper_position_detail(
+        self,
+        token: TokenSignal,
+        now: datetime,
+    ) -> dict[str, object]:
+        summary = self._mobile_paper_position_summary(token, now)
+        observed_at = token.last_observed_trade_at or token.detected_at
+        realized = float(token.realized_pnl_sol or 0.0)
+        unrealized = float(token.pnl_sol or 0.0) - realized
+        total = realized + unrealized
+        return {
+            **summary,
+            "wallet_label": "Paper model",
+            "token_balance": 0.0,
+            "mark": {
+                "price_sol": float(token.current_price or token.entry_price or 0.0),
+                "source": token.price_source or "paper_model",
+                "confidence": float(token.price_confidence or 0.0),
+                "observed_at": observed_at.isoformat(),
+                "age_seconds": summary["mark_age_seconds"],
+                "fresh": summary["mark_fresh"],
+            },
+            "pnl": {
+                "realized_sol": realized,
+                "unrealized_sol": unrealized,
+                "total_sol": total,
+                "percentage": summary["pnl_pct"],
+                "approximate": True,
+                "confidence": "paper_model",
+                "notes": ["Paper PnL is simulated and is not account equity."],
+            },
+            "reconciliation_status": "paper_model",
+            "version": 1,
+            "stop_pct": float(self.settings.stop_loss_pct),
+            "target_pct": float(self.settings.take_profit_pct),
+            "prepared_close": None,
+            "allowed_actions": {
+                "adjust_exit": False,
+                "close": False,
+                "reason": "Guarded position actions are available in the review flow.",
+            },
+        }
+
+    def _mobile_live_position_detail(
+        self,
+        position: LiveLedgerPosition,
+        now: datetime,
+    ) -> dict[str, object]:
+        summary = self._mobile_live_position_summary(position, now)
+        total = float(position.realized_pnl_sol + position.unrealized_pnl_sol)
+        wallet = position.wallet_public_key
+        wallet_label = f"{wallet[:6]}...{wallet[-4:]}" if len(wallet) > 12 else wallet or "Unknown wallet"
+        prepared_close = next(
+            (
+                intent
+                for intent in self.storage.load_live_intents(200)
+                if intent.action == "sell"
+                and intent.amount == "100%"
+                and intent.mint == position.mint
+                and intent.wallet_public_key == position.wallet_public_key
+                and intent.generated_from_position
+                and intent.generated_position_id == position.id
+                and int(intent.generated_position_version)
+                == int(position.version)
+                and abs(
+                    float(intent.generated_position_token_balance)
+                    - float(position.token_balance)
+                )
+                <= 1e-12
+                and intent.status == "simulated"
+                and not intent.stale
+                and (
+                    intent.expires_at is None
+                    or intent.expires_at > now
+                )
+            ),
+            None,
+        )
+        prepared_close_audit = (
+            self.storage.load_live_execution_audit(prepared_close.audit_id)
+            if prepared_close is not None
+            else None
+        )
+        if (
+            prepared_close_audit is None
+            or prepared_close_audit.status != "simulated"
+            or prepared_close_audit.final_status != "simulated"
+            or bool(prepared_close_audit.guarded_action_id)
+            or prepared_close_audit.action != "sell"
+            or prepared_close_audit.amount != "100%"
+            or str(prepared_close_audit.quote.get("status") or "") != "ready"
+            or bool(prepared_close_audit.quote.get("shadow_only"))
+            or float(prepared_close_audit.quote.get("slippage_pct") or 0) <= 0
+            or (
+                self._parse_iso_datetime(
+                    str(prepared_close_audit.quote.get("expires_at") or "")
+                )
+                or now
+            )
+            <= now
+        ):
+            prepared_close = None
+            prepared_close_audit = None
+        controls_available = (
+            position.status == "open"
+            and position.token_balance > 0
+            and position.reconciliation_status != "needs_review"
+        )
+        return {
+            **summary,
+            "wallet_label": wallet_label,
+            "token_balance": float(position.token_balance),
+            "mark": {
+                "price_sol": float(position.mark_price_sol),
+                "source": position.mark_price_source,
+                "confidence": float(position.mark_price_confidence),
+                "observed_at": position.mark_price_at.isoformat() if position.mark_price_at else None,
+                "age_seconds": summary["mark_age_seconds"],
+                "fresh": summary["mark_fresh"],
+            },
+            "pnl": {
+                "realized_sol": float(position.realized_pnl_sol),
+                "unrealized_sol": float(position.unrealized_pnl_sol),
+                "total_sol": total,
+                "percentage": summary["pnl_pct"],
+                "approximate": summary["pnl_approximate"],
+                "confidence": position.unrealized_pnl_confidence,
+                "notes": list(position.pnl_confidence_notes),
+            },
+            "reconciliation_status": position.reconciliation_status,
+            "version": int(position.version),
+            "stop_pct": float(
+                position.stop_pct
+                if position.stop_pct is not None
+                else self.settings.stop_loss_pct
+            ),
+            "target_pct": float(
+                position.target_pct
+                if position.target_pct is not None
+                else self.settings.take_profit_pct
+            ),
+            "prepared_close": (
+                {
+                    "intent_id": prepared_close.id,
+                    "intent_version": int(prepared_close.version),
+                    "position_version": int(position.version),
+                    "amount": "100%",
+                    "slippage_pct": float(
+                        prepared_close_audit.quote.get("slippage_pct") or 0
+                    ),
+                    "expires_at": prepared_close.expires_at.isoformat()
+                    if prepared_close.expires_at
+                    else None,
+                }
+                if prepared_close is not None
+                else None
+            ),
+            "allowed_actions": {
+                "adjust_exit": controls_available,
+                "close": controls_available and prepared_close is not None,
+                "reason": (
+                    "A simulated sell intent is ready for guarded close review."
+                    if controls_available and prepared_close is not None
+                    else "Prepare and simulate a matching sell intent before closing from mobile."
+                    if controls_available
+                    else "Resolve position reconciliation before changing live controls."
+                ),
+            },
+        }
+
+    def _mobile_positions_freshness(
+        self,
+        positions: list[dict[str, object]],
+        now: datetime,
+    ) -> dict[str, object]:
+        ages = [
+            int(position["mark_age_seconds"])
+            for position in positions
+            if position.get("mark_age_seconds") is not None
+        ]
+        age = max(ages, default=0)
+        if not positions or not ages:
+            status = "unavailable"
+        elif any(not bool(position["mark_fresh"]) for position in positions):
+            status = "stale"
+        else:
+            status = "fresh"
+        return {
+            "status": status,
+            "generated_at": now.isoformat(),
+            "age_seconds": age,
+            "stale_after_seconds": self.settings.source_stale_seconds,
+            "approximate_pnl": any(
+                bool(position["pnl_approximate"]) for position in positions
+            ),
+        }
+
+    @staticmethod
+    def _mobile_mark_age(
+        observed_at: datetime | None,
+        now: datetime,
+    ) -> int | None:
+        if (
+            observed_at is None
+            or observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or observed_at > now
+        ):
+            return None
+        return int((now - observed_at).total_seconds())
+
+    @staticmethod
+    def _mobile_allocation(
+        positions: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        included = [
+            (position, Decimal(str(float(position["value_sol"]))))
+            for position in positions
+            if float(position["value_sol"]) > 0
+        ]
+        total_value = sum((value for _, value in included), Decimal("0"))
+        if total_value <= 0:
+            return []
+        exact_basis_points = [
+            (value / total_value) * Decimal("10000")
+            for _, value in included
+        ]
+        basis_points = [
+            int(value.quantize(Decimal("1"), rounding=ROUND_DOWN))
+            for value in exact_basis_points
+        ]
+        remainder = 10000 - sum(basis_points)
+        remainder_order = sorted(
+            range(len(included)),
+            key=lambda index: (
+                -(exact_basis_points[index] - Decimal(basis_points[index])),
+                str(included[index][0]["id"]),
+            ),
+        )
+        for index in remainder_order[:remainder]:
+            basis_points[index] += 1
+        return [
+            {
+                "key": str(position["id"]),
+                "label": str(position["symbol"]),
+                "value_sol": float(value),
+                "percentage": basis_points[index] / 100,
+                "mode": str(position["mode"]),
+            }
+            for index, (position, value) in enumerate(included)
+        ]
+
     def mobile_start_bot(self, live_trading_enabled: bool = False, local_auth_enabled: bool = False) -> dict[str, object]:
         self.start()
         self.add_event("info", "Mobile cockpit started bot", subsystem="mobile")
@@ -530,8 +2075,7 @@ class BotState:
 
     def _normalize_mobile_scopes(self, scopes: list[str] | None) -> list[str]:
         requested = scopes or list(self.MOBILE_DEFAULT_SCOPES)
-        allowed = {self.MOBILE_MONITOR_SCOPE, self.MOBILE_CONTROL_SCOPE}
-        clean = [scope for scope in requested if scope in allowed]
+        clean = [scope for scope in requested if scope in self.MOBILE_ALLOWED_SCOPES]
         if self.MOBILE_MONITOR_SCOPE not in clean:
             clean.insert(0, self.MOBILE_MONITOR_SCOPE)
         return list(dict.fromkeys(clean))
@@ -5080,17 +6624,35 @@ class BotState:
             hot_wallet = self.hot_wallet.status()
             imported = bool(hot_wallet["imported"])
             unlocked = bool(hot_wallet["unlocked"])
+            sidecar_mismatch = bool(hot_wallet.get("sidecar_mismatch"))
+            can_sign = unlocked and not sidecar_mismatch
             return SignerStatus(
                 mode="local_hot_wallet",
                 connected=imported,
                 wallet_public_key=str(hot_wallet["wallet_public_key"] or ""),
-                healthy=imported,
-                can_sign=unlocked,
-                can_unattended_sign=unlocked,
-                supports_auto_sell=unlocked,
-                supports_auto_buy=unlocked,
-                disabled_reason="" if unlocked else "Unlock the encrypted local hot wallet to enable unattended execution." if imported else "Import an encrypted local hot wallet first.",
-                message="Encrypted local hot wallet is unlocked and ready." if unlocked else "Encrypted local hot wallet is imported but locked." if imported else "No local hot wallet is imported.",
+                healthy=imported and can_sign,
+                can_sign=can_sign,
+                can_unattended_sign=can_sign,
+                supports_auto_sell=can_sign,
+                supports_auto_buy=can_sign,
+                disabled_reason=(
+                    "Hot wallet sidecar does not match the actual unlocked signer."
+                    if sidecar_mismatch
+                    else ""
+                    if unlocked
+                    else "Unlock the encrypted local hot wallet to enable unattended execution."
+                    if imported
+                    else "Import an encrypted local hot wallet first."
+                ),
+                message=(
+                    "Encrypted local hot wallet identity changed on disk; lock and unlock again."
+                    if sidecar_mismatch
+                    else "Encrypted local hot wallet is unlocked and ready."
+                    if unlocked
+                    else "Encrypted local hot wallet is imported but locked."
+                    if imported
+                    else "No local hot wallet is imported."
+                ),
                 transport="encrypted_local_file",
                 version="v1",
                 last_heartbeat_at=str(hot_wallet["last_unlock_at"] or ""),
@@ -6408,6 +7970,11 @@ class BotState:
                         expires_at=now + timedelta(seconds=30),
                         priority_reason=str(top_signal["priority_reason"]),
                         generated_from_position=True,
+                        generated_position_id=position.id,
+                        generated_position_version=int(position.version),
+                        generated_position_token_balance=float(
+                            position.token_balance
+                        ),
                         operator_recommendation="Review the triggered risk condition, then use manual quote/sign if you want to exit now.",
                     )
                 )
@@ -6441,6 +8008,7 @@ class BotState:
         intent = self._require_live_intent(intent_id)
         intent.status = "cancelled"
         intent.updated_at = utc_now()
+        intent.version += 1
         self.storage.save_live_intent(intent)
         return intent.to_dict()
 
@@ -6677,6 +8245,7 @@ class BotState:
         intent.updated_at = utc_now()
         intent.expires_at = utc_now() + timedelta(seconds=30)
         intent.stale = False
+        intent.version += 1
         self.storage.save_live_intent(intent)
         if shadow_only and intent.source == "paper_promoted":
             stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
@@ -6758,16 +8327,39 @@ class BotState:
             if intent:
                 intent.status = audit.status
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         return audit.to_dict()
 
-    def live_submit(self, audit_id: str, signature: str) -> dict[str, object]:
-        audit = self._require_live_audit(audit_id)
+    def live_submit(
+        self,
+        audit_id: str,
+        signature: str,
+        *,
+        guarded_action_id: str = "",
+    ) -> dict[str, object]:
+        if guarded_action_id:
+            claimed = self.storage.begin_mobile_execution_dispatch(
+                audit_id=audit_id,
+                action_id=guarded_action_id,
+            )
+            if claimed is None:
+                return self._require_live_audit(audit_id).to_dict()
+            audit = claimed
+        else:
+            audit = self._require_live_audit(audit_id)
+            if audit.guarded_action_id:
+                raise ValueError(
+                    "guarded execution audits require their owning mobile action"
+                )
         if audit.quote.get("shadow_only"):
             raise ValueError("shadow-only quote cannot be submitted")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
-        preflight_blockers = self._live_audit_preflight_blockers(audit)
+        preflight_blockers = self._live_audit_preflight_blockers(
+            audit,
+            require_exact=bool(guarded_action_id),
+        )
         if preflight_blockers:
             raise ValueError(f"cannot submit live audit with failed preflight checks: {'; '.join(preflight_blockers[:4])}")
         if audit.action == "buy":
@@ -6832,6 +8424,7 @@ class BotState:
             if intent:
                 intent.status = "submitted"
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         self.add_event("warning", f"Live {audit.action} submitted: {audit.transaction_signature[:10]}")
         if audit.signer_mode != "browser_wallet":
@@ -6863,6 +8456,7 @@ class BotState:
             if intent:
                 intent.status = "executed" if audit.status == "confirmed" else "needs_review"
                 intent.updated_at = utc_now()
+                intent.version += 1
                 self.storage.save_live_intent(intent)
         if audit.status == "confirmed":
             position = self._record_live_fill(audit)
@@ -6882,7 +8476,11 @@ class BotState:
     def _execute_backend_audit(self, audit: LiveExecutionAudit) -> dict[str, object]:
         unsigned_transaction_base64 = str(audit.quote.get("unsigned_transaction_base64") or "")
         if audit.signer_mode == "local_hot_wallet":
-            return self.hot_wallet.simulate_and_submit(unsigned_transaction_base64, self.settings.solana_rpc_url)
+            return self.hot_wallet.simulate_and_submit(
+                unsigned_transaction_base64,
+                self.settings.solana_rpc_url,
+                expected_public_key=audit.wallet_public_key,
+            )
         if audit.signer_mode == "local_signer_daemon":
             base_endpoint = self.signer_daemon_url or "http://127.0.0.1:8799"
             if not self._local_signer_daemon_endpoint_allowed(base_endpoint):
@@ -7180,75 +8778,55 @@ class BotState:
             blockers.append("profit sweep destination wallet is required")
         if destination and wallet and destination == wallet:
             blockers.append("profit sweep destination must differ from the trading wallet")
-        sweep_mode = self.settings.profit_sweep_mode if self.settings.profit_sweep_mode in {"fixed_sol", "percentage"} else "fixed_sol"
-        minimum_profit = float(self.settings.profit_sweep_min_profit_sol or 0.0)
-        legacy_threshold = float(self.settings.profit_sweep_threshold_sol or 0.0)
-        threshold = minimum_profit if minimum_profit > 0 else legacy_threshold
-        fixed_amount = float(self.settings.profit_sweep_amount_sol or 0.0)
-        sweep_percentage = float(self.settings.profit_sweep_percentage or 0.0)
-        amount = fixed_amount
-        reserve = float(self.settings.profit_sweep_min_reserve_sol or 0.0)
-        if threshold <= 0:
-            blockers.append("minimum profit to sweep must be greater than zero")
-        if sweep_mode == "fixed_sol" and fixed_amount <= 0:
-            blockers.append("profit sweep amount must be greater than zero")
-        if sweep_mode == "percentage" and not (0 < sweep_percentage <= 100):
-            blockers.append("profit sweep percentage must be greater than zero and no more than 100")
         if not wallet:
             blockers.append("armed live wallet is required")
         if blockers:
             reason = "; ".join(blockers)
             return {"status": "blocked", "reason": reason, "blockers": blockers}
-
-        ledger = self.live_ledger(wallet)
-        summary = ledger.get("summary", {}) if isinstance(ledger, dict) else {}
-        realized_pnl = float(summary.get("realized_pnl_sol", 0.0) or 0.0)
-        if realized_pnl < threshold:
+        balance = self._wallet_sol_balance(wallet)
+        balance_sol = Decimal(str(balance.get("balance_sol", 0.0) or 0.0))
+        if balance.get("error"):
+            return {
+                "status": "blocked",
+                "reason": f"wallet SOL balance check failed: {balance['error']}",
+                "balance_snapshot": balance,
+            }
+        policy = self._profit_sweep_policy_evaluation(
+            wallet_public_key=wallet,
+            destination=destination,
+            balance_sol=balance_sol,
+        )
+        policy_blockers = [
+            str(value) for value in policy.get("blockers", [])
+        ]
+        realized_pnl = float(policy["realized_pnl_sol"])
+        threshold = float(policy["minimum_profit_sol"])
+        if (
+            "realized live profit is below minimum profit to sweep"
+            in policy_blockers
+        ):
             return {
                 "status": "idle",
                 "reason": "realized live profit is below minimum profit to sweep",
                 "realized_pnl_sol": round(realized_pnl, 9),
                 "minimum_profit_sol": round(threshold, 9),
             }
-        if sweep_mode == "percentage":
-            amount = round(realized_pnl * (sweep_percentage / 100.0), 9)
-            if amount <= 0:
-                return {
-                    "status": "blocked",
-                    "reason": "percentage sweep amount resolved to zero",
-                    "realized_pnl_sol": round(realized_pnl, 9),
-                    "sweep_percentage": round(sweep_percentage, 4),
-                }
-
-        now = utc_now()
-        sweeps = [
-            audit
-            for audit in self.storage.load_live_execution_audits(500)
-            if audit.action == "profit_sweep" and audit.wallet_public_key == wallet and audit.final_status in {"submitted", "confirmed", "reconciled"}
-        ]
-        recent_sweeps = [audit for audit in sweeps if (now - audit.created_at).total_seconds() < 86400]
-        max_per_day = int(self.settings.profit_sweep_max_per_day or 0)
-        if max_per_day > 0 and len(recent_sweeps) >= max_per_day:
-            return {"status": "blocked", "reason": "daily sweep cap reached", "sweeps_today": len(recent_sweeps), "max_per_day": max_per_day}
-        cooldown_seconds = int(self.settings.profit_sweep_cooldown_seconds or 0)
-        last_sweep = max(sweeps, key=lambda audit: audit.created_at, default=None)
-        if last_sweep and cooldown_seconds > 0:
-            age_seconds = int((now - last_sweep.created_at).total_seconds())
-            if age_seconds < cooldown_seconds:
-                return {"status": "blocked", "reason": "profit sweep cooldown active", "cooldown_seconds": cooldown_seconds, "age_seconds": age_seconds}
-
-        balance = self._wallet_sol_balance(wallet)
-        balance_sol = float(balance.get("balance_sol", 0.0) or 0.0)
-        if balance.get("error"):
-            return {"status": "blocked", "reason": f"wallet SOL balance check failed: {balance['error']}", "balance_snapshot": balance}
-        if balance_sol - amount < reserve:
+        if policy_blockers:
             return {
                 "status": "blocked",
-                "reason": "profit sweep would breach minimum reserve",
-                "balance_sol": round(balance_sol, 9),
-                "amount_sol": round(amount, 9),
-                "min_reserve_sol": round(reserve, 9),
+                "reason": "; ".join(policy_blockers),
+                "blockers": policy_blockers,
+                "policy": policy,
             }
+        now = utc_now()
+        amount = float(policy["expected_amount_sol"])
+        reserve = float(policy["minimum_reserve_sol"])
+        sweep_mode = str(policy["sweep_mode"])
+        sweep_percentage = float(policy["sweep_percentage"])
+        max_per_day = int(policy["max_per_day"])
+        cooldown_seconds = int(policy["cooldown_seconds"])
+        sweeps_today = int(policy["sweeps_today"])
+        balance_sol_float = float(balance_sol)
 
         audit = LiveExecutionAudit(
             id=new_id("liveaudit"),
@@ -7282,7 +8860,7 @@ class BotState:
             },
             preflight_checks=[
                 self._preflight_check("minimum_profit", "Minimum Profit", "pass", round(realized_pnl, 9), f">= {round(threshold, 9)} SOL", ""),
-                self._preflight_check("minimum_reserve", "Minimum Reserve", "pass", round(balance_sol - amount, 9), f">= {round(reserve, 9)} SOL", ""),
+                self._preflight_check("minimum_reserve", "Minimum Reserve", "pass", round(balance_sol_float - amount, 9), f">= {round(reserve, 9)} SOL", ""),
                 self._preflight_check("local_hot_wallet", "Local Hot Wallet", "pass", "unlocked", "unlocked and armed", ""),
             ],
             caps_snapshot={
@@ -7291,7 +8869,7 @@ class BotState:
                 "profit_sweep_mode": sweep_mode,
                 "profit_sweep_percentage": round(sweep_percentage, 4) if sweep_mode == "percentage" else 0.0,
                 "profit_sweep_min_profit_sol": round(threshold, 9),
-                "sweeps_today": len(recent_sweeps),
+                "sweeps_today": sweeps_today,
             },
             balance_snapshot=balance,
             final_status="ready",
@@ -7299,7 +8877,12 @@ class BotState:
         )
         self.storage.save_live_execution_audit(audit)
         try:
-            execution = self.hot_wallet.transfer_sol(destination, amount, self.settings.solana_rpc_url)
+            execution = self.hot_wallet.transfer_sol(
+                destination,
+                amount,
+                self.settings.solana_rpc_url,
+                expected_public_key=wallet,
+            )
             audit.transaction_signature = str(execution.get("signature") or execution.get("transaction_signature") or "")
             simulation = execution.get("simulation")
             if isinstance(simulation, dict):
@@ -7455,18 +9038,61 @@ class BotState:
             "reason": reason,
         }
 
-    def _live_audit_preflight_blockers(self, audit: LiveExecutionAudit | None) -> list[str]:
+    def _live_audit_preflight_blockers(
+        self,
+        audit: LiveExecutionAudit | None,
+        *,
+        require_exact: bool = False,
+    ) -> list[str]:
         if audit is None:
             return ["missing live audit"]
         rows = audit.preflight_checks or []
         if not rows:
-            return []
+            return ["missing preflight inventory"] if require_exact else []
+        required_ids = {
+            "environment",
+            "mint",
+            "wallet",
+            "signer",
+            "amount",
+            "slippage",
+            "priority_fee",
+            "pool",
+            "caps",
+            "blockers",
+        }
+        optional_ids = {
+            "estimated_wallet_spend",
+            "rent_dominance",
+            "wallet_token_balance",
+        }
         blockers = []
+        seen: set[str] = set()
         for row in rows:
-            if str(row.get("status") or "").lower() == "fail":
-                label = str(row.get("label") or row.get("id") or "preflight")
-                reason = str(row.get("reason") or "failed")
-                blockers.append(f"{label}: {reason}")
+            if not isinstance(row, dict):
+                if require_exact:
+                    blockers.append("malformed preflight row")
+                continue
+            check_id = str(row.get("id") or "").strip()
+            label = str(row.get("label") or "").strip()
+            reason = str(row.get("reason") or "").strip()
+            status = str(row.get("status") or "").lower()
+            if not check_id or not label or not reason:
+                if require_exact:
+                    blockers.append("malformed preflight row")
+                continue
+            if check_id in seen:
+                if require_exact:
+                    blockers.append(f"duplicate preflight check: {check_id}")
+                continue
+            seen.add(check_id)
+            if require_exact and check_id not in required_ids | optional_ids:
+                blockers.append(f"unknown preflight check: {check_id}")
+            if status == "fail" or (require_exact and status != "pass"):
+                blockers.append(f"{label}: {reason or 'not passing'}")
+        missing = sorted(required_ids - seen) if require_exact else []
+        if require_exact and missing:
+            blockers.append("missing preflight checks: " + ", ".join(missing))
         return blockers
 
     def _wallet_token_balance(self, wallet_public_key: str, mint: str) -> dict[str, object]:
@@ -7787,14 +9413,34 @@ class BotState:
         if price > 0 and entry_price > 0:
             current_pct = ((price - entry_price) / entry_price) * 100
         signals: list[dict[str, object]] = []
-        if self.settings.stop_loss_pct > 0 and current_pct <= -abs(self.settings.stop_loss_pct):
+        stop_pct = (
+            float(position.stop_pct)
+            if position.stop_pct is not None
+            else float(self.settings.stop_loss_pct)
+        )
+        if stop_pct > 0 and current_pct <= -abs(stop_pct):
             signals.append(
                 {
                     "signal": "stop_loss",
-                    "reason": f"Stop-loss triggered at {current_pct:.2f}% versus -{abs(self.settings.stop_loss_pct):.2f}%",
+                    "reason": f"Stop-loss triggered at {current_pct:.2f}% versus -{abs(stop_pct):.2f}%",
                     "priority_reason": f"Risk exit: stop-loss breach {current_pct:.2f}%",
                     "priority": 1000 + abs(current_pct),
                     "score": 100,
+                }
+            )
+        target_pct = (
+            float(position.target_pct)
+            if position.target_pct is not None
+            else float(self.settings.take_profit_pct)
+        )
+        if target_pct > 0 and current_pct >= target_pct:
+            signals.append(
+                {
+                    "signal": "take_profit",
+                    "reason": f"Take-profit triggered at {current_pct:.2f}% versus {target_pct:.2f}%",
+                    "priority_reason": f"Profit exit: target reached at {current_pct:.2f}%",
+                    "priority": 980 + current_pct,
+                    "score": 98,
                 }
             )
         if self.settings.break_even_stop_enabled and token.highest_unrealized_pct >= self.settings.break_even_after_profit_pct and current_pct <= 0:
@@ -7881,6 +9527,30 @@ class BotState:
         if audit.action == "buy":
             position.cost_basis_sol = round(position.cost_basis_sol + amount_sol + priority_fee, 9)
             position.status = "open"
+            authorization = (
+                audit.guarded_authorization
+                if isinstance(audit.guarded_authorization, dict)
+                else {}
+            )
+            if not authorization and isinstance(audit.request, dict):
+                candidate = audit.request.get("mobile_authorization")
+                authorization = candidate if isinstance(candidate, dict) else {}
+            if authorization:
+                try:
+                    stop_pct = float(authorization.get("stop_pct"))
+                    target_pct = float(authorization.get("target_pct"))
+                except (TypeError, ValueError):
+                    stop_pct = 0.0
+                    target_pct = 0.0
+                if not (0 < stop_pct <= 100 and 0 < target_pct <= 100):
+                    raise ValueError(
+                        "guarded buy authorization is missing bounded exit controls"
+                    )
+                position.stop_pct = round(stop_pct, 4)
+                position.target_pct = round(target_pct, 4)
+                position.last_mobile_action_id = str(
+                    authorization.get("action_id") or ""
+                )
             fill["accounting"] = {
                 "type": "buy",
                 "method": position.cost_basis_method,
@@ -7920,6 +9590,7 @@ class BotState:
         position.cost_basis_breakdown = self._live_cost_basis_breakdown(position)
         position.updated_at = now
         position.reconciliation_status = "pending"
+        position.version += 1
         self.storage.save_live_ledger_position(position)
         return self._reconcile_live_audit(audit)
 
@@ -8181,6 +9852,12 @@ class BotState:
         position = next((item for item in self.storage.load_live_ledger_positions(500) if item.mint == audit.mint and item.wallet_public_key == wallet), None)
         if position is None:
             return None
+        material_before = (
+            position.status,
+            float(position.token_balance),
+            position.reconciliation_status,
+            len(position.fills),
+        )
         balance = self._wallet_token_balance(wallet, audit.mint)
         if not balance.get("checked_at"):
             balance["checked_at"] = utc_now().isoformat()
@@ -8225,6 +9902,14 @@ class BotState:
                 self._recompute_live_position_accounting(position)
         self._refresh_live_position_estimate(position)
         position.updated_at = utc_now()
+        material_after = (
+            position.status,
+            float(position.token_balance),
+            position.reconciliation_status,
+            len(position.fills),
+        )
+        if material_after != material_before:
+            position.version += 1
         audit.updated_at = utc_now()
         self.storage.save_live_ledger_position(position)
         self.storage.save_live_execution_audit(audit)
@@ -8236,7 +9921,11 @@ class BotState:
             positions = [position for position in positions if position.wallet_public_key == wallet_public_key.strip()]
         refreshed: list[LiveLedgerPosition] = []
         for position in positions:
+            previous_status = position.status
             self._normalize_live_position_status(position)
+            if position.status != previous_status:
+                position.version += 1
+                position.updated_at = utc_now()
             self._refresh_live_position_estimate(position)
             self.storage.save_live_ledger_position(position)
             refreshed.append(position)
@@ -8244,16 +9933,27 @@ class BotState:
 
     def _refresh_live_position_estimate(self, position: LiveLedgerPosition) -> None:
         mark = self._latest_live_mark_price_snapshot(position.mint)
-        price = float(mark.get("price", 0.0) or 0.0)
-        position.mark_price_sol = price
-        position.mark_price_source = str(mark.get("source", ""))
-        position.mark_price_confidence = float(mark.get("confidence", 0.0) or 0.0)
-        position.mark_price_at = mark.get("observed_at") if isinstance(mark.get("observed_at"), datetime) else None
-        position.mark_price_age_seconds = (
-            max(0, int((utc_now() - position.mark_price_at).total_seconds()))
-            if position.mark_price_at
+        observed_at = (
+            mark.get("observed_at")
+            if isinstance(mark.get("observed_at"), datetime)
             else None
         )
+        now = utc_now()
+        mark_age = self._mobile_mark_age(observed_at, now)
+        price = (
+            float(mark.get("price", 0.0) or 0.0)
+            if mark_age is not None
+            else 0.0
+        )
+        position.mark_price_sol = price
+        position.mark_price_source = str(mark.get("source", ""))
+        position.mark_price_confidence = (
+            float(mark.get("confidence", 0.0) or 0.0)
+            if mark_age is not None
+            else 0.0
+        )
+        position.mark_price_at = observed_at if mark_age is not None else None
+        position.mark_price_age_seconds = mark_age
         if price > 0 and position.token_balance > 0:
             estimated_value = position.token_balance * price
             position.unrealized_pnl_sol = round(estimated_value - position.cost_basis_sol, 9)
@@ -8370,8 +10070,12 @@ class BotState:
 
     def _latest_live_mark_price_snapshot(self, mint: str) -> dict[str, object]:
         token = next((item for item in self.storage.load_all_tokens(5000) if item.mint == mint), None)
+        now = utc_now()
         for observation in self.storage.load_price_observations_newest_first(100, mint=mint):
-            if observation.accepted:
+            if (
+                observation.accepted
+                and self._mobile_mark_age(observation.observed_at, now) is not None
+            ):
                 for key, value in (
                     ("selected_price", observation.selected_price),
                     ("price", observation.price),
@@ -8386,7 +10090,7 @@ class BotState:
                             "confidence": float(observation.confidence or 0.0),
                             "observed_at": observation.observed_at,
                         }
-        if token:
+        if token and self._mobile_mark_age(token.detected_at, now) is not None:
             for source, value in (("token_current_price", token.current_price), ("token_exit_price", token.exit_price), ("token_entry_price", token.entry_price)):
                 price = float(value or 0.0)
                 if price > 0:

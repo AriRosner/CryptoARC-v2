@@ -5,30 +5,75 @@ import React, { useState } from "react";
 import { ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { claimMobilePairing, normalizeApiBaseUrl, probeMobileHealth } from "@/src/api";
 import { ActionButton, DetailRow, ErrorBanner, MetricTile, PageHeader, Section, StatusBadge } from "@/src/components/ui";
-import { useMobileSession } from "@/src/MobileSession";
+import { useSession } from "@/src/core/session/SessionProvider";
+import { parsePairingPayload } from "@/src/security";
 import { colors, spacing } from "@/src/theme";
 
 export default function PairingScreen() {
-  const { token, apiBaseUrl, device, loading, error, setError, pairWithManualCode, pairWithQrPayload, probeHealth } = useMobileSession();
+  const session = useSession();
   const [permission, requestPermission] = useCameraPermissions();
-  const [apiBaseInput, setApiBaseInput] = useState(apiBaseUrl);
+  const [apiBaseInput, setApiBaseInput] = useState(session.apiBaseUrl);
   const [pairingId, setPairingId] = useState("");
   const [code, setCode] = useState("");
   const [deviceName, setDeviceName] = useState("Android cockpit");
   const [scanning, setScanning] = useState(false);
   const [healthOk, setHealthOk] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const pairWithManualCode = async (input: {
+    apiBaseUrl: string;
+    pairingId: string;
+    code: string;
+    deviceName: string;
+  }) => {
+    const generation = session.generation;
+    setLoading(true);
+    setError("");
+    try {
+      const apiBaseUrl = normalizeApiBaseUrl(input.apiBaseUrl);
+      const claimed = await claimMobilePairing({
+        apiBaseUrl,
+        pairingId: input.pairingId,
+        code: input.code,
+        deviceName: input.deviceName || "Android cockpit",
+        platform: "android",
+      });
+      if (!session.isCurrentGeneration(generation)) return false;
+      return session.replaceSession(apiBaseUrl, claimed.token, claimed.device, generation);
+    } catch (cause) {
+      if (session.isCurrentGeneration(generation)) {
+        setError(cause instanceof Error ? cause.message : "Pairing failed");
+      }
+      throw cause;
+    } finally {
+      if (session.isCurrentGeneration(generation)) setLoading(false);
+    }
+  };
+
+  const pairWithQrPayload = async (payload: string) => {
+    const parsed = parsePairingPayload(payload);
+    return pairWithManualCode({
+      apiBaseUrl: parsed.apiBaseUrl || apiBaseInput,
+      pairingId: parsed.pairingId,
+      code: parsed.code,
+      deviceName,
+    });
+  };
 
   const submitManual = async () => {
     try {
-      await pairWithManualCode({ apiBaseUrl: apiBaseInput, pairingId, code, deviceName });
-      router.push("/");
+      if (await pairWithManualCode({ apiBaseUrl: apiBaseInput, pairingId, code, deviceName })) {
+        router.replace("/");
+      }
     } catch {}
   };
 
   const submitHealth = async () => {
     try {
-      await probeHealth(apiBaseInput);
+      await probeMobileHealth(apiBaseInput);
       setHealthOk(true);
     } catch {
       setHealthOk(false);
@@ -54,17 +99,17 @@ export default function PairingScreen() {
           eyebrow="Private tunnel pairing"
           title="Pair Device"
           subtitle="Connect this phone to the revocable mobile cockpit token from desktop Settings."
-          right={<StatusBadge label={token ? "Paired" : "Setup"} tone={token ? "success" : "warning"} />}
+          right={<StatusBadge label={session.token ? "Paired" : "Setup"} tone={session.token ? "success" : "warning"} />}
         />
         <ErrorBanner message={error} />
 
-        {token ? (
+        {session.token ? (
           <Section title="Current Device" right={<StatusBadge label="Paired" tone="success" />}>
             <View style={styles.metricGrid}>
-              <MetricTile label="Device" value={device?.name || "Mobile"} detail="secure token" />
-              <MetricTile label="Scopes" value={(device?.scopes ?? []).length || 0} detail="revocable" />
+              <MetricTile label="Device" value={session.device?.name || "Mobile"} detail="secure token" />
+              <MetricTile label="Scopes" value={(session.device?.scopes ?? []).length || 0} detail="revocable" />
             </View>
-            <DetailRow label="API URL" value={apiBaseUrl} tone="info" />
+            <DetailRow label="API URL" value={session.apiBaseUrl} tone="info" />
           </Section>
         ) : null}
 
@@ -74,11 +119,11 @@ export default function PairingScreen() {
               <Text style={styles.stepNumber}>1</Text>
               <Text style={styles.stepLabel}>Tunnel</Text>
             </View>
-            <View style={[styles.step, token && styles.stepDone]}>
+            <View style={[styles.step, session.token && styles.stepDone]}>
               <Text style={styles.stepNumber}>2</Text>
               <Text style={styles.stepLabel}>Pair</Text>
             </View>
-            <View style={[styles.step, token && styles.stepDone]}>
+            <View style={[styles.step, session.token && styles.stepDone]}>
               <Text style={styles.stepNumber}>3</Text>
               <Text style={styles.stepLabel}>Cockpit</Text>
             </View>
@@ -112,8 +157,10 @@ export default function PairingScreen() {
                 barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
                 onBarcodeScanned={({ data }) => {
                   setScanning(false);
-                  void pairWithQrPayload(String(data), apiBaseInput, deviceName)
-                    .then(() => router.push("/"))
+                  void pairWithQrPayload(String(data))
+                    .then((paired) => {
+                      if (paired) router.replace("/");
+                    })
                     .catch(() => setScanning(false));
                 }}
               />

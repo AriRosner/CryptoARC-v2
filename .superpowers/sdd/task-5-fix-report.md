@@ -1,0 +1,195 @@
+# Task 5 Safety Fix Report
+
+## Status
+
+DONE_WITH_CONCERNS
+
+All Critical, Important, and Minor findings from the independent Task 5 review
+were corrected in the isolated mobile command-center worktree. Automated
+backend and mobile gates are green. The remaining concerns are physical-device,
+process-crash, signer, wallet, and network integration checks that were
+explicitly outside this task's safety boundary.
+
+## Commits
+
+- `6b9c04c` - Harden guarded mobile execution claims
+- `0f4a86d` - Complete guarded mobile action recovery
+
+## Finding Resolution
+
+1. Guarded execution now claims a simulated audit and intent atomically in
+   SQLite, uniquely binds one execution action to the audit, and separately
+   compare-and-swaps the one-time dispatch start. Tests cover a different key,
+   a second device/service instance, concurrency, timeout, and restart.
+2. Approved stop/target values are persisted in the guarded authorization and
+   applied to the resulting position. Position tests prove the authorized
+   controls survive later global-setting changes.
+3. Position close accepts only the canonical exact `100%` prepared intent bound
+   to the position, version, wallet, mint, and full token balance. Partial and
+   stale sells cannot be labeled as a close.
+4. Mobile position adjustment and close controls are functional and carry the
+   required position, intent, audit, and version identities.
+5. Position versions now advance on fills, reconciliation, status changes, and
+   exit adjustment. Close state is rechecked inside the atomic reservation
+   transaction before dispatch.
+6. Guarded mobile execution requires the complete mandatory preflight
+   inventory. Missing, duplicate, malformed, unknown, non-pass, or failed rows
+   block dispatch.
+7. The mobile app persists one pending financial action in SecureStore before
+   dispatch, restores it after remount/restart, retries transient
+   reconciliation failures, and never automatically resubmits. Backend
+   reconciliation recovers pending reject and exit-adjustment receipts.
+8. Approval, rejection, validation, close/adjust, and reconciliation requests
+   use generation-safe authenticated handling. A `401` quarantines the matching
+   session; a `403` produces a stable scope-denied state without revoking it.
+9. Mobile request validation strips rejected input values so secret and raw
+   transaction values are not reflected in API error responses.
+10. The guarded flow exposes rejection. Hold confirmation uses its own 1400 ms
+    timer and cancels on early release, movement, app backgrounding, and
+    unmount; tests advance real fake-timer duration instead of firing a
+    synthetic long-press event.
+
+## Test-First Evidence
+
+- The preserved interrupted edits began red: the guarded backend suite reported
+  14 failures and 1 error across 19 tests.
+- Added audit-lifecycle and close-race regressions failed before the production
+  changes and passed afterward.
+- The mobile position-action tests initially failed because the guarded
+  position component did not exist; they passed after the implementation.
+- A combined focused Jest run had one cold-start `PortfolioScreen` timeout.
+  That suite immediately passed 5/5 alone, and the full mobile gate later
+  passed all 121 tests.
+
+## Verification
+
+- Guarded backend suite: 21/21 passed.
+- Guarded, command-center, and mobile API suites: 58/58 passed in 13.746s.
+- Full backend core regression: 255/255 passed in 266.547s.
+- Focused guarded mobile suite: 13/13 passed.
+- Mobile TypeScript: passed.
+- `scripts/verify-mobile.ps1`: passed in 190.8s:
+  - 18 suites, 121 tests passed.
+  - Production dependency audit: 0 vulnerabilities.
+  - Expo Doctor: 20/20.
+  - Android export: passed.
+- `git diff --check`: passed.
+
+The backend tests used temporary databases and fake submission callbacks. No
+shared runtime/database was started, no backend was armed, and no signer,
+wallet, RPC, or live network was invoked. The full repository verifier, pnpm,
+and shutdown commands were not run, as required by the task boundary.
+
+## Residual Verification
+
+- No physical-device biometric enrollment, failure, or cancellation run.
+- No physical 1400 ms gesture, movement cancellation, app-backgrounding,
+  TalkBack, or switch-access run.
+- No private-tunnel drop/reconnect test while an action was pending.
+- No operating-system process-kill test between reservation and receipt
+  completion. Restart recovery was tested through fresh service instances and
+  the same durable temporary database.
+- No real signer daemon, hot wallet, Solana RPC, or confirmation integration.
+- Concurrent claims were tested with two service instances and one SQLite file,
+  but not with two independently launched backend processes.
+
+## Final Re-review Fix Pass
+
+Commit `18ac72b` closes the three blockers appended by the final independent
+re-review.
+
+### Finding Resolution
+
+1. Guarded trade drafts now require finite, positive, at-most-100 stop and
+   target values in the HTTP contract. Service validation independently rejects
+   null or omitted controls before receipt reservation, audit claim, or
+   dispatch. The production fill recorder retains its fail-closed invariant if
+   corrupt or legacy authorization reaches confirmation recovery.
+2. Trade rejection and exit adjustment now reserve the idempotency key,
+   compare-and-swap the entity version/state, apply the mutation, and write a
+   terminal receipt in one SQLite `BEGIN IMMEDIATE` transaction. Existing
+   pre-effect pending receipts are recoverable through the same idempotent POST
+   or receipt reconciliation. Exact-version operations apply once; stale,
+   missing, or changed entities terminate as `review_required`.
+3. Durable mobile records now bind API base, device ID, and stable saved-session
+   identity. Definitive pre-receipt `401`, `403`, `409`, and `422` responses
+   clear the local record. Permanent reconciliation `404` and owner mismatch
+   become non-polling `review_required` states with an explicit local abandon
+   action. Both trade and position flows use the same fail-closed lifecycle.
+
+### Test-First Evidence
+
+- Before the backend correction, both null service cases failed to raise, one
+  dispatched, and both HTTP null/omission cases reached the approval service.
+- Seeded pre-effect reject and adjustment receipts remained `pending` after a
+  fresh service instance; stale seeded operations also remained `pending`
+  instead of becoming review-required.
+- The expanded focused mobile suite was red at 12 passed / 13 failed. Failures
+  covered definitive-response cleanup, trade and position `404` handling, and
+  re-pair ownership.
+- After correction, the exact backend blocker tests passed 5/5: HTTP
+  null/omission, service zero-dispatch, confirmed-fill invariant, pre-effect
+  retry/restart, and stale version classification.
+
+### Final Verification
+
+- Guarded backend suite: 24/24 passed.
+- Guarded, command-center, and mobile API suites: 62/62 passed in 15.407s.
+  The former 58-test gate now includes four new route/recovery regressions.
+- Focused guarded mobile suite: 25/25 passed in 10.149s.
+- Mobile TypeScript: passed.
+- `scripts/verify-mobile.ps1`: passed:
+  - 18 suites, 133 tests passed.
+  - Production dependency audit: 0 vulnerabilities.
+  - Expo Doctor: 20/20.
+  - Android export: passed, 4,434 modules bundled.
+- `git diff --check`: passed.
+
+No shared runtime or database was started. No backend was armed, and no signer,
+wallet, RPC, private tunnel, or live network was invoked. The full repository
+verifier, pnpm, and shutdown commands remained outside this pass.
+
+### Remaining Concerns
+
+The residual concerns remain integration-only: physical biometric and gesture
+behavior, private-tunnel interruption, operating-system process kills at each
+transaction boundary, two independently launched backend processes contending
+on one database, and real signer/wallet/RPC confirmation reconciliation.
+
+## Cross-entity Pending Action Closure
+
+Commit `efada05` closes the final Important re-review finding without backend
+changes.
+
+- A same-owner pending action is now visible from every guarded trade or
+  position screen, even when the displayed entity differs from the pending
+  record.
+- Trade approval/rejection records route to `/trade/{intentId}`. Position
+  adjustment/close records route to `/position/{positionId}`. Entity IDs are
+  URL-encoded before navigation.
+- The non-owning screen does not poll the receipt or permit another financial
+  submission. It directs the operator to the owning screen for reconciliation.
+- Owner-mismatched records remain review-required and are not offered an
+  unusable reconciliation route.
+- Local abandonment is two-step and warns that it removes only recovery state,
+  not any possible backend financial outcome.
+
+### Evidence
+
+- Focused RED: 22/27 passed and 5 failed. Both cross-entity directions were
+  invisible, and the existing 404/owner-mismatch abandon flows cleared without
+  the new warning confirmation.
+- Focused GREEN: 27/27 passed, including trade-to-position and
+  position-to-trade routing, same-owner visibility, owner mismatch, two-step
+  abandon, and zero submission from the non-owning screen.
+- Mobile TypeScript: passed.
+- `scripts/verify-mobile.ps1`: passed:
+  - 18 suites, 135 tests passed.
+  - Production dependency audit: 0 vulnerabilities.
+  - Expo Doctor: 20/20.
+  - Android export: passed, 4,434 modules bundled.
+- `git diff --check`: passed.
+
+No backend tests were rerun because this pass changed only mobile UI/state and
+component tests. No shared runtime/database, signer, wallet, RPC, tunnel, or
+live network was used.

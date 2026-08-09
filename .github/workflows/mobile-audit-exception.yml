@@ -1,0 +1,29 @@
+name: Mobile audit exception monitor
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  review-exception:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - name: Install mobile dependencies
+        run: npm ci
+        working-directory: mobile
+      - name: Enforce scoped audit policy
+        shell: pwsh
+        run: ./scripts/audit-mobile.ps1 -Strict
+      - name: Check for an upstream release
+        shell: pwsh
+        run: ./scripts/check-mobile-audit-upstream.ps1

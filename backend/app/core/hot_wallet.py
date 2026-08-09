@@ -36,10 +36,22 @@ class HotWalletVault:
 
     def status(self) -> dict[str, Any]:
         payload = self._load_payload()
+        sidecar_public_key = (
+            str(payload.get("wallet_public_key") or "") if payload else ""
+        )
+        unlocked_public_key = (
+            str(self._keypair.pubkey()) if self._keypair else ""
+        )
+        sidecar_mismatch = bool(
+            self._keypair is not None
+            and sidecar_public_key != unlocked_public_key
+        )
         return {
             "imported": payload is not None,
             "unlocked": self._keypair is not None,
-            "wallet_public_key": str(payload.get("wallet_public_key") or "") if payload else "",
+            "wallet_public_key": unlocked_public_key or sidecar_public_key,
+            "sidecar_wallet_public_key": sidecar_public_key,
+            "sidecar_mismatch": sidecar_mismatch,
             "label": str(payload.get("label") or "") if payload else "",
             "imported_at": str(payload.get("imported_at") or "") if payload else "",
             "last_unlock_at": self._last_unlock_at,
@@ -78,7 +90,18 @@ class HotWalletVault:
         decrypted = self._decrypt(payload, password)
         data = json.loads(decrypted.decode("utf-8"))
         key_bytes = bytes(data["private_key_bytes"])
-        self._keypair = Keypair.from_bytes(key_bytes)
+        keypair = Keypair.from_bytes(key_bytes)
+        actual_public_key = str(keypair.pubkey())
+        encrypted_public_key = str(data.get("wallet_public_key") or "")
+        sidecar_public_key = str(payload.get("wallet_public_key") or "")
+        if (
+            actual_public_key != encrypted_public_key
+            or actual_public_key != sidecar_public_key
+        ):
+            raise ValueError(
+                "hot wallet sidecar does not match encrypted signer key"
+            )
+        self._keypair = keypair
         self._last_unlock_at = utc_now_iso()
         return self.status()
 
@@ -94,16 +117,26 @@ class HotWalletVault:
         return self.status()
 
     def can_sign(self) -> bool:
-        return self._keypair is not None
+        return bool(
+            self._keypair is not None
+            and not self.status().get("sidecar_mismatch")
+        )
 
     def wallet_public_key(self) -> str:
+        if self._keypair:
+            return str(self._keypair.pubkey())
         payload = self._load_payload()
         if payload:
             return str(payload.get("wallet_public_key") or "")
-        return str(self._keypair.pubkey()) if self._keypair else ""
+        return ""
 
-    def sign_transaction(self, unsigned_transaction_base64: str) -> dict[str, Any]:
-        keypair = self._require_unlocked_keypair()
+    def sign_transaction(
+        self,
+        unsigned_transaction_base64: str,
+        *,
+        expected_public_key: str,
+    ) -> dict[str, Any]:
+        keypair = self._require_unlocked_keypair(expected_public_key)
         raw = base64.b64decode(unsigned_transaction_base64.encode("utf-8"))
         transaction = VersionedTransaction.from_bytes(raw)
         signature = keypair.sign_message(to_bytes_versioned(transaction.message))
@@ -113,8 +146,17 @@ class HotWalletVault:
             "signed_transaction_base64": base64.b64encode(bytes(signed)).decode("utf-8"),
         }
 
-    def simulate_and_submit(self, unsigned_transaction_base64: str, rpc_url: str) -> dict[str, Any]:
-        signing = self.sign_transaction(unsigned_transaction_base64)
+    def simulate_and_submit(
+        self,
+        unsigned_transaction_base64: str,
+        rpc_url: str,
+        *,
+        expected_public_key: str,
+    ) -> dict[str, Any]:
+        signing = self.sign_transaction(
+            unsigned_transaction_base64,
+            expected_public_key=expected_public_key,
+        )
         client = SolanaReadOnlyClient(rpc_url)
         signed_transaction_base64 = str(signing["signed_transaction_base64"])
         simulation = self._simulate(client, signed_transaction_base64)
@@ -139,8 +181,15 @@ class HotWalletVault:
             "simulation": simulation,
         }
 
-    def transfer_sol(self, destination: str, amount_sol: float, rpc_url: str) -> dict[str, Any]:
-        keypair = self._require_unlocked_keypair()
+    def transfer_sol(
+        self,
+        destination: str,
+        amount_sol: float,
+        rpc_url: str,
+        *,
+        expected_public_key: str,
+    ) -> dict[str, Any]:
+        keypair = self._require_unlocked_keypair(expected_public_key)
         destination_pubkey = Pubkey.from_string(destination.strip())
         lamports = int(round(float(amount_sol) * 1_000_000_000))
         if lamports <= 0:
@@ -236,9 +285,28 @@ class HotWalletVault:
             "result": {},
         }
 
-    def _require_unlocked_keypair(self) -> Keypair:
+    def _require_unlocked_keypair(
+        self,
+        expected_public_key: str,
+    ) -> Keypair:
         if self._keypair is None:
             raise ValueError("hot wallet is locked")
+        expected = expected_public_key.strip()
+        if not expected:
+            raise ValueError("expected source wallet public key is required")
+        actual = str(self._keypair.pubkey())
+        if actual != expected:
+            raise ValueError(
+                "actual unlocked signer does not match expected source wallet"
+            )
+        payload = self._load_payload()
+        sidecar = (
+            str(payload.get("wallet_public_key") or "") if payload else ""
+        )
+        if sidecar != actual:
+            raise ValueError(
+                "hot wallet sidecar does not match actual unlocked signer"
+            )
         return self._keypair
 
     def _load_payload(self) -> dict[str, Any] | None:

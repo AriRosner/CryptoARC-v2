@@ -4,3 +4,4 @@ pydantic-settings
 websockets
 solana
 solders
+cryptography==50.0.0

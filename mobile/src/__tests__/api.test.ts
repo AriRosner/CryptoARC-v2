@@ -1,4 +1,9 @@
-import { fetchMobileCockpit } from "../api";
+import {
+  fetchMobileCockpit,
+  MobileApiError,
+  mobileWebSocketTicketUrl,
+  requestMobileWebSocketTicket,
+} from "../api";
 
 describe("fetchMobileCockpit", () => {
   const originalFetch = globalThis.fetch;
@@ -37,5 +42,66 @@ describe("fetchMobileCockpit", () => {
     expect(outcome.message).not.toContain("mobile-secret-token");
     expect(outcome.message).not.toContain("cryptoarc.test");
     expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
+describe("mobile WebSocket tickets", () => {
+  const originalFetch = globalThis.fetch;
+
+  afterEach(() => {
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: originalFetch });
+  });
+
+  it("uses the bearer only in the ticket request header and puts only the one-time ticket in the URL", async () => {
+    const fetchMock = jest.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({
+        ticket: "one-time-ticket",
+        scope: "mobile:monitor",
+        ttl_seconds: 30,
+      }),
+    })) as unknown as typeof fetch;
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: fetchMock });
+
+    const issued = await requestMobileWebSocketTicket(
+      "https://cryptoarc.test",
+      "long-lived-bearer-secret",
+    );
+    const websocketUrl = mobileWebSocketTicketUrl(
+      "https://cryptoarc.test",
+      issued.ticket,
+    );
+
+    const [requestUrl, requestInit] = jest.mocked(fetchMock).mock.calls[0];
+    const headers = new Headers(requestInit?.headers);
+    expect(requestUrl).toBe("https://cryptoarc.test/api/mobile/ws-ticket");
+    expect(requestInit?.method).toBe("POST");
+    expect(headers.get("Authorization")).toBe("Bearer long-lived-bearer-secret");
+    expect(websocketUrl).toBe("wss://cryptoarc.test/ws/mobile?ticket=one-time-ticket");
+    expect(websocketUrl).not.toContain("long-lived-bearer-secret");
+  });
+
+  it("preserves authenticated ticket denial as a typed non-retryable error", async () => {
+    const fetchMock = jest.fn(async () => ({
+      ok: false,
+      status: 401,
+      statusText: "Unauthorized",
+      json: async () => ({ detail: "session denied" }),
+    })) as unknown as typeof fetch;
+    Object.defineProperty(globalThis, "fetch", { configurable: true, value: fetchMock });
+
+    const outcome = requestMobileWebSocketTicket(
+      "https://cryptoarc.test",
+      "long-lived-bearer-secret",
+    );
+
+    await expect(outcome).rejects.toBeInstanceOf(MobileApiError);
+    await expect(outcome).rejects.toMatchObject({
+      category: "authentication",
+      retryable: false,
+      status: 401,
+    });
   });
 });

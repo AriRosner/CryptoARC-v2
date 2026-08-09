@@ -1,7 +1,15 @@
 import { Tabs } from "expo-router";
-import { Bell, Gauge, Link2, ShieldAlert, Smartphone } from "lucide-react-native";
+import { BellRing, ChartNoAxesCombined, Ellipsis, Repeat2, WalletCards } from "lucide-react-native";
 
 import { colors } from "@/src/theme";
+
+export const FINAL_TABS = [
+  ["index", "Portfolio"],
+  ["trades", "Trades"],
+  ["wallet", "Wallet"],
+  ["alerts", "Alerts"],
+  ["more", "More"],
+] as const;
 
 export default function TabLayout() {
   return (
@@ -17,46 +25,14 @@ export default function TabLayout() {
           paddingBottom: 8,
           paddingTop: 8,
         },
-        tabBarLabelStyle: {
-          fontSize: 10,
-          fontWeight: "800",
-        },
+        tabBarLabelStyle: { fontSize: 10, fontWeight: "800" },
+        tabBarItemStyle: { minHeight: 48, minWidth: 52 },
       }}>
-      <Tabs.Screen
-        name="pairing"
-        options={{
-          title: "Pair",
-          tabBarIcon: ({ color }) => <Link2 size={22} color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: "Cockpit",
-          tabBarIcon: ({ color }) => <Gauge size={22} color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="feed"
-        options={{
-          title: "Feed",
-          tabBarIcon: ({ color }) => <Bell size={22} color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="risk"
-        options={{
-          title: "Risk",
-          tabBarIcon: ({ color }) => <ShieldAlert size={22} color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="device"
-        options={{
-          title: "Device",
-          tabBarIcon: ({ color }) => <Smartphone size={22} color={color} />,
-        }}
-      />
+      <Tabs.Screen name="index" options={{ title: "Portfolio", tabBarIcon: ({ color }) => <ChartNoAxesCombined color={color} size={22} /> }} />
+      <Tabs.Screen name="trades" options={{ title: "Trades", tabBarIcon: ({ color }) => <Repeat2 color={color} size={22} /> }} />
+      <Tabs.Screen name="wallet" options={{ title: "Wallet", tabBarIcon: ({ color }) => <WalletCards color={color} size={22} /> }} />
+      <Tabs.Screen name="alerts" options={{ title: "Alerts", tabBarIcon: ({ color }) => <BellRing color={color} size={22} /> }} />
+      <Tabs.Screen name="more" options={{ title: "More", tabBarIcon: ({ color }) => <Ellipsis color={color} size={22} /> }} />
     </Tabs>
   );
 }

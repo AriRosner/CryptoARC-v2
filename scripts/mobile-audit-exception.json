@@ -1,0 +1,25 @@
+{
+  "format_version": 1,
+  "package": "image-size",
+  "installed_version": "1.2.1",
+  "known_latest_compatible_version": "1.2.1",
+  "known_latest_version": "2.0.2",
+  "advisories": [
+    "GHSA-w3rx-r6r6-pgpr",
+    "GHSA-5p2g-fcmc-qvqq"
+  ],
+  "cascade_packages": [
+    "@expo/cli",
+    "@expo/metro",
+    "@expo/metro-config",
+    "@react-native/community-cli-plugin",
+    "expo",
+    "image-size",
+    "metro",
+    "metro-config",
+    "metro-transform-worker",
+    "react-native"
+  ],
+  "expires_at": "2026-11-07T23:59:59Z",
+  "tracking_issue": "https://github.com/AriRosner/CryptoARC-v2/issues/3"
+}

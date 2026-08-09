@@ -1,4 +1,8 @@
 import type { MobileCockpitPayload, MobileFeedPayload, PairingClaimResponse } from "./types";
+import { mobileHttpError } from "./core/api/errors";
+
+export { mobileAction, mobileGet } from "./core/api/client";
+export { MobileApiError } from "./core/api/errors";
 
 const MOBILE_COCKPIT_TIMEOUT_MS = 10000;
 
@@ -8,6 +12,12 @@ export interface PairingClaimInput {
   code: string;
   deviceName: string;
   platform?: string;
+}
+
+export interface MobileWebSocketTicketResponse {
+  ticket: string;
+  scope: "mobile:monitor";
+  ttl_seconds: number;
 }
 
 export function normalizeApiBaseUrl(value: string): string {
@@ -32,14 +42,16 @@ async function mobileRequest<T>(apiBaseUrl: string, path: string, token?: string
   }
   const response = await fetch(`${base}${path}`, { ...init, headers });
   if (!response.ok) {
-    let detail = `${response.status} ${response.statusText}`;
+    let body: { action_id?: unknown; detail?: unknown; message?: unknown } = {};
     try {
-      const body = await response.json();
-      detail = typeof body.detail === "string" ? body.detail : detail;
+      const value = await response.json();
+      if (value && typeof value === "object") {
+        body = value as typeof body;
+      }
     } catch {
       // Response body is optional for health and auth failures.
     }
-    throw new Error(detail);
+    throw mobileHttpError(response.status, response.statusText, body);
   }
   return response.json() as Promise<T>;
 }
@@ -107,8 +119,20 @@ export async function setMobileKillSwitch(
   });
 }
 
-export function mobileWebSocketUrl(apiBaseUrl: string, token: string): string {
+export async function requestMobileWebSocketTicket(
+  apiBaseUrl: string,
+  token: string,
+): Promise<MobileWebSocketTicketResponse> {
+  return mobileRequest<MobileWebSocketTicketResponse>(
+    apiBaseUrl,
+    "/api/mobile/ws-ticket",
+    token,
+    { method: "POST" },
+  );
+}
+
+export function mobileWebSocketTicketUrl(apiBaseUrl: string, ticket: string): string {
   const base = normalizeApiBaseUrl(apiBaseUrl);
   const wsBase = base.replace(/^https:/i, "wss:").replace(/^http:/i, "ws:");
-  return `${wsBase}/ws/mobile?token=${encodeURIComponent(token)}`;
+  return `${wsBase}/ws/mobile?ticket=${encodeURIComponent(ticket)}`;
 }
