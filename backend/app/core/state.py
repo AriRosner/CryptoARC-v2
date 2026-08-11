@@ -3102,10 +3102,14 @@ class BotState:
 
     def solana_logs_verification_report(self, limit: int | None = None) -> dict[str, object]:
         limit = max(1, min(5000, int(limit or 500)))
-        events = self.storage.load_source_events(limit)
-        direct_events = [event for event in events if event.source in {"solana_logs", "solana_logs_subscribe", "solana"}]
-        portal_events = [event for event in events if event.source == "pumpportal"]
-        direct_rows = [self._solana_log_evidence(event) for event in direct_events]
+        direct_events = self.storage.load_source_events_by_source(
+            ("solana_logs", "solana_logs_subscribe", "solana"),
+            limit,
+        )
+        portal_events = self.storage.load_source_events_by_source(("pumpportal",), limit)
+        all_direct_rows = [self._solana_log_evidence(event) for event in direct_events]
+        direct_rows = [row for row in all_direct_rows if not row.get("err")]
+        failed_direct_rows = [row for row in all_direct_rows if row.get("err")]
         portal_rows = [self._portal_source_evidence(event) for event in portal_events]
         portal_by_mint: dict[str, list[dict[str, object]]] = {}
         portal_by_signature: dict[str, list[dict[str, object]]] = {}
@@ -3119,12 +3123,25 @@ class BotState:
         matches: list[dict[str, object]] = []
         conflicts: list[dict[str, object]] = []
         unmatched_direct: list[dict[str, object]] = []
-        for row in direct_rows:
+        for row in all_direct_rows:
             signature = str(row.get("signature") or "")
             mints = [str(mint) for mint in row.get("mints", [])]
             signature_matches = portal_by_signature.get(signature, []) if signature else []
             mint_matches = [match for mint in mints for match in portal_by_mint.get(mint, [])]
             unique_matches = {str(match["event_id"]): match for match in [*signature_matches, *mint_matches]}
+            if row.get("err"):
+                if unique_matches:
+                    conflicts.append(
+                        {
+                            "event_id": row["event_id"],
+                            "signature": signature,
+                            "slot": row["slot"],
+                            "portal_event_ids": list(unique_matches.keys())[:10],
+                            "reason": "PumpPortal evidence matches a failed direct-chain transaction notification",
+                            "error": row["err"],
+                        }
+                    )
+                continue
             if unique_matches:
                 earliest_portal = min(unique_matches.values(), key=lambda item: str(item["received_at"]))
                 lag_ms = self._iso_lag_ms(str(row["received_at"]), str(earliest_portal["received_at"]))
@@ -3143,17 +3160,6 @@ class BotState:
                 )
             elif row.get("create_hint") or mints or signature:
                 unmatched_direct.append(row)
-            if row.get("err"):
-                conflicts.append(
-                    {
-                        "event_id": row["event_id"],
-                        "signature": signature,
-                        "slot": row["slot"],
-                        "reason": "logsSubscribe notification includes a transaction error",
-                        "error": row["err"],
-                    }
-                )
-
         unmatched_portal = [
             row
             for row in portal_rows
@@ -3164,10 +3170,10 @@ class BotState:
             status = "not_configured"
         elif not self.solana_logs_mentions_address:
             status = "missing_mentions_address"
-        elif not direct_rows:
-            status = "configured_no_events"
         elif conflicts:
             status = "review"
+        elif not direct_rows:
+            status = "failed_notifications" if failed_direct_rows else "configured_no_events"
         elif matches and unmatched_direct:
             status = "partial"
         elif matches:
@@ -3176,7 +3182,11 @@ class BotState:
             status = "no_matches"
 
         direct_create_hints = [row for row in direct_rows if row.get("create_hint")]
-        decoded_create_rows = [row for row in direct_rows if row.get("create_evidence", {}).get("field_count", 0)]
+        decoded_create_rows = [
+            row
+            for row in direct_rows
+            if row.get("create_hint") and row.get("create_evidence", {}).get("field_count", 0)
+        ]
         action_items: list[str] = []
         if not self.solana_wss_endpoint:
             action_items.append("Set SOLANA_WSS_ENDPOINT before collecting direct-chain verification evidence.")
@@ -3184,6 +3194,8 @@ class BotState:
             action_items.append("Set SOLANA_LOGS_MENTIONS_ADDRESS to the Pump.fun program or related address before opening logsSubscribe.")
         if self.solana_wss_endpoint and not direct_rows:
             action_items.append("Archive solana_logs source events from logsSubscribe before comparing sources.")
+        if failed_direct_rows:
+            action_items.append("Treat failed direct-chain notifications as diagnostic evidence, not successful launch verification.")
         if unmatched_direct:
             action_items.append("Inspect direct Solana log events that do not match PumpPortal mints or signatures.")
         if unmatched_portal:
@@ -3206,6 +3218,7 @@ class BotState:
             "mentions_address_configured": bool(self.solana_logs_mentions_address),
             "summary": {
                 "direct_events": len(direct_rows),
+                "failed_direct_events": len(failed_direct_rows),
                 "pumpportal_events": len(portal_rows),
                 "direct_create_hints": len(direct_create_hints),
                 "decoded_create_events": len(decoded_create_rows),
@@ -3218,6 +3231,7 @@ class BotState:
             "unmatched_direct": unmatched_direct[:50],
             "unmatched_pumpportal": unmatched_portal,
             "conflicts": conflicts[:50],
+            "failed_direct_events": failed_direct_rows[:50],
             "direct_events": direct_rows[:100],
             "source_soak": self._source_soak_from_verification(
                 len(direct_rows),
@@ -3608,8 +3622,10 @@ class BotState:
         return decoded
 
     def _logs_have_create_hint(self, logs: list[str]) -> bool:
-        text = "\n".join(logs).lower()
-        return any(marker in text for marker in ("initialize mint", "create", "mintto", "createpool", "create pool", "instruction: create"))
+        return any(
+            re.search(r"\binstruction:\s*create(?:v2)?\s*$", log.strip(), flags=re.IGNORECASE)
+            for log in logs
+        )
 
     def _direct_solana_token_from_event(self, event: LaunchEvent) -> TokenSignal | None:
         if event.source not in {"solana_logs", "solana_logs_subscribe", "solana"}:
@@ -13245,6 +13261,9 @@ class BotState:
                     "subscription_limit": "one address per logsSubscribe subscription",
                     "last_event_at": self.solana_logs_status.last_event_at.isoformat() if self.solana_logs_status.last_event_at else "",
                     "reconnect_attempts": self.solana_logs_status.reconnect_attempts,
+                    "raw_events_seen": self.solana_logs_status.raw_events_seen,
+                    "successful_events_seen": self.solana_logs_status.events_received,
+                    "failed_events_seen": self.solana_logs_status.failed_events_seen,
                     "operator_action": "Set SOLANA_WSS_ENDPOINT and SOLANA_LOGS_MENTIONS_ADDRESS to archive direct-chain logs for PumpPortal comparison." if not solana_ready else "Direct-chain verifier archives logsSubscribe notifications for source-soak comparison.",
                 },
             },

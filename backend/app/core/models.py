@@ -1025,6 +1025,7 @@ class SourceStatus:
     launch_events_seen: int = 0
     trade_events_seen: int = 0
     status_events_seen: int = 0
+    failed_events_seen: int = 0
     active_trade_subscriptions: int = 0
     dropped_trade_subscriptions: int = 0
     connection_requested_at: datetime | None = None

@@ -4543,6 +4543,18 @@ class Storage:
             ).fetchall()
         return [self._source_event_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def load_source_events_by_source(self, sources: tuple[str, ...], limit: int = 200) -> list[SourceEvent]:
+        normalized_sources = tuple(dict.fromkeys(source.strip() for source in sources if source.strip()))
+        if not normalized_sources:
+            return []
+        placeholders = ", ".join("?" for _ in normalized_sources)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM source_events WHERE source IN ({placeholders}) ORDER BY received_at DESC LIMIT ?",
+                (*normalized_sources, limit),
+            ).fetchall()
+        return [self._source_event_from_payload(json.loads(row["payload"])) for row in rows]
+
     def count_source_events(self) -> int:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM source_events").fetchone()

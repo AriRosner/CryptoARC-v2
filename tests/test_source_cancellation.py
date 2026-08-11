@@ -1,12 +1,13 @@
 import asyncio
 import gc
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import main as main_app
 from app.core.models import SourceStatus
-from app.core.sources import LaunchEvent, PumpPortalLaunchSource
+from app.core.sources import LaunchEvent, PumpPortalLaunchSource, SolanaLogsSource
 
 
 class _TrackingQueue(asyncio.Queue[str]):
@@ -63,6 +64,24 @@ class _WebSocketContext:
 
     async def __aexit__(self, *_: object) -> None:
         return None
+
+
+class _StreamingWebSocket:
+    def __init__(self, messages: list[str]) -> None:
+        self.messages = iter(messages)
+
+    async def send(self, _: str) -> None:
+        return None
+
+    def __aiter__(self) -> "_StreamingWebSocket":
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self.messages)
+        except StopIteration:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
 
 class _RuntimeState:
@@ -133,6 +152,44 @@ class _SlowCancellationSource(PumpPortalLaunchSource):
 
 
 class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_solana_logs_source_does_not_queue_failed_transactions(self) -> None:
+        failed = json.dumps(
+            {
+                "params": {
+                    "result": {
+                        "context": {"slot": 1},
+                        "value": {"signature": "SigFailed", "err": {"InstructionError": [0, "Custom"]}, "logs": []},
+                    }
+                }
+            }
+        )
+        successful = json.dumps(
+            {
+                "params": {
+                    "result": {
+                        "context": {"slot": 2},
+                        "value": {"signature": "SigSuccessful", "err": None, "logs": []},
+                    }
+                }
+            }
+        )
+        websocket = _StreamingWebSocket([failed, successful])
+        source = SolanaLogsSource("wss://example.invalid", "PumpFunProgram111")
+        queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        status = SourceStatus(source="solana_logs")
+
+        with patch("app.core.sources.websockets.connect", return_value=_WebSocketContext(websocket)):
+            run_task = asyncio.create_task(source.run(queue, status))
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1)
+                self.assertEqual(event.raw_payload["params"]["result"]["value"]["signature"], "SigSuccessful")
+                self.assertTrue(queue.empty())
+                self.assertEqual(status.failed_events_seen, 1)
+                self.assertEqual(status.events_received, 1)
+            finally:
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+
     async def test_ensure_source_task_redacts_completed_failure_status_and_event(self) -> None:
         async def failed_source_root() -> None:
             raise RuntimeError("source failed api-key=sentinel-secret")

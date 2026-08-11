@@ -6994,6 +6994,9 @@ class CoreLogicTests(unittest.TestCase):
             )
             state.solana_logs_status.status = "connected"
             state.solana_logs_status.last_event_at = utc_now()
+            state.solana_logs_status.raw_events_seen = 12
+            state.solana_logs_status.events_received = 5
+            state.solana_logs_status.failed_events_seen = 7
             adapters = {adapter["name"]: adapter for adapter in state.source_adapters()}
 
             self.assertTrue(adapters["solana_logs"]["enabled"])
@@ -7002,6 +7005,9 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(adapters["solana_logs"]["details"]["mentions_address_configured"])
             self.assertIn("paper_create_normalization", adapters["solana_logs"]["capabilities"])
             self.assertFalse(adapters["solana_logs"]["details"]["paper_normalization_enabled"])
+            self.assertEqual(adapters["solana_logs"]["details"]["raw_events_seen"], 12)
+            self.assertEqual(adapters["solana_logs"]["details"]["successful_events_seen"], 5)
+            self.assertEqual(adapters["solana_logs"]["details"]["failed_events_seen"], 7)
 
     def test_solana_logs_subscribe_payload_uses_single_mentions_address(self) -> None:
         payload = solana_logs_subscribe_payload("PumpFunProgram111", "processed")
@@ -7193,6 +7199,44 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("program_data_text", evidence)
             self.assertTrue(evidence["program_data_decoded"])
 
+    def test_solana_logs_verification_does_not_treat_token_account_setup_as_pump_create(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            unrelated_program_data = base64.b64encode(b"mint=MintUnrelated111 symbol=NOPE").decode("ascii")
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_solana_account_setup",
+                    source="solana_logs",
+                    received_at=utc_now(),
+                    raw_payload={
+                        "result": {
+                            "context": {"slot": 701},
+                            "value": {
+                                "signature": "SigAccountSetup111",
+                                "err": None,
+                                "logs": [
+                                    "Program log: CreateIdempotent",
+                                    "Program log: Instruction: GetAccountDataSize",
+                                    f"Program data: {unrelated_program_data}",
+                                ],
+                            },
+                        }
+                    },
+                    status="raw",
+                )
+            )
+
+            report = state.solana_logs_verification_report(limit=20)
+
+            self.assertEqual(report["summary"]["direct_events"], 1)
+            self.assertEqual(report["summary"]["direct_create_hints"], 0)
+            self.assertEqual(report["summary"]["decoded_create_events"], 0)
+            self.assertFalse(report["direct_events"][0]["create_hint"])
+
     def test_solana_logs_verification_flags_errors_and_missing_configuration(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
@@ -7226,13 +7270,123 @@ class CoreLogicTests(unittest.TestCase):
                     status="raw",
                 )
             )
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_portal_error_match",
+                    source="pumpportal",
+                    received_at=utc_now(),
+                    raw_payload={"txType": "create", "mint": "MintError111", "signature": "SigError111"},
+                    normalized_token_id="tok_error_match",
+                    status="normalized",
+                )
+            )
 
             report = state.solana_logs_verification_report(limit=20)
 
             self.assertEqual(report["status"], "review")
+            self.assertEqual(report["summary"]["direct_events"], 0)
+            self.assertEqual(report["summary"]["failed_direct_events"], 1)
             self.assertEqual(report["summary"]["conflicts"], 1)
             self.assertEqual(report["conflicts"][0]["event_id"], "src_solana_error")
+            self.assertEqual(report["conflicts"][0]["portal_event_ids"], ["src_portal_error_match"])
             self.assertTrue(any("error notifications" in item for item in report["action_items"]))
+
+    def test_solana_logs_verification_separates_unmatched_failures_from_conflicts(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_unmatched_solana_failure",
+                    source="solana_logs",
+                    received_at=utc_now(),
+                    raw_payload={
+                        "result": {
+                            "context": {"slot": 501},
+                            "value": {
+                                "signature": "SigUnmatchedFailure111",
+                                "err": {"InstructionError": [0, "Custom"]},
+                                "logs": ["Program log: Instruction: Create"],
+                            },
+                        }
+                    },
+                    status="raw",
+                )
+            )
+
+            report = state.solana_logs_verification_report(limit=20)
+
+            self.assertEqual(report["status"], "failed_notifications")
+            self.assertEqual(report["summary"]["direct_events"], 0)
+            self.assertEqual(report["summary"]["failed_direct_events"], 1)
+            self.assertEqual(report["summary"]["conflicts"], 0)
+            self.assertEqual(report["failed_direct_events"][0]["event_id"], "src_unmatched_solana_failure")
+
+    def test_solana_logs_verification_balances_direct_and_portal_windows(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            now = utc_now()
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_balanced_portal",
+                    source="pumpportal",
+                    received_at=now,
+                    raw_payload={"txType": "create", "mint": "MintBalanced111", "signature": "SigBalanced111"},
+                    normalized_token_id="tok_balanced",
+                    status="normalized",
+                )
+            )
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_balanced_direct",
+                    source="solana_logs",
+                    received_at=now + timedelta(seconds=1),
+                    raw_payload={
+                        "result": {
+                            "context": {"slot": 600},
+                            "value": {
+                                "signature": "SigBalanced111",
+                                "err": None,
+                                "logs": ["Program log: Instruction: Create", "Program log: mint MintBalanced111"],
+                            },
+                        }
+                    },
+                    status="raw",
+                )
+            )
+            for index in range(19):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_direct_noise_{index}",
+                        source="solana_logs",
+                        received_at=now + timedelta(seconds=2 + index),
+                        raw_payload={
+                            "result": {
+                                "context": {"slot": 700 + index},
+                                "value": {
+                                    "signature": f"SigNoise{index:03d}",
+                                    "err": None,
+                                    "logs": ["Program log: unrelated"],
+                                },
+                            }
+                        },
+                        status="raw",
+                    )
+                )
+
+            report = state.solana_logs_verification_report(limit=20)
+
+            self.assertEqual(report["summary"]["direct_events"], 20)
+            self.assertEqual(report["summary"]["pumpportal_events"], 1)
+            self.assertEqual(report["summary"]["matches"], 1)
+            self.assertEqual(report["matches"][0]["match_type"], "signature")
 
     def test_source_soak_acceptance_requires_matched_direct_samples(self) -> None:
         with TemporaryDirectory() as directory:
