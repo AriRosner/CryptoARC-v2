@@ -53,6 +53,7 @@ from app.core.models import (
     TokenSignal,
     TokenStatus,
     TradeEvent,
+    TradeGradeCorrection,
     TradeLabel,
     TradeRecord,
     TradeSession,
@@ -4574,6 +4575,36 @@ class BotState:
 
     def trade_labels(self) -> list[dict[str, object]]:
         return [label.to_dict() for label in self.storage.load_trade_labels(500)]
+
+    def trade_grades(self, trade_id: str = "", mode: str = "") -> list[dict[str, object]]:
+        return [grade.to_dict() for grade in self.storage.load_trade_grades(trade_id, mode=mode, limit=500)]
+
+    def correct_trade_grade(
+        self,
+        grade_id: str,
+        operator_intent_id: str,
+        patch: dict[str, object],
+        note: str = "",
+    ) -> dict[str, object]:
+        grade = next((item for item in self.storage.load_trade_grades(limit=5000) if item.grade_id == grade_id), None)
+        if grade is None:
+            raise ValueError("trade grade not found")
+        if not operator_intent_id.strip() or not patch:
+            raise ValueError("operator intent and a non-empty correction patch are required")
+        correction = TradeGradeCorrection(
+            correction_id=new_id("grade_correction"),
+            grade_id=grade_id,
+            trade_id=grade.trade_id,
+            created_at=utc_now(),
+            operator_intent_id=operator_intent_id.strip(),
+            patch=dict(patch),
+            note=note.strip(),
+        )
+        self.storage.append_trade_grade_correction(correction)
+        return correction.to_dict()
+
+    def trade_grade_corrections(self, trade_id: str) -> list[dict[str, object]]:
+        return [item.to_dict() for item in self.storage.load_trade_grade_corrections(trade_id)]
 
     def trade_review_queue(self) -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]

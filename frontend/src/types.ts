@@ -1418,6 +1418,34 @@ export interface TradeLabel {
   note: string;
 }
 
+export interface TradeGrade {
+  grade_id: string;
+  trade_id: string;
+  revision_id: string;
+  mode: "paper" | "shadow" | "manual_live" | "autonomous_live";
+  created_at: string;
+  grader_version: string;
+  rules_version: string;
+  strategy_version: string;
+  data_schema_version: number;
+  classifications: Record<"entry" | "signal" | "risk" | "source" | "execution" | "exit" | "outcome", "good" | "warning" | "poor" | "unknown">;
+  ex_ante_facts: Record<string, unknown>;
+  ex_post_facts: Record<string, unknown>;
+  evidence_ids: string[];
+  confidence: number;
+  reasons: string[];
+}
+
+export interface TradeGradeCorrection {
+  correction_id: string;
+  grade_id: string;
+  trade_id: string;
+  created_at: string;
+  operator_intent_id: string;
+  patch: Record<string, unknown>;
+  note: string;
+}
+
 export interface TradeReviewQueue {
   total_closed: number;
   labeled: number;

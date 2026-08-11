@@ -760,6 +760,82 @@ class SentinelVerdict:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class TradeRevision:
+    revision_id: str
+    trade_id: str
+    mode: str
+    strategy_version: str
+    rules_version: str
+    data_schema_version: int
+    completed_at: datetime
+    decision_at: datetime
+    evidence_ids: tuple[str, ...]
+    ex_ante_facts: dict[str, Any]
+    ex_post_facts: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["completed_at"] = self.completed_at.isoformat()
+        payload["decision_at"] = self.decision_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TradeGrade:
+    grade_id: str
+    trade_id: str
+    revision_id: str
+    mode: str
+    created_at: datetime
+    grader_version: str
+    rules_version: str
+    strategy_version: str
+    data_schema_version: int
+    classifications: dict[str, str]
+    ex_ante_facts: dict[str, Any]
+    ex_post_facts: dict[str, Any]
+    evidence_ids: tuple[str, ...]
+    confidence: float
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        payload["reasons"] = list(self.reasons)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TradeReviewJob:
+    job_id: str
+    status: str
+    attempts: int
+    claim_id: str
+    lease_owner: str
+    lease_until: datetime | None
+    revision: TradeRevision
+    last_error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TradeGradeCorrection:
+    correction_id: str
+    grade_id: str
+    trade_id: str
+    created_at: datetime
+    operator_intent_id: str
+    patch: dict[str, Any]
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
 @dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str

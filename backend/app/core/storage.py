@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 
 
@@ -43,6 +43,9 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("sniper_strategy_versions", "sniper_strategy_versions"),
     ("shadow_economic_comparisons", "shadow_economic_comparisons"),
     ("sentinel_verdicts", "sentinel_verdicts"),
+    ("trade_review_jobs", "trade_review_jobs"),
+    ("trade_grades", "trade_grades"),
+    ("trade_grade_corrections", "trade_grade_corrections"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -50,7 +53,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 15
+    SCHEMA_VERSION = 16
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -76,6 +79,9 @@ class Storage:
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
         "sentinel_verdicts",
+        "trade_review_jobs",
+        "trade_grades",
+        "trade_grade_corrections",
     )
     BACKUP_TABLES = (
         "settings",
@@ -103,6 +109,9 @@ class Storage:
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
         "sentinel_verdicts",
+        "trade_review_jobs",
+        "trade_grades",
+        "trade_grade_corrections",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -233,6 +242,7 @@ class Storage:
             (13, "013_sniper_strategy_versions", "immutable versioned sniper strategy contracts", self._migration_013_sniper_strategy_versions),
             (14, "014_shadow_economic_comparisons", "all-cost versioned shadow comparisons", self._migration_014_shadow_economic_comparisons),
             (15, "015_sentinel_verdicts", "immutable expiring market sentinel verdicts", self._migration_015_sentinel_verdicts),
+            (16, "016_trade_grading", "durable deterministic trade grading queue", self._migration_016_trade_grading),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -697,6 +707,58 @@ class Storage:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_sentinel_verdicts_identity ON sentinel_verdicts(strategy_version, input_version, created_at DESC)"
+        )
+
+    def _migration_016_trade_grading(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_review_jobs (
+                job_id TEXT PRIMARY KEY,
+                revision_id TEXT NOT NULL UNIQUE,
+                trade_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claim_id TEXT NOT NULL DEFAULT '',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_until TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                revision_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_review_jobs_claim ON trade_review_jobs(status, lease_until, created_at)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_grades (
+                grade_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL UNIQUE,
+                mode TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trade_grades_trade ON trade_grades(trade_id, created_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trade_grades_mode ON trade_grades(mode, created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_grade_corrections (
+                correction_id TEXT PRIMARY KEY,
+                grade_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_grade_corrections_trade ON trade_grade_corrections(trade_id, created_at ASC)"
         )
 
     def schema_status(self) -> dict[str, Any]:
@@ -1190,6 +1252,160 @@ class Storage:
                 (bounded_limit,),
             ).fetchall()
         return [self._sentinel_verdict_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def enqueue_trade_review(self, revision: TradeRevision, *, max_pending: int = 10000) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        job_id = f"review_{uuid.uuid5(uuid.NAMESPACE_URL, revision.revision_id).hex}"
+        with self._connect() as connection:
+            pending = connection.execute(
+                "SELECT COUNT(*) AS count FROM trade_review_jobs WHERE status IN ('queued', 'processing')"
+            ).fetchone()
+            if int(pending["count"] if pending else 0) >= max(1, max_pending):
+                return False
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO trade_review_jobs (
+                    job_id, revision_id, trade_id, mode, status, revision_payload,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (job_id, revision.revision_id, revision.trade_id, revision.mode, json.dumps(revision.to_dict(), sort_keys=True), now, now),
+            )
+        return cursor.rowcount == 1
+
+    def claim_trade_review(
+        self,
+        lease_owner: str,
+        lease_until: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> TradeReviewJob | None:
+        claimed_at = now or datetime.now(timezone.utc)
+        claim_id = f"claim_{uuid.uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM trade_review_jobs
+                WHERE status = 'queued'
+                   OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until <= ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (claimed_at.isoformat(),),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE trade_review_jobs
+                SET status = 'processing', attempts = attempts + 1, claim_id = ?,
+                    lease_owner = ?, lease_until = ?, updated_at = ?
+                WHERE job_id = ? AND (
+                    status = 'queued'
+                    OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until <= ?)
+                )
+                """,
+                (claim_id, lease_owner, lease_until.isoformat(), claimed_at.isoformat(), row["job_id"], claimed_at.isoformat()),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = connection.execute("SELECT * FROM trade_review_jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+        return self._trade_review_job_from_row(claimed)
+
+    def finish_trade_review(
+        self,
+        job_id: str,
+        claim_id: str,
+        expected_revision: str,
+        result: TradeGrade,
+    ) -> bool:
+        serialized = json.dumps(result.to_dict(), sort_keys=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT revision_id, trade_id, mode FROM trade_review_jobs WHERE job_id = ? AND status = 'processing' AND claim_id = ?",
+                (job_id, claim_id),
+            ).fetchone()
+            if row is None or str(row["revision_id"]) != expected_revision:
+                return False
+            if result.revision_id != expected_revision or result.trade_id != str(row["trade_id"]) or result.mode != str(row["mode"]):
+                return False
+            connection.execute(
+                "INSERT OR IGNORE INTO trade_grades (grade_id, trade_id, revision_id, mode, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (result.grade_id, result.trade_id, result.revision_id, result.mode, result.created_at.isoformat(), serialized),
+            )
+            cursor = connection.execute(
+                "UPDATE trade_review_jobs SET status = 'completed', lease_until = NULL, updated_at = ? WHERE job_id = ? AND claim_id = ?",
+                (now, job_id, claim_id),
+            )
+        return cursor.rowcount == 1
+
+    def fail_trade_review(
+        self,
+        job_id: str,
+        claim_id: str,
+        error: str,
+        *,
+        max_attempts: int = 3,
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM trade_review_jobs WHERE job_id = ? AND status = 'processing' AND claim_id = ?",
+                (job_id, claim_id),
+            ).fetchone()
+            if row is None:
+                return "stale_claim"
+            status = "dead_letter" if int(row["attempts"]) >= max(1, max_attempts) else "queued"
+            connection.execute(
+                "UPDATE trade_review_jobs SET status = ?, claim_id = '', lease_owner = '', lease_until = NULL, last_error = ?, updated_at = ? WHERE job_id = ? AND claim_id = ?",
+                (status, error[:1000], now, job_id, claim_id),
+            )
+        return status
+
+    def load_trade_grades(self, trade_id: str = "", *, mode: str = "", limit: int = 500) -> list[TradeGrade]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if trade_id:
+            clauses.append("trade_id = ?")
+            values.append(trade_id)
+        if mode:
+            clauses.append("mode = ?")
+            values.append(mode)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(max(1, min(5000, limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM trade_grades{where} ORDER BY created_at DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        return [self._trade_grade_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def append_trade_grade_correction(self, correction: TradeGradeCorrection) -> bool:
+        serialized = json.dumps(correction.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM trade_grade_corrections WHERE correction_id = ?", (correction.correction_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("trade grade correction already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO trade_grade_corrections (correction_id, grade_id, trade_id, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (correction.correction_id, correction.grade_id, correction.trade_id, correction.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_trade_grade_corrections(self, trade_id: str, limit: int = 500) -> list[TradeGradeCorrection]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM trade_grade_corrections WHERE trade_id = ? ORDER BY created_at ASC LIMIT ?",
+                (trade_id, max(1, min(5000, limit))),
+            ).fetchall()
+        return [self._trade_grade_correction_from_payload(json.loads(row["payload"])) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -3428,6 +3644,12 @@ class Storage:
                     trade.closed_at.isoformat() if trade.closed_at else None,
                 ),
             )
+        if trade.closed_at and trade.pnl_sol is not None:
+            try:
+                self.enqueue_trade_review(self._trade_revision_from_trade(trade))
+            except Exception:
+                # The authoritative trade commit must never depend on low-priority grading.
+                pass
 
     def clear_tokens(self) -> None:
         with self._connect() as connection:
@@ -3553,6 +3775,56 @@ class Storage:
         payload["closed_at"] = datetime.fromisoformat(payload["closed_at"]) if payload.get("closed_at") else None
         return TradeRecord(**payload)
 
+    def _trade_revision_from_trade(self, trade: TradeRecord) -> TradeRevision:
+        completed_at = trade.closed_at or datetime.now(timezone.utc)
+        decision_at = trade.opened_at or completed_at
+        serialized = json.dumps(trade.to_dict(), sort_keys=True, separators=(",", ":"))
+        revision_hash = uuid.uuid5(uuid.NAMESPACE_URL, serialized).hex
+        mode = trade.mode if trade.mode in {"paper", "shadow", "manual_live", "autonomous_live"} else "paper"
+        return TradeRevision(
+            revision_id=f"{trade.id}:{revision_hash}",
+            trade_id=trade.id,
+            mode=mode,
+            strategy_version=trade.settings_version_id or trade.strategy_profile or "unversioned",
+            rules_version="trade-grader-v1",
+            data_schema_version=self.SCHEMA_VERSION,
+            completed_at=completed_at,
+            decision_at=decision_at,
+            evidence_ids=tuple(
+                value for value in (f"trade:{trade.id}", f"settings:{trade.settings_version_id}" if trade.settings_version_id else "") if value
+            ),
+            ex_ante_facts={
+                "signal_score": None,
+                "entry_compliant": trade.entry_price is not None and trade.amount_sol is not None,
+                "risk_clear": trade.lifecycle_status == "closed",
+                "source_confidence": trade.source_price_confidence,
+                "latency_ms": None,
+                "slippage_pct": trade.slippage_paid_pct,
+                "entry_reason": trade.entry_reason,
+            },
+            ex_post_facts={
+                "pnl_sol": trade.pnl_sol,
+                "exit_compliant": bool(trade.exit_reason),
+                "exit_reason": trade.exit_reason,
+                "hold_duration_seconds": trade.hold_duration_seconds,
+                "total_cost_sol": sum(
+                    float(value or 0.0)
+                    for value in (
+                        trade.entry_fee_sol,
+                        trade.exit_fee_sol,
+                        trade.entry_provider_fee_sol,
+                        trade.exit_provider_fee_sol,
+                        trade.entry_network_fee_sol,
+                        trade.exit_network_fee_sol,
+                        trade.entry_priority_fee_sol,
+                        trade.exit_priority_fee_sol,
+                        trade.entry_slippage_cost_sol,
+                        trade.entry_price_impact_cost_sol,
+                    )
+                ),
+            },
+        )
+
     def _price_observation_from_payload(self, payload: dict[str, Any]) -> PriceObservation:
         payload["observed_at"] = datetime.fromisoformat(payload["observed_at"])
         allowed = set(PriceObservation.__dataclass_fields__.keys())
@@ -3579,6 +3851,37 @@ class Storage:
             payload[field_name] = tuple(payload.get(field_name) or ())
         allowed = set(SentinelVerdict.__dataclass_fields__.keys())
         return SentinelVerdict(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_revision_from_payload(self, payload: dict[str, Any]) -> TradeRevision:
+        payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        payload["decision_at"] = datetime.fromisoformat(payload["decision_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        allowed = set(TradeRevision.__dataclass_fields__.keys())
+        return TradeRevision(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_review_job_from_row(self, row: sqlite3.Row) -> TradeReviewJob:
+        return TradeReviewJob(
+            job_id=str(row["job_id"]),
+            status=str(row["status"]),
+            attempts=int(row["attempts"]),
+            claim_id=str(row["claim_id"]),
+            lease_owner=str(row["lease_owner"]),
+            lease_until=datetime.fromisoformat(row["lease_until"]) if row["lease_until"] else None,
+            revision=self._trade_revision_from_payload(json.loads(row["revision_payload"])),
+            last_error=str(row["last_error"]),
+        )
+
+    def _trade_grade_from_payload(self, payload: dict[str, Any]) -> TradeGrade:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        payload["reasons"] = tuple(payload.get("reasons") or ())
+        allowed = set(TradeGrade.__dataclass_fields__.keys())
+        return TradeGrade(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_grade_correction_from_payload(self, payload: dict[str, Any]) -> TradeGradeCorrection:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        allowed = set(TradeGradeCorrection.__dataclass_fields__.keys())
+        return TradeGradeCorrection(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

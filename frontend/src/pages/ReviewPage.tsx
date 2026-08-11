@@ -14,7 +14,8 @@ import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
+import { fetchTradeGrades } from "../api";
+import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
 
 interface ReviewPageProps {
   trades: TradeRecord[];
@@ -167,6 +168,7 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
 }) => {
   const [search, setSearch] = React.useState("");
   const [activeQueueId, setActiveQueueId] = React.useState("unlabeled");
+  const [selectedGrade, setSelectedGrade] = React.useState<TradeGrade | null>(null);
   const tokenById = React.useMemo(() => new Map(tokens.map((token) => [token.id, token])), [tokens]);
   const labelByTokenId = React.useMemo(() => new Map(labels.map((label) => [label.token_id, label.label])), [labels]);
   const selectedTrade = detail?.trade ?? trades.find((trade) => trade.token_id === selectedTradeId) ?? null;
@@ -209,6 +211,17 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   const acceptedObservations = detail?.observations?.filter((observation) => observation.accepted) ?? [];
   const rejectedObservations = detail?.observations?.filter((observation) => !observation.accepted) ?? [];
   const activeQueue = reviewQueue?.queues.find((queue) => queue.id === activeQueueId);
+
+  React.useEffect(() => {
+    let active = true;
+    setSelectedGrade(null);
+    if (selectedTrade?.id) {
+      fetchTradeGrades(selectedTrade.id)
+        .then((grades) => { if (active) setSelectedGrade(grades[0] ?? null); })
+        .catch(() => { if (active) setSelectedGrade(null); });
+    }
+    return () => { active = false; };
+  }, [selectedTrade?.id]);
 
   React.useEffect(() => {
     if (!reviewQueue?.queues.some((queue) => queue.id === activeQueueId)) {
@@ -447,6 +460,30 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                       <ReviewMetric label="Confidence" value={`${Math.round((selectedTrade.source_price_confidence ?? 0) * 100)}%`} tone="warn" />
                     </div>
                   </div>
+                </div>
+
+                <div className="mt-5 rounded-xl border border-white/5 bg-white/[0.02] p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-zinc-500">
+                      <Target size={14} /> Deterministic Grade
+                    </div>
+                    <Badge variant={selectedGrade ? "info" : "warning"}>{selectedGrade ? `${Math.round(selectedGrade.confidence * 100)}% confidence` : "queued"}</Badge>
+                  </div>
+                  {selectedGrade ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-7">
+                        {Object.entries(selectedGrade.classifications).map(([name, value]) => (
+                          <div key={name} className="rounded-lg bg-black/20 p-2">
+                            <span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">{name}</span>
+                            <span className={cn("font-black", value === "good" ? "text-emerald-400" : value === "poor" ? "text-rose-400" : "text-amber-300")}>{value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-3 text-[10px] text-zinc-600">{selectedGrade.mode.replace(/_/g, " ")} · {selectedGrade.grader_version} · {selectedGrade.evidence_ids.length} evidence IDs</div>
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">The low-priority worker has not published a grade for this immutable revision yet. Trade persistence is unaffected.</p>
+                  )}
                 </div>
 
                 <div className="mt-5 rounded-xl border border-amber-500/10 bg-amber-500/[0.03] p-4">

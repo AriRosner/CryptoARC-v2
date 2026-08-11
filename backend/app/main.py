@@ -179,6 +179,12 @@ class TradeLabelRequest(BaseModel):
     note: str = ""
 
 
+class TradeGradeCorrectionRequest(BaseModel):
+    operator_intent_id: str = Field(min_length=1, max_length=200)
+    patch: dict[str, object]
+    note: str = Field(default="", max_length=1000)
+
+
 class PaperRecoveryRequest(BaseModel):
     note: str = Field(default="operator stopped run", max_length=160)
 
@@ -1294,6 +1300,24 @@ async def create_experiment(payload: ExperimentRequest) -> dict:
 @app.get("/api/trade-labels", dependencies=[Depends(require_auth)])
 async def trade_labels() -> list[dict]:
     return state.trade_labels()
+
+
+@app.get("/api/trade-grades", dependencies=[Depends(require_auth)])
+async def trade_grades(trade_id: str = "", mode: str = "") -> list[dict]:
+    return state.trade_grades(trade_id, mode)
+
+
+@app.get("/api/trade-grades/{trade_id}/corrections", dependencies=[Depends(require_auth)])
+async def trade_grade_corrections(trade_id: str) -> list[dict]:
+    return state.trade_grade_corrections(trade_id)
+
+
+@app.post("/api/trade-grades/{grade_id}/corrections", dependencies=[Depends(require_auth)])
+async def correct_trade_grade(grade_id: str, payload: TradeGradeCorrectionRequest) -> dict:
+    try:
+        return state.correct_trade_grade(grade_id, payload.operator_intent_id, payload.patch, payload.note)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/trade-review/queue", dependencies=[Depends(require_auth)])
