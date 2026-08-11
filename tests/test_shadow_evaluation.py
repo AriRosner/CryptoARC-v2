@@ -9,9 +9,10 @@ from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient
 
 from app.auth import AuthManager
-from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown
+from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown, TokenSignal, TokenStatus, utc_now
 from app.core.pilot_risk import PilotRiskPolicy
 from app.core.shadow_evaluation import EconomicValidator
+from app.core.sources import LaunchEvent
 from app.core.state import BotState
 from app.core.storage import Storage
 
@@ -284,6 +285,15 @@ class ShadowEvaluationTests(unittest.TestCase):
                 observed_at=NOW - timedelta(minutes=3), received_at=NOW - timedelta(minutes=3),
                 mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
             ))
+            for market_observation_id, role in (("market-entry", "entry"), ("market-exit", "path")):
+                state.storage.save_shadow_market_evidence_binding(
+                    audit_id=audit.id,
+                    market_observation_id=market_observation_id,
+                    strategy_id=state.settings.strategy_profile,
+                    strategy_version=state.current_settings_version_id,
+                    role=role,
+                    created_at=NOW,
+                )
             state.settings.take_profit_pct = 50
             state.settings.paper_fee_bps = 900
             self.assertTrue(state._persist_economic_shadow_comparison(audit))
@@ -296,6 +306,62 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertAlmostEqual(stored[0].costs.base_fee_sol, 0.0002)
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["entry_market_evidence_id"], "market-entry")
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["exit_market_evidence_id"], "market-exit")
+
+    def test_production_ingestion_binds_real_observations_to_shadow_quote_and_materializes(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 5
+            state.settings.paper_fee_bps = 100
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "production shadow capture", ["take_profit_pct", "paper_fee_bps"]
+            )
+            now = utc_now()
+            state.storage.save_pilot_risk_policy(PilotRiskPolicy.create(
+                Decimal("200"), Decimal("0.4"), now - timedelta(minutes=1),
+                reference_observation_id="sol-usd-production", settings_version=state.current_settings_version_id,
+                operator_intent_id="intent-production",
+            ))
+            token = TokenSignal(
+                id="token-production-shadow", symbol="SHDW", name="Shadow", mint="mint-production-shadow",
+                creator="creator", detected_at=now - timedelta(minutes=1), status=TokenStatus.MONITORING,
+                entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=1),
+                raw_payload={"signature": "entry-source", "mint": token.mint, "txType": "buy", "price": 1.0},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "WalletShadow",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+            self.assertIsNotNone(audit)
+
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=audit.created_at + timedelta(seconds=5),
+                raw_payload={"signature": "exit-source", "mint": token.mint, "txType": "sell", "price": 1.1},
+                token=None, kind="trade", mint=token.mint, trade_side="sell",
+            ))
+            refreshed = state._refresh_shadow_comparisons([audit])[0]
+            accepted = state.storage.load_accepted_market_observations(limit=10)
+            bindings = state.storage.load_shadow_market_evidence_bindings(audit.id)
+            materialized = state.storage.load_shadow_comparisons(limit=10)
+
+            self.assertEqual(refreshed.shadow_comparison["status"], "evaluated")
+            self.assertEqual({item["role"] for item in bindings}, {"entry", "path"})
+            self.assertEqual({item.evidence_mode for item in accepted}, {"paper"})
+            self.assertEqual(len({item.source_event_id for item in accepted}), 2)
+            self.assertEqual(len(materialized), 1)
+            self.assertEqual(set(materialized[0].source_evidence_ids), {item.record_id for item in accepted})
 
 
 if __name__ == "__main__":

@@ -2389,7 +2389,77 @@ class BotState:
             fixture_only=event.raw_payload.get("fixture_only") is True,
             direct_comparison_sample_id=str(event.raw_payload.get("direct_comparison_sample_id") or ""),
         )
-        self.storage.save_accepted_market_observation(item)
+        if self.storage.save_accepted_market_observation(item):
+            self._bind_accepted_market_observation_to_pending_shadows(item)
+
+    def _bind_shadow_market_observation(
+        self,
+        audit: LiveExecutionAudit,
+        observation: AcceptedMarketObservation,
+        *,
+        role: str,
+    ) -> bool:
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        strategy_id = str(comparison.get("strategy_id") or "")
+        strategy_version = str(comparison.get("strategy_version") or "")
+        if (
+            not bool(audit.quote.get("shadow_only"))
+            or not strategy_id
+            or not strategy_version
+            or observation.mint != audit.mint
+            or observation.strategy_id != strategy_id
+            or observation.strategy_version != strategy_version
+            or observation.fixture_only
+            or observation.conflict_state != "clear"
+            or observation.access_state != "ready"
+        ):
+            return False
+        return self.storage.save_shadow_market_evidence_binding(
+            audit_id=audit.id,
+            market_observation_id=observation.record_id,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+            role=role,
+            created_at=utc_now(),
+        )
+
+    def _bind_shadow_entry_market_evidence(self, audit: LiveExecutionAudit) -> bool:
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        strategy_id = str(comparison.get("strategy_id") or "")
+        strategy_version = str(comparison.get("strategy_version") or "")
+        candidates = [
+            item
+            for item in self.storage.load_accepted_market_observations(
+                limit=5000,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+            )
+            if item.mint == audit.mint and item.observed_at <= audit.created_at
+        ]
+        if not candidates:
+            return False
+        entry = max(candidates, key=lambda item: item.observed_at)
+        return self._bind_shadow_market_observation(audit, entry, role="entry")
+
+    def _bind_accepted_market_observation_to_pending_shadows(
+        self,
+        observation: AcceptedMarketObservation,
+    ) -> int:
+        bound = 0
+        for audit in self.storage.load_live_execution_audits(500):
+            comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+            if (
+                audit.action != "buy"
+                or audit.mint != observation.mint
+                or not bool(audit.quote.get("shadow_only"))
+                or comparison.get("mode") != "dry_run_shadow"
+                or comparison.get("status") == "evaluated"
+                or observation.observed_at <= audit.created_at
+            ):
+                continue
+            if self._bind_shadow_market_observation(audit, observation, role="path"):
+                bound += 1
+        return bound
 
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
@@ -5901,13 +5971,29 @@ class BotState:
         )
         captured_settings = BotSettings(**settings_payload)
         quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
+        bindings = self.storage.load_shadow_market_evidence_bindings(audit.id)
+        if not bindings or any(
+            item.get("evidence_mode") != "shadow"
+            or item.get("strategy_id") != strategy_id
+            or item.get("strategy_version") != strategy_version
+            for item in bindings
+        ):
+            return False
+        bound_ids = {str(item.get("market_observation_id") or "") for item in bindings}
+        entry_ids = {
+            str(item.get("market_observation_id") or "")
+            for item in bindings
+            if item.get("role") == "entry"
+        }
         market_rows = [
             item
-            for item in self.storage.load_accepted_market_observations(limit=5000)
-            if item.mint == audit.mint
-            and item.strategy_id == strategy_id
-            and item.strategy_version == strategy_version
-            and item.evidence_mode == "shadow"
+            for item in self.storage.load_accepted_market_observations(
+                limit=5000,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+            )
+            if item.record_id in bound_ids
+            and item.mint == audit.mint
             and item.access_state == "ready"
             and item.price is not None
             and item.price > 0
@@ -5916,10 +6002,12 @@ class BotState:
         exit_candidates = [item for item in market_rows if item.observed_at > quoted_at]
         if not entry_candidates or not exit_candidates:
             return False
-        relevant_rows = [max(entry_candidates, key=lambda item: item.observed_at), *sorted(exit_candidates, key=lambda item: item.observed_at)]
+        entry = max(entry_candidates, key=lambda item: item.observed_at)
+        if entry.record_id not in entry_ids:
+            return False
+        relevant_rows = [entry, *sorted(exit_candidates, key=lambda item: item.observed_at)]
         if any(item.fixture_only or item.conflict_state != "clear" for item in relevant_rows):
             return False
-        entry = relevant_rows[0]
         observations = [
             PriceObservation(
                 id=item.record_id,
@@ -8542,6 +8630,8 @@ class BotState:
         if wallet_spend_estimate:
             audit.quote["wallet_spend_estimate"] = wallet_spend_estimate
         audit.shadow_comparison = self._build_shadow_comparison(audit)
+        if shadow_only and audit.shadow_comparison:
+            self._bind_shadow_entry_market_evidence(audit)
         intent.quote_id = quote.id
         intent.audit_id = audit.id
         intent.status = "blocked" if blockers else "quoted"

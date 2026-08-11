@@ -42,6 +42,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("backup_restore_history", "backup_restore_history"),
     ("source_soak_history", "source_soak_history"),
     ("accepted_market_observations", "accepted_market_observations"),
+    ("shadow_market_evidence_bindings", "shadow_market_evidence_bindings"),
     ("source_access_evidence", "source_access_evidence"),
     ("sniper_strategy_versions", "sniper_strategy_versions"),
     ("shadow_economic_comparisons", "shadow_economic_comparisons"),
@@ -68,7 +69,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 23
+    SCHEMA_VERSION = 24
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -90,6 +91,7 @@ class Storage:
         "live_ledger_positions",
         "source_soak_history",
         "accepted_market_observations",
+        "shadow_market_evidence_bindings",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -135,6 +137,7 @@ class Storage:
         "backup_restore_history",
         "source_soak_history",
         "accepted_market_observations",
+        "shadow_market_evidence_bindings",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -311,6 +314,7 @@ class Storage:
             (21, "021_autonomous_pilot", "append-only attended autonomous pilot window evaluations", self._migration_021_autonomous_pilot),
             (22, "022_post_pilot_review", "append-only post-pilot reviews and operator decisions", self._migration_022_post_pilot_review),
             (23, "023_production_rehearsal_evidence", "append-only scoped production rehearsal evidence", self._migration_023_production_rehearsal_evidence),
+            (24, "024_shadow_market_evidence_bindings", "append-only shadow audit bindings to accepted market observations", self._migration_024_shadow_market_evidence_bindings),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -1035,6 +1039,27 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_evidence_gate ON production_rehearsal_evidence(gate_id, observed_at DESC)"
         )
 
+    def _migration_024_shadow_market_evidence_bindings(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_market_evidence_bindings (
+                binding_id TEXT PRIMARY KEY,
+                audit_id TEXT NOT NULL,
+                market_observation_id TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                evidence_mode TEXT NOT NULL CHECK (evidence_mode = 'shadow'),
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(audit_id, market_observation_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_market_evidence_audit ON shadow_market_evidence_bindings(audit_id, created_at ASC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1370,6 +1395,61 @@ class Storage:
                 tuple(values),
             ).fetchall()
         return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def save_shadow_market_evidence_binding(
+        self,
+        *,
+        audit_id: str,
+        market_observation_id: str,
+        strategy_id: str,
+        strategy_version: str,
+        role: str,
+        created_at: datetime,
+    ) -> bool:
+        binding_id = f"shadow_binding_{audit_id}_{market_observation_id}"
+        payload = {
+            "binding_id": binding_id,
+            "audit_id": audit_id,
+            "market_observation_id": market_observation_id,
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "evidence_mode": "shadow",
+            "role": role,
+            "created_at": created_at.isoformat(),
+        }
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                    binding_id, audit_id, market_observation_id, strategy_id,
+                    strategy_version, evidence_mode, role, created_at, payload
+                ) VALUES (?, ?, ?, ?, ?, 'shadow', ?, ?, ?)
+                """,
+                (
+                    binding_id,
+                    audit_id,
+                    market_observation_id,
+                    strategy_id,
+                    strategy_version,
+                    role,
+                    created_at.isoformat(),
+                    json.dumps(payload),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_shadow_market_evidence_bindings(self, audit_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM shadow_market_evidence_bindings
+                WHERE audit_id = ? AND evidence_mode = 'shadow'
+                ORDER BY created_at ASC
+                """,
+                (audit_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
         created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
