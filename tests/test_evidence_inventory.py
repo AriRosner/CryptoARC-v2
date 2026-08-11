@@ -217,6 +217,8 @@ class EvidenceInventoryTests(unittest.TestCase):
             self.assertIn(marker, runbook)
 
     def test_capture_script_recognizes_a_linked_git_worktree(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+        self.assertIsNotNone(powershell, "PowerShell is required to exercise the evidence inventory script")
         with TemporaryDirectory() as directory:
             fixture_root = Path(directory)
             repository = fixture_root / "repository"
@@ -240,7 +242,7 @@ class EvidenceInventoryTests(unittest.TestCase):
             script = linked_worktree / "scripts" / "capture-evidence-inventory.ps1"
             clean_output = fixture_root / "clean.json"
             clean = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-File", str(script), "-BaseRef", "HEAD", "-OutputPath", str(clean_output)],
+                [powershell, "-NoProfile", "-File", str(script), "-BaseRef", "HEAD", "-OutputPath", str(clean_output)],
                 cwd=linked_worktree,
                 capture_output=True,
                 text=True,
@@ -251,7 +253,7 @@ class EvidenceInventoryTests(unittest.TestCase):
 
             (linked_worktree / "dirty-marker.txt").write_text("dirty", encoding="utf-8")
             dirty = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-File", str(script), "-BaseRef", "HEAD", "-OutputPath", str(fixture_root / "must-not-write.json")],
+                [powershell, "-NoProfile", "-File", str(script), "-BaseRef", "HEAD", "-OutputPath", str(fixture_root / "must-not-write.json")],
                 cwd=linked_worktree,
                 capture_output=True,
                 text=True,
