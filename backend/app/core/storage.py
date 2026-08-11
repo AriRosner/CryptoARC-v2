@@ -56,6 +56,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("pilot_risk_policies", "pilot_risk_policies"),
     ("pilot_loss_ledger", "pilot_loss_ledger"),
     ("production_rehearsal_reports", "production_rehearsal_reports"),
+    ("manual_live_proof_reports", "manual_live_proof_reports"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -63,7 +64,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 19
+    SCHEMA_VERSION = 20
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -102,6 +103,7 @@ class Storage:
         "pilot_risk_policies",
         "pilot_loss_ledger",
         "production_rehearsal_reports",
+        "manual_live_proof_reports",
     )
     BACKUP_TABLES = (
         "settings",
@@ -142,6 +144,7 @@ class Storage:
         "pilot_risk_policies",
         "pilot_loss_ledger",
         "production_rehearsal_reports",
+        "manual_live_proof_reports",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -292,6 +295,7 @@ class Storage:
             (17, "017_strategy_candidates", "immutable strategy candidates and gated promotion", self._migration_017_strategy_candidates),
             (18, "018_pilot_risk", "immutable micro-pilot risk policy and cumulative loss ledger", self._migration_018_pilot_risk),
             (19, "019_production_rehearsal", "append-only production gate rehearsal reports", self._migration_019_production_rehearsal),
+            (20, "020_manual_live_proof", "append-only manual live proof qualification reports", self._migration_020_manual_live_proof),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -944,6 +948,20 @@ class Storage:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_created ON production_rehearsal_reports(created_at DESC)"
         )
+
+    def _migration_020_manual_live_proof(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_live_proof_reports (
+                proof_id TEXT PRIMARY KEY,
+                qualified INTEGER NOT NULL,
+                wallet_public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_manual_live_proof_created ON manual_live_proof_reports(created_at DESC)")
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1842,6 +1860,24 @@ class Storage:
         with self.read_connection() as connection:
             row = connection.execute(
                 "SELECT payload FROM production_rehearsal_reports ORDER BY created_at DESC, report_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_manual_live_proof_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        created_at = datetime.now(timezone.utc).isoformat()
+        proof_id = f"manual_live_proof_{uuid.uuid4().hex}"
+        payload = {**report, "proof_id": proof_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO manual_live_proof_reports (proof_id, qualified, wallet_public_key, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (proof_id, int(bool(report.get("qualified"))), str(report.get("wallet_public_key") or ""), created_at, json.dumps(payload, sort_keys=True)),
+            )
+        return payload
+
+    def load_latest_manual_live_proof_report(self) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM manual_live_proof_reports ORDER BY created_at DESC, proof_id DESC LIMIT 1"
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 

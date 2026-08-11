@@ -21,7 +21,7 @@ import { Button } from "../components/Button";
 import { Badge } from "../components/Badge";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import { exportUrl, backupDatabase, backupRestoreExportUrl, confirmRestoreArtifact, createBackupArtifact, downloadAuthenticatedExport, evidenceModeSeparationExportUrl, fetchEvidenceModeSeparation, fetchOperatorLogs, fetchOutcomeExplanations, fetchPilotReadiness, fetchPostRunReview, fetchReleaseReadiness, fetchSessionReport, fetchSetupReadiness, fetchSolanaLogsVerification, fetchSourceParserReplay, fetchSourceSoakAcceptance, incidentExportUrl, operatorLogsExportUrl, outcomeExplanationsExportUrl, pilotReadinessExportUrl, postRunReviewExportUrl, previewRestoreArtifact, recordIncidentExportReview, recordReleaseVerification, recordSourceSoakSnapshot, releaseReadinessExportUrl, runRestoreSmokeTest, sessionReportExportUrl, setupReadinessExportUrl, solanaLogsVerificationExportUrl, sourceHealthExportUrl, sourceParserReplayExportUrl, sourceSoakAcceptanceExportUrl } from "../api";
+import { exportUrl, backupDatabase, backupRestoreExportUrl, confirmRestoreArtifact, createBackupArtifact, downloadAuthenticatedExport, evidenceModeSeparationExportUrl, fetchEvidenceModeSeparation, fetchManualLiveProof, fetchOperatorLogs, fetchOutcomeExplanations, fetchPilotReadiness, fetchPostRunReview, fetchReleaseReadiness, fetchSessionReport, fetchSetupReadiness, fetchSolanaLogsVerification, fetchSourceParserReplay, fetchSourceSoakAcceptance, incidentExportUrl, manualLiveProofExportUrl, operatorLogsExportUrl, outcomeExplanationsExportUrl, pilotReadinessExportUrl, postRunReviewExportUrl, previewRestoreArtifact, recordIncidentExportReview, recordReleaseVerification, recordSourceSoakSnapshot, releaseReadinessExportUrl, runRestoreSmokeTest, sessionReportExportUrl, setupReadinessExportUrl, solanaLogsVerificationExportUrl, sourceHealthExportUrl, sourceParserReplayExportUrl, sourceSoakAcceptanceExportUrl } from "../api";
 import type { 
   BackupRestoreHistoryEntry,
   DataSummary, 
@@ -48,6 +48,7 @@ import type {
   OperatorSessionReport,
   OutcomeExplanationsReport,
   PilotReadinessReport,
+  ManualLiveProofReport,
   PostRunReviewReport,
   SetupReadinessReport,
   SourceAdapterStatus, 
@@ -251,6 +252,8 @@ export const DataPage: React.FC<DataPageProps> = ({
   const [sourceEventMintFilter, setSourceEventMintFilter] = React.useState("");
   const [pilotReadiness, setPilotReadiness] = React.useState<PilotReadinessReport | null>(null);
   const [pilotReadinessError, setPilotReadinessError] = React.useState("");
+  const [manualLiveProof, setManualLiveProof] = React.useState<ManualLiveProofReport | null>(null);
+  const [manualLiveProofError, setManualLiveProofError] = React.useState("");
   const [setupReadiness, setSetupReadiness] = React.useState<SetupReadinessReport | null>(null);
   const [setupReadinessError, setSetupReadinessError] = React.useState("");
   const [releaseReadiness, setReleaseReadiness] = React.useState<ReleaseReadinessReport | null>(null);
@@ -351,6 +354,15 @@ export const DataPage: React.FC<DataPageProps> = ({
       setPilotReadinessError("");
     } catch (error) {
       setPilotReadinessError(error instanceof Error ? error.message : "Pilot readiness failed");
+    }
+  }
+
+  async function refreshManualLiveProof() {
+    try {
+      setManualLiveProof(await fetchManualLiveProof());
+      setManualLiveProofError("");
+    } catch (error) {
+      setManualLiveProofError(error instanceof Error ? error.message : "Manual-live proof report failed");
     }
   }
 
@@ -506,6 +518,7 @@ export const DataPage: React.FC<DataPageProps> = ({
 
   React.useEffect(() => {
     void refreshPilotReadiness();
+    void refreshManualLiveProof();
     void refreshSetupReadiness();
     void refreshReleaseReadiness();
     void refreshPostRunReview();
@@ -519,7 +532,7 @@ export const DataPage: React.FC<DataPageProps> = ({
   }, []);
 
   async function refreshAll() {
-    await Promise.all([onRefresh(), refreshPilotReadiness(), refreshSetupReadiness(), refreshReleaseReadiness(), refreshPostRunReview(), refreshSessionReport(), refreshEvidenceModeSeparation(), refreshOperatorLogs(), refreshOutcomeExplanations(), refreshSourceParserReplay(), refreshSolanaLogsVerification(), refreshSourceSoakAcceptance()]);
+    await Promise.all([onRefresh(), refreshPilotReadiness(), refreshManualLiveProof(), refreshSetupReadiness(), refreshReleaseReadiness(), refreshPostRunReview(), refreshSessionReport(), refreshEvidenceModeSeparation(), refreshOperatorLogs(), refreshOutcomeExplanations(), refreshSourceParserReplay(), refreshSolanaLogsVerification(), refreshSourceSoakAcceptance()]);
   }
 
   function downloadSourceEventBundle() {
@@ -761,6 +774,18 @@ export const DataPage: React.FC<DataPageProps> = ({
               ))}
               {setupReadiness && !setupReadiness.gates.some((gate) => gate.status !== "pass") ? <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-2 text-xs text-emerald-100">First-run setup is clean for paper monitoring.</div> : null}
               {!setupReadiness ? <Skeleton className="h-16 w-full" /> : null}
+            </div>
+            <div className="mt-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-black uppercase tracking-widest text-zinc-400">Manual-live proof</span>
+                <div className="flex items-center gap-3">
+                  <Badge variant={manualLiveProof?.qualified ? "success" : "warning"}>{manualLiveProof?.status ?? "loading"}</Badge>
+                  <button type="button" className="text-[10px] font-black uppercase tracking-widest text-amber-300 hover:text-amber-200" onClick={() => downloadExport(manualLiveProofExportUrl(), "cryptoarc-manual-live-proof.json")}>Export</button>
+                </div>
+              </div>
+              <p className="mt-2 text-zinc-400">{manualLiveProof?.operator_action ?? "Loading read-only proof status."}</p>
+              {manualLiveProof?.blockers?.length ? <p className="mt-1 text-amber-300">{manualLiveProof.blockers.length} blocker(s); no authority changed.</p> : null}
+              {manualLiveProofError ? <p className="mt-1 text-rose-300">{manualLiveProofError}</p> : null}
             </div>
           </div>
         </div>

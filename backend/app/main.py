@@ -1918,6 +1918,19 @@ async def pilot_readiness_report_export(wallet_public_key: str = "", signer_mode
     )
 
 
+@app.get("/api/reports/manual-live-proof", dependencies=[Depends(require_auth)])
+async def manual_live_proof_report() -> dict:
+    return state.manual_live_proof_status()
+
+
+@app.get("/api/reports/manual-live-proof/export", dependencies=[Depends(require_auth)])
+async def manual_live_proof_report_export() -> JSONResponse:
+    return JSONResponse(
+        content=state.manual_live_proof_status(),
+        headers={"Content-Disposition": 'attachment; filename="cryptoarc-manual-live-proof.json"'},
+    )
+
+
 @app.get("/api/reports/post-run-review", dependencies=[Depends(require_auth)])
 async def post_run_review_report(timeframe: str = "24h", wallet_public_key: str = "") -> dict:
     return state.post_run_review_report(timeframe, wallet_public_key)

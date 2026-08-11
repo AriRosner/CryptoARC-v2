@@ -1298,6 +1298,22 @@ export interface PilotRiskStatus {
   operator_action: string;
 }
 
+export interface ManualLiveProofReport {
+  proof_id?: string;
+  created_at?: string;
+  status: "QUALIFIED" | "DEFERRED" | "INVALID";
+  qualified: boolean;
+  blockers: string[];
+  authorization_id?: string;
+  wallet_public_key?: string;
+  signer_mode?: string;
+  signer_identity_id?: string;
+  audit_ids: string[];
+  transaction_signatures: string[];
+  authority_changed: false;
+  operator_action: string;
+}
+
 export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
 
 export interface SentinelVerdict {

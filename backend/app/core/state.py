@@ -80,6 +80,7 @@ from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
 from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskState
 from app.core.production_rehearsal import ProductionGateRehearsal
+from app.core.manual_live_proof import ManualLiveProof
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -8396,6 +8397,7 @@ class BotState:
             final_status=quote.status,
             intent_id=intent.id,
             pilot_risk_policy_id=pilot_policy.policy_id if pilot_policy else "",
+            signer_identity_id=f"{signer_mode}:{wallet_public_key}",
         )
         audit.quote["shadow_only"] = bool(shadow_only)
         audit.quote["live_env_enabled_at_quote"] = bool(env_live_enabled)
@@ -10782,6 +10784,30 @@ class BotState:
             "blockers": ["physical_rehearsal_required"],
             "authority_changed": False,
             "operator_action": "Run the fixture-only rehearsal, then separately authorize any physical window.",
+        }
+
+    def qualify_manual_live_proof(
+        self,
+        audits: list[dict[str, object]],
+        ledger: dict[str, object],
+        signer_identity: dict[str, object],
+        authorization: dict[str, object],
+    ) -> dict[str, object]:
+        report = ManualLiveProof.qualify(audits, ledger, signer_identity, authorization).to_dict()
+        return self.storage.save_manual_live_proof_report(report)
+
+    def manual_live_proof_status(self) -> dict[str, object]:
+        latest = self.storage.load_latest_manual_live_proof_report()
+        if latest is not None:
+            return latest
+        return {
+            "status": "DEFERRED",
+            "qualified": False,
+            "blockers": ["separate_manual_live_authorization_required", "actual_live_evidence_required"],
+            "audit_ids": [],
+            "transaction_signatures": [],
+            "authority_changed": False,
+            "operator_action": "Request a fresh separately authorized $2-$5 manual round-trip window; no live action starts here.",
         }
 
     def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
