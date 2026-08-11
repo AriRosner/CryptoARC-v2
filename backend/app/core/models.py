@@ -638,6 +638,10 @@ class StrategyDecisionRecord:
     score_breakdown: list[str] = field(default_factory=list)
     decision_log: list[str] = field(default_factory=list)
     settings_version_id: str = ""
+    strategy_id: str = ""
+    strategy_version: str = ""
+    strategy_fingerprint: str = ""
+    canonical_strategy: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

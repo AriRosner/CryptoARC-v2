@@ -69,6 +69,7 @@ from app.core.simulator import LaunchSimulator
 from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
+from app.core.strategy_contract import SniperStrategyVersion
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -2718,6 +2719,8 @@ class BotState:
         )
 
     def decision_record_from_token(self, token: TokenSignal, decision) -> StrategyDecisionRecord:
+        contract = decision.snapshot.get("strategy_contract", {}) if isinstance(decision.snapshot, dict) else {}
+        canonical_strategy = contract if isinstance(contract, dict) else {}
         return StrategyDecisionRecord(
             id=new_id("dec"),
             token_id=token.id,
@@ -2734,6 +2737,10 @@ class BotState:
             score_breakdown=token.score_breakdown,
             decision_log=decision.log,
             settings_version_id=token.settings_version_id or self.current_settings_version_id,
+            strategy_id=str(canonical_strategy.get("strategy_id") or self.settings.strategy_profile),
+            strategy_version=str(canonical_strategy.get("strategy_version") or token.settings_version_id or self.current_settings_version_id),
+            strategy_fingerprint=str(canonical_strategy.get("strategy_fingerprint") or ""),
+            canonical_strategy=dict(canonical_strategy.get("configuration") or {}) if isinstance(canonical_strategy.get("configuration"), dict) else {},
         )
 
     def session_from_token(self, token: TokenSignal, status: str) -> TradeSession:
@@ -4658,6 +4665,27 @@ class BotState:
         self.storage.save_strategy_preset(preset)
         self.add_event("info", f"Strategy preset saved: {clean_name}")
         return preset.to_dict()
+
+    def register_sniper_strategy_version(self, payload: dict[str, object]) -> dict[str, object]:
+        strategy = SniperStrategyVersion.from_dict(payload)
+        created = self.storage.save_sniper_strategy_version(strategy)
+        return {
+            "strategy_id": strategy.strategy_id,
+            "strategy_version": strategy.strategy_version,
+            "strategy_fingerprint": strategy.fingerprint(),
+            "configuration": strategy.to_dict(),
+            "created": created,
+        }
+
+    def evaluate_sniper_strategy(
+        self,
+        payload: dict[str, object],
+        evidence: dict[str, object],
+        session_state: dict[str, object],
+    ) -> dict[str, object]:
+        strategy = SniperStrategyVersion.from_dict(payload)
+        self.storage.save_sniper_strategy_version(strategy)
+        return self.strategy.evaluate_sniper(strategy, evidence, session_state).to_dict()
 
     def monitor_pnl_summary(self, timeframe: str = "all") -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]

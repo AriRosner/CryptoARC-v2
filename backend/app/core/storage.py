@@ -15,6 +15,7 @@ from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
 from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.strategy_contract import SniperStrategyVersion
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -39,6 +40,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("source_soak_history", "source_soak_history"),
     ("accepted_market_observations", "accepted_market_observations"),
     ("source_access_evidence", "source_access_evidence"),
+    ("sniper_strategy_versions", "sniper_strategy_versions"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -46,7 +48,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 12
+    SCHEMA_VERSION = 13
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -69,6 +71,7 @@ class Storage:
         "source_soak_history",
         "accepted_market_observations",
         "source_access_evidence",
+        "sniper_strategy_versions",
     )
     BACKUP_TABLES = (
         "settings",
@@ -93,6 +96,7 @@ class Storage:
         "source_soak_history",
         "accepted_market_observations",
         "source_access_evidence",
+        "sniper_strategy_versions",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -220,6 +224,7 @@ class Storage:
             (10, "010_mobile_command_center", "scoped mobile command center persistence", self._migration_010_mobile_command_center),
             (11, "011_mobile_guarded_execution_claims", "durable guarded execution audit claims", self._migration_011_mobile_guarded_execution_claims),
             (12, "012_genuine_source_evidence", "accepted market observations and source access evidence", self._migration_012_genuine_source_evidence),
+            (13, "013_sniper_strategy_versions", "immutable versioned sniper strategy contracts", self._migration_013_sniper_strategy_versions),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -627,6 +632,23 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_source_access_evidence_source ON source_access_evidence(source, created_at DESC)"
         )
 
+    def _migration_013_sniper_strategy_versions(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sniper_strategy_versions (
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                canonical_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(strategy_id, strategy_version)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sniper_strategy_versions_created_at ON sniper_strategy_versions(created_at DESC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -989,6 +1011,37 @@ class Storage:
                     (bounded_limit,),
                 ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def save_sniper_strategy_version(self, strategy: SniperStrategyVersion) -> bool:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT canonical_json FROM sniper_strategy_versions WHERE strategy_id = ? AND strategy_version = ?",
+                (strategy.strategy_id, strategy.strategy_version),
+            ).fetchone()
+            if existing:
+                if str(existing["canonical_json"]) != strategy.canonical_json():
+                    raise ValueError("strategy version already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO sniper_strategy_versions (strategy_id, strategy_version, fingerprint, canonical_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    strategy.strategy_id,
+                    strategy.strategy_version,
+                    strategy.fingerprint(),
+                    strategy.canonical_json(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        return True
+
+    def load_sniper_strategy_versions(self, limit: int = 50) -> list[SniperStrategyVersion]:
+        bounded_limit = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT canonical_json FROM sniper_strategy_versions ORDER BY created_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [SniperStrategyVersion.from_dict(json.loads(row["canonical_json"])) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])

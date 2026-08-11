@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from app.core.models import BotSettings, BotStats, TokenSignal
 from app.core.risk import RiskDecision, RiskEngine
 from app.core.scoring import ScoreResult, ScoringEngine
+from app.core.strategy_contract import SniperDecision, SniperStrategyVersion, StrategyDecision as SniperStrategyDecision
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,3 +95,11 @@ class DecisionPipeline:
     def describe_modules(self, settings: BotSettings) -> list[dict[str, object]]:
         snapshot = self.strategy_snapshot(settings)
         return list(snapshot["modules"])
+
+    def evaluate_sniper(
+        self,
+        strategy: SniperStrategyVersion,
+        evidence: dict[str, object],
+        session_state: dict[str, object],
+    ) -> SniperStrategyDecision:
+        return SniperDecision.evaluate(strategy, evidence, session_state)
