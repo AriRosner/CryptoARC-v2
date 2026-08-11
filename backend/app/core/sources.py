@@ -393,6 +393,16 @@ class SolanaLogsSource(LaunchSource):
                             status.message = f"Solana logsSubscribe subscription id {payload.get('result')}"
                             await queue.put(LaunchEvent(self.name, received_at, payload, None, status.message, kind="verification_status"))
                             continue
+                        params = payload.get("params")
+                        result = params.get("result") if isinstance(params, dict) else None
+                        value = result.get("value") if isinstance(result, dict) else None
+                        if isinstance(value, dict) and value.get("err") is not None:
+                            status.failed_events_seen += 1
+                            status.message = (
+                                "Solana logsSubscribe verifier active; "
+                                f"{status.failed_events_seen} failed transaction notifications skipped"
+                            )
+                            continue
                         await queue.put(LaunchEvent(self.name, received_at, payload, None, "Solana logsSubscribe notification", kind="verification"))
                         status.events_received += 1
                         status.launch_events_seen += 1
