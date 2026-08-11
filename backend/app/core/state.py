@@ -78,6 +78,7 @@ from app.core.shadow_evaluation import EconomicValidator
 from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
+from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskState
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -8245,12 +8246,26 @@ class BotState:
         if validation_error:
             blockers.append(validation_error)
         wallet_spend_estimate: dict[str, object] = {}
+        pilot_policy: PilotRiskPolicy | None = None
+        pilot_decision: dict[str, object] | None = None
         if action == "buy" and denominated_in_sol:
             wallet_spend_estimate = self._estimate_live_buy_wallet_spend(amount, priority_fee_sol)
             if not shadow_only and wallet_spend_estimate.get("exceeds_max_trade_cap"):
                 blockers.append(
                     f"estimated wallet spend exceeds live max trade cap ({wallet_spend_estimate['estimated_wallet_spend_sol']:.6f} SOL > {wallet_spend_estimate['max_trade_cap_sol']:.6f} SOL)"
                 )
+            if not shadow_only:
+                requested = Decimal(str(wallet_spend_estimate.get("requested_amount_sol") or "0"))
+                total_cost = Decimal(str(wallet_spend_estimate.get("estimated_wallet_spend_sol") or "0")) - requested
+                pilot_policy, pilot_decision = self._pilot_risk_decision(
+                    action="buy",
+                    amount_sol=requested,
+                    slippage_pct=Decimal(str(slippage_pct)),
+                    total_cost_sol=max(Decimal("0"), total_cost),
+                    wallet_public_key=wallet_public_key,
+                )
+                if pilot_decision and not pilot_decision.get("allowed"):
+                    blockers.extend(f"pilot risk: {item}" for item in pilot_decision.get("blockers", []))
         preflight_checks = self._live_order_preflight_checks(
             env_live_enabled=quote_env_enabled,
             action=action,
@@ -8287,6 +8302,17 @@ class BotState:
                         "Token-account setup rent dominates this dust buy; use a larger proof size or an existing token account if practical.",
                     )
                 )
+        if pilot_policy and pilot_decision:
+            preflight_checks.append(
+                self._preflight_check(
+                    "pilot_risk",
+                    "Immutable Pilot Risk",
+                    "pass" if pilot_decision.get("allowed") else "fail",
+                    {"policy_id": pilot_policy.policy_id, **pilot_decision},
+                    "all immutable micro-pilot caps clear",
+                    "Pilot risk is rechecked from the recorded session-start reference at quote, preflight, and submit.",
+                )
+            )
         if action == "sell":
             balance = self._wallet_token_balance(wallet_public_key, mint)
             if balance["error"]:
@@ -8355,7 +8381,11 @@ class BotState:
             request=intent.to_dict(),
             preflight_checks=preflight_checks,
             quote={**quote.to_dict(), "provider_request": quote_payload},
-            caps_snapshot=self.live_caps_snapshot(),
+            caps_snapshot={
+                **self.live_caps_snapshot(),
+                "pilot_risk_policy": pilot_policy.to_dict() if pilot_policy else None,
+                "pilot_risk_decision": pilot_decision,
+            },
             balance_snapshot=balance,
             errors=blockers,
             warnings=(
@@ -8364,6 +8394,7 @@ class BotState:
             + (["Token-account setup rent dominates this buy; review total wallet spend before signing."] if wallet_spend_estimate.get("rent_dominates_trade") and not blockers else []),
             final_status=quote.status,
             intent_id=intent.id,
+            pilot_risk_policy_id=pilot_policy.policy_id if pilot_policy else "",
         )
         audit.quote["shadow_only"] = bool(shadow_only)
         audit.quote["live_env_enabled_at_quote"] = bool(env_live_enabled)
@@ -8567,6 +8598,23 @@ class BotState:
             raise ValueError("shadow-only quote cannot be submitted")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
+        active_pilot_policy = self.storage.load_latest_pilot_risk_policy()
+        captured_pilot_policy = audit.caps_snapshot.get("pilot_risk_policy") if isinstance(audit.caps_snapshot, dict) else None
+        if audit.action == "buy" and active_pilot_policy is not None:
+            if audit.pilot_risk_policy_id != active_pilot_policy.policy_id or not isinstance(captured_pilot_policy, dict) or captured_pilot_policy.get("policy_id") != active_pilot_policy.policy_id:
+                raise ValueError("cannot submit live buy after pilot risk policy changed")
+            spend = audit.quote.get("wallet_spend_estimate") if isinstance(audit.quote, dict) else {}
+            requested = Decimal(str((spend or {}).get("requested_amount_sol") or audit.amount or "0"))
+            total_cost = Decimal(str((spend or {}).get("estimated_wallet_spend_sol") or requested)) - requested
+            _, submit_pilot_decision = self._pilot_risk_decision(
+                action="buy",
+                amount_sol=requested,
+                slippage_pct=Decimal(str(audit.quote.get("slippage_pct") or "0")),
+                total_cost_sol=max(Decimal("0"), total_cost),
+                wallet_public_key=audit.wallet_public_key,
+            )
+            if submit_pilot_decision and not submit_pilot_decision.get("allowed"):
+                raise ValueError(f"cannot submit live buy after pilot risk changed: {'; '.join(submit_pilot_decision.get('blockers', [])[:4])}")
         preflight_blockers = self._live_audit_preflight_blockers(
             audit,
             require_exact=bool(guarded_action_id),
@@ -9276,6 +9324,7 @@ class BotState:
             "estimated_wallet_spend",
             "rent_dominance",
             "wallet_token_balance",
+            "pilot_risk",
         }
         blockers = []
         seen: set[str] = set()
@@ -10667,6 +10716,81 @@ class BotState:
                 "fingerprint": fingerprint or "unknown",
             },
         }
+
+    def create_pilot_risk_policy(
+        self,
+        reference_usd_per_sol: str,
+        wallet_equity_sol: str,
+        observed_at: datetime,
+        reference_observation_id: str,
+        operator_intent_id: str,
+        initial_slippage_pct: str = "3",
+    ) -> dict[str, object]:
+        if self.active_live_session_id:
+            raise ValueError("pilot risk policy cannot change during an active session")
+        if not reference_observation_id.strip() or not operator_intent_id.strip():
+            raise ValueError("reference observation and explicit operator intent are required")
+        policy = PilotRiskPolicy.create(
+            Decimal(reference_usd_per_sol),
+            Decimal(wallet_equity_sol),
+            observed_at,
+            reference_observation_id=reference_observation_id.strip(),
+            settings_version=self.current_settings_version_id,
+            operator_intent_id=operator_intent_id.strip(),
+            initial_slippage_pct=Decimal(initial_slippage_pct),
+        )
+        self.storage.save_pilot_risk_policy(policy)
+        return self.pilot_risk_status()
+
+    def pilot_risk_status(self) -> dict[str, object]:
+        policy = self.storage.load_latest_pilot_risk_policy()
+        if policy is None:
+            return {
+                "status": "not_configured",
+                "authority_changed": False,
+                "operator_action": "Create an immutable policy only from a recorded session-start SOL/USD observation and wallet equity.",
+            }
+        ledger = self.storage.pilot_loss_ledger(policy.policy_id)
+        return {
+            "status": "configured",
+            "policy": policy.to_dict(),
+            "ledger": ledger,
+            "authority_changed": False,
+            "operator_action": "Review the immutable reference and caps; this policy does not enable or arm live trading.",
+        }
+
+    def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
+        positions = self.storage.load_live_ledger_positions(500)
+        relevant = [item for item in positions if not wallet_public_key or item.wallet_public_key == wallet_public_key]
+        pnl = sum((Decimal(str(item.realized_pnl_sol)) + Decimal(str(item.unrealized_pnl_sol)) for item in relevant), Decimal("0"))
+        ledger = self.storage.pilot_loss_ledger(policy.policy_id)
+        entries = list(ledger.get("entries") or [])
+        return PilotRiskState(
+            open_positions=len([item for item in relevant if item.status == "open" and item.token_balance > 0]),
+            session_pnl_sol=pnl,
+            daily_pnl_sol=pnl,
+            cumulative_loss_sol=Decimal(str(ledger.get("cumulative_loss_sol") or "0")),
+            consecutive_losses=min(len(entries), policy.consecutive_loss_stop),
+            stopped=bool(self.settings.kill_switch_enabled),
+        )
+
+    def _pilot_risk_decision(
+        self,
+        *,
+        action: str,
+        amount_sol: Decimal,
+        slippage_pct: Decimal,
+        total_cost_sol: Decimal,
+        wallet_public_key: str,
+        protective: bool = False,
+    ) -> tuple[PilotRiskPolicy | None, dict[str, object] | None]:
+        policy = self.storage.load_latest_pilot_risk_policy()
+        if policy is None:
+            return None, None
+        request = PilotRiskRequest(action, amount_sol, slippage_pct, total_cost_sol, protective)
+        state = self._pilot_risk_state(policy, wallet_public_key)
+        decision = policy.evaluate_entry(request, state) if action == "buy" else policy.evaluate_exit(request, state)
+        return policy, decision.to_dict()
         return EvidenceInventory.build(
             repo_head=str(repo_state.get("head") or ""),
             origin_main=str(repo_state.get("origin_main") or ""),

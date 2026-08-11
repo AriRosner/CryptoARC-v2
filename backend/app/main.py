@@ -5,6 +5,7 @@ import hmac
 import json
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import AsyncIterator, Callable, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import WeakSet
@@ -193,6 +194,15 @@ class StrategyCandidateRequest(BaseModel):
 
 class StrategyCandidatePromotionRequest(BaseModel):
     operator_intent_id: str = Field(min_length=1, max_length=200)
+
+
+class PilotRiskPolicyRequest(BaseModel):
+    reference_usd_per_sol: str = Field(min_length=1, max_length=40)
+    wallet_equity_sol: str = Field(min_length=1, max_length=40)
+    observed_at: datetime
+    reference_observation_id: str = Field(min_length=1, max_length=200)
+    operator_intent_id: str = Field(min_length=1, max_length=200)
+    initial_slippage_pct: str = Field(default="3", min_length=1, max_length=20)
 
 
 class PaperRecoveryRequest(BaseModel):
@@ -1418,6 +1428,26 @@ async def safety_status() -> dict:
 @app.get("/api/readiness/status", dependencies=[Depends(require_auth)])
 async def readiness_status() -> dict:
     return state.readiness_status()
+
+
+@app.get("/api/pilot-risk/status", dependencies=[Depends(require_auth)])
+async def pilot_risk_status() -> dict:
+    return state.pilot_risk_status()
+
+
+@app.post("/api/pilot-risk/policy", dependencies=[Depends(require_auth)])
+async def create_pilot_risk_policy(payload: PilotRiskPolicyRequest) -> dict:
+    try:
+        return state.create_pilot_risk_policy(
+            payload.reference_usd_per_sol,
+            payload.wallet_equity_sol,
+            payload.observed_at,
+            payload.reference_observation_id,
+            payload.operator_intent_id,
+            payload.initial_slippage_pct,
+        )
+    except (ArithmeticError, ValueError) as exc:
+        raise HTTPException(status_code=409 if "active session" in str(exc).lower() else 400, detail=str(exc)) from exc
 
 
 @app.get("/api/sentinel/current", dependencies=[Depends(require_auth)])

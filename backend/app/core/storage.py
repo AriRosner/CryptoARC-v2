@@ -10,6 +10,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
@@ -17,6 +18,7 @@ from typing import Any, Callable, Iterator
 from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, CandidateValidation, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyCandidate, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 from app.core.model_classifier import ModelClassification
+from app.core.pilot_risk import PilotRiskPolicy
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -51,6 +53,8 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("strategy_candidates", "strategy_candidates"),
     ("candidate_validations", "candidate_validations"),
     ("strategy_promotions", "strategy_promotions"),
+    ("pilot_risk_policies", "pilot_risk_policies"),
+    ("pilot_loss_ledger", "pilot_loss_ledger"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -58,7 +62,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 17
+    SCHEMA_VERSION = 18
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -94,6 +98,8 @@ class Storage:
         "strategy_promotions",
         "active_strategy_selection",
         "strategy_validation_campaigns",
+        "pilot_risk_policies",
+        "pilot_loss_ledger",
     )
     BACKUP_TABLES = (
         "settings",
@@ -131,6 +137,8 @@ class Storage:
         "strategy_promotions",
         "active_strategy_selection",
         "strategy_validation_campaigns",
+        "pilot_risk_policies",
+        "pilot_loss_ledger",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -279,6 +287,7 @@ class Storage:
             (15, "015_sentinel_verdicts", "immutable expiring market sentinel verdicts", self._migration_015_sentinel_verdicts),
             (16, "016_trade_grading", "durable deterministic trade grading queue", self._migration_016_trade_grading),
             (17, "017_strategy_candidates", "immutable strategy candidates and gated promotion", self._migration_017_strategy_candidates),
+            (18, "018_pilot_risk", "immutable micro-pilot risk policy and cumulative loss ledger", self._migration_018_pilot_risk),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -838,6 +847,7 @@ class Storage:
             )
             """
         )
+
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS candidate_validations (
@@ -886,6 +896,34 @@ class Storage:
             )
             """
         )
+
+    def _migration_018_pilot_risk(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_risk_policies (
+                policy_id TEXT PRIMARY KEY,
+                policy_version TEXT NOT NULL,
+                reference_observation_id TEXT NOT NULL,
+                settings_version TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_risk_policies_created ON pilot_risk_policies(created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_loss_ledger (
+                loss_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                loss_sol TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_loss_policy ON pilot_loss_ledger(policy_id, created_at ASC)")
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1717,6 +1755,57 @@ class Storage:
                 (f"campaign_{promotion_id}", candidate.candidate_id, candidate.proposed_strategy_version, now.isoformat()),
             )
         return True
+
+    def save_pilot_risk_policy(self, policy: PilotRiskPolicy) -> bool:
+        serialized = json.dumps(policy.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM pilot_risk_policies WHERE policy_id = ?", (policy.policy_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("pilot risk policy already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO pilot_risk_policies (policy_id, policy_version, reference_observation_id, settings_version, operator_intent_id, created_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (policy.policy_id, policy.policy_version, policy.reference_observation_id, policy.settings_version, policy.operator_intent_id, policy.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_latest_pilot_risk_policy(self) -> PilotRiskPolicy | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM pilot_risk_policies ORDER BY created_at DESC, policy_id DESC LIMIT 1"
+            ).fetchone()
+        return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
+
+    def append_pilot_loss(self, policy_id: str, loss_id: str, loss_sol: Decimal, created_at: datetime) -> bool:
+        amount = Decimal(loss_sol)
+        if amount <= 0:
+            raise ValueError("pilot loss ledger accepts positive loss magnitudes only")
+        payload = {"loss_id": loss_id, "policy_id": policy_id, "loss_sol": str(amount), "created_at": created_at.isoformat()}
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM pilot_loss_ledger WHERE loss_id = ?", (loss_id,)).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("pilot loss entry already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO pilot_loss_ledger (loss_id, policy_id, loss_sol, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (loss_id, policy_id, str(amount), created_at.isoformat(), serialized),
+            )
+        return True
+
+    def pilot_loss_ledger(self, policy_id: str) -> dict[str, Any]:
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM pilot_loss_ledger WHERE policy_id = ? ORDER BY created_at ASC, loss_id ASC",
+                (policy_id,),
+            ).fetchall()
+        entries = [json.loads(row["payload"]) for row in rows]
+        cumulative = sum((Decimal(str(item["loss_sol"])) for item in entries), Decimal("0"))
+        return {"policy_id": policy_id, "cumulative_loss_sol": str(cumulative), "entries": entries}
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])

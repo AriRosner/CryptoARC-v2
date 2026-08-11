@@ -1270,6 +1270,34 @@ export interface ReadinessStatus {
   min_readiness_score: number;
 }
 
+export interface PilotRiskPolicy {
+  policy_id: string;
+  policy_version: string;
+  created_at: string;
+  observed_at: string;
+  reference_observation_id: string;
+  settings_version: string;
+  operator_intent_id: string;
+  reference_usd_per_sol: string;
+  wallet_equity_sol: string;
+  max_trade_sol: string;
+  max_open_positions: number;
+  session_loss_stop_sol: string;
+  daily_loss_stop_sol: string;
+  cumulative_loss_freeze_sol: string;
+  consecutive_loss_stop: number;
+  initial_slippage_pct: string;
+  max_reviewable_slippage_pct: string;
+}
+
+export interface PilotRiskStatus {
+  status: "not_configured" | "configured";
+  policy?: PilotRiskPolicy;
+  ledger?: { cumulative_loss_sol: string; consecutive_losses: number; entries: unknown[] };
+  authority_changed: false;
+  operator_action: string;
+}
+
 export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
 
 export interface SentinelVerdict {

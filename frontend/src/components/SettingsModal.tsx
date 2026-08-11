@@ -30,8 +30,8 @@ import { Modal } from "./Modal";
 import { Button } from "./Button";
 import { Badge } from "./Badge";
 import { cn } from "./utils";
-import { updatePassword, setupTotp, verifyTotp, disableTotp, startMobilePairing, fetchMobileDevices, revokeMobileDevice, fetchProfitSweepHistory } from "../api";
-import type { BotSettings, LiveExecutionAudit, MobileDevice, MobilePairingStartResponse } from "../types";
+import { updatePassword, setupTotp, verifyTotp, disableTotp, startMobilePairing, fetchMobileDevices, revokeMobileDevice, fetchProfitSweepHistory, fetchPilotRiskStatus } from "../api";
+import type { BotSettings, LiveExecutionAudit, MobileDevice, MobilePairingStartResponse, PilotRiskStatus } from "../types";
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -344,6 +344,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [sweepHistory, setSweepHistory] = useState<LiveExecutionAudit[]>([]);
   const [sweepHistoryLoading, setSweepHistoryLoading] = useState(false);
   const [sweepHistoryError, setSweepHistoryError] = useState("");
+  const [pilotRiskStatus, setPilotRiskStatus] = useState<PilotRiskStatus | null>(null);
+  const [pilotRiskError, setPilotRiskError] = useState("");
   const warnings = validateSettings(draft);
 
   const updateDraft = <K extends keyof BotSettings>(key: K, value: BotSettings[K]) => {
@@ -511,6 +513,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     if (isOpen && activeTab === "profit-vault") {
       void refreshSweepHistory();
     }
+  }, [isOpen, activeTab]);
+
+  React.useEffect(() => {
+    if (!isOpen || activeTab !== "simulation") return;
+    setPilotRiskError("");
+    void fetchPilotRiskStatus()
+      .then(setPilotRiskStatus)
+      .catch((error: unknown) => setPilotRiskError(error instanceof Error ? error.message : "Unable to load pilot risk policy"));
   }, [isOpen, activeTab]);
 
   return (
@@ -918,6 +928,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       <NumberInput field="live_max_slippage_pct" step="0.1" className="w-20" />
                       <NumberInput field="live_priority_fee_cap_sol" step="0.00001" className="w-20" />
                     </div>
+                  </SettingRow>
+                  <SettingRow label="Immutable Micro-Pilot Policy" description="Read-only reference. This display cannot raise caps, arm a signer, or enable live trading.">
+                    {pilotRiskError ? (
+                      <span className="text-xs text-red-400">{pilotRiskError}</span>
+                    ) : pilotRiskStatus?.policy ? (
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-zinc-400">
+                        <span>Version</span><span className="text-right text-zinc-200">{pilotRiskStatus.policy.policy_version}</span>
+                        <span>Reference observation</span><span className="truncate text-right text-zinc-200" title={pilotRiskStatus.policy.reference_observation_id}>{pilotRiskStatus.policy.reference_observation_id}</span>
+                        <span>Observed SOL/USD</span><span className="text-right text-zinc-200">${pilotRiskStatus.policy.reference_usd_per_sol}</span>
+                        <span>Trade cap</span><span className="text-right text-zinc-200">{pilotRiskStatus.policy.max_trade_sol} SOL</span>
+                        <span>Status</span><span className="text-right text-amber-400">configured, zero authority</span>
+                      </div>
+                    ) : (
+                      <span className="text-xs text-zinc-500">No immutable pilot policy is configured.</span>
+                    )}
                   </SettingRow>
                   <SettingRow label="Live Signer Mode" description="Browser wallet is manual; local hot wallet is the encrypted local executor; signer daemon remains localhost-gated.">
                     <select value={draft.live_signer_mode} onChange={(e) => updateDraft("live_signer_mode", e.target.value as BotSettings["live_signer_mode"])} className="dashboard-select rounded-lg border border-white/10 bg-black px-2 py-1 text-xs text-white">

@@ -487,6 +487,7 @@ class LiveExecutionAudit:
     guarded_action_id: str = ""
     guarded_authorization: dict[str, Any] = field(default_factory=dict)
     dispatch_started_at: datetime | None = None
+    pilot_risk_policy_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
