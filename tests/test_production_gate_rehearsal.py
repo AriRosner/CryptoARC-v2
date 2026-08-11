@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from app.core.production_rehearsal import ProductionGateRehearsal
+from app.core.state import BotState
 
 
 def passing_evidence() -> dict[str, object]:
@@ -118,6 +121,30 @@ class ProductionGateRehearsalTests(unittest.TestCase):
         serialized = str(payload)
         self.assertNotIn("do-not-export", serialized)
         self.assertNotIn("password", payload["evidence"])
+
+    def test_state_evaluation_cannot_be_qualified_by_spoofed_posted_flags(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(str(Path(directory) / "rehearsal.db"))
+            report = state.evaluate_production_rehearsal(passing_evidence())
+
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["fixture_only"])
+        self.assertIn("physical_window_authorized", report["blockers"])
+        self.assertIn("wallet_signer_match", report["blockers"])
+
+    def test_durable_rehearsal_evidence_is_scoped_fresh_and_append_only(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(str(Path(directory) / "rehearsal.db"))
+            record = {
+                "evidence_id": "evidence-wallet-match", "gate_id": "wallet_signer_match",
+                "scope": "production-rehearsal", "passed": True, "fixture_only": False,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            }
+            self.assertTrue(state.storage.append_production_rehearsal_evidence(record))
+            self.assertFalse(state.storage.append_production_rehearsal_evidence(record))
+            with self.assertRaisesRegex(ValueError, "different content"):
+                state.storage.append_production_rehearsal_evidence({**record, "gate_id": "kill_switch"})
 
 
 if __name__ == "__main__":

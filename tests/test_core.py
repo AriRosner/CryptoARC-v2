@@ -1774,7 +1774,8 @@ class CoreLogicTests(unittest.TestCase):
         return state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
 
     def authorize_attended_autonomy_for_test(self, state: BotState) -> None:
-        state.autonomous_pilot_status = lambda: {"opened": True}  # type: ignore[method-assign]
+        state.autonomous_pilot_status = lambda: {"opened": True, "status": "OPEN"}  # type: ignore[method-assign]
+        state._enforce_pilot_runtime_guard = lambda **_kwargs: None  # type: ignore[method-assign]
 
     def seed_genuine_market_observation(self, state: BotState, *, now: datetime | None = None) -> None:
         observed_at = now or utc_now()

@@ -44,6 +44,8 @@ from app.core.models import (
     SentinelEvidence,
     SentinelInputs,
     SentinelThresholds,
+    ShadowComparison,
+    ShadowCostBreakdown,
     SettingsVersion,
     SignerStatus,
     SourceStatus,
@@ -79,7 +81,7 @@ from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
 from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskState
-from app.core.production_rehearsal import ProductionGateRehearsal
+from app.core.production_rehearsal import EVIDENCE_ID_GATES, PASS_FIELDS, ProductionGateRehearsal
 from app.core.manual_live_proof import ManualLiveProof
 from app.core.autonomous_pilot import AutonomousPilotGate, PilotStopEvaluator
 from app.core.post_pilot_review import PilotReview
@@ -5863,11 +5865,63 @@ class BotState:
                 audit.shadow_comparison = self._build_shadow_comparison(audit)
             if audit.shadow_comparison:
                 audit.shadow_comparison = self._evaluate_shadow_comparison(audit)
+                self._persist_economic_shadow_comparison(audit)
             updated = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
             if updated != original:
                 audit.updated_at = utc_now()
                 self.storage.save_live_execution_audit(audit)
         return audits
+
+    def _persist_economic_shadow_comparison(self, audit: LiveExecutionAudit) -> bool:
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        if comparison.get("status") != "evaluated" or audit.action != "buy":
+            return False
+        policy = self.storage.load_latest_pilot_risk_policy()
+        if policy is None or policy.reference_usd_per_sol <= 0:
+            return False
+        completed_at = self._parse_iso_datetime(str(comparison.get("exit_observed_at") or ""))
+        if completed_at is None:
+            return False
+        source_rows = [
+            item
+            for item in self.storage.load_accepted_market_observations(limit=5000)
+            if item.mint == audit.mint
+            and item.observed_at <= completed_at
+            and item.created_at >= audit.created_at - timedelta(minutes=5)
+        ]
+        genuine = [item for item in source_rows if not item.fixture_only and item.conflict_state == "clear"]
+        if not genuine:
+            return False
+        costs = comparison.get("costs") if isinstance(comparison.get("costs"), dict) else {}
+        strategy_version = policy.settings_version
+        shadow = ShadowComparison(
+            record_id=f"economic_{audit.id}",
+            created_at=completed_at,
+            schema_version=self.storage.SCHEMA_VERSION,
+            strategy_id=self.settings.strategy_profile,
+            strategy_version=strategy_version,
+            evidence_mode="shadow",
+            completed_at=completed_at,
+            regime=str(comparison.get("regime") or "normal"),
+            gross_pnl_sol=float(comparison.get("gross_pnl_sol") or 0.0),
+            costs=ShadowCostBreakdown(
+                base_fee_sol=float(costs.get("paper_fee_drag_sol") or 0.0),
+                priority_fee_sol=float(costs.get("priority_fee_sol") or 0.0),
+                entry_slippage_sol=float(costs.get("price_impact_drag_sol") or 0.0),
+            ),
+            held_out=int(hashlib.sha256(audit.id.encode("utf-8")).hexdigest()[:8], 16) % 5 == 0,
+            source_evidence_ids=tuple(sorted({item.record_id for item in genuine})),
+            quote_id=str(audit.quote.get("id") or "") if isinstance(audit.quote, dict) else "",
+            landing_status="evaluated",
+            fixture_only=False,
+            contaminated=any(item.conflict_state != "clear" for item in source_rows),
+            exit_reason=str(comparison.get("exit_reason") or ""),
+            hold_seconds=int(comparison.get("hold_duration_seconds") or 0),
+            reference_usd_per_sol=float(policy.reference_usd_per_sol),
+        )
+        if not shadow.quote_id:
+            return False
+        return self.storage.save_shadow_comparison(shadow)
 
     def _shadow_quote_cost_breakdown(self, audit: LiveExecutionAudit, amount_sol: float) -> dict[str, float]:
         priority_fee = float(audit.quote.get("priority_fee_sol", 0.0) or 0.0) if isinstance(audit.quote, dict) else 0.0
@@ -10960,9 +11014,76 @@ class BotState:
         }
 
     def evaluate_production_rehearsal(self, evidence: dict[str, object]) -> dict[str, object]:
-        report = ProductionGateRehearsal.evaluate(evidence).to_dict()
+        now = utc_now()
+        submitted_ids = evidence.get("evidence_ids") if isinstance(evidence.get("evidence_ids"), dict) else {}
+
+        def resolved(gate_id: str, evidence_id: str) -> dict[str, object] | None:
+            record = self.storage.load_production_rehearsal_evidence(evidence_id)
+            if record is None:
+                return None
+            observed_at = self._parse_iso_datetime(str(record.get("observed_at") or ""))
+            expires_at = self._parse_iso_datetime(str(record.get("expires_at") or ""))
+            if (
+                record.get("gate_id") != gate_id
+                or record.get("scope") != "production-rehearsal"
+                or record.get("passed") is not True
+                or record.get("fixture_only") is not False
+                or observed_at is None
+                or expires_at is None
+                or observed_at > now
+                or now - observed_at > timedelta(hours=24)
+                or expires_at <= now
+            ):
+                return None
+            return record
+
+        resolved_records: dict[str, dict[str, object]] = {}
+        resolved_ids: dict[str, str] = {}
+        for gate_id in EVIDENCE_ID_GATES:
+            candidate_id = str(submitted_ids.get(gate_id) or "")
+            record = resolved(gate_id, candidate_id)
+            if record is not None:
+                resolved_records[gate_id] = record
+                resolved_ids[gate_id] = candidate_id
+        authorization_id = str(evidence.get("authorization_id") or "")
+        authorization = resolved("physical_window_authorized", authorization_id)
+        schema = self.storage.schema_status()
+        unresolved_audits = len(
+            [
+                audit
+                for audit in self.storage.load_live_execution_audits(5000)
+                if audit.transaction_signature and audit.status in {"submitted", "needs_review", "failed"}
+            ]
+        )
+        ledger_debt = len(
+            [
+                position
+                for position in self.storage.load_live_ledger_positions(5000)
+                if position.reconciliation_status != "matched" and (position.fills or position.token_balance > 0)
+            ]
+        )
+        durable: dict[str, object] = {
+            "fixture_only": authorization is None,
+            "physical_window_authorized": authorization is not None,
+            "authorization_id": authorization_id if authorization else "",
+            "authorization_expires_at": str(authorization.get("expires_at") or "") if authorization else "",
+            "unresolved_audits": unresolved_audits,
+            "ledger_debt": ledger_debt,
+            "evidence_ids": resolved_ids,
+        }
+        for gate_id in PASS_FIELDS:
+            passed = gate_id in resolved_records
+            if gate_id == "schema_match":
+                passed = passed and bool(schema.get("ok"))
+            durable[gate_id] = "pass" if passed else "fail"
+        for gate_id in ("tailnet_only", "image_size_risk_accepted"):
+            durable[gate_id] = gate_id in resolved_records
+        durable["public_exposure"] = False if "public_exposure" in resolved_records else True
+        image_record = resolved_records.get("image_size_risk_accepted") or {}
+        durable["image_size_risk_acceptance_expires_at"] = str(image_record.get("expires_at") or "")
+        report = ProductionGateRehearsal.evaluate(durable, now=now).to_dict()
         report["local_observations"] = {
-            "schema": self.storage.schema_status(),
+            "schema": schema,
             "backup_restore": self.storage.backup_restore_status(),
             "hot_wallet": self.hot_wallet.rehearsal_status(self.settings.live_active_wallet_public_key),
             "live_backend_armed": bool(self.settings.live_active_backend_armed),

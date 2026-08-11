@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
 from app.auth import AuthManager
-from app.core.models import ShadowComparison, ShadowCostBreakdown
+from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown
+from app.core.pilot_risk import PilotRiskPolicy
 from app.core.shadow_evaluation import EconomicValidator
 from app.core.state import BotState
 from app.core.storage import Storage
@@ -230,6 +232,40 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(allowed.status_code, 200)
         self.assertFalse(allowed.json()["ready"])
         self.assertIn("sample_count_below_100", allowed.json()["blockers"])
+
+    def test_evaluated_runtime_shadow_is_persisted_with_genuine_source_and_usd_reference(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            policy = PilotRiskPolicy.create(
+                Decimal("200"), Decimal("0.4"), NOW - timedelta(minutes=10),
+                reference_observation_id="sol-usd-1", settings_version=state.current_settings_version_id,
+                operator_intent_id="intent-1",
+            )
+            state.storage.save_pilot_risk_policy(policy)
+            state.storage.save_accepted_market_observation(AcceptedMarketObservation(
+                record_id="market-1", created_at=NOW - timedelta(minutes=1), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                evidence_mode="shadow", source="pumpportal", source_event_id="source-1",
+                observed_at=NOW - timedelta(minutes=1), received_at=NOW - timedelta(minutes=1),
+                mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
+            ))
+            audit = LiveExecutionAudit(
+                id="audit-1", created_at=NOW - timedelta(minutes=2), updated_at=NOW,
+                action="buy", mint="mint-1", amount="0.01", status="ready",
+                signer_mode="local_hot_wallet", wallet_public_key="wallet-1", quote={"id": "quote-1"},
+                shadow_comparison={
+                    "status": "evaluated", "exit_observed_at": NOW.isoformat(), "gross_pnl_sol": 0.002,
+                    "exit_reason": "take_profit", "hold_duration_seconds": 60,
+                    "costs": {"paper_fee_drag_sol": 0.0001, "priority_fee_sol": 0.00001, "price_impact_drag_sol": 0.00002},
+                },
+            )
+
+            self.assertTrue(state._persist_economic_shadow_comparison(audit))
+            self.assertFalse(state._persist_economic_shadow_comparison(audit))
+            stored = state.storage.load_shadow_comparisons(limit=10)
+            self.assertEqual(stored[0].source_evidence_ids, ("market-1",))
+            self.assertEqual(stored[0].reference_usd_per_sol, 200.0)
+            self.assertFalse(stored[0].fixture_only)
 
 
 if __name__ == "__main__":

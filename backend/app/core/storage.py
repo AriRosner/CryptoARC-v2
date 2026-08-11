@@ -56,6 +56,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("pilot_risk_policies", "pilot_risk_policies"),
     ("pilot_loss_ledger", "pilot_loss_ledger"),
     ("production_rehearsal_reports", "production_rehearsal_reports"),
+    ("production_rehearsal_evidence", "production_rehearsal_evidence"),
     ("manual_live_proof_reports", "manual_live_proof_reports"),
     ("autonomous_pilot_windows", "autonomous_pilot_windows"),
     ("post_pilot_reviews", "post_pilot_reviews"),
@@ -67,7 +68,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 22
+    SCHEMA_VERSION = 23
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -106,6 +107,7 @@ class Storage:
         "pilot_risk_policies",
         "pilot_loss_ledger",
         "production_rehearsal_reports",
+        "production_rehearsal_evidence",
         "manual_live_proof_reports",
         "autonomous_pilot_windows",
         "post_pilot_reviews",
@@ -150,6 +152,7 @@ class Storage:
         "pilot_risk_policies",
         "pilot_loss_ledger",
         "production_rehearsal_reports",
+        "production_rehearsal_evidence",
         "manual_live_proof_reports",
         "autonomous_pilot_windows",
         "post_pilot_reviews",
@@ -307,6 +310,7 @@ class Storage:
             (20, "020_manual_live_proof", "append-only manual live proof qualification reports", self._migration_020_manual_live_proof),
             (21, "021_autonomous_pilot", "append-only attended autonomous pilot window evaluations", self._migration_021_autonomous_pilot),
             (22, "022_post_pilot_review", "append-only post-pilot reviews and operator decisions", self._migration_022_post_pilot_review),
+            (23, "023_production_rehearsal_evidence", "append-only scoped production rehearsal evidence", self._migration_023_production_rehearsal_evidence),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -1014,6 +1018,22 @@ class Storage:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_decisions_created ON pilot_operator_decisions(created_at DESC)")
+
+    def _migration_023_production_rehearsal_evidence(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_rehearsal_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_evidence_gate ON production_rehearsal_evidence(gate_id, observed_at DESC)"
+        )
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1929,6 +1949,54 @@ class Storage:
                 (report_id, int(bool(report.get("ready"))), int(bool(report.get("fixture_only", True))), created_at, json.dumps(payload, sort_keys=True)),
             )
         return payload
+
+    def append_production_rehearsal_evidence(self, evidence: dict[str, Any]) -> bool:
+        evidence_id = str(evidence.get("evidence_id") or "").strip()
+        gate_id = str(evidence.get("gate_id") or "").strip()
+        if not evidence_id or not gate_id:
+            raise ValueError("production rehearsal evidence ID and gate ID are required")
+        observed_at = datetime.fromisoformat(str(evidence.get("observed_at") or ""))
+        expires_at = datetime.fromisoformat(str(evidence.get("expires_at") or ""))
+        if (
+            observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or expires_at <= observed_at
+        ):
+            raise ValueError("production rehearsal evidence requires an aware bounded validity window")
+        payload = {
+            "evidence_id": evidence_id,
+            "gate_id": gate_id,
+            "scope": str(evidence.get("scope") or ""),
+            "passed": evidence.get("passed") is True,
+            "fixture_only": evidence.get("fixture_only") is not False,
+            "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+            "expires_at": expires_at.astimezone(timezone.utc).isoformat(),
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM production_rehearsal_evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("production rehearsal evidence already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO production_rehearsal_evidence (evidence_id, gate_id, observed_at, expires_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (evidence_id, gate_id, payload["observed_at"], payload["expires_at"], serialized),
+            )
+        return True
+
+    def load_production_rehearsal_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM production_rehearsal_evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
 
     def load_latest_production_rehearsal_report(self) -> dict[str, Any] | None:
         with self.read_connection() as connection:
