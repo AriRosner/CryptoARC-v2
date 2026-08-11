@@ -75,6 +75,18 @@ class AuthManager:
         self.totp_secret = ""
         self.sessions.clear()
 
+    def rehearsal_status(self) -> dict[str, object]:
+        """Describe machine-checkable auth state without exporting credentials."""
+        return {
+            "password_configured": self.enabled,
+            "totp_configured": self.totp_enabled,
+            "bearer_only": True,
+            "active_sessions": len([expiry for expiry in self.sessions.values() if expiry >= time.time()]),
+            "password_restart": "deferred",
+            "totp_restart": "deferred",
+            "authority_changed": False,
+        }
+
 
 def verify_totp(secret: str, code: str, window: int = 1) -> bool:
     if not code:

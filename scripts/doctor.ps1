@@ -90,23 +90,27 @@ try {
 }
 
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
-if (Test-Path -LiteralPath $venvPython) {
-  $version = Invoke-CryptoArcDoctorVersion $venvPython @("--version")
-  $value = if ($version) { $version } else { ".venv" }
-  Add-CryptoArcDoctorCheck "venv" "Local virtualenv" "pass" $value "Use the project-local Python for backend commands."
+$configuredPython = Resolve-ExistingPath @(
+  $venvPython,
+  $env:CRYPTOARC_PYTHON
+)
+if ($configuredPython) {
+  $version = Invoke-CryptoArcDoctorVersion $configuredPython @("--version")
+  $value = if ($version) { "$version ($configuredPython)" } else { $configuredPython }
+  Add-CryptoArcDoctorCheck "venv" "Configured Python environment" "pass" $value "Use this configured Python for backend commands."
 } else {
-  Add-CryptoArcDoctorCheck "venv" "Local virtualenv" "fail" "missing" "Run scripts\bootstrap.ps1 to create .venv."
+  Add-CryptoArcDoctorCheck "venv" "Configured Python environment" "fail" "missing" "Run scripts\bootstrap.ps1 to create .venv or set CRYPTOARC_PYTHON."
 }
 
-if (Test-Path -LiteralPath $venvPython) {
-  $backendReady = Test-CryptoArcPythonImport $venvPython "import fastapi; import solders; from solders.keypair import Keypair; from app.core.state import BotState"
+if ($configuredPython) {
+  $backendReady = Test-CryptoArcPythonImport $configuredPython "import fastapi; import solders; from solders.keypair import Keypair; from app.core.state import BotState"
   if ($backendReady) {
     Add-CryptoArcDoctorCheck "backend_imports" "Backend imports" "pass" "fastapi + solders + app" "Backend dependencies are importable."
   } else {
     Add-CryptoArcDoctorCheck "backend_imports" "Backend imports" "fail" "missing dependency" "Run scripts\bootstrap.ps1 or install backend\requirements.txt into .venv."
   }
 } else {
-  Add-CryptoArcDoctorCheck "backend_imports" "Backend imports" "fail" "no .venv" "Create .venv before checking backend dependencies."
+  Add-CryptoArcDoctorCheck "backend_imports" "Backend imports" "fail" "no configured Python" "Create .venv or set CRYPTOARC_PYTHON before checking backend dependencies."
 }
 
 try {

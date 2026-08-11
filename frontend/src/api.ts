@@ -1,4 +1,4 @@
-import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyDecisionRecord, StrategyPreset, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, AutonomousPilotStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, ManualLiveProofReport, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PilotRiskStatus, PostPilotReviewReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SentinelVerdict, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyCandidate, StrategyCandidatePromotionResult, StrategyDecisionRecord, StrategyPreset, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -233,6 +233,49 @@ export async function fetchSafetyStatus(): Promise<SafetyStatus> {
 
 export async function fetchReadinessStatus(): Promise<ReadinessStatus> {
   return request("/api/readiness/status");
+}
+
+export async function fetchPilotRiskStatus(): Promise<PilotRiskStatus> {
+  return request("/api/pilot-risk/status");
+}
+
+export async function fetchTradeGrades(tradeId = "", mode = ""): Promise<TradeGrade[]> {
+  const params = new URLSearchParams();
+  if (tradeId) params.set("trade_id", tradeId);
+  if (mode) params.set("mode", mode);
+  return request(`/api/trade-grades?${params.toString()}`);
+}
+
+export async function fetchTradeGradeCorrections(tradeId: string): Promise<TradeGradeCorrection[]> {
+  return request(`/api/trade-grades/${encodeURIComponent(tradeId)}/corrections`);
+}
+
+export async function correctTradeGrade(gradeId: string, operatorIntentId: string, patch: Record<string, unknown>, note = ""): Promise<TradeGradeCorrection> {
+  return request(`/api/trade-grades/${encodeURIComponent(gradeId)}/corrections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_intent_id: operatorIntentId, patch, note })
+  });
+}
+
+export async function fetchStrategyCandidates(): Promise<StrategyCandidate[]> {
+  return request("/api/strategy-candidates");
+}
+
+export async function promoteStrategyCandidate(candidateId: string, operatorIntentId: string): Promise<StrategyCandidatePromotionResult> {
+  return request(`/api/strategy-candidates/${encodeURIComponent(candidateId)}/promote`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operator_intent_id: operatorIntentId })
+  });
+}
+
+export async function fetchSentinelCurrent(): Promise<SentinelVerdict> {
+  return request("/api/sentinel/current");
+}
+
+export async function fetchSentinelHistory(limit = 20): Promise<SentinelVerdict[]> {
+  return request(`/api/sentinel/history?limit=${Math.max(1, Math.min(100, limit))}`);
 }
 
 export async function fetchPilotReadiness(walletPublicKey = "", signerMode = "browser_wallet"): Promise<PilotReadinessReport> {
@@ -522,6 +565,35 @@ export async function fetchOperationalMonitoring(): Promise<OperationalMonitorin
   return request("/api/monitoring/ops");
 }
 
+export async function fetchManualLiveProof(): Promise<ManualLiveProofReport> {
+  return request("/api/reports/manual-live-proof");
+}
+
+export async function fetchAutonomousPilotStatus(): Promise<AutonomousPilotStatus> {
+  return request("/api/autonomous-pilot/status");
+}
+
+export async function fetchPostPilotReview(): Promise<PostPilotReviewReport> {
+  return request("/api/reports/post-pilot-review");
+}
+
+export async function recordPostPilotDecision(
+  reviewId: string,
+  decision: "scale" | "hold" | "revise" | "stop",
+  rationale: string,
+  authorizationId: string,
+): Promise<NonNullable<PostPilotReviewReport["decision"]>> {
+  return request(`/api/reports/post-pilot-review/${encodeURIComponent(reviewId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision, rationale, authorization_id: authorizationId }),
+  });
+}
+
+export async function fetchWorkloadPressure(): Promise<WorkloadPressure> {
+  return request("/api/monitoring/workload-pressure");
+}
+
 export async function fetchOperatorLogs(timeframe = "24h", level = "", subsystem = "", limit = 200): Promise<OperatorLogsReport> {
   const params = new URLSearchParams({ timeframe, limit: String(limit) });
   if (level) params.set("level", level);
@@ -725,6 +797,14 @@ export function pilotReadinessExportUrl(walletPublicKey = "", signerMode = "brow
   const params = new URLSearchParams({ signer_mode: signerMode });
   if (walletPublicKey) params.set("wallet_public_key", walletPublicKey);
   return `${API_BASE}/api/reports/pilot-readiness/export?${params.toString()}`;
+}
+
+export function manualLiveProofExportUrl(): string {
+  return `${API_BASE}/api/reports/manual-live-proof/export`;
+}
+
+export function postPilotReviewExportUrl(): string {
+  return `${API_BASE}/api/reports/post-pilot-review/export`;
 }
 
 export function setupReadinessExportUrl(): string {

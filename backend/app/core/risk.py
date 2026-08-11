@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from app.core.models import BotSettings, BotStats, TokenSignal
 
@@ -27,6 +28,25 @@ class RiskEngine:
         "high": -6,
         "degen": -12,
     }
+
+    @staticmethod
+    def contract_session_reasons(
+        strategy: Mapping[str, object],
+        session_state: Mapping[str, object],
+    ) -> tuple[str, ...]:
+        exposure = strategy.get("exposure") if isinstance(strategy.get("exposure"), Mapping) else {}
+        stops = strategy.get("stops") if isinstance(strategy.get("stops"), Mapping) else {}
+        version = str(strategy.get("strategy_version") or "")
+        checks = (
+            (session_state.get("active_strategy_version") not in {None, "", version}, "strategy_version_changed_restart_required"),
+            (int(session_state.get("open_positions") or 0) >= int(exposure.get("max_positions") or 0), "maximum_positions_reached"),
+            (float(session_state.get("exposure_sol") or 0) >= float(exposure.get("max_exposure_sol") or 0), "maximum_exposure_reached"),
+            (float(session_state.get("session_loss_sol") or 0) >= float(stops.get("session_loss_sol") or 0), "session_loss_stop"),
+            (float(session_state.get("daily_loss_sol") or 0) >= float(stops.get("daily_loss_sol") or 0), "daily_loss_stop"),
+            (float(session_state.get("cumulative_drawdown_sol") or 0) >= float(stops.get("cumulative_drawdown_sol") or 0), "cumulative_drawdown_stop"),
+            (int(session_state.get("consecutive_losses") or 0) >= int(stops.get("consecutive_losses") or 0), "consecutive_loss_stop"),
+        )
+        return tuple(reason for failed, reason in checks if failed)
 
     def evaluate(
         self,

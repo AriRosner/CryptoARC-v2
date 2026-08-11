@@ -1270,6 +1270,118 @@ export interface ReadinessStatus {
   min_readiness_score: number;
 }
 
+export interface PilotRiskPolicy {
+  policy_id: string;
+  policy_version: string;
+  created_at: string;
+  observed_at: string;
+  reference_observation_id: string;
+  settings_version: string;
+  operator_intent_id: string;
+  reference_usd_per_sol: string;
+  wallet_equity_sol: string;
+  max_trade_sol: string;
+  max_open_positions: number;
+  session_loss_stop_sol: string;
+  daily_loss_stop_sol: string;
+  cumulative_loss_freeze_sol: string;
+  consecutive_loss_stop: number;
+  initial_slippage_pct: string;
+  max_reviewable_slippage_pct: string;
+}
+
+export interface PilotRiskStatus {
+  status: "not_configured" | "configured";
+  policy?: PilotRiskPolicy;
+  ledger?: { cumulative_loss_sol: string; consecutive_losses: number; entries: unknown[] };
+  authority_changed: false;
+  operator_action: string;
+}
+
+export interface ManualLiveProofReport {
+  proof_id?: string;
+  created_at?: string;
+  status: "QUALIFIED" | "DEFERRED" | "INVALID";
+  qualified: boolean;
+  blockers: string[];
+  authorization_id?: string;
+  wallet_public_key?: string;
+  signer_mode?: string;
+  signer_identity_id?: string;
+  audit_ids: string[];
+  transaction_signatures: string[];
+  authority_changed: false;
+  operator_action: string;
+}
+
+export interface AutonomousPilotStatus {
+  window_id?: string;
+  status: "ELIGIBLE_DEFERRED" | "BLOCKED" | "DEFERRED";
+  eligible: boolean;
+  opened: boolean;
+  blockers: string[];
+  authorization_id?: string;
+  wallet_public_key?: string;
+  signer_mode?: string;
+  signer_identity_id?: string;
+  policy_id?: string;
+  manual_proof_id?: string;
+  starts_at?: string;
+  ends_at?: string;
+  attended?: boolean;
+  max_open_positions?: number;
+  automatic_restart_allowed: false;
+  authority_changed: false;
+  operator_action: string;
+}
+
+export interface PostPilotReviewReport {
+  review_id?: string;
+  window_id?: string;
+  created_at?: string;
+  status: "CLEAR" | "BLOCKED" | "DEFERRED";
+  clear: boolean;
+  blockers: string[];
+  next_pilot_blocked: boolean;
+  allowed_decisions: Array<"scale" | "hold" | "revise" | "stop">;
+  audit_ids?: string[];
+  transaction_signatures?: string[];
+  grade_count?: number;
+  cumulative_loss_usd?: string;
+  decision?: {
+    decision_id: string;
+    decision: "scale" | "hold" | "revise" | "stop";
+    rationale: string;
+    authorization_id: string;
+    scaling_applied: false;
+    authority_changed: false;
+  } | null;
+  automatic_scaling_applied: false;
+  authority_changed: false;
+  operator_action: string;
+}
+
+export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
+
+export interface SentinelVerdict {
+  verdict_id: string;
+  status: SentinelVerdictStatus;
+  created_at: string;
+  expires_at: string;
+  strategy_id: string;
+  strategy_version: string;
+  input_version: string;
+  inputs: Record<string, unknown>;
+  thresholds: Record<string, number>;
+  sample_size: number;
+  confidence: number;
+  blockers: string[];
+  warnings: string[];
+  reasons: string[];
+  stale: boolean;
+  authority: "none";
+}
+
 export interface OperationalMonitoring {
   backend: Record<string, string | number | boolean>;
   source: SourceHealth;
@@ -1395,6 +1507,79 @@ export interface TradeLabel {
   label: string;
   created_at: string;
   note: string;
+}
+
+export interface WorkloadPressure {
+  artifact_type: "cryptoarc_workload_pressure";
+  format_version: 1;
+  status: "healthy" | "degraded_observability";
+  disabled_tiers: Array<"model" | "grading" | "sentinel" | "dashboard_analytics">;
+  failure_windows: number;
+  recovery_windows: number;
+  snapshot_version: number;
+  reasons: string[];
+  worker_failures: string[];
+  metrics: Record<string, unknown>;
+  queue: Record<string, number>;
+  core_tiers_shed: false;
+  operator_action: string;
+}
+
+export interface TradeGrade {
+  grade_id: string;
+  trade_id: string;
+  revision_id: string;
+  mode: "paper" | "shadow" | "manual_live" | "autonomous_live";
+  created_at: string;
+  grader_version: string;
+  rules_version: string;
+  strategy_version: string;
+  data_schema_version: number;
+  classifications: Record<"entry" | "signal" | "risk" | "source" | "execution" | "exit" | "outcome", "good" | "warning" | "poor" | "unknown">;
+  ex_ante_facts: Record<string, unknown>;
+  ex_post_facts: Record<string, unknown>;
+  evidence_ids: string[];
+  confidence: number;
+  reasons: string[];
+}
+
+export interface TradeGradeCorrection {
+  correction_id: string;
+  grade_id: string;
+  trade_id: string;
+  created_at: string;
+  operator_intent_id: string;
+  patch: Record<string, unknown>;
+  note: string;
+}
+
+export interface StrategyCandidateValidation {
+  validation_id: string;
+  candidate_id: string;
+  created_at: string;
+  accepted: boolean;
+  blockers: string[];
+  metrics: Record<string, unknown>;
+}
+
+export interface StrategyCandidate {
+  candidate_id: string;
+  base_strategy_version: string;
+  proposed_strategy_version: string;
+  created_at: string;
+  patch: Record<string, unknown>;
+  evidence_ids: string[];
+  fingerprint: string;
+  validation: StrategyCandidateValidation | null;
+  active: boolean;
+}
+
+export interface StrategyCandidatePromotionResult {
+  candidate_id: string;
+  promoted: boolean;
+  blocker: string;
+  idempotent: boolean;
+  promotion_id: string;
 }
 
 export interface TradeReviewQueue {

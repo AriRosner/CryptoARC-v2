@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "fixture_only": true,
+  "source": "pumpportal",
+  "source_event_id": "fixture-conflict-1",
+  "observed_price": 0.0000123,
+  "direct_price": 0.000021,
+  "conflict_state": "primary_direct_conflict",
+  "acceptance_reason": "fixture_contract_only"
+}

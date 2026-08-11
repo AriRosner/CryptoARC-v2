@@ -323,6 +323,10 @@ class LiveSession:
     caps_snapshot: dict[str, Any] = field(default_factory=dict)
     acknowledged_at: datetime | None = None
     closed_at: datetime | None = None
+    autonomous_pilot_window_id: str = ""
+    autonomous_authorization_id: str = ""
+    attended: bool = False
+    post_pilot_review_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -487,6 +491,11 @@ class LiveExecutionAudit:
     guarded_action_id: str = ""
     guarded_authorization: dict[str, Any] = field(default_factory=dict)
     dispatch_started_at: datetime | None = None
+    pilot_risk_policy_id: str = ""
+    autonomous_pilot_window_id: str = ""
+    signer_identity_id: str = ""
+    manual_live_authorization_id: str = ""
+    fixture_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -593,6 +602,296 @@ class PriceObservation:
 
 
 @dataclass(slots=True)
+class AcceptedMarketObservation:
+    record_id: str
+    created_at: datetime
+    schema_version: int
+    strategy_id: str
+    strategy_version: str
+    evidence_mode: str
+    source: str
+    source_event_id: str
+    observed_at: datetime
+    received_at: datetime
+    mint: str
+    price: float | None
+    confidence: float
+    acceptance_reason: str
+    conflict_state: str = "clear"
+    access_state: str = "ready"
+    fixture_only: bool = False
+    direct_comparison_sample_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["observed_at"] = self.observed_at.isoformat()
+        payload["received_at"] = self.received_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
+class ShadowCostBreakdown:
+    base_fee_sol: float = 0.0
+    priority_fee_sol: float = 0.0
+    inclusion_tip_sol: float = 0.0
+    rent_setup_sol: float = 0.0
+    failed_attempt_sol: float = 0.0
+    entry_slippage_sol: float = 0.0
+    exit_slippage_sol: float = 0.0
+
+    def fixed_total_sol(self) -> float:
+        return float(self.base_fee_sol) + float(self.rent_setup_sol)
+
+    def variable_total_sol(self) -> float:
+        return sum(
+            float(value)
+            for value in (
+                self.priority_fee_sol,
+                self.inclusion_tip_sol,
+                self.failed_attempt_sol,
+                self.entry_slippage_sol,
+                self.exit_slippage_sol,
+            )
+        )
+
+    def total_sol(self) -> float:
+        return self.fixed_total_sol() + self.variable_total_sol()
+
+    def stressed_total_sol(self) -> float:
+        return self.fixed_total_sol() + (2 * self.variable_total_sol())
+
+
+@dataclass(slots=True)
+class ShadowComparison:
+    record_id: str
+    created_at: datetime
+    schema_version: int
+    strategy_id: str
+    strategy_version: str
+    evidence_mode: str
+    completed_at: datetime
+    regime: str
+    gross_pnl_sol: float
+    costs: ShadowCostBreakdown
+    held_out: bool
+    source_evidence_ids: tuple[str, ...]
+    quote_id: str
+    landing_status: str
+    fixture_only: bool = False
+    contaminated: bool = False
+    exit_reason: str = ""
+    hold_seconds: int = 0
+    reference_usd_per_sol: float = 0.0
+
+    def net_pnl_sol(self, *, cost_stress: bool = False) -> float:
+        costs = self.costs.stressed_total_sol() if cost_stress else self.costs.total_sol()
+        return float(self.gross_pnl_sol) - costs
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["completed_at"] = self.completed_at.isoformat()
+        payload["source_evidence_ids"] = list(self.source_evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelEvidence:
+    name: str
+    observed_at: datetime
+    sample_size: int
+    status: str
+    value: float | int | str | bool | None = None
+    threshold: float | int | str | bool | None = None
+    evidence_ids: tuple[str, ...] = ()
+    conflicting: bool = False
+    expires_at: datetime | None = None
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["observed_at"] = self.observed_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelInputs:
+    strategy_id: str
+    strategy_version: str
+    input_version: str
+    evidence: tuple[SentinelEvidence, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_id": self.strategy_id,
+            "strategy_version": self.strategy_version,
+            "input_version": self.input_version,
+            "evidence": [item.to_dict() for item in self.evidence],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelThresholds:
+    min_sample_size: int = 10
+    max_evidence_age_seconds: int = 300
+    validity_seconds: int = 60
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelVerdict:
+    verdict_id: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    strategy_id: str
+    strategy_version: str
+    input_version: str
+    inputs: dict[str, Any]
+    thresholds: dict[str, Any]
+    sample_size: int
+    confidence: float
+    blockers: tuple[str, ...]
+    warnings: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat()
+        payload["blockers"] = list(self.blockers)
+        payload["warnings"] = list(self.warnings)
+        payload["reasons"] = list(self.reasons)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TradeRevision:
+    revision_id: str
+    trade_id: str
+    mode: str
+    strategy_version: str
+    rules_version: str
+    data_schema_version: int
+    completed_at: datetime
+    decision_at: datetime
+    evidence_ids: tuple[str, ...]
+    ex_ante_facts: dict[str, Any]
+    ex_post_facts: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["completed_at"] = self.completed_at.isoformat()
+        payload["decision_at"] = self.decision_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TradeGrade:
+    grade_id: str
+    trade_id: str
+    revision_id: str
+    mode: str
+    created_at: datetime
+    grader_version: str
+    rules_version: str
+    strategy_version: str
+    data_schema_version: int
+    classifications: dict[str, str]
+    ex_ante_facts: dict[str, Any]
+    ex_post_facts: dict[str, Any]
+    evidence_ids: tuple[str, ...]
+    confidence: float
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        payload["reasons"] = list(self.reasons)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class TradeReviewJob:
+    job_id: str
+    status: str
+    attempts: int
+    claim_id: str
+    lease_owner: str
+    lease_until: datetime | None
+    revision: TradeRevision
+    last_error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TradeGradeCorrection:
+    correction_id: str
+    grade_id: str
+    trade_id: str
+    created_at: datetime
+    operator_intent_id: str
+    patch: dict[str, Any]
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyCandidate:
+    candidate_id: str
+    base_strategy_version: str
+    proposed_strategy_version: str
+    created_at: datetime
+    patch: dict[str, Any]
+    evidence_ids: tuple[str, ...]
+    fingerprint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateValidation:
+    validation_id: str
+    candidate_id: str
+    created_at: datetime
+    accepted: bool
+    blockers: tuple[str, ...]
+    metrics: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["blockers"] = list(self.blockers)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionResult:
+    candidate_id: str
+    promoted: bool
+    blocker: str = ""
+    idempotent: bool = False
+    promotion_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str
     token_id: str
@@ -609,6 +908,10 @@ class StrategyDecisionRecord:
     score_breakdown: list[str] = field(default_factory=list)
     decision_log: list[str] = field(default_factory=list)
     settings_version_id: str = ""
+    strategy_id: str = ""
+    strategy_version: str = ""
+    strategy_fingerprint: str = ""
+    canonical_strategy: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

@@ -60,6 +60,21 @@ class HotWalletVault:
             "recovery_note": "Hot wallet sidecar is local-only and is not embedded in database backup artifacts.",
         }
 
+    def rehearsal_status(self, expected_wallet_public_key: str = "") -> dict[str, Any]:
+        """Return identity/lifecycle evidence without unlocking or invoking the signer."""
+        status = self.status()
+        actual = str(status.get("wallet_public_key") or "")
+        expected = expected_wallet_public_key.strip()
+        return {
+            "imported": bool(status.get("imported")),
+            "unlocked": bool(status.get("unlocked")),
+            "wallet_public_key": actual,
+            "wallet_signer_match": bool(expected and actual == expected and not status.get("sidecar_mismatch")),
+            "signer_rotation_invalidation": "deferred",
+            "signer_loss_disarm": "deferred",
+            "authority_changed": False,
+        }
+
     def import_private_key(self, private_key: str, password: str, label: str = "") -> dict[str, Any]:
         keypair = self._parse_private_key(private_key)
         private_key_bytes = list(bytes(keypair))

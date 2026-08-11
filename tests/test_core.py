@@ -14,7 +14,7 @@ from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 
 from app.core.alerts import AlertRouter
-from app.core.models import BacktestRun, BotMode, BotSettings, BotStats, BotStatus, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, BotStats, BotStatus, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, PriceObservation, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession, new_id, utc_now
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline, numeric as price_pipeline_numeric
 from app.core.risk import RiskEngine
@@ -1773,6 +1773,35 @@ class CoreLogicTests(unittest.TestCase):
         self.stub_wallet_sol_balance(state)
         return state.arm_live_backend(True, "local_hot_wallet", local_auth_enabled=True)
 
+    def authorize_attended_autonomy_for_test(self, state: BotState) -> None:
+        state.autonomous_pilot_status = lambda: {"opened": True, "status": "OPEN"}  # type: ignore[method-assign]
+        state._enforce_pilot_runtime_guard = lambda **_kwargs: None  # type: ignore[method-assign]
+
+    def seed_genuine_market_observation(self, state: BotState, *, now: datetime | None = None) -> None:
+        observed_at = now or utc_now()
+        state.storage.save_accepted_market_observation(
+            AcceptedMarketObservation(
+                record_id="market_soak_ready",
+                created_at=observed_at,
+                schema_version=1,
+                strategy_id=state.settings.strategy_profile,
+                strategy_version=state.current_settings_version_id or "unversioned",
+                evidence_mode="paper",
+                source="pumpportal",
+                source_event_id="src_pump_soak_000",
+                observed_at=observed_at,
+                received_at=observed_at,
+                mint="MintSoak000",
+                price=0.00001,
+                confidence=1.0,
+                acceptance_reason="test_genuine_trade_price",
+                conflict_state="clear",
+                access_state="ready",
+                fixture_only=False,
+                direct_comparison_sample_id="src_direct_soak_000",
+            )
+        )
+
     def seed_ready_source_soak_events(self, state: BotState) -> None:
         now = utc_now()
         state.source_status.status = "connected"
@@ -1815,6 +1844,7 @@ class CoreLogicTests(unittest.TestCase):
                     status="raw",
                 )
             )
+        self.seed_genuine_market_observation(state, now=now)
 
     def test_alert_router_status_hides_telegram_secret_and_test_sends(self) -> None:
         sent: list[tuple[str, str, str]] = []
@@ -3025,6 +3055,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             self.arm_local_hot_wallet_backend(state)
+            self.authorize_attended_autonomy_for_test(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url, **_kwargs: {  # type: ignore[method-assign]
                 "signature": "sighot111",
@@ -3062,6 +3093,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.live_active_wallet_public_key = "WalletPersisted"
             state.storage.save_settings(state.settings)
             restarted = BotState(database_path=str(database_path))
+            self.authorize_attended_autonomy_for_test(restarted)
             generated: list[bool] = []
             restarted.generate_live_intents = lambda *args, **kwargs: generated.append(True) or []  # type: ignore[method-assign]
 
@@ -3079,6 +3111,7 @@ class CoreLogicTests(unittest.TestCase):
             state.settings.autonomous_live_enabled = True
             state.import_hot_wallet(str(Keypair()), "password123", "ops")
             self.arm_local_hot_wallet_backend(state)
+            self.authorize_attended_autonomy_for_test(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             submitted: list[str] = []
             state.hot_wallet.simulate_and_submit = lambda unsigned_transaction_base64, rpc_url, **_kwargs: submitted.append(unsigned_transaction_base64) or {  # type: ignore[method-assign]
@@ -7248,6 +7281,8 @@ class CoreLogicTests(unittest.TestCase):
                         status="raw",
                     )
                 )
+
+            self.seed_genuine_market_observation(state, now=now)
 
             report = state.source_soak_acceptance_report(limit=200)
             gate_status = {gate["id"]: gate["status"] for gate in report["gates"]}

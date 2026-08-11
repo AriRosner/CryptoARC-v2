@@ -987,7 +987,7 @@ class MobileCommandCenterContractTests(unittest.TestCase):
         self.assertEqual(preview["schema_version"], 9)
         self.assertIn("Artifact will be migrated forward after restore.", preview["warnings"])
         self.assertEqual(result["status"], "restored")
-        self.assertEqual(target.schema_status()["current_version"], 11)
+        self.assertEqual(target.schema_status()["current_version"], Storage.SCHEMA_VERSION)
         with closing(sqlite3.connect(target.path)) as connection:
             restored_tables = {
                 str(row[0])

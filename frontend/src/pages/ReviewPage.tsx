@@ -14,7 +14,8 @@ import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
+import { fetchStrategyCandidates, fetchTradeGrades, promoteStrategyCandidate } from "../api";
+import type { PerformanceAnalytics, SettingsVersion, StrategyCandidate, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion, WorkloadPressure } from "../types";
 
 interface ReviewPageProps {
   trades: TradeRecord[];
@@ -27,6 +28,7 @@ interface ReviewPageProps {
   detail: TradeReviewDetail | null;
   labels: TradeLabel[];
   reviewQueue: TradeReviewQueue | null;
+  workloadPressure: WorkloadPressure | null;
   loading: boolean;
   onLabelTrade: (tokenId: string, label: string) => Promise<void>;
   onSelectTrade: (tokenId: string) => void;
@@ -160,6 +162,7 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   detail,
   labels,
   reviewQueue,
+  workloadPressure,
   loading,
   onLabelTrade,
   onSelectTrade,
@@ -167,6 +170,9 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
 }) => {
   const [search, setSearch] = React.useState("");
   const [activeQueueId, setActiveQueueId] = React.useState("unlabeled");
+  const [selectedGrade, setSelectedGrade] = React.useState<TradeGrade | null>(null);
+  const [candidates, setCandidates] = React.useState<StrategyCandidate[]>([]);
+  const [candidateStatus, setCandidateStatus] = React.useState("");
   const tokenById = React.useMemo(() => new Map(tokens.map((token) => [token.id, token])), [tokens]);
   const labelByTokenId = React.useMemo(() => new Map(labels.map((label) => [label.token_id, label.label])), [labels]);
   const selectedTrade = detail?.trade ?? trades.find((trade) => trade.token_id === selectedTradeId) ?? null;
@@ -211,6 +217,36 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   const activeQueue = reviewQueue?.queues.find((queue) => queue.id === activeQueueId);
 
   React.useEffect(() => {
+    let active = true;
+    setSelectedGrade(null);
+    if (selectedTrade?.id) {
+      fetchTradeGrades(selectedTrade.id)
+        .then((grades) => { if (active) setSelectedGrade(grades[0] ?? null); })
+        .catch(() => { if (active) setSelectedGrade(null); });
+    }
+    return () => { active = false; };
+  }, [selectedTrade?.id]);
+
+  const refreshCandidates = React.useCallback(() => {
+    fetchStrategyCandidates().then(setCandidates).catch(() => setCandidates([]));
+  }, []);
+
+  React.useEffect(() => { refreshCandidates(); }, [refreshCandidates]);
+
+  const handlePromoteCandidate = React.useCallback(async (candidate: StrategyCandidate) => {
+    if (!window.confirm(`Select ${candidate.proposed_strategy_version} as the active strategy and require a fresh validation campaign?`)) return;
+    setCandidateStatus("Recording explicit promotion intent...");
+    try {
+      const intentId = `dashboard-${window.crypto?.randomUUID?.() ?? Date.now()}`;
+      await promoteStrategyCandidate(candidate.candidate_id, intentId);
+      setCandidateStatus("Candidate selected; Sentinel invalidated and fresh validation required.");
+      refreshCandidates();
+    } catch (error) {
+      setCandidateStatus(error instanceof Error ? error.message : "Promotion blocked");
+    }
+  }, [refreshCandidates]);
+
+  React.useEffect(() => {
     if (!reviewQueue?.queues.some((queue) => queue.id === activeQueueId)) {
       setActiveQueueId(reviewQueue?.next_queue_id || "unlabeled");
     }
@@ -222,6 +258,32 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
         title="Trade Review"
         description="Inspect paper executions, decision evidence, and tuning opportunities trade by trade."
       />
+
+      {workloadPressure?.status === "degraded_observability" ? (
+        <div data-critical-projection="review" className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+          Review analytics are backed off under pressure. Durable queues remain intact; ingestion and protective controls are not shed.
+        </div>
+      ) : null}
+
+      {candidates.length ? (
+        <Card className="p-4" hover={false}>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div><h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">Immutable Strategy Candidates</h3><p className="mt-1 text-[11px] text-zinc-500">Promotion is explicit, audited, inactive-session-only, and resets validation readiness.</p></div>
+            <Badge variant={candidates.some((candidate) => candidate.active) ? "warning" : "info"}>{candidates.length} candidates</Badge>
+          </div>
+          <div className="grid gap-2 lg:grid-cols-2">
+            {candidates.slice(0, 6).map((candidate) => (
+              <div key={candidate.candidate_id} className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px]">
+                <div className="flex items-center justify-between gap-3"><span className="font-black text-zinc-300">{candidate.proposed_strategy_version}</span><Badge variant={candidate.active ? "warning" : candidate.validation?.accepted ? "success" : "danger"}>{candidate.active ? "fresh validation required" : candidate.validation?.accepted ? "validated" : "blocked"}</Badge></div>
+                <div className="mt-2 text-[10px] text-zinc-600">{candidate.evidence_ids.length} evidence IDs · {candidate.fingerprint.slice(0, 12)}</div>
+                {candidate.validation?.blockers.slice(0, 2).map((blocker) => <div key={blocker} className="mt-1 text-rose-300">{blocker.replace(/_/g, " ")}</div>)}
+                {!candidate.active && candidate.validation?.accepted ? <Button className="mt-3" variant="secondary" size="sm" onClick={() => handlePromoteCandidate(candidate)}>Promote with explicit intent</Button> : null}
+              </div>
+            ))}
+          </div>
+          {candidateStatus ? <p className="mt-3 text-[11px] text-amber-200">{candidateStatus}</p> : null}
+        </Card>
+      ) : null}
 
       {loading && !reviewQueue ? (
         <ReviewQueueSkeleton />
@@ -447,6 +509,30 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
                       <ReviewMetric label="Confidence" value={`${Math.round((selectedTrade.source_price_confidence ?? 0) * 100)}%`} tone="warn" />
                     </div>
                   </div>
+                </div>
+
+                <div className="mt-5 rounded-xl border border-white/5 bg-white/[0.02] p-4">
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 text-xs font-black uppercase tracking-widest text-zinc-500">
+                      <Target size={14} /> Deterministic Grade
+                    </div>
+                    <Badge variant={selectedGrade ? "info" : "warning"}>{selectedGrade ? `${Math.round(selectedGrade.confidence * 100)}% confidence` : "queued"}</Badge>
+                  </div>
+                  {selectedGrade ? (
+                    <>
+                      <div className="grid grid-cols-2 gap-2 md:grid-cols-4 xl:grid-cols-7">
+                        {Object.entries(selectedGrade.classifications).map(([name, value]) => (
+                          <div key={name} className="rounded-lg bg-black/20 p-2">
+                            <span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">{name}</span>
+                            <span className={cn("font-black", value === "good" ? "text-emerald-400" : value === "poor" ? "text-rose-400" : "text-amber-300")}>{value}</span>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-3 text-[10px] text-zinc-600">{selectedGrade.mode.replace(/_/g, " ")} · {selectedGrade.grader_version} · {selectedGrade.evidence_ids.length} evidence IDs</div>
+                    </>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">The low-priority worker has not published a grade for this immutable revision yet. Trade persistence is unaffected.</p>
+                  )}
                 </div>
 
                 <div className="mt-5 rounded-xl border border-amber-500/10 bg-amber-500/[0.03] p-4">

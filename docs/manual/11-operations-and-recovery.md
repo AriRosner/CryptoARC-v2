@@ -111,6 +111,19 @@ cd frontend
 npm run build
 ```
 
+## Production Gate Rehearsal
+
+Run the safe default without starting services or touching a wallet/signer:
+
+```powershell
+$env:CRYPTOARC_PYTHON='C:\absolute\path\to\python.exe'
+& .\scripts\rehearse-production-gates.ps1 -FixtureOnly
+```
+
+The fixture report is always ineligible for production and labels every physical step `DEFERRED`. A later physical window requires a fresh JSON authorization record with `scope=production-rehearsal`, `authorization_id`, and an unexpired timezone-aware `expires_at`. Even with that record, the harness only validates local tests and enumerates the physical checklist; it does not import, unlock, rotate, clear, or invoke a signer and it refuses to proceed if `LIVE_TRADING_ENABLED=true`.
+
+Production evidence must cover password and TOTP persistence across restart, bearer-only APIs, exact wallet/signer identity, signer rotation and loss invalidation, source-loss entry blocking plus guarded protective-exit preparation, kill switch, fresh backup, restore preview/smoke/schema match, restart recovery, zero audit/ledger debt, tailnet-only exposure, notification limitations, and a fresh explicit acceptance of the transitive `image-size` build risk. No credential or secret belongs in a rehearsal report.
+
 ## Screenshot Placeholders
 
 - `assets/screenshots/ops/watchdog-recovery.png`

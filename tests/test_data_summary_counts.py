@@ -116,7 +116,10 @@ class DataSummaryCountsTests(unittest.TestCase):
             legacy = {key: getattr(storage, method)() for key, method in LEGACY_COUNT_METHODS.items()}
 
             self.assertEqual(legacy, expected)
-            self.assertEqual(storage.data_summary_counts(), legacy)
+            summary = storage.data_summary_counts()
+            self.assertEqual({key: summary[key] for key in legacy}, legacy)
+            self.assertEqual(summary["accepted_market_observations"], 0)
+            self.assertEqual(summary["post_pilot_reviews"], 0)
 
     def test_data_summary_counts_uses_one_connection_lifecycle(self) -> None:
         with TemporaryDirectory() as directory:

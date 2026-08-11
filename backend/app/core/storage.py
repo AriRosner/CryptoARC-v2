@@ -10,11 +10,15 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, CandidateValidation, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyCandidate, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
+from app.core.strategy_contract import SniperStrategyVersion
+from app.core.model_classifier import ModelClassification
+from app.core.pilot_risk import PilotRiskPolicy
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -37,6 +41,28 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("live_ledger_positions", "live_ledger_positions"),
     ("backup_restore_history", "backup_restore_history"),
     ("source_soak_history", "source_soak_history"),
+    ("accepted_market_observations", "accepted_market_observations"),
+    ("shadow_market_evidence_bindings", "shadow_market_evidence_bindings"),
+    ("pending_shadow_audit_captures", "pending_shadow_audit_captures"),
+    ("source_access_evidence", "source_access_evidence"),
+    ("sniper_strategy_versions", "sniper_strategy_versions"),
+    ("shadow_economic_comparisons", "shadow_economic_comparisons"),
+    ("sentinel_verdicts", "sentinel_verdicts"),
+    ("trade_review_jobs", "trade_review_jobs"),
+    ("trade_grades", "trade_grades"),
+    ("trade_grade_corrections", "trade_grade_corrections"),
+    ("model_classifications", "model_classifications"),
+    ("strategy_candidates", "strategy_candidates"),
+    ("candidate_validations", "candidate_validations"),
+    ("strategy_promotions", "strategy_promotions"),
+    ("pilot_risk_policies", "pilot_risk_policies"),
+    ("pilot_loss_ledger", "pilot_loss_ledger"),
+    ("production_rehearsal_reports", "production_rehearsal_reports"),
+    ("production_rehearsal_evidence", "production_rehearsal_evidence"),
+    ("manual_live_proof_reports", "manual_live_proof_reports"),
+    ("autonomous_pilot_windows", "autonomous_pilot_windows"),
+    ("post_pilot_reviews", "post_pilot_reviews"),
+    ("pilot_operator_decisions", "pilot_operator_decisions"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -44,7 +70,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 25
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -65,6 +91,31 @@ class Storage:
         "live_intents",
         "live_ledger_positions",
         "source_soak_history",
+        "accepted_market_observations",
+        "shadow_market_evidence_bindings",
+        "pending_shadow_audit_captures",
+        "source_access_evidence",
+        "sniper_strategy_versions",
+        "shadow_economic_comparisons",
+        "sentinel_verdicts",
+        "trade_review_jobs",
+        "trade_grades",
+        "trade_grade_corrections",
+        "model_classifications",
+        "model_classification_budget",
+        "strategy_candidates",
+        "candidate_validations",
+        "strategy_promotions",
+        "active_strategy_selection",
+        "strategy_validation_campaigns",
+        "pilot_risk_policies",
+        "pilot_loss_ledger",
+        "production_rehearsal_reports",
+        "production_rehearsal_evidence",
+        "manual_live_proof_reports",
+        "autonomous_pilot_windows",
+        "post_pilot_reviews",
+        "pilot_operator_decisions",
     )
     BACKUP_TABLES = (
         "settings",
@@ -87,6 +138,31 @@ class Storage:
         "live_ledger_positions",
         "backup_restore_history",
         "source_soak_history",
+        "accepted_market_observations",
+        "shadow_market_evidence_bindings",
+        "pending_shadow_audit_captures",
+        "source_access_evidence",
+        "sniper_strategy_versions",
+        "shadow_economic_comparisons",
+        "sentinel_verdicts",
+        "trade_review_jobs",
+        "trade_grades",
+        "trade_grade_corrections",
+        "model_classifications",
+        "model_classification_budget",
+        "strategy_candidates",
+        "candidate_validations",
+        "strategy_promotions",
+        "active_strategy_selection",
+        "strategy_validation_campaigns",
+        "pilot_risk_policies",
+        "pilot_loss_ledger",
+        "production_rehearsal_reports",
+        "production_rehearsal_evidence",
+        "manual_live_proof_reports",
+        "autonomous_pilot_windows",
+        "post_pilot_reviews",
+        "pilot_operator_decisions",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -108,20 +184,36 @@ class Storage:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=0.05)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 50")
         try:
             yield connection
             connection.commit()
         finally:
             connection.close()
 
+    @contextmanager
+    def read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Short, bounded read-only connection for dashboards and observability."""
+        connection = sqlite3.connect(self.path, timeout=0.05)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 50")
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def _ensure_schema(self) -> None:
         try:
             with self._connect() as connection:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = NORMAL")
                 self._prepare_schema_migration_table(connection)
                 self._apply_migrations(connection)
                 self._ensure_mobile_notification_schema(connection)
+                self._ensure_model_classifier_schema(connection)
             self._migration_status = {
                 "status": "ok",
                 "startup_error": "",
@@ -213,6 +305,20 @@ class Storage:
             (9, "009_mobile_companion", "mobile companion pairing and devices", self._migration_009_mobile_companion),
             (10, "010_mobile_command_center", "scoped mobile command center persistence", self._migration_010_mobile_command_center),
             (11, "011_mobile_guarded_execution_claims", "durable guarded execution audit claims", self._migration_011_mobile_guarded_execution_claims),
+            (12, "012_genuine_source_evidence", "accepted market observations and source access evidence", self._migration_012_genuine_source_evidence),
+            (13, "013_sniper_strategy_versions", "immutable versioned sniper strategy contracts", self._migration_013_sniper_strategy_versions),
+            (14, "014_shadow_economic_comparisons", "all-cost versioned shadow comparisons", self._migration_014_shadow_economic_comparisons),
+            (15, "015_sentinel_verdicts", "immutable expiring market sentinel verdicts", self._migration_015_sentinel_verdicts),
+            (16, "016_trade_grading", "durable deterministic trade grading queue", self._migration_016_trade_grading),
+            (17, "017_strategy_candidates", "immutable strategy candidates and gated promotion", self._migration_017_strategy_candidates),
+            (18, "018_pilot_risk", "immutable micro-pilot risk policy and cumulative loss ledger", self._migration_018_pilot_risk),
+            (19, "019_production_rehearsal", "append-only production gate rehearsal reports", self._migration_019_production_rehearsal),
+            (20, "020_manual_live_proof", "append-only manual live proof qualification reports", self._migration_020_manual_live_proof),
+            (21, "021_autonomous_pilot", "append-only attended autonomous pilot window evaluations", self._migration_021_autonomous_pilot),
+            (22, "022_post_pilot_review", "append-only post-pilot reviews and operator decisions", self._migration_022_post_pilot_review),
+            (23, "023_production_rehearsal_evidence", "append-only scoped production rehearsal evidence", self._migration_023_production_rehearsal_evidence),
+            (24, "024_shadow_market_evidence_bindings", "append-only shadow audit bindings to accepted market observations", self._migration_024_shadow_market_evidence_bindings),
+            (25, "025_pending_shadow_audit_captures", "indexed pending shadow audit capture registry", self._migration_025_pending_shadow_audit_captures),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -582,6 +688,404 @@ class Storage:
             )
             connection.execute("DROP TABLE mobile_action_receipts_010")
 
+    def _migration_012_genuine_source_evidence(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accepted_market_observations (
+                record_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(source, source_event_id, observed_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accepted_market_observations_strategy ON accepted_market_observations(strategy_id, strategy_version, observed_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accepted_market_observations_genuine ON accepted_market_observations(fixture_only, observed_at DESC)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_access_evidence (
+                record_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                access_state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_access_evidence_source ON source_access_evidence(source, created_at DESC)"
+        )
+
+    def _migration_013_sniper_strategy_versions(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sniper_strategy_versions (
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                canonical_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(strategy_id, strategy_version)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sniper_strategy_versions_created_at ON sniper_strategy_versions(created_at DESC)"
+        )
+
+    def _migration_014_shadow_economic_comparisons(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_economic_comparisons (
+                record_id TEXT PRIMARY KEY,
+                strategy_version TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                evidence_mode TEXT NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_economic_strategy ON shadow_economic_comparisons(strategy_version, completed_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_economic_mode ON shadow_economic_comparisons(evidence_mode, fixture_only, completed_at DESC)"
+        )
+
+    def _migration_015_sentinel_verdicts(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sentinel_verdicts (
+                verdict_id TEXT PRIMARY KEY,
+                strategy_version TEXT NOT NULL,
+                input_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(strategy_version, input_version, created_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sentinel_verdicts_current ON sentinel_verdicts(created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sentinel_verdicts_identity ON sentinel_verdicts(strategy_version, input_version, created_at DESC)"
+        )
+
+    def _migration_016_trade_grading(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_review_jobs (
+                job_id TEXT PRIMARY KEY,
+                revision_id TEXT NOT NULL UNIQUE,
+                trade_id TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                claim_id TEXT NOT NULL DEFAULT '',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_until TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                revision_payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_review_jobs_claim ON trade_review_jobs(status, lease_until, created_at)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_grades (
+                grade_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL UNIQUE,
+                mode TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trade_grades_trade ON trade_grades(trade_id, created_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trade_grades_mode ON trade_grades(mode, created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_grade_corrections (
+                correction_id TEXT PRIMARY KEY,
+                grade_id TEXT NOT NULL,
+                trade_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_trade_grade_corrections_trade ON trade_grade_corrections(trade_id, created_at ASC)"
+        )
+        self._ensure_model_classifier_schema(connection)
+
+    def _ensure_model_classifier_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_classification_budget (
+                budget_day TEXT PRIMARY KEY,
+                tokens INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_classifications (
+                job_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(trade_id, revision_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_classifications_trade ON model_classifications(trade_id, created_at DESC)"
+        )
+
+    def _migration_017_strategy_candidates(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                base_strategy_version TEXT NOT NULL,
+                proposed_strategy_version TEXT NOT NULL UNIQUE,
+                fingerprint TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_validations (
+                validation_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                accepted INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_candidate_validations_latest ON candidate_validations(candidate_id, created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                validation_id TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_strategy_selection (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                candidate_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                promotion_id TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                selected_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_validation_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migration_018_pilot_risk(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_risk_policies (
+                policy_id TEXT PRIMARY KEY,
+                policy_version TEXT NOT NULL,
+                reference_observation_id TEXT NOT NULL,
+                settings_version TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_risk_policies_created ON pilot_risk_policies(created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_loss_ledger (
+                loss_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                loss_sol TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_loss_policy ON pilot_loss_ledger(policy_id, created_at ASC)")
+
+    def _migration_019_production_rehearsal(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_rehearsal_reports (
+                report_id TEXT PRIMARY KEY,
+                ready INTEGER NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_created ON production_rehearsal_reports(created_at DESC)"
+        )
+
+    def _migration_020_manual_live_proof(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_live_proof_reports (
+                proof_id TEXT PRIMARY KEY,
+                qualified INTEGER NOT NULL,
+                wallet_public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_manual_live_proof_created ON manual_live_proof_reports(created_at DESC)")
+
+    def _migration_021_autonomous_pilot(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS autonomous_pilot_windows (
+                window_id TEXT PRIMARY KEY,
+                eligible INTEGER NOT NULL,
+                opened INTEGER NOT NULL,
+                wallet_public_key TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_autonomous_pilot_created ON autonomous_pilot_windows(created_at DESC)")
+
+    def _migration_022_post_pilot_review(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS post_pilot_reviews (
+                review_id TEXT PRIMARY KEY,
+                window_id TEXT NOT NULL,
+                clear INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_post_pilot_reviews_created ON post_pilot_reviews(created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_operator_decisions (
+                decision_id TEXT PRIMARY KEY,
+                review_id TEXT NOT NULL UNIQUE,
+                decision TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_decisions_created ON pilot_operator_decisions(created_at DESC)")
+
+    def _migration_023_production_rehearsal_evidence(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_rehearsal_evidence (
+                evidence_id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_evidence_gate ON production_rehearsal_evidence(gate_id, observed_at DESC)"
+        )
+
+    def _migration_024_shadow_market_evidence_bindings(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_market_evidence_bindings (
+                binding_id TEXT PRIMARY KEY,
+                audit_id TEXT NOT NULL,
+                market_observation_id TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                evidence_mode TEXT NOT NULL CHECK (evidence_mode = 'shadow'),
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(audit_id, market_observation_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_market_evidence_audit ON shadow_market_evidence_bindings(audit_id, created_at ASC)"
+        )
+
+    def _migration_025_pending_shadow_audit_captures(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_shadow_audit_captures (
+                audit_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                quoted_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pending_shadow_capture_lookup
+            ON pending_shadow_audit_captures(mint, strategy_id, strategy_version, status, quoted_at)
+            """
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -869,6 +1373,1079 @@ class Storage:
                 """,
                 (item_id, json.dumps(payload), created_at, status, ready),
             )
+
+    def save_accepted_market_observation(self, observation: AcceptedMarketObservation) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO accepted_market_observations (
+                    record_id, source, source_event_id, observed_at, received_at,
+                    strategy_id, strategy_version, fixture_only, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation.record_id,
+                    observation.source,
+                    observation.source_event_id,
+                    observation.observed_at.isoformat(),
+                    observation.received_at.isoformat(),
+                    observation.strategy_id,
+                    observation.strategy_version,
+                    1 if observation.fixture_only else 0,
+                    json.dumps(observation.to_dict()),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_accepted_market_observations(
+        self,
+        limit: int = 500,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> list[AcceptedMarketObservation]:
+        bounded_limit = max(1, min(5000, int(limit)))
+        clauses: list[str] = []
+        values: list[Any] = []
+        if strategy_id:
+            clauses.append("strategy_id = ?")
+            values.append(strategy_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            values.append(strategy_version)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(bounded_limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM accepted_market_observations{where} ORDER BY observed_at DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def save_shadow_market_evidence_binding(
+        self,
+        *,
+        audit_id: str,
+        market_observation_id: str,
+        strategy_id: str,
+        strategy_version: str,
+        role: str,
+        created_at: datetime,
+    ) -> bool:
+        binding_id = f"shadow_binding_{audit_id}_{market_observation_id}"
+        payload = {
+            "binding_id": binding_id,
+            "audit_id": audit_id,
+            "market_observation_id": market_observation_id,
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "evidence_mode": "shadow",
+            "role": role,
+            "created_at": created_at.isoformat(),
+        }
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                    binding_id, audit_id, market_observation_id, strategy_id,
+                    strategy_version, evidence_mode, role, created_at, payload
+                ) VALUES (?, ?, ?, ?, ?, 'shadow', ?, ?, ?)
+                """,
+                (
+                    binding_id,
+                    audit_id,
+                    market_observation_id,
+                    strategy_id,
+                    strategy_version,
+                    role,
+                    created_at.isoformat(),
+                    json.dumps(payload),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_shadow_market_evidence_bindings(self, audit_id: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload
+                FROM shadow_market_evidence_bindings
+                WHERE audit_id = ? AND evidence_mode = 'shadow'
+                ORDER BY created_at ASC
+                """,
+                (audit_id,),
+            ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_pending_shadow_audit_capture(
+        self,
+        *,
+        audit_id: str,
+        mint: str,
+        strategy_id: str,
+        strategy_version: str,
+        quoted_at: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pending_shadow_audit_captures (
+                    audit_id, mint, strategy_id, strategy_version, quoted_at,
+                    status, created_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    audit_id,
+                    mint,
+                    strategy_id,
+                    strategy_version,
+                    quoted_at.isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def save_shadow_quote_audit_capture(
+        self,
+        audit: LiveExecutionAudit,
+        entry_observation: AcceptedMarketObservation | None,
+    ) -> None:
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        strategy_id = str(comparison.get("strategy_id") or "")
+        strategy_version = str(comparison.get("strategy_version") or "")
+        if not bool(audit.quote.get("shadow_only")) or not strategy_id or not strategy_version:
+            raise ValueError("shadow audit capture requires a versioned shadow-only audit")
+        if entry_observation is not None and (
+            entry_observation.mint != audit.mint
+            or entry_observation.strategy_id != strategy_id
+            or entry_observation.strategy_version != strategy_version
+            or entry_observation.fixture_only
+            or entry_observation.conflict_state != "clear"
+            or entry_observation.access_state != "ready"
+        ):
+            raise ValueError("shadow entry evidence does not match the audit identity")
+        created_at = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pending_shadow_audit_captures (
+                    audit_id, mint, strategy_id, strategy_version, quoted_at,
+                    status, created_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    audit.id,
+                    audit.mint,
+                    strategy_id,
+                    strategy_version,
+                    audit.created_at.isoformat(),
+                    created_at.isoformat(),
+                ),
+            )
+            if entry_observation is not None:
+                binding_id = f"shadow_binding_{audit.id}_{entry_observation.record_id}"
+                payload = {
+                    "binding_id": binding_id,
+                    "audit_id": audit.id,
+                    "market_observation_id": entry_observation.record_id,
+                    "strategy_id": strategy_id,
+                    "strategy_version": strategy_version,
+                    "evidence_mode": "shadow",
+                    "role": "entry",
+                    "created_at": created_at.isoformat(),
+                }
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                        binding_id, audit_id, market_observation_id, strategy_id,
+                        strategy_version, evidence_mode, role, created_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, 'shadow', 'entry', ?, ?)
+                    """,
+                    (
+                        binding_id,
+                        audit.id,
+                        entry_observation.record_id,
+                        strategy_id,
+                        strategy_version,
+                        created_at.isoformat(),
+                        json.dumps(payload),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO live_execution_audits (id, payload, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (audit.id, json.dumps(audit.to_dict()), audit.created_at.isoformat()),
+            )
+
+    def bind_accepted_market_observation_to_pending_shadows(
+        self,
+        observation: AcceptedMarketObservation,
+    ) -> int:
+        if observation.fixture_only or observation.conflict_state != "clear" or observation.access_state != "ready":
+            return 0
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT audit_id
+                FROM pending_shadow_audit_captures
+                WHERE mint = ?
+                  AND strategy_id = ?
+                  AND strategy_version = ?
+                  AND status = 'pending'
+                  AND quoted_at < ?
+                """,
+                (
+                    observation.mint,
+                    observation.strategy_id,
+                    observation.strategy_version,
+                    observation.observed_at.isoformat(),
+                ),
+            ).fetchall()
+            inserted = 0
+            for row in rows:
+                audit_id = str(row["audit_id"])
+                binding_id = f"shadow_binding_{audit_id}_{observation.record_id}"
+                payload = {
+                    "binding_id": binding_id,
+                    "audit_id": audit_id,
+                    "market_observation_id": observation.record_id,
+                    "strategy_id": observation.strategy_id,
+                    "strategy_version": observation.strategy_version,
+                    "evidence_mode": "shadow",
+                    "role": "path",
+                    "created_at": created_at,
+                }
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                        binding_id, audit_id, market_observation_id, strategy_id,
+                        strategy_version, evidence_mode, role, created_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, 'shadow', 'path', ?, ?)
+                    """,
+                    (
+                        binding_id,
+                        audit_id,
+                        observation.record_id,
+                        observation.strategy_id,
+                        observation.strategy_version,
+                        created_at,
+                        json.dumps(payload),
+                    ),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def close_pending_shadow_audit_capture(self, audit_id: str, *, closed_at: datetime) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pending_shadow_audit_captures
+                SET status = 'closed', closed_at = ?
+                WHERE audit_id = ? AND status = 'pending'
+                """,
+                (closed_at.isoformat(), audit_id),
+            )
+
+    def count_pending_shadow_audit_captures(self, audit_id: str = "") -> int:
+        with self._connect() as connection:
+            if audit_id:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures WHERE audit_id = ?",
+                    (audit_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures"
+                ).fetchone()
+        return int(row["count"] if row else 0)
+
+    def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
+        created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+        record_id = str(payload.get("record_id") or f"source_access_{uuid.uuid4().hex}")
+        source = str(payload.get("source") or "unknown")
+        access_state = str(payload.get("access_state") or "unknown")
+        stored = {**payload, "record_id": record_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO source_access_evidence (record_id, source, access_state, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (record_id, source, access_state, created_at, json.dumps(stored)),
+            )
+
+    def load_source_access_evidence(self, limit: int = 100, *, source: str = "") -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit)))
+        with self._connect() as connection:
+            if source:
+                rows = connection.execute(
+                    "SELECT payload FROM source_access_evidence WHERE source = ? ORDER BY created_at DESC LIMIT ?",
+                    (source, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM source_access_evidence ORDER BY created_at DESC LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
+
+    def save_sniper_strategy_version(self, strategy: SniperStrategyVersion) -> bool:
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT canonical_json FROM sniper_strategy_versions WHERE strategy_id = ? AND strategy_version = ?",
+                (strategy.strategy_id, strategy.strategy_version),
+            ).fetchone()
+            if existing:
+                if str(existing["canonical_json"]) != strategy.canonical_json():
+                    raise ValueError("strategy version already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO sniper_strategy_versions (strategy_id, strategy_version, fingerprint, canonical_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    strategy.strategy_id,
+                    strategy.strategy_version,
+                    strategy.fingerprint(),
+                    strategy.canonical_json(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        return True
+
+    def load_sniper_strategy_versions(self, limit: int = 50) -> list[SniperStrategyVersion]:
+        bounded_limit = max(1, min(500, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT canonical_json FROM sniper_strategy_versions ORDER BY created_at DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [SniperStrategyVersion.from_dict(json.loads(row["canonical_json"])) for row in rows]
+
+    def save_shadow_comparison(self, comparison: ShadowComparison) -> bool:
+        serialized = json.dumps(comparison.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM shadow_economic_comparisons WHERE record_id = ?",
+                (comparison.record_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("shadow comparison record already exists with different content")
+                return False
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO shadow_economic_comparisons (
+                    record_id, strategy_version, completed_at, evidence_mode, fixture_only, payload
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    comparison.record_id,
+                    comparison.strategy_version,
+                    comparison.completed_at.isoformat(),
+                    comparison.evidence_mode,
+                    1 if comparison.fixture_only else 0,
+                    serialized,
+                ),
+            )
+        return True
+
+    def load_shadow_comparisons(self, limit: int = 500, *, strategy_version: str = "") -> list[ShadowComparison]:
+        bounded_limit = max(1, min(5000, int(limit)))
+        with self._connect() as connection:
+            if strategy_version:
+                rows = connection.execute(
+                    "SELECT payload FROM shadow_economic_comparisons WHERE strategy_version = ? ORDER BY completed_at ASC LIMIT ?",
+                    (strategy_version, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM shadow_economic_comparisons ORDER BY completed_at ASC LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [self._shadow_comparison_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def publish_sentinel_verdict(
+        self,
+        verdict: SentinelVerdict,
+        *,
+        active_strategy_version: str,
+        current_input_version: str,
+    ) -> bool:
+        """Publish only while the caller's immutable read snapshot is still current."""
+        if verdict.strategy_version != active_strategy_version or verdict.input_version != current_input_version:
+            return False
+        serialized = json.dumps(verdict.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM sentinel_verdicts WHERE verdict_id = ?",
+                (verdict.verdict_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("sentinel verdict already exists with different content")
+                return False
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO sentinel_verdicts (
+                    verdict_id, strategy_version, input_version, status,
+                    created_at, expires_at, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    verdict.verdict_id,
+                    verdict.strategy_version,
+                    verdict.input_version,
+                    verdict.status,
+                    verdict.created_at.isoformat(),
+                    verdict.expires_at.isoformat(),
+                    serialized,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_current_sentinel_verdict(self) -> SentinelVerdict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM sentinel_verdicts ORDER BY created_at DESC, verdict_id DESC LIMIT 1"
+            ).fetchone()
+        return self._sentinel_verdict_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_sentinel_history(self, limit: int = 100) -> list[SentinelVerdict]:
+        bounded_limit = max(1, min(100, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM sentinel_verdicts ORDER BY created_at DESC, verdict_id DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [self._sentinel_verdict_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def enqueue_trade_review(self, revision: TradeRevision, *, max_pending: int = 10000) -> bool:
+        now = datetime.now(timezone.utc).isoformat()
+        job_id = f"review_{uuid.uuid5(uuid.NAMESPACE_URL, revision.revision_id).hex}"
+        with self._connect() as connection:
+            pending = connection.execute(
+                "SELECT COUNT(*) AS count FROM trade_review_jobs WHERE status IN ('queued', 'processing')"
+            ).fetchone()
+            if int(pending["count"] if pending else 0) >= max(1, max_pending):
+                return False
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO trade_review_jobs (
+                    job_id, revision_id, trade_id, mode, status, revision_payload,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)
+                """,
+                (job_id, revision.revision_id, revision.trade_id, revision.mode, json.dumps(revision.to_dict(), sort_keys=True), now, now),
+            )
+        return cursor.rowcount == 1
+
+    def trade_review_queue_stats(self) -> dict[str, int]:
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM trade_review_jobs GROUP BY status"
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return {
+            "queued": counts.get("queued", 0),
+            "processing": counts.get("processing", 0),
+            "dead_letter": counts.get("dead_letter", 0),
+            "completed": counts.get("completed", 0),
+        }
+
+    def claim_trade_review(
+        self,
+        lease_owner: str,
+        lease_until: datetime,
+        *,
+        now: datetime | None = None,
+    ) -> TradeReviewJob | None:
+        claimed_at = now or datetime.now(timezone.utc)
+        claim_id = f"claim_{uuid.uuid4().hex}"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT * FROM trade_review_jobs
+                WHERE status = 'queued'
+                   OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until <= ?)
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (claimed_at.isoformat(),),
+            ).fetchone()
+            if row is None:
+                return None
+            cursor = connection.execute(
+                """
+                UPDATE trade_review_jobs
+                SET status = 'processing', attempts = attempts + 1, claim_id = ?,
+                    lease_owner = ?, lease_until = ?, updated_at = ?
+                WHERE job_id = ? AND (
+                    status = 'queued'
+                    OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until <= ?)
+                )
+                """,
+                (claim_id, lease_owner, lease_until.isoformat(), claimed_at.isoformat(), row["job_id"], claimed_at.isoformat()),
+            )
+            if cursor.rowcount != 1:
+                return None
+            claimed = connection.execute("SELECT * FROM trade_review_jobs WHERE job_id = ?", (row["job_id"],)).fetchone()
+        return self._trade_review_job_from_row(claimed)
+
+    def finish_trade_review(
+        self,
+        job_id: str,
+        claim_id: str,
+        expected_revision: str,
+        result: TradeGrade,
+    ) -> bool:
+        serialized = json.dumps(result.to_dict(), sort_keys=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT revision_id, trade_id, mode FROM trade_review_jobs WHERE job_id = ? AND status = 'processing' AND claim_id = ?",
+                (job_id, claim_id),
+            ).fetchone()
+            if row is None or str(row["revision_id"]) != expected_revision:
+                return False
+            if result.revision_id != expected_revision or result.trade_id != str(row["trade_id"]) or result.mode != str(row["mode"]):
+                return False
+            connection.execute(
+                "INSERT OR IGNORE INTO trade_grades (grade_id, trade_id, revision_id, mode, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (result.grade_id, result.trade_id, result.revision_id, result.mode, result.created_at.isoformat(), serialized),
+            )
+            cursor = connection.execute(
+                "UPDATE trade_review_jobs SET status = 'completed', lease_until = NULL, updated_at = ? WHERE job_id = ? AND claim_id = ?",
+                (now, job_id, claim_id),
+            )
+        return cursor.rowcount == 1
+
+    def fail_trade_review(
+        self,
+        job_id: str,
+        claim_id: str,
+        error: str,
+        *,
+        max_attempts: int = 3,
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT attempts FROM trade_review_jobs WHERE job_id = ? AND status = 'processing' AND claim_id = ?",
+                (job_id, claim_id),
+            ).fetchone()
+            if row is None:
+                return "stale_claim"
+            status = "dead_letter" if int(row["attempts"]) >= max(1, max_attempts) else "queued"
+            connection.execute(
+                "UPDATE trade_review_jobs SET status = ?, claim_id = '', lease_owner = '', lease_until = NULL, last_error = ?, updated_at = ? WHERE job_id = ? AND claim_id = ?",
+                (status, error[:1000], now, job_id, claim_id),
+            )
+        return status
+
+    def load_trade_grades(self, trade_id: str = "", *, mode: str = "", limit: int = 500) -> list[TradeGrade]:
+        clauses: list[str] = []
+        values: list[Any] = []
+        if trade_id:
+            clauses.append("trade_id = ?")
+            values.append(trade_id)
+        if mode:
+            clauses.append("mode = ?")
+            values.append(mode)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(max(1, min(5000, limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM trade_grades{where} ORDER BY created_at DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        return [self._trade_grade_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def append_trade_grade_correction(self, correction: TradeGradeCorrection) -> bool:
+        serialized = json.dumps(correction.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM trade_grade_corrections WHERE correction_id = ?", (correction.correction_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("trade grade correction already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO trade_grade_corrections (correction_id, grade_id, trade_id, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (correction.correction_id, correction.grade_id, correction.trade_id, correction.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_trade_grade_corrections(self, trade_id: str, limit: int = 500) -> list[TradeGradeCorrection]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM trade_grade_corrections WHERE trade_id = ? ORDER BY created_at ASC LIMIT ?",
+                (trade_id, max(1, min(5000, limit))),
+            ).fetchall()
+        return [self._trade_grade_correction_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def reserve_model_classification_budget(
+        self,
+        budget_day: str,
+        *,
+        tokens: int,
+        cost: float,
+        token_limit: int,
+        cost_limit: float,
+    ) -> bool:
+        if tokens < 0 or cost < 0 or not budget_day:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT tokens, cost FROM model_classification_budget WHERE budget_day = ?",
+                (budget_day,),
+            ).fetchone()
+            used_tokens = int(row["tokens"] if row else 0)
+            used_cost = float(row["cost"] if row else 0.0)
+            if used_tokens + tokens > max(0, token_limit) or used_cost + cost > max(0.0, cost_limit):
+                return False
+            connection.execute(
+                """
+                INSERT INTO model_classification_budget (budget_day, tokens, cost, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(budget_day) DO UPDATE SET tokens = excluded.tokens, cost = excluded.cost, updated_at = excluded.updated_at
+                """,
+                (budget_day, used_tokens + tokens, used_cost + cost, now),
+            )
+        return True
+
+    def model_classification_budget(self, budget_day: str) -> dict[str, int | float]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT tokens, cost FROM model_classification_budget WHERE budget_day = ?", (budget_day,)
+            ).fetchone()
+        return {"tokens": int(row["tokens"]), "cost": float(row["cost"])} if row else {"tokens": 0, "cost": 0.0}
+
+    def save_model_classification(self, classification: ModelClassification) -> bool:
+        payload = asdict(classification)
+        serialized = json.dumps(payload, sort_keys=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM model_classifications WHERE job_id = ?", (classification.job_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("model classification already exists with different content")
+                return False
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO model_classifications (job_id, trade_id, revision_id, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (classification.job_id, classification.trade_id, classification.revision_id, serialized, now),
+            )
+        return cursor.rowcount == 1
+
+    def load_model_classifications(self, trade_id: str = "", limit: int = 500) -> list[ModelClassification]:
+        bounded = max(1, min(5000, limit))
+        with self._connect() as connection:
+            if trade_id:
+                rows = connection.execute(
+                    "SELECT payload FROM model_classifications WHERE trade_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (trade_id, bounded),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM model_classifications ORDER BY created_at DESC LIMIT ?", (bounded,)
+                ).fetchall()
+        return [ModelClassification(**json.loads(row["payload"])) for row in rows]
+
+    def save_strategy_candidate(self, candidate: StrategyCandidate) -> bool:
+        serialized = json.dumps(candidate.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM strategy_candidates WHERE candidate_id = ?", (candidate.candidate_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("strategy candidate already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO strategy_candidates (candidate_id, base_strategy_version, proposed_strategy_version, fingerprint, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (candidate.candidate_id, candidate.base_strategy_version, candidate.proposed_strategy_version, candidate.fingerprint, candidate.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_strategy_candidate(self, candidate_id: str) -> StrategyCandidate | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM strategy_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+        return self._strategy_candidate_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_strategy_candidates(self, limit: int = 100) -> list[StrategyCandidate]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM strategy_candidates ORDER BY created_at DESC LIMIT ?", (max(1, min(500, limit)),)
+            ).fetchall()
+        return [self._strategy_candidate_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def save_candidate_validation(self, validation: CandidateValidation) -> bool:
+        serialized = json.dumps(validation.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM candidate_validations WHERE validation_id = ?", (validation.validation_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("candidate validation already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO candidate_validations (validation_id, candidate_id, accepted, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (validation.validation_id, validation.candidate_id, 1 if validation.accepted else 0, validation.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_latest_candidate_validation(self, candidate_id: str) -> CandidateValidation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM candidate_validations WHERE candidate_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+        return self._candidate_validation_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_active_strategy_selection(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM active_strategy_selection WHERE id = 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def promote_strategy_candidate(
+        self,
+        candidate: StrategyCandidate,
+        validation: CandidateValidation,
+        promotion_id: str,
+        operator_intent_id: str,
+        now: datetime,
+    ) -> bool:
+        payload = {
+            "promotion_id": promotion_id,
+            "candidate_id": candidate.candidate_id,
+            "strategy_version": candidate.proposed_strategy_version,
+            "validation_id": validation.validation_id,
+            "operator_intent_id": operator_intent_id,
+            "selected_at": now.isoformat(),
+            "validation_campaign_status": "required",
+            "sentinel_status": "invalidated",
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT validation_id, accepted FROM candidate_validations WHERE candidate_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (candidate.candidate_id,),
+            ).fetchone()
+            if latest is None or str(latest["validation_id"]) != validation.validation_id or not bool(latest["accepted"]):
+                return False
+            existing = connection.execute("SELECT payload FROM strategy_promotions WHERE promotion_id = ?", (promotion_id,)).fetchone()
+            if existing:
+                return json.dumps(json.loads(existing["payload"]), sort_keys=True) == serialized
+            connection.execute(
+                "INSERT INTO strategy_promotions (promotion_id, candidate_id, validation_id, operator_intent_id, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (promotion_id, candidate.candidate_id, validation.validation_id, operator_intent_id, now.isoformat(), serialized),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO active_strategy_selection (id, candidate_id, strategy_version, promotion_id, operator_intent_id, selected_at, payload) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                (candidate.candidate_id, candidate.proposed_strategy_version, promotion_id, operator_intent_id, now.isoformat(), serialized),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO strategy_validation_campaigns (campaign_id, candidate_id, strategy_version, status, created_at) VALUES (?, ?, ?, 'required', ?)",
+                (f"campaign_{promotion_id}", candidate.candidate_id, candidate.proposed_strategy_version, now.isoformat()),
+            )
+        return True
+
+    def save_pilot_risk_policy(self, policy: PilotRiskPolicy) -> bool:
+        serialized = json.dumps(policy.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM pilot_risk_policies WHERE policy_id = ?", (policy.policy_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("pilot risk policy already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO pilot_risk_policies (policy_id, policy_version, reference_observation_id, settings_version, operator_intent_id, created_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (policy.policy_id, policy.policy_version, policy.reference_observation_id, policy.settings_version, policy.operator_intent_id, policy.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_latest_pilot_risk_policy(self) -> PilotRiskPolicy | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM pilot_risk_policies ORDER BY created_at DESC, policy_id DESC LIMIT 1"
+            ).fetchone()
+        return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
+
+    def load_pilot_risk_policy(self, policy_id: str) -> PilotRiskPolicy | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM pilot_risk_policies WHERE policy_id = ?",
+                (policy_id,),
+            ).fetchone()
+        return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
+
+    def append_pilot_outcome(
+        self,
+        policy_id: str,
+        window_id: str,
+        outcome_id: str,
+        pnl_sol: Decimal,
+        created_at: datetime,
+    ) -> bool:
+        amount = Decimal(pnl_sol)
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("pilot outcome timestamp must be timezone-aware")
+        loss = max(Decimal("0"), -amount)
+        payload = {
+            "loss_id": outcome_id,
+            "outcome_id": outcome_id,
+            "policy_id": policy_id,
+            "window_id": window_id,
+            "pnl_sol": str(amount),
+            "loss_sol": str(loss),
+            "created_at": created_at.astimezone(timezone.utc).isoformat(),
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM pilot_loss_ledger WHERE loss_id = ?", (outcome_id,)).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("pilot outcome already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO pilot_loss_ledger (loss_id, policy_id, loss_sol, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (outcome_id, policy_id, str(loss), payload["created_at"], serialized),
+            )
+        return True
+
+    def append_pilot_loss(self, policy_id: str, loss_id: str, loss_sol: Decimal, created_at: datetime) -> bool:
+        amount = Decimal(loss_sol)
+        if amount <= 0:
+            raise ValueError("pilot loss ledger accepts positive loss magnitudes only")
+        return self.append_pilot_outcome(policy_id, "legacy-unscoped", loss_id, -amount, created_at)
+
+    def pilot_loss_ledger(self, policy_id: str) -> dict[str, Any]:
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM pilot_loss_ledger WHERE policy_id = ? ORDER BY created_at ASC, loss_id ASC",
+                (policy_id,),
+            ).fetchall()
+        entries = [json.loads(row["payload"]) for row in rows]
+        cumulative = sum((Decimal(str(item.get("loss_sol") or "0")) for item in entries), Decimal("0"))
+        return {"policy_id": policy_id, "cumulative_loss_sol": str(cumulative), "entries": entries}
+
+    def save_production_rehearsal_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        created_at = datetime.now(timezone.utc).isoformat()
+        report_id = f"production_rehearsal_{uuid.uuid4().hex}"
+        payload = {**report, "report_id": report_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO production_rehearsal_reports (report_id, ready, fixture_only, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (report_id, int(bool(report.get("ready"))), int(bool(report.get("fixture_only", True))), created_at, json.dumps(payload, sort_keys=True)),
+            )
+        return payload
+
+    def append_production_rehearsal_evidence(self, evidence: dict[str, Any]) -> bool:
+        evidence_id = str(evidence.get("evidence_id") or "").strip()
+        gate_id = str(evidence.get("gate_id") or "").strip()
+        if not evidence_id or not gate_id:
+            raise ValueError("production rehearsal evidence ID and gate ID are required")
+        observed_at = datetime.fromisoformat(str(evidence.get("observed_at") or ""))
+        expires_at = datetime.fromisoformat(str(evidence.get("expires_at") or ""))
+        if (
+            observed_at.tzinfo is None
+            or observed_at.utcoffset() is None
+            or expires_at.tzinfo is None
+            or expires_at.utcoffset() is None
+            or expires_at <= observed_at
+        ):
+            raise ValueError("production rehearsal evidence requires an aware bounded validity window")
+        payload = {
+            "evidence_id": evidence_id,
+            "gate_id": gate_id,
+            "scope": str(evidence.get("scope") or ""),
+            "passed": evidence.get("passed") is True,
+            "fixture_only": evidence.get("fixture_only") is not False,
+            "observed_at": observed_at.astimezone(timezone.utc).isoformat(),
+            "expires_at": expires_at.astimezone(timezone.utc).isoformat(),
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM production_rehearsal_evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("production rehearsal evidence already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO production_rehearsal_evidence (evidence_id, gate_id, observed_at, expires_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (evidence_id, gate_id, payload["observed_at"], payload["expires_at"], serialized),
+            )
+        return True
+
+    def load_production_rehearsal_evidence(self, evidence_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM production_rehearsal_evidence WHERE evidence_id = ?",
+                (evidence_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_latest_production_rehearsal_report(self) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM production_rehearsal_reports ORDER BY created_at DESC, report_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_manual_live_proof_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        created_at = datetime.now(timezone.utc).isoformat()
+        proof_id = f"manual_live_proof_{uuid.uuid4().hex}"
+        payload = {**report, "proof_id": proof_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO manual_live_proof_reports (proof_id, qualified, wallet_public_key, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (proof_id, int(bool(report.get("qualified"))), str(report.get("wallet_public_key") or ""), created_at, json.dumps(payload, sort_keys=True)),
+            )
+        return payload
+
+    def load_latest_manual_live_proof_report(self) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM manual_live_proof_reports ORDER BY created_at DESC, proof_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_autonomous_pilot_window(self, window: dict[str, Any]) -> dict[str, Any]:
+        window_id = str(window.get("window_id") or "").strip()
+        if not window_id:
+            raise ValueError("autonomous pilot window ID is required")
+        created_at = datetime.now(timezone.utc).isoformat()
+        payload = {**window, "recorded_at": created_at}
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM autonomous_pilot_windows WHERE window_id = ?", (window_id,)).fetchone()
+            if existing:
+                existing_payload = json.loads(existing["payload"])
+                comparable = {key: value for key, value in existing_payload.items() if key != "recorded_at"}
+                if json.dumps(comparable, sort_keys=True) != json.dumps(window, sort_keys=True):
+                    raise ValueError("autonomous pilot window already exists with different content")
+                return existing_payload
+            connection.execute(
+                "INSERT INTO autonomous_pilot_windows (window_id, eligible, opened, wallet_public_key, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (window_id, int(bool(window.get("eligible"))), int(bool(window.get("opened"))), str(window.get("wallet_public_key") or ""), created_at, serialized),
+            )
+        return payload
+
+    def load_latest_autonomous_pilot_window(self) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_pilot_windows ORDER BY created_at DESC, window_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_autonomous_pilot_window(self, window_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_pilot_windows WHERE window_id = ?",
+                (window_id,),
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def stop_autonomous_pilot_window(
+        self,
+        window_id: str,
+        settings: BotSettings,
+        blockers: list[str],
+        stopped_at: datetime,
+    ) -> dict[str, Any]:
+        if stopped_at.tzinfo is None or stopped_at.utcoffset() is None:
+            raise ValueError("pilot stop timestamp must be timezone-aware")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_pilot_windows WHERE window_id = ?",
+                (window_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("autonomous pilot window was not found")
+            payload = json.loads(row["payload"])
+            payload.update(
+                {
+                    "status": "CLOSED",
+                    "active": False,
+                    "stop_blockers": list(dict.fromkeys(str(item) for item in blockers if item)),
+                    "stopped_at": stopped_at.astimezone(timezone.utc).isoformat(),
+                    "automatic_restart_allowed": False,
+                    "requires_post_run_review": True,
+                }
+            )
+            connection.execute(
+                "UPDATE autonomous_pilot_windows SET payload = ? WHERE window_id = ?",
+                (json.dumps(payload, sort_keys=True), window_id),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?)",
+                (json.dumps(asdict(settings)),),
+            )
+        return payload
+
+    def save_post_pilot_review(self, review: dict[str, Any]) -> dict[str, Any]:
+        review_id = str(review.get("review_id") or "").strip()
+        if not review_id:
+            raise ValueError("post-pilot review ID is required")
+        created_at = datetime.now(timezone.utc).isoformat()
+        payload = {**review, "created_at": created_at}
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM post_pilot_reviews WHERE review_id = ?", (review_id,)).fetchone()
+            if existing:
+                existing_payload = json.loads(existing["payload"])
+                comparable = {key: value for key, value in existing_payload.items() if key != "created_at"}
+                if json.dumps(comparable, sort_keys=True) != json.dumps(review, sort_keys=True):
+                    raise ValueError("post-pilot review already exists with different content")
+                return existing_payload
+            connection.execute(
+                "INSERT INTO post_pilot_reviews (review_id, window_id, clear, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (review_id, str(review.get("window_id") or ""), int(bool(review.get("clear"))), created_at, serialized),
+            )
+        return payload
+
+    def load_post_pilot_review(self, review_id: str = "") -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            if review_id:
+                row = connection.execute("SELECT payload FROM post_pilot_reviews WHERE review_id = ?", (review_id,)).fetchone()
+            else:
+                row = connection.execute("SELECT payload FROM post_pilot_reviews ORDER BY created_at DESC, review_id DESC LIMIT 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_pilot_operator_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        decision_id = str(decision.get("decision_id") or "").strip()
+        review_id = str(decision.get("review_id") or "").strip()
+        if not decision_id or not review_id:
+            raise ValueError("pilot decision and review IDs are required")
+        serialized = json.dumps(decision, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM pilot_operator_decisions WHERE review_id = ?", (review_id,)).fetchone()
+            if existing:
+                existing_payload = json.loads(existing["payload"])
+                if json.dumps(existing_payload, sort_keys=True) != serialized:
+                    raise ValueError("post-pilot review already has a different operator decision")
+                return existing_payload
+            connection.execute(
+                "INSERT INTO pilot_operator_decisions (decision_id, review_id, decision, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (decision_id, review_id, str(decision.get("decision") or ""), str(decision.get("created_at") or datetime.now(timezone.utc).isoformat()), serialized),
+            )
+        return decision
+
+    def load_pilot_operator_decision(self, review_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT payload FROM pilot_operator_decisions WHERE review_id = ?", (review_id,)).fetchone()
+        return json.loads(row["payload"]) if row else None
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -1240,6 +2817,7 @@ class Storage:
             attempted + timedelta(seconds=max(1, int(lease_seconds)))
         ).isoformat()
         with self._connect() as connection:
+            connection.execute("PRAGMA busy_timeout = 500")
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
@@ -2717,6 +4295,14 @@ class Storage:
             ).fetchall()
         return [self._settings_version_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def load_settings_version(self, version_id: str) -> SettingsVersion | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM settings_versions WHERE id = ?",
+                (version_id,),
+            ).fetchone()
+        return self._settings_version_from_payload(json.loads(row["payload"])) if row else None
+
     def count_settings_versions(self) -> int:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM settings_versions").fetchone()
@@ -3107,6 +4693,12 @@ class Storage:
                     trade.closed_at.isoformat() if trade.closed_at else None,
                 ),
             )
+        if trade.closed_at and trade.pnl_sol is not None:
+            try:
+                self.enqueue_trade_review(self._trade_revision_from_trade(trade))
+            except Exception:
+                # The authoritative trade commit must never depend on low-priority grading.
+                pass
 
     def clear_tokens(self) -> None:
         with self._connect() as connection:
@@ -3232,10 +4824,125 @@ class Storage:
         payload["closed_at"] = datetime.fromisoformat(payload["closed_at"]) if payload.get("closed_at") else None
         return TradeRecord(**payload)
 
+    def _trade_revision_from_trade(self, trade: TradeRecord) -> TradeRevision:
+        completed_at = trade.closed_at or datetime.now(timezone.utc)
+        decision_at = trade.opened_at or completed_at
+        serialized = json.dumps(trade.to_dict(), sort_keys=True, separators=(",", ":"))
+        revision_hash = uuid.uuid5(uuid.NAMESPACE_URL, serialized).hex
+        mode = trade.mode if trade.mode in {"paper", "shadow", "manual_live", "autonomous_live"} else "paper"
+        return TradeRevision(
+            revision_id=f"{trade.id}:{revision_hash}",
+            trade_id=trade.id,
+            mode=mode,
+            strategy_version=trade.settings_version_id or trade.strategy_profile or "unversioned",
+            rules_version="trade-grader-v1",
+            data_schema_version=self.SCHEMA_VERSION,
+            completed_at=completed_at,
+            decision_at=decision_at,
+            evidence_ids=tuple(
+                value for value in (f"trade:{trade.id}", f"settings:{trade.settings_version_id}" if trade.settings_version_id else "") if value
+            ),
+            ex_ante_facts={
+                "signal_score": None,
+                "entry_compliant": trade.entry_price is not None and trade.amount_sol is not None,
+                "risk_clear": trade.lifecycle_status == "closed",
+                "source_confidence": trade.source_price_confidence,
+                "latency_ms": None,
+                "slippage_pct": trade.slippage_paid_pct,
+                "entry_reason": trade.entry_reason,
+            },
+            ex_post_facts={
+                "pnl_sol": trade.pnl_sol,
+                "exit_compliant": bool(trade.exit_reason),
+                "exit_reason": trade.exit_reason,
+                "hold_duration_seconds": trade.hold_duration_seconds,
+                "total_cost_sol": sum(
+                    float(value or 0.0)
+                    for value in (
+                        trade.entry_fee_sol,
+                        trade.exit_fee_sol,
+                        trade.entry_provider_fee_sol,
+                        trade.exit_provider_fee_sol,
+                        trade.entry_network_fee_sol,
+                        trade.exit_network_fee_sol,
+                        trade.entry_priority_fee_sol,
+                        trade.exit_priority_fee_sol,
+                        trade.entry_slippage_cost_sol,
+                        trade.entry_price_impact_cost_sol,
+                    )
+                ),
+            },
+        )
+
     def _price_observation_from_payload(self, payload: dict[str, Any]) -> PriceObservation:
         payload["observed_at"] = datetime.fromisoformat(payload["observed_at"])
         allowed = set(PriceObservation.__dataclass_fields__.keys())
         return PriceObservation(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _accepted_market_observation_from_payload(self, payload: dict[str, Any]) -> AcceptedMarketObservation:
+        for field_name in ("created_at", "observed_at", "received_at"):
+            payload[field_name] = datetime.fromisoformat(payload[field_name])
+        allowed = set(AcceptedMarketObservation.__dataclass_fields__.keys())
+        return AcceptedMarketObservation(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _shadow_comparison_from_payload(self, payload: dict[str, Any]) -> ShadowComparison:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        payload["source_evidence_ids"] = tuple(payload.get("source_evidence_ids") or ())
+        payload["costs"] = ShadowCostBreakdown(**dict(payload.get("costs") or {}))
+        allowed = set(ShadowComparison.__dataclass_fields__.keys())
+        return ShadowComparison(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _sentinel_verdict_from_payload(self, payload: dict[str, Any]) -> SentinelVerdict:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["expires_at"] = datetime.fromisoformat(payload["expires_at"])
+        for field_name in ("blockers", "warnings", "reasons"):
+            payload[field_name] = tuple(payload.get(field_name) or ())
+        allowed = set(SentinelVerdict.__dataclass_fields__.keys())
+        return SentinelVerdict(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_revision_from_payload(self, payload: dict[str, Any]) -> TradeRevision:
+        payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        payload["decision_at"] = datetime.fromisoformat(payload["decision_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        allowed = set(TradeRevision.__dataclass_fields__.keys())
+        return TradeRevision(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_review_job_from_row(self, row: sqlite3.Row) -> TradeReviewJob:
+        return TradeReviewJob(
+            job_id=str(row["job_id"]),
+            status=str(row["status"]),
+            attempts=int(row["attempts"]),
+            claim_id=str(row["claim_id"]),
+            lease_owner=str(row["lease_owner"]),
+            lease_until=datetime.fromisoformat(row["lease_until"]) if row["lease_until"] else None,
+            revision=self._trade_revision_from_payload(json.loads(row["revision_payload"])),
+            last_error=str(row["last_error"]),
+        )
+
+    def _trade_grade_from_payload(self, payload: dict[str, Any]) -> TradeGrade:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        payload["reasons"] = tuple(payload.get("reasons") or ())
+        allowed = set(TradeGrade.__dataclass_fields__.keys())
+        return TradeGrade(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _trade_grade_correction_from_payload(self, payload: dict[str, Any]) -> TradeGradeCorrection:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        allowed = set(TradeGradeCorrection.__dataclass_fields__.keys())
+        return TradeGradeCorrection(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _strategy_candidate_from_payload(self, payload: dict[str, Any]) -> StrategyCandidate:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        allowed = set(StrategyCandidate.__dataclass_fields__.keys())
+        return StrategyCandidate(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _candidate_validation_from_payload(self, payload: dict[str, Any]) -> CandidateValidation:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["blockers"] = tuple(payload.get("blockers") or ())
+        allowed = set(CandidateValidation.__dataclass_fields__.keys())
+        return CandidateValidation(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

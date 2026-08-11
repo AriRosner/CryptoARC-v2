@@ -6,13 +6,13 @@ import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
 
-from app.core.models import SourceStatus, TokenSignal, TokenStatus, new_id, utc_now
+from app.core.models import AcceptedMarketObservation, SourceStatus, TokenSignal, TokenStatus, new_id, utc_now
 from app.core.price_pipeline import PricePipeline, numeric
 from app.core.simulator import LaunchSimulator
 
@@ -23,6 +23,87 @@ logger = logging.getLogger(__name__)
 PUMPPORTAL_NON_LAUNCH_MINTS = {
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEvidenceResult:
+    shadow_eligible: bool
+    blockers: tuple[str, ...]
+    accepted_count: int
+    genuine_count: int
+    fixture_count: int
+    conflict_count: int
+    direct_comparison_sample_ids: tuple[str, ...]
+
+
+class SourceEvidenceGate:
+    """Fail-closed eligibility check for attributable accepted market prices."""
+
+    @staticmethod
+    def evaluate(
+        observations: Sequence[AcceptedMarketObservation],
+        access_state: str,
+        now: datetime,
+        *,
+        max_age_seconds: int = 300,
+        required_strategy_id: str = "",
+        required_strategy_version: str = "",
+    ) -> SourceEvidenceResult:
+        items = list(observations)
+        fixture_count = sum(1 for item in items if item.fixture_only)
+        genuine = [item for item in items if not item.fixture_only]
+        conflicts = [item for item in genuine if item.conflict_state != "clear"]
+        blockers: list[str] = []
+        if access_state != "ready":
+            blockers.append(
+                "funded_trade_price_access_unavailable"
+                if access_state in {"funding_required", "unfunded", "denied"}
+                else f"source_access_{access_state or 'unknown'}"
+            )
+        else:
+            identities: set[tuple[str, str, str]] = set()
+            for item in items:
+                identity = (item.source, item.source_event_id, item.observed_at.isoformat())
+                if identity in identities:
+                    blockers.append("duplicate_source_event_identity")
+                identities.add(identity)
+                if item.price is None or item.price <= 0:
+                    blockers.append("missing_price")
+                if item.observed_at.tzinfo is None or item.observed_at.utcoffset() is None:
+                    blockers.append("naive_observation_time")
+                    continue
+                observed_at = item.observed_at.astimezone(timezone.utc)
+                if now.tzinfo is None or now.utcoffset() is None:
+                    blockers.append("naive_evaluation_time")
+                elif observed_at > now.astimezone(timezone.utc):
+                    blockers.append("future_observation")
+                elif (now.astimezone(timezone.utc) - observed_at).total_seconds() > max(1, max_age_seconds):
+                    blockers.append("stale_observation")
+                if item.conflict_state != "clear":
+                    blockers.append("source_conflict")
+                if required_strategy_id and item.strategy_id != required_strategy_id:
+                    blockers.append("strategy_id_mismatch")
+                if required_strategy_version and item.strategy_version != required_strategy_version:
+                    blockers.append("strategy_version_mismatch")
+            if not genuine:
+                blockers.append("genuine_observation_required")
+        deduped = tuple(dict.fromkeys(blockers))
+        direct_ids = tuple(
+            dict.fromkeys(
+                item.direct_comparison_sample_id
+                for item in genuine
+                if item.direct_comparison_sample_id
+            )
+        )
+        return SourceEvidenceResult(
+            shadow_eligible=not deduped and bool(genuine),
+            blockers=deduped,
+            accepted_count=len(items),
+            genuine_count=len(genuine),
+            fixture_count=fixture_count,
+            conflict_count=len(conflicts),
+            direct_comparison_sample_ids=direct_ids,
+        )
 
 
 def _log_cleanup_failures(context: str, results: list[Any]) -> None:
