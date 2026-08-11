@@ -1504,6 +1504,80 @@ class Storage:
                 ),
             )
 
+    def save_shadow_quote_audit_capture(
+        self,
+        audit: LiveExecutionAudit,
+        entry_observation: AcceptedMarketObservation | None,
+    ) -> None:
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        strategy_id = str(comparison.get("strategy_id") or "")
+        strategy_version = str(comparison.get("strategy_version") or "")
+        if not bool(audit.quote.get("shadow_only")) or not strategy_id or not strategy_version:
+            raise ValueError("shadow audit capture requires a versioned shadow-only audit")
+        if entry_observation is not None and (
+            entry_observation.mint != audit.mint
+            or entry_observation.strategy_id != strategy_id
+            or entry_observation.strategy_version != strategy_version
+            or entry_observation.fixture_only
+            or entry_observation.conflict_state != "clear"
+            or entry_observation.access_state != "ready"
+        ):
+            raise ValueError("shadow entry evidence does not match the audit identity")
+        created_at = datetime.now(timezone.utc)
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pending_shadow_audit_captures (
+                    audit_id, mint, strategy_id, strategy_version, quoted_at,
+                    status, created_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    audit.id,
+                    audit.mint,
+                    strategy_id,
+                    strategy_version,
+                    audit.created_at.isoformat(),
+                    created_at.isoformat(),
+                ),
+            )
+            if entry_observation is not None:
+                binding_id = f"shadow_binding_{audit.id}_{entry_observation.record_id}"
+                payload = {
+                    "binding_id": binding_id,
+                    "audit_id": audit.id,
+                    "market_observation_id": entry_observation.record_id,
+                    "strategy_id": strategy_id,
+                    "strategy_version": strategy_version,
+                    "evidence_mode": "shadow",
+                    "role": "entry",
+                    "created_at": created_at.isoformat(),
+                }
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                        binding_id, audit_id, market_observation_id, strategy_id,
+                        strategy_version, evidence_mode, role, created_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, 'shadow', 'entry', ?, ?)
+                    """,
+                    (
+                        binding_id,
+                        audit.id,
+                        entry_observation.record_id,
+                        strategy_id,
+                        strategy_version,
+                        created_at.isoformat(),
+                        json.dumps(payload),
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO live_execution_audits (id, payload, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (audit.id, json.dumps(audit.to_dict()), audit.created_at.isoformat()),
+            )
+
     def bind_accepted_market_observation_to_pending_shadows(
         self,
         observation: AcceptedMarketObservation,
@@ -1573,6 +1647,19 @@ class Storage:
                 """,
                 (closed_at.isoformat(), audit_id),
             )
+
+    def count_pending_shadow_audit_captures(self, audit_id: str = "") -> int:
+        with self._connect() as connection:
+            if audit_id:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures WHERE audit_id = ?",
+                    (audit_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures"
+                ).fetchone()
+        return int(row["count"] if row else 0)
 
     def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
         created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())

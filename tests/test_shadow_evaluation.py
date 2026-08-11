@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -370,6 +371,48 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(len({item.source_event_id for item in accepted}), 2)
             self.assertEqual(len(materialized), 1)
             self.assertEqual(set(materialized[0].source_evidence_ids), {item.record_id for item in accepted})
+
+    def test_shadow_capture_rolls_back_if_audit_persistence_fails(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            version_id = state.ensure_settings_version("rollback shadow capture", [])
+            now = utc_now()
+            entry = AcceptedMarketObservation(
+                record_id="rollback-entry", created_at=now - timedelta(seconds=1), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=version_id,
+                evidence_mode="paper", source="pumpportal", source_event_id="rollback-source",
+                observed_at=now - timedelta(seconds=1), received_at=now - timedelta(seconds=1),
+                mint="rollback-mint", price=1.0, confidence=0.9, acceptance_reason="direct: accepted",
+            )
+            state.storage.save_accepted_market_observation(entry)
+            audit = LiveExecutionAudit(
+                id="rollback-audit", created_at=now, updated_at=now,
+                action="buy", mint=entry.mint, amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="RollbackWallet",
+                quote={"id": "rollback-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "waiting_for_price",
+                    "strategy_id": state.settings.strategy_profile, "strategy_version": version_id,
+                },
+            )
+            with state.storage._connect() as connection:
+                connection.execute(
+                    """
+                    CREATE TRIGGER fail_shadow_audit_insert
+                    BEFORE INSERT ON live_execution_audits
+                    WHEN NEW.id = 'rollback-audit'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected audit persistence failure');
+                    END
+                    """
+                )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                state.storage.save_shadow_quote_audit_capture(audit, entry)
+
+            self.assertIsNone(state.storage.load_live_execution_audit(audit.id))
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 0)
+            self.assertEqual(state.storage.load_shadow_market_evidence_bindings(audit.id), [])
 
 
 if __name__ == "__main__":
