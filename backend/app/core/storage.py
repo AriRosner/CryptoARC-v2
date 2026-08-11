@@ -43,6 +43,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("source_soak_history", "source_soak_history"),
     ("accepted_market_observations", "accepted_market_observations"),
     ("shadow_market_evidence_bindings", "shadow_market_evidence_bindings"),
+    ("pending_shadow_audit_captures", "pending_shadow_audit_captures"),
     ("source_access_evidence", "source_access_evidence"),
     ("sniper_strategy_versions", "sniper_strategy_versions"),
     ("shadow_economic_comparisons", "shadow_economic_comparisons"),
@@ -69,7 +70,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 24
+    SCHEMA_VERSION = 25
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -92,6 +93,7 @@ class Storage:
         "source_soak_history",
         "accepted_market_observations",
         "shadow_market_evidence_bindings",
+        "pending_shadow_audit_captures",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -138,6 +140,7 @@ class Storage:
         "source_soak_history",
         "accepted_market_observations",
         "shadow_market_evidence_bindings",
+        "pending_shadow_audit_captures",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -315,6 +318,7 @@ class Storage:
             (22, "022_post_pilot_review", "append-only post-pilot reviews and operator decisions", self._migration_022_post_pilot_review),
             (23, "023_production_rehearsal_evidence", "append-only scoped production rehearsal evidence", self._migration_023_production_rehearsal_evidence),
             (24, "024_shadow_market_evidence_bindings", "append-only shadow audit bindings to accepted market observations", self._migration_024_shadow_market_evidence_bindings),
+            (25, "025_pending_shadow_audit_captures", "indexed pending shadow audit capture registry", self._migration_025_pending_shadow_audit_captures),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -1060,6 +1064,28 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_shadow_market_evidence_audit ON shadow_market_evidence_bindings(audit_id, created_at ASC)"
         )
 
+    def _migration_025_pending_shadow_audit_captures(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_shadow_audit_captures (
+                audit_id TEXT PRIMARY KEY,
+                mint TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                quoted_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                closed_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pending_shadow_capture_lookup
+            ON pending_shadow_audit_captures(mint, strategy_id, strategy_version, status, quoted_at)
+            """
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1450,6 +1476,103 @@ class Storage:
                 (audit_id,),
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
+
+    def save_pending_shadow_audit_capture(
+        self,
+        *,
+        audit_id: str,
+        mint: str,
+        strategy_id: str,
+        strategy_version: str,
+        quoted_at: datetime,
+    ) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO pending_shadow_audit_captures (
+                    audit_id, mint, strategy_id, strategy_version, quoted_at,
+                    status, created_at, closed_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    audit_id,
+                    mint,
+                    strategy_id,
+                    strategy_version,
+                    quoted_at.isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def bind_accepted_market_observation_to_pending_shadows(
+        self,
+        observation: AcceptedMarketObservation,
+    ) -> int:
+        if observation.fixture_only or observation.conflict_state != "clear" or observation.access_state != "ready":
+            return 0
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT audit_id
+                FROM pending_shadow_audit_captures
+                WHERE mint = ?
+                  AND strategy_id = ?
+                  AND strategy_version = ?
+                  AND status = 'pending'
+                  AND quoted_at < ?
+                """,
+                (
+                    observation.mint,
+                    observation.strategy_id,
+                    observation.strategy_version,
+                    observation.observed_at.isoformat(),
+                ),
+            ).fetchall()
+            inserted = 0
+            for row in rows:
+                audit_id = str(row["audit_id"])
+                binding_id = f"shadow_binding_{audit_id}_{observation.record_id}"
+                payload = {
+                    "binding_id": binding_id,
+                    "audit_id": audit_id,
+                    "market_observation_id": observation.record_id,
+                    "strategy_id": observation.strategy_id,
+                    "strategy_version": observation.strategy_version,
+                    "evidence_mode": "shadow",
+                    "role": "path",
+                    "created_at": created_at,
+                }
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO shadow_market_evidence_bindings (
+                        binding_id, audit_id, market_observation_id, strategy_id,
+                        strategy_version, evidence_mode, role, created_at, payload
+                    ) VALUES (?, ?, ?, ?, ?, 'shadow', 'path', ?, ?)
+                    """,
+                    (
+                        binding_id,
+                        audit_id,
+                        observation.record_id,
+                        observation.strategy_id,
+                        observation.strategy_version,
+                        created_at,
+                        json.dumps(payload),
+                    ),
+                )
+                inserted += cursor.rowcount
+        return inserted
+
+    def close_pending_shadow_audit_capture(self, audit_id: str, *, closed_at: datetime) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE pending_shadow_audit_captures
+                SET status = 'closed', closed_at = ?
+                WHERE audit_id = ? AND status = 'pending'
+                """,
+                (closed_at.isoformat(), audit_id),
+            )
 
     def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
         created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())

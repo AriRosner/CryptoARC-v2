@@ -2445,21 +2445,7 @@ class BotState:
         self,
         observation: AcceptedMarketObservation,
     ) -> int:
-        bound = 0
-        for audit in self.storage.load_live_execution_audits(500):
-            comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
-            if (
-                audit.action != "buy"
-                or audit.mint != observation.mint
-                or not bool(audit.quote.get("shadow_only"))
-                or comparison.get("mode") != "dry_run_shadow"
-                or comparison.get("status") == "evaluated"
-                or observation.observed_at <= audit.created_at
-            ):
-                continue
-            if self._bind_shadow_market_observation(audit, observation, role="path"):
-                bound += 1
-        return bound
+        return self.storage.bind_accepted_market_observation_to_pending_shadows(observation)
 
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
@@ -5937,6 +5923,8 @@ class BotState:
             if audit.shadow_comparison:
                 audit.shadow_comparison = self._evaluate_shadow_comparison(audit)
                 self._persist_economic_shadow_comparison(audit)
+                if audit.shadow_comparison.get("status") == "evaluated":
+                    self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=utc_now())
             updated = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
             if updated != original:
                 audit.updated_at = utc_now()
@@ -8632,6 +8620,13 @@ class BotState:
         audit.shadow_comparison = self._build_shadow_comparison(audit)
         if shadow_only and audit.shadow_comparison:
             self._bind_shadow_entry_market_evidence(audit)
+            self.storage.save_pending_shadow_audit_capture(
+                audit_id=audit.id,
+                mint=audit.mint,
+                strategy_id=str(audit.shadow_comparison.get("strategy_id") or ""),
+                strategy_version=str(audit.shadow_comparison.get("strategy_version") or ""),
+                quoted_at=audit.created_at,
+            )
         intent.quote_id = quote.id
         intent.audit_id = audit.id
         intent.status = "blocked" if blockers else "quoted"

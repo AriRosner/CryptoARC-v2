@@ -346,6 +346,14 @@ class ShadowEvaluationTests(unittest.TestCase):
             audit = state.storage.load_live_execution_audit(str(quoted["id"]))
             self.assertIsNotNone(audit)
 
+            for index in range(501):
+                unrelated_at = audit.created_at + timedelta(milliseconds=index + 1)
+                state.storage.save_live_execution_audit(LiveExecutionAudit(
+                    id=f"unrelated-newer-{index}", created_at=unrelated_at, updated_at=unrelated_at,
+                    action="sell", mint=f"unrelated-mint-{index}", amount="100%", status="ready",
+                    signer_mode="browser_wallet", wallet_public_key="OtherWallet",
+                ))
+
             state.ingest_source_event(LaunchEvent(
                 source="pumpportal", received_at=audit.created_at + timedelta(seconds=5),
                 raw_payload={"signature": "exit-source", "mint": token.mint, "txType": "sell", "price": 1.1},
