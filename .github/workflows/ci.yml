@@ -38,6 +38,22 @@ jobs:
         shell: pwsh
         run: ./scripts/audit-frontend.ps1 -Strict
 
+  mobile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+      - name: Install mobile dependencies
+        run: npm ci --legacy-peer-deps
+        working-directory: mobile
+      - name: Run mobile verification
+        shell: pwsh
+        run: ./scripts/verify-mobile.ps1
+
   docs:
     runs-on: ubuntu-latest
     steps:
