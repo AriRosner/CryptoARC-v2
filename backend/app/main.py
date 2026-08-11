@@ -185,6 +185,16 @@ class TradeGradeCorrectionRequest(BaseModel):
     note: str = Field(default="", max_length=1000)
 
 
+class StrategyCandidateRequest(BaseModel):
+    base_version: dict[str, object]
+    patch: dict[str, object]
+    evidence_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class StrategyCandidatePromotionRequest(BaseModel):
+    operator_intent_id: str = Field(min_length=1, max_length=200)
+
+
 class PaperRecoveryRequest(BaseModel):
     note: str = Field(default="operator stopped run", max_length=160)
 
@@ -1318,6 +1328,28 @@ async def correct_trade_grade(grade_id: str, payload: TradeGradeCorrectionReques
         return state.correct_trade_grade(grade_id, payload.operator_intent_id, payload.patch, payload.note)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/strategy-candidates", dependencies=[Depends(require_auth)])
+async def strategy_candidates() -> list[dict]:
+    return state.strategy_candidates()
+
+
+@app.post("/api/strategy-candidates", dependencies=[Depends(require_auth)])
+async def propose_strategy_candidate(payload: StrategyCandidateRequest) -> dict:
+    try:
+        return state.propose_strategy_candidate(payload.base_version, payload.patch, payload.evidence_ids)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/strategy-candidates/{candidate_id}/promote", dependencies=[Depends(require_auth)])
+async def promote_strategy_candidate(candidate_id: str, payload: StrategyCandidatePromotionRequest) -> dict:
+    result = state.promote_strategy_candidate(candidate_id, payload.operator_intent_id)
+    if not result.get("promoted"):
+        raise HTTPException(status_code=409, detail=str(result.get("blocker") or "promotion blocked"))
+    await broadcast_snapshot()
+    return result
 
 
 @app.get("/api/trade-review/queue", dependencies=[Depends(require_auth)])

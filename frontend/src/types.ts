@@ -1446,6 +1446,35 @@ export interface TradeGradeCorrection {
   note: string;
 }
 
+export interface StrategyCandidateValidation {
+  validation_id: string;
+  candidate_id: string;
+  created_at: string;
+  accepted: boolean;
+  blockers: string[];
+  metrics: Record<string, unknown>;
+}
+
+export interface StrategyCandidate {
+  candidate_id: string;
+  base_strategy_version: string;
+  proposed_strategy_version: string;
+  created_at: string;
+  patch: Record<string, unknown>;
+  evidence_ids: string[];
+  fingerprint: string;
+  validation: StrategyCandidateValidation | null;
+  active: boolean;
+}
+
+export interface StrategyCandidatePromotionResult {
+  candidate_id: string;
+  promoted: boolean;
+  blocker: string;
+  idempotent: boolean;
+  promotion_id: string;
+}
+
 export interface TradeReviewQueue {
   total_closed: number;
   labeled: number;

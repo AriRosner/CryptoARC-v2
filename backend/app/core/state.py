@@ -76,6 +76,7 @@ from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvi
 from app.core.strategy_contract import SniperStrategyVersion
 from app.core.shadow_evaluation import EconomicValidator
 from app.core.sentinel import Sentinel
+from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -4605,6 +4606,42 @@ class BotState:
 
     def trade_grade_corrections(self, trade_id: str) -> list[dict[str, object]]:
         return [item.to_dict() for item in self.storage.load_trade_grade_corrections(trade_id)]
+
+    def strategy_candidates(self) -> list[dict[str, object]]:
+        selection = self.storage.load_active_strategy_selection() or {}
+        rows: list[dict[str, object]] = []
+        for candidate in self.storage.load_strategy_candidates(100):
+            validation = self.storage.load_latest_candidate_validation(candidate.candidate_id)
+            rows.append(
+                {
+                    **candidate.to_dict(),
+                    "validation": validation.to_dict() if validation else None,
+                    "active": selection.get("candidate_id") == candidate.candidate_id,
+                }
+            )
+        return rows
+
+    def propose_strategy_candidate(
+        self,
+        base_version: dict[str, object],
+        patch: dict[str, object],
+        evidence_ids: list[str],
+    ) -> dict[str, object]:
+        candidate = CandidateFactory.propose(base_version, patch, tuple(evidence_ids), now=utc_now())
+        self.storage.save_strategy_candidate(candidate)
+        return candidate.to_dict()
+
+    def promote_strategy_candidate(self, candidate_id: str, operator_intent_id: str) -> dict[str, object]:
+        result = PromotionGate(self.storage).promote(
+            candidate_id,
+            operator_intent_id,
+            now=utc_now(),
+            active_session_id=self.active_live_session_id,
+        )
+        if result.promoted and not result.idempotent:
+            self._invalidate_readiness_cache()
+            self.add_event("warning", f"Strategy candidate selected; fresh validation required: {candidate_id}")
+        return result.to_dict()
 
     def trade_review_queue(self) -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
@@ -10661,7 +10698,8 @@ class BotState:
     def refresh_sentinel_verdict(self, now: datetime | None = None) -> dict[str, object]:
         """Assess bounded immutable evidence and publish no authority-bearing state."""
         assessed_at = now or utc_now()
-        strategy_version = self.current_settings_version_id or "unversioned"
+        active_selection = self.storage.load_active_strategy_selection() or {}
+        strategy_version = str(active_selection.get("strategy_version") or self.current_settings_version_id or "unversioned")
         observations = self.storage.load_accepted_market_observations(
             limit=100,
             strategy_version=strategy_version,

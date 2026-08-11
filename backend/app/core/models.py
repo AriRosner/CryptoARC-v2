@@ -836,6 +836,51 @@ class TradeGradeCorrection:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class StrategyCandidate:
+    candidate_id: str
+    base_strategy_version: str
+    proposed_strategy_version: str
+    created_at: datetime
+    patch: dict[str, Any]
+    evidence_ids: tuple[str, ...]
+    fingerprint: str
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateValidation:
+    validation_id: str
+    candidate_id: str
+    created_at: datetime
+    accepted: bool
+    blockers: tuple[str, ...]
+    metrics: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["blockers"] = list(self.blockers)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionResult:
+    candidate_id: str
+    promoted: bool
+    blocker: str = ""
+    idempotent: bool = False
+    promotion_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str

@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, CandidateValidation, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyCandidate, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 from app.core.model_classifier import ModelClassification
 
@@ -48,6 +48,9 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("trade_grades", "trade_grades"),
     ("trade_grade_corrections", "trade_grade_corrections"),
     ("model_classifications", "model_classifications"),
+    ("strategy_candidates", "strategy_candidates"),
+    ("candidate_validations", "candidate_validations"),
+    ("strategy_promotions", "strategy_promotions"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -55,7 +58,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 16
+    SCHEMA_VERSION = 17
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -86,6 +89,11 @@ class Storage:
         "trade_grade_corrections",
         "model_classifications",
         "model_classification_budget",
+        "strategy_candidates",
+        "candidate_validations",
+        "strategy_promotions",
+        "active_strategy_selection",
+        "strategy_validation_campaigns",
     )
     BACKUP_TABLES = (
         "settings",
@@ -118,6 +126,11 @@ class Storage:
         "trade_grade_corrections",
         "model_classifications",
         "model_classification_budget",
+        "strategy_candidates",
+        "candidate_validations",
+        "strategy_promotions",
+        "active_strategy_selection",
+        "strategy_validation_campaigns",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -250,6 +263,7 @@ class Storage:
             (14, "014_shadow_economic_comparisons", "all-cost versioned shadow comparisons", self._migration_014_shadow_economic_comparisons),
             (15, "015_sentinel_verdicts", "immutable expiring market sentinel verdicts", self._migration_015_sentinel_verdicts),
             (16, "016_trade_grading", "durable deterministic trade grading queue", self._migration_016_trade_grading),
+            (17, "017_strategy_candidates", "immutable strategy candidates and gated promotion", self._migration_017_strategy_candidates),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -794,6 +808,68 @@ class Storage:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_model_classifications_trade ON model_classifications(trade_id, created_at DESC)"
+        )
+
+    def _migration_017_strategy_candidates(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                base_strategy_version TEXT NOT NULL,
+                proposed_strategy_version TEXT NOT NULL UNIQUE,
+                fingerprint TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS candidate_validations (
+                validation_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                accepted INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_candidate_validations_latest ON candidate_validations(candidate_id, created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_promotions (
+                promotion_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                validation_id TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS active_strategy_selection (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                candidate_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                promotion_id TEXT NOT NULL,
+                operator_intent_id TEXT NOT NULL,
+                selected_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_validation_campaigns (
+                campaign_id TEXT PRIMARY KEY,
+                candidate_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
         )
 
     def schema_status(self) -> dict[str, Any]:
@@ -1512,6 +1588,107 @@ class Storage:
                     "SELECT payload FROM model_classifications ORDER BY created_at DESC LIMIT ?", (bounded,)
                 ).fetchall()
         return [ModelClassification(**json.loads(row["payload"])) for row in rows]
+
+    def save_strategy_candidate(self, candidate: StrategyCandidate) -> bool:
+        serialized = json.dumps(candidate.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM strategy_candidates WHERE candidate_id = ?", (candidate.candidate_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("strategy candidate already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO strategy_candidates (candidate_id, base_strategy_version, proposed_strategy_version, fingerprint, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (candidate.candidate_id, candidate.base_strategy_version, candidate.proposed_strategy_version, candidate.fingerprint, candidate.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_strategy_candidate(self, candidate_id: str) -> StrategyCandidate | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM strategy_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+        return self._strategy_candidate_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_strategy_candidates(self, limit: int = 100) -> list[StrategyCandidate]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM strategy_candidates ORDER BY created_at DESC LIMIT ?", (max(1, min(500, limit)),)
+            ).fetchall()
+        return [self._strategy_candidate_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def save_candidate_validation(self, validation: CandidateValidation) -> bool:
+        serialized = json.dumps(validation.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM candidate_validations WHERE validation_id = ?", (validation.validation_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("candidate validation already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO candidate_validations (validation_id, candidate_id, accepted, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (validation.validation_id, validation.candidate_id, 1 if validation.accepted else 0, validation.created_at.isoformat(), serialized),
+            )
+        return True
+
+    def load_latest_candidate_validation(self, candidate_id: str) -> CandidateValidation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM candidate_validations WHERE candidate_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+        return self._candidate_validation_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_active_strategy_selection(self) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute("SELECT payload FROM active_strategy_selection WHERE id = 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def promote_strategy_candidate(
+        self,
+        candidate: StrategyCandidate,
+        validation: CandidateValidation,
+        promotion_id: str,
+        operator_intent_id: str,
+        now: datetime,
+    ) -> bool:
+        payload = {
+            "promotion_id": promotion_id,
+            "candidate_id": candidate.candidate_id,
+            "strategy_version": candidate.proposed_strategy_version,
+            "validation_id": validation.validation_id,
+            "operator_intent_id": operator_intent_id,
+            "selected_at": now.isoformat(),
+            "validation_campaign_status": "required",
+            "sentinel_status": "invalidated",
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            latest = connection.execute(
+                "SELECT validation_id, accepted FROM candidate_validations WHERE candidate_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (candidate.candidate_id,),
+            ).fetchone()
+            if latest is None or str(latest["validation_id"]) != validation.validation_id or not bool(latest["accepted"]):
+                return False
+            existing = connection.execute("SELECT payload FROM strategy_promotions WHERE promotion_id = ?", (promotion_id,)).fetchone()
+            if existing:
+                return json.dumps(json.loads(existing["payload"]), sort_keys=True) == serialized
+            connection.execute(
+                "INSERT INTO strategy_promotions (promotion_id, candidate_id, validation_id, operator_intent_id, created_at, payload) VALUES (?, ?, ?, ?, ?, ?)",
+                (promotion_id, candidate.candidate_id, validation.validation_id, operator_intent_id, now.isoformat(), serialized),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO active_strategy_selection (id, candidate_id, strategy_version, promotion_id, operator_intent_id, selected_at, payload) VALUES (1, ?, ?, ?, ?, ?, ?)",
+                (candidate.candidate_id, candidate.proposed_strategy_version, promotion_id, operator_intent_id, now.isoformat(), serialized),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO strategy_validation_campaigns (campaign_id, candidate_id, strategy_version, status, created_at) VALUES (?, ?, ?, 'required', ?)",
+                (f"campaign_{promotion_id}", candidate.candidate_id, candidate.proposed_strategy_version, now.isoformat()),
+            )
+        return True
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -3988,6 +4165,18 @@ class Storage:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         allowed = set(TradeGradeCorrection.__dataclass_fields__.keys())
         return TradeGradeCorrection(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _strategy_candidate_from_payload(self, payload: dict[str, Any]) -> StrategyCandidate:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["evidence_ids"] = tuple(payload.get("evidence_ids") or ())
+        allowed = set(StrategyCandidate.__dataclass_fields__.keys())
+        return StrategyCandidate(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _candidate_validation_from_payload(self, payload: dict[str, Any]) -> CandidateValidation:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["blockers"] = tuple(payload.get("blockers") or ())
+        allowed = set(CandidateValidation.__dataclass_fields__.keys())
+        return CandidateValidation(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

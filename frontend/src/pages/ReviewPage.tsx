@@ -14,8 +14,8 @@ import { Badge } from "../components/Badge";
 import { Button } from "../components/Button";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import { fetchTradeGrades } from "../api";
-import type { PerformanceAnalytics, SettingsVersion, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
+import { fetchStrategyCandidates, fetchTradeGrades, promoteStrategyCandidate } from "../api";
+import type { PerformanceAnalytics, SettingsVersion, StrategyCandidate, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
 
 interface ReviewPageProps {
   trades: TradeRecord[];
@@ -169,6 +169,8 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   const [search, setSearch] = React.useState("");
   const [activeQueueId, setActiveQueueId] = React.useState("unlabeled");
   const [selectedGrade, setSelectedGrade] = React.useState<TradeGrade | null>(null);
+  const [candidates, setCandidates] = React.useState<StrategyCandidate[]>([]);
+  const [candidateStatus, setCandidateStatus] = React.useState("");
   const tokenById = React.useMemo(() => new Map(tokens.map((token) => [token.id, token])), [tokens]);
   const labelByTokenId = React.useMemo(() => new Map(labels.map((label) => [label.token_id, label.label])), [labels]);
   const selectedTrade = detail?.trade ?? trades.find((trade) => trade.token_id === selectedTradeId) ?? null;
@@ -223,6 +225,25 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
     return () => { active = false; };
   }, [selectedTrade?.id]);
 
+  const refreshCandidates = React.useCallback(() => {
+    fetchStrategyCandidates().then(setCandidates).catch(() => setCandidates([]));
+  }, []);
+
+  React.useEffect(() => { refreshCandidates(); }, [refreshCandidates]);
+
+  const handlePromoteCandidate = React.useCallback(async (candidate: StrategyCandidate) => {
+    if (!window.confirm(`Select ${candidate.proposed_strategy_version} as the active strategy and require a fresh validation campaign?`)) return;
+    setCandidateStatus("Recording explicit promotion intent...");
+    try {
+      const intentId = `dashboard-${window.crypto?.randomUUID?.() ?? Date.now()}`;
+      await promoteStrategyCandidate(candidate.candidate_id, intentId);
+      setCandidateStatus("Candidate selected; Sentinel invalidated and fresh validation required.");
+      refreshCandidates();
+    } catch (error) {
+      setCandidateStatus(error instanceof Error ? error.message : "Promotion blocked");
+    }
+  }, [refreshCandidates]);
+
   React.useEffect(() => {
     if (!reviewQueue?.queues.some((queue) => queue.id === activeQueueId)) {
       setActiveQueueId(reviewQueue?.next_queue_id || "unlabeled");
@@ -235,6 +256,26 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
         title="Trade Review"
         description="Inspect paper executions, decision evidence, and tuning opportunities trade by trade."
       />
+
+      {candidates.length ? (
+        <Card className="p-4" hover={false}>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div><h3 className="text-xs font-black uppercase tracking-widest text-zinc-500">Immutable Strategy Candidates</h3><p className="mt-1 text-[11px] text-zinc-500">Promotion is explicit, audited, inactive-session-only, and resets validation readiness.</p></div>
+            <Badge variant={candidates.some((candidate) => candidate.active) ? "warning" : "info"}>{candidates.length} candidates</Badge>
+          </div>
+          <div className="grid gap-2 lg:grid-cols-2">
+            {candidates.slice(0, 6).map((candidate) => (
+              <div key={candidate.candidate_id} className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-[11px]">
+                <div className="flex items-center justify-between gap-3"><span className="font-black text-zinc-300">{candidate.proposed_strategy_version}</span><Badge variant={candidate.active ? "warning" : candidate.validation?.accepted ? "success" : "danger"}>{candidate.active ? "fresh validation required" : candidate.validation?.accepted ? "validated" : "blocked"}</Badge></div>
+                <div className="mt-2 text-[10px] text-zinc-600">{candidate.evidence_ids.length} evidence IDs · {candidate.fingerprint.slice(0, 12)}</div>
+                {candidate.validation?.blockers.slice(0, 2).map((blocker) => <div key={blocker} className="mt-1 text-rose-300">{blocker.replace(/_/g, " ")}</div>)}
+                {!candidate.active && candidate.validation?.accepted ? <Button className="mt-3" variant="secondary" size="sm" onClick={() => handlePromoteCandidate(candidate)}>Promote with explicit intent</Button> : null}
+              </div>
+            ))}
+          </div>
+          {candidateStatus ? <p className="mt-3 text-[11px] text-amber-200">{candidateStatus}</p> : null}
+        </Card>
+      ) : null}
 
       {loading && !reviewQueue ? (
         <ReviewQueueSkeleton />
