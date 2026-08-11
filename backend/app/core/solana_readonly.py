@@ -27,7 +27,7 @@ class SolanaReadOnlyClient:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"RPC request failed: {exc}") from exc
+            raise RuntimeError("RPC request failed") from exc
         if "error" in body:
             message = body["error"].get("message", "unknown RPC error") if isinstance(body["error"], dict) else str(body["error"])
             raise RuntimeError(message)

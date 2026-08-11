@@ -219,10 +219,10 @@ class Storage:
                 "startup_error": "",
                 "startup_completed_at": datetime.now(timezone.utc).isoformat(),
             }
-        except Exception as exc:
+        except Exception:
             self._migration_status = {
                 "status": "failed",
-                "startup_error": f"{exc.__class__.__name__}: {exc}",
+                "startup_error": "Database schema migration failed.",
                 "startup_completed_at": datetime.now(timezone.utc).isoformat(),
             }
             raise
@@ -1303,8 +1303,8 @@ class Storage:
                     self._migration_status = original_migration_status
                 except Exception as rollback_exc:
                     raise RuntimeError(
-                        f"Restore failed and atomic safety rollback failed: {rollback_exc.__class__.__name__}: {rollback_exc}"
-                    ) from exc
+                        "Restore failed and atomic safety rollback failed."
+                    ) from rollback_exc
             raise
         finally:
             if temp_path.exists():

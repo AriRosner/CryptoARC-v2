@@ -283,11 +283,11 @@ class HotWalletVault:
                 "error": "" if err is None else json.dumps(err),
                 "result": value,
             }
-        except Exception as exc:
+        except Exception:
             return {
                 "ok": False,
                 "warning": "",
-                "error": f"{exc.__class__.__name__}: {exc}",
+                "error": "Transaction simulation failed.",
                 "result": {},
             }
 

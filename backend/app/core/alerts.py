@@ -71,8 +71,8 @@ class AlertRouter:
             return self._record("throttled", "alert recently sent", key)
         try:
             ok, detail = self.sender(self.telegram_bot_token, self.telegram_chat_id, safe_message)
-        except Exception as exc:
-            return self._record("error", f"{exc.__class__.__name__}: {exc}", key)
+        except Exception:
+            return self._record("error", "Telegram alert delivery failed.", key)
         self.sent_at[key] = now
         return self._record("sent" if ok else "error", self._safe_message(detail)[:500], key)
 
