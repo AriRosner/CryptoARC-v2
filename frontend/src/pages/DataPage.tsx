@@ -1856,12 +1856,12 @@ export const DataPage: React.FC<DataPageProps> = ({
                       <div className="space-y-2">
                         <div className="grid grid-cols-3 gap-2">
                           <div className="rounded-lg bg-black/20 p-2">
-                            <span className="text-zinc-500">Direct</span>
-                            <div className="font-black text-white">{solanaLogsVerification.summary.direct_events}</div>
+                            <span className="text-zinc-500">Direct creates</span>
+                            <div className="font-black text-white">{solanaLogsVerification.summary.direct_create_hints}</div>
                           </div>
                           <div className="rounded-lg bg-black/20 p-2">
-                            <span className="text-zinc-500">Matches</span>
-                            <div className="font-black text-emerald-300">{solanaLogsVerification.summary.matches}</div>
+                            <span className="text-zinc-500">Create matches</span>
+                            <div className="font-black text-emerald-300">{solanaLogsVerification.summary.create_matches}</div>
                           </div>
                           <div className="rounded-lg bg-black/20 p-2">
                             <span className="text-zinc-500">Review</span>
