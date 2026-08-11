@@ -2652,7 +2652,9 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(promoted["source"], "paper_promoted")
             self.assertIn("Automatic shadow quote failed", " ".join(promoted["warnings"]))
             self.assertEqual(refreshed_token.quote_shadow_status, "quote_failed")
-            self.assertIn("quote provider unavailable", " ".join(refreshed_token.decision_log))
+            decision_log = " ".join(refreshed_token.decision_log)
+            self.assertIn("Shadow quote provider request failed", decision_log)
+            self.assertNotIn("quote provider unavailable", decision_log)
 
     def test_simulation_accuracy_report_compares_paper_shadow_and_live(self) -> None:
         with TemporaryDirectory() as directory:

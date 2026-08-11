@@ -52,11 +52,11 @@ def process_one(
                 )
                 for result in results:
                     storage.save_model_classification(result)
-    except Exception as exc:
+    except Exception:
         storage.fail_trade_review(
             job.job_id,
             job.claim_id,
-            f"{exc.__class__.__name__}: {exc}",
+            "Trade grading failed.",
             max_attempts=max_attempts,
         )
     return True

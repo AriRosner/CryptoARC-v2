@@ -804,10 +804,10 @@ class BotState:
             rent = self.live_rent_recovery_scan(wallet) if wallet else {}
             rent_status = "ready" if rent.get("eligible_count") else "clear"
             rent_error = ""
-        except Exception as exc:
+        except Exception:
             rent = {}
             rent_status = "unavailable"
-            rent_error = f"{exc.__class__.__name__}: {exc}"
+            rent_error = "Rent recovery scan failed."
         signer = self.signer_status(
             self.settings.live_signer_mode,
             wallet,
@@ -1216,11 +1216,9 @@ class BotState:
                 )
             try:
                 scan = self.live_rent_recovery_scan(wallet) if wallet else {}
-            except Exception as exc:
+            except Exception:
                 scan = {}
-                blockers.append(
-                    f"rent recovery RPC scan failed: {exc.__class__.__name__}: {exc}"
-                )
+                blockers.append("rent recovery RPC scan failed")
             eligible = {
                 str(row.get("token_account") or ""): row
                 for row in scan.get("eligible_accounts", [])
@@ -3952,8 +3950,8 @@ class BotState:
                     "stale": False,
                     "error": "",
                 }
-            except Exception as exc:
-                errors.append(f"{source}: {exc.__class__.__name__}: {exc}")
+            except Exception:
+                errors.append(f"{source}: market price request failed")
         return {
             "symbol": "SOL",
             "currency": "USD",
@@ -6997,8 +6995,8 @@ class BotState:
             result["health"] = client.health()
             if self.settings.watch_wallet_address.strip():
                 result["balance_sol"] = client.balance_sol(self.settings.watch_wallet_address)
-        except Exception as exc:
-            result["error"] = f"{exc.__class__.__name__}: {exc}"
+        except Exception:
+            result["error"] = "Solana RPC status check failed."
         return result
 
     def signer_status(self, mode: str = "browser_wallet", wallet_public_key: str = "") -> dict[str, object]:
@@ -8114,8 +8112,8 @@ class BotState:
             balance = 0.0
             try:
                 balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet, mint) or 0.0
-            except Exception as exc:
-                warning = f"{exc.__class__.__name__}: {exc}"
+            except Exception:
+                warning = "Wallet token balance check failed."
             positions.append(
                 LivePosition(
                     mint=mint,
@@ -8390,11 +8388,11 @@ class BotState:
                         shadow_only=True,
                     )
                     updated_candidates.append(self.storage.load_live_intent(intent.id) or intent)
-                except Exception as exc:
-                    intent.warnings.append(f"Automatic shadow quote failed: {exc}")
+                except Exception:
+                    intent.warnings.append("Automatic shadow quote failed.")
                     intent.updated_at = utc_now()
                     self.storage.save_live_intent(intent)
-                    self._record_shadow_quote_failure_for_token(intent.mint, str(exc))
+                    self._record_shadow_quote_failure_for_token(intent.mint, "Shadow quote provider request failed.")
                     updated_candidates.append(intent)
             else:
                 updated_candidates.append(intent)
@@ -9003,9 +9001,9 @@ class BotState:
                 if after != before:
                     updated += 1
                 recovered.append(result)
-            except Exception as exc:
+            except Exception:
                 checked += 1
-                errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
+                errors.append(f"{audit.id}: recovery failed")
         summary = {
             "checked": checked,
             "updated": updated,
@@ -9049,9 +9047,9 @@ class BotState:
                     updated += 1
                 if str(result.get("status", "")) == "needs_review":
                     needs_review += 1
-            except Exception as exc:
+            except Exception:
                 checked += 1
-                errors.append(f"{audit.id}: {exc.__class__.__name__}: {exc}")
+                errors.append(f"{audit.id}: recovery failed")
         summary = {"checked": checked, "updated": updated, "needs_review": needs_review, "max_recovery_attempts": self.live_recovery_max_attempts, "errors": errors, "skipped": checked == 0, "reason": ""}
         self.live_last_poll_at = utc_now()
         self.live_last_poll_summary = summary
@@ -9140,8 +9138,8 @@ class BotState:
                 executed.append({"intent_id": intent.id, "audit_id": str(result.get("id") or audit["id"]), "status": str(result.get("status") or "")})
                 if intent.action == "buy":
                     break
-            except Exception as exc:
-                self.add_event("warning", f"Autonomous {intent.action} failed for {intent.symbol or intent.mint[:8]}: {exc}", subsystem="live")
+            except Exception:
+                self.add_event("warning", f"Autonomous {intent.action} failed for {intent.symbol or intent.mint[:8]}", subsystem="live")
         return {"status": "ok", "generated": len(generated), "executed": executed}
 
     def _pilot_runtime_blockers(
@@ -9533,21 +9531,21 @@ class BotState:
                 "destination_wallet": destination,
                 "realized_pnl_sol": round(realized_pnl, 9),
             }
-        except Exception as exc:
+        except Exception:
             audit.status = "failed"
             audit.final_status = "failed"
-            audit.errors.append(f"{exc.__class__.__name__}: {exc}")
+            audit.errors.append("Profit sweep execution failed.")
             audit.recommended_action = "Review the local hot wallet, destination, RPC, and vault sweep settings before retrying."
             audit.updated_at = utc_now()
             self.storage.save_live_execution_audit(audit)
-            return {"status": "failed", "reason": f"{exc.__class__.__name__}: {exc}", "audit": audit.to_dict()}
+            return {"status": "failed", "reason": "Profit sweep execution failed.", "audit": audit.to_dict()}
 
     def _wallet_sol_balance(self, wallet_public_key: str) -> dict[str, object]:
         try:
             balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).balance_sol(wallet_public_key)
             return {"wallet_public_key": wallet_public_key, "balance_sol": float(balance or 0.0), "error": ""}
-        except Exception as exc:
-            return {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": f"{exc.__class__.__name__}: {exc}"}
+        except Exception:
+            return {"wallet_public_key": wallet_public_key, "balance_sol": 0.0, "error": "Solana RPC balance check failed."}
 
     def live_wallet_balance(self, wallet_public_key: str) -> dict[str, object]:
         wallet = wallet_public_key.strip()
@@ -9723,8 +9721,8 @@ class BotState:
         try:
             balance = SolanaReadOnlyClient(self.settings.solana_rpc_url).token_balance(wallet_public_key, mint)
             return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": balance, "error": "", "checked_at": checked_at}
-        except Exception as exc:
-            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": f"{exc.__class__.__name__}: {exc}", "checked_at": checked_at}
+        except Exception:
+            return {"wallet_public_key": wallet_public_key, "mint": mint, "token_balance": None, "error": "Solana RPC token balance check failed.", "checked_at": checked_at}
 
     def live_rent_recovery_scan(self, wallet_public_key: str) -> dict[str, object]:
         wallet = wallet_public_key.strip()
@@ -9879,8 +9877,8 @@ class BotState:
                 "confirmations": status.get("confirmations"),
                 "err": status.get("err"),
             }
-        except Exception as exc:
-            return {"ok": False, "found": False, "confirmation_status": "", "signature": signature, "error": f"{exc.__class__.__name__}: {exc}"}
+        except Exception:
+            return {"ok": False, "found": False, "confirmation_status": "", "signature": signature, "error": "Transaction status lookup failed."}
 
     def _transaction_details(self, signature: str) -> dict[str, object]:
         signature = signature.strip()
@@ -9902,8 +9900,8 @@ class BotState:
             if not transaction:
                 return {"ok": True, "found": False, "signature": signature, "error": "transaction not found"}
             return {"ok": True, "found": True, "signature": signature, "transaction": transaction}
-        except Exception as exc:
-            return {"ok": False, "found": False, "signature": signature, "error": f"{exc.__class__.__name__}: {exc}"}
+        except Exception:
+            return {"ok": False, "found": False, "signature": signature, "error": "Transaction detail lookup failed."}
 
     def _append_unique(self, values: list[str], value: str) -> None:
         clean = str(value or "").strip()
@@ -9941,8 +9939,8 @@ class BotState:
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 body = response.read()
-        except urllib.error.URLError as exc:
-            return payload, "", f"PumpPortal quote failed: {exc}"
+        except urllib.error.URLError:
+            return payload, "", "PumpPortal quote request failed."
         return payload, base64.b64encode(body).decode("ascii"), ""
 
     def _require_live_audit(self, audit_id: str) -> LiveExecutionAudit:
