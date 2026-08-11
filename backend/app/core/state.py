@@ -5888,6 +5888,18 @@ class BotState:
             or policy.settings_version != strategy_version
         ):
             return False
+        settings_version = self.storage.load_settings_version(strategy_version)
+        if settings_version is None:
+            return False
+        settings_payload = asdict(BotSettings())
+        settings_payload.update(
+            {
+                key: value
+                for key, value in settings_version.settings.items()
+                if key in settings_payload
+            }
+        )
+        captured_settings = BotSettings(**settings_payload)
         quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
         market_rows = [
             item
@@ -5895,6 +5907,7 @@ class BotState:
             if item.mint == audit.mint
             and item.strategy_id == strategy_id
             and item.strategy_version == strategy_version
+            and item.evidence_mode == "shadow"
             and item.access_state == "ready"
             and item.price is not None
             and item.price > 0
@@ -5923,7 +5936,7 @@ class BotState:
         ]
         amount_sol = self._audit_amount_sol(audit)
         exit_price, _exit_source, completed_at, exit_reason, partial_realized = self._shadow_exit_from_observations(
-            float(entry.price), quoted_at, observations, amount_sol
+            float(entry.price), quoted_at, observations, amount_sol, settings=captured_settings
         )
         if not exit_price or completed_at is None:
             return False
@@ -5933,7 +5946,7 @@ class BotState:
             return False
         move_pct = ((exit_price - float(entry.price)) / max(float(entry.price), 0.000000001)) * 100
         gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
-        costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
+        costs = self._shadow_quote_cost_breakdown(audit, amount_sol, settings=captured_settings)
         evidence_ids = tuple(dict.fromkeys([entry.record_id, *[item.record_id for item in used_exit_rows]]))
         comparison["economic_evidence"] = {
             "entry_market_evidence_id": entry.record_id,
@@ -5971,12 +5984,19 @@ class BotState:
             return False
         return self.storage.save_shadow_comparison(shadow)
 
-    def _shadow_quote_cost_breakdown(self, audit: LiveExecutionAudit, amount_sol: float) -> dict[str, float]:
+    def _shadow_quote_cost_breakdown(
+        self,
+        audit: LiveExecutionAudit,
+        amount_sol: float,
+        *,
+        settings: BotSettings | None = None,
+    ) -> dict[str, float]:
+        active_settings = settings or self.settings
         priority_fee = float(audit.quote.get("priority_fee_sol", 0.0) or 0.0) if isinstance(audit.quote, dict) else 0.0
-        fee_rate = float(self.settings.paper_fee_bps or 0.0) / 10000
+        fee_rate = float(active_settings.paper_fee_bps or 0.0) / 10000
         entry_fee = amount_sol * fee_rate
         exit_fee = amount_sol * fee_rate
-        impact_drag = amount_sol * (float(self.settings.paper_price_impact_pct or 0.0) / 100)
+        impact_drag = amount_sol * (float(active_settings.paper_price_impact_pct or 0.0) / 100)
         total_fee_drag = entry_fee + exit_fee
         return {
             "amount_sol": round(amount_sol, 9),
@@ -6329,7 +6349,10 @@ class BotState:
         quoted_at: datetime,
         observations: list[PriceObservation],
         amount_sol: float,
+        *,
+        settings: BotSettings | None = None,
     ) -> tuple[float | None, str, datetime | None, str, float]:
+        active_settings = settings or self.settings
         highest_move = 0.0
         partial_realized = 0.0
         partial_taken = False
@@ -6344,26 +6367,26 @@ class BotState:
             move_pct = ((price - entry_price) / max(entry_price, 0.000000001)) * 100
             highest_move = max(highest_move, move_pct)
             hold_seconds = max(0, int((observation.observed_at - quoted_at).total_seconds()))
-            if self.settings.partial_take_profit_enabled and not partial_taken and move_pct >= self.settings.partial_take_profit_pct:
-                fraction = max(0.0, min(1.0, self.settings.partial_take_profit_fraction))
+            if active_settings.partial_take_profit_enabled and not partial_taken and move_pct >= active_settings.partial_take_profit_pct:
+                fraction = max(0.0, min(1.0, active_settings.partial_take_profit_fraction))
                 partial_realized = round(amount_sol * (move_pct / 100) * fraction, 6)
                 partial_taken = True
-            if hold_seconds < self.settings.minimum_hold_time_seconds:
+            if hold_seconds < active_settings.minimum_hold_time_seconds:
                 continue
             reason = ""
-            if move_pct >= self.settings.take_profit_pct:
+            if move_pct >= active_settings.take_profit_pct:
                 reason = "take profit"
-            elif self.settings.trailing_stop_enabled and highest_move >= self.settings.partial_take_profit_pct and move_pct <= highest_move - self.settings.trailing_stop_pct:
+            elif active_settings.trailing_stop_enabled and highest_move >= active_settings.partial_take_profit_pct and move_pct <= highest_move - active_settings.trailing_stop_pct:
                 reason = "trailing stop"
-            elif self.settings.break_even_stop_enabled and highest_move >= self.settings.break_even_after_profit_pct and move_pct <= 0:
+            elif active_settings.break_even_stop_enabled and highest_move >= active_settings.break_even_after_profit_pct and move_pct <= 0:
                 reason = "break-even stop"
-            elif self.settings.stalled_trade_exit_enabled and hold_seconds >= self.settings.stalled_trade_seconds and abs(move_pct) <= self.settings.stalled_trade_min_move_pct:
+            elif active_settings.stalled_trade_exit_enabled and hold_seconds >= active_settings.stalled_trade_seconds and abs(move_pct) <= active_settings.stalled_trade_min_move_pct:
                 reason = "stalled trade"
-            elif move_pct <= -abs(self.settings.stop_loss_pct):
+            elif move_pct <= -abs(active_settings.stop_loss_pct):
                 reason = "stop loss"
-            elif hold_seconds >= self.settings.max_hold_time_seconds:
+            elif hold_seconds >= active_settings.max_hold_time_seconds:
                 reason = "max hold time"
-            elif ticks >= self.settings.max_position_ticks:
+            elif ticks >= active_settings.max_position_ticks:
                 reason = "max position ticks"
             if reason:
                 return price, observation.price_source, observation.observed_at, reason, partial_realized
@@ -8739,6 +8762,12 @@ class BotState:
                 or str(captured_window.get("policy_id") or "") != audit.pilot_risk_policy_id
             ):
                 raise ValueError("cannot submit autonomous audit after pilot window authority changed")
+            runtime_stop = self._enforce_pilot_runtime_guard()
+            if runtime_stop is not None:
+                raise ValueError(
+                    "cannot submit autonomous audit after pilot runtime stop: "
+                    + "; ".join(str(item) for item in runtime_stop.get("blockers", [])[:4])
+                )
         active_pilot_policy = self.storage.load_latest_pilot_risk_policy()
         captured_pilot_policy = audit.caps_snapshot.get("pilot_risk_policy") if isinstance(audit.caps_snapshot, dict) else None
         if audit.action == "buy" and active_pilot_policy is not None:

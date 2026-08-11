@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.core.autonomous_pilot import AutonomousPilotGate, PilotStopEvaluator
+from app.core.models import LiveExecutionAudit
 from app.core.pilot_risk import PilotRiskPolicy
 from app.core.state import BotState
 
@@ -149,7 +150,12 @@ class PilotStopEvaluatorTests(unittest.TestCase):
 
 
 class AutonomousPilotIntegrationTests(unittest.TestCase):
-    def configured_runtime(self, temp_dir: str) -> tuple[BotState, dict[str, object], PilotRiskPolicy]:
+    def configured_runtime(
+        self,
+        temp_dir: str,
+        *,
+        window_ends_at: datetime | None = None,
+    ) -> tuple[BotState, dict[str, object], PilotRiskPolicy]:
         state = BotState(str(Path(temp_dir) / "pilot.db"))
         policy = PilotRiskPolicy.create(
             Decimal("200"), Decimal("0.4"), NOW - timedelta(minutes=10),
@@ -161,7 +167,8 @@ class AutonomousPilotIntegrationTests(unittest.TestCase):
             "window_id": "runtime-window", "status": "OPEN", "eligible": True, "opened": True,
             "wallet_public_key": WALLET, "signer_mode": SIGNER_MODE, "signer_identity_id": SIGNER_ID,
             "policy_id": policy.policy_id, "manual_proof_id": "manual-proof-1", "attended": True,
-            "starts_at": (NOW - timedelta(minutes=2)).isoformat(), "ends_at": (NOW + timedelta(minutes=20)).isoformat(),
+            "starts_at": (NOW - timedelta(minutes=2)).isoformat(),
+            "ends_at": (window_ends_at or NOW + timedelta(minutes=20)).isoformat(),
         }
         state.storage.save_autonomous_pilot_window(window)
         state.settings.live_active_backend_armed = True
@@ -235,6 +242,31 @@ class AutonomousPilotIntegrationTests(unittest.TestCase):
             self.assertTrue(persisted_settings.kill_switch_enabled)
             self.assertFalse(persisted_settings.live_active_backend_armed)
             self.assertEqual(persisted_settings.live_active_wallet_public_key, "")
+
+    def test_expired_window_submit_closes_authority_before_signer_invocation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state, window, policy = self.configured_runtime(
+                temp_dir, window_ends_at=datetime.now(timezone.utc) - timedelta(seconds=1)
+            )
+            audit = LiveExecutionAudit(
+                id="expired-submit", created_at=NOW - timedelta(seconds=10), updated_at=NOW,
+                action="buy", mint="mint-1", amount="0.01", status="ready",
+                signer_mode=SIGNER_MODE, wallet_public_key=WALLET,
+                quote={"unsigned_transaction_base64": "dHgi"},
+                pilot_risk_policy_id=policy.policy_id,
+                autonomous_pilot_window_id=str(window["window_id"]),
+            )
+            state.storage.save_live_execution_audit(audit)
+            signer_calls: list[str] = []
+            state.hot_wallet.simulate_and_submit = lambda *args, **kwargs: signer_calls.append("called") or {}  # type: ignore[method-assign]
+
+            with self.assertRaisesRegex(ValueError, "pilot runtime stop"):
+                state.live_submit(audit.id, "")
+
+            self.assertEqual(signer_calls, [])
+            self.assertEqual(state.storage.load_latest_autonomous_pilot_window()["status"], "CLOSED")
+            self.assertTrue(state.storage.load_settings().kill_switch_enabled)
+            self.assertFalse(state.storage.load_settings().live_active_backend_armed)
 
 
 if __name__ == "__main__":

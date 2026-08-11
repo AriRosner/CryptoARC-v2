@@ -4005,6 +4005,14 @@ class Storage:
             ).fetchall()
         return [self._settings_version_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def load_settings_version(self, version_id: str) -> SettingsVersion | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM settings_versions WHERE id = ?",
+                (version_id,),
+            ).fetchone()
+        return self._settings_version_from_payload(json.loads(row["payload"])) if row else None
+
     def count_settings_versions(self) -> int:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM settings_versions").fetchone()

@@ -236,6 +236,12 @@ class ShadowEvaluationTests(unittest.TestCase):
     def test_evaluated_runtime_shadow_is_persisted_with_genuine_source_and_usd_reference(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 5
+            state.settings.paper_fee_bps = 100
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "captured shadow rules", ["take_profit_pct", "paper_fee_bps"]
+            )
             policy = PilotRiskPolicy.create(
                 Decimal("200"), Decimal("0.4"), NOW - timedelta(minutes=10),
                 reference_observation_id="sol-usd-1", settings_version=state.current_settings_version_id,
@@ -263,6 +269,13 @@ class ShadowEvaluationTests(unittest.TestCase):
                 },
             )
 
+            state.storage.save_accepted_market_observation(AcceptedMarketObservation(
+                record_id="market-paper-entry", created_at=NOW - timedelta(minutes=3), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                evidence_mode="paper", source="pumpportal", source_event_id="source-paper-entry",
+                observed_at=NOW - timedelta(minutes=3), received_at=NOW - timedelta(minutes=3),
+                mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
+            ))
             self.assertFalse(state._persist_economic_shadow_comparison(audit))
             state.storage.save_accepted_market_observation(AcceptedMarketObservation(
                 record_id="market-entry", created_at=NOW - timedelta(minutes=3), schema_version=1,
@@ -271,12 +284,16 @@ class ShadowEvaluationTests(unittest.TestCase):
                 observed_at=NOW - timedelta(minutes=3), received_at=NOW - timedelta(minutes=3),
                 mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
             ))
+            state.settings.take_profit_pct = 50
+            state.settings.paper_fee_bps = 900
             self.assertTrue(state._persist_economic_shadow_comparison(audit))
             self.assertFalse(state._persist_economic_shadow_comparison(audit))
             stored = state.storage.load_shadow_comparisons(limit=10)
             self.assertEqual(stored[0].source_evidence_ids, ("market-entry", "market-exit"))
             self.assertEqual(stored[0].reference_usd_per_sol, 200.0)
             self.assertFalse(stored[0].fixture_only)
+            self.assertEqual(stored[0].exit_reason, "take profit")
+            self.assertAlmostEqual(stored[0].costs.base_fee_sol, 0.0002)
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["entry_market_evidence_id"], "market-entry")
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["exit_market_evidence_id"], "market-exit")
 
