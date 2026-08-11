@@ -365,10 +365,12 @@ export interface SolanaLogsVerificationReport {
   mentions_address_configured: boolean;
   summary: {
     direct_events: number;
+    failed_direct_events: number;
     pumpportal_events: number;
     direct_create_hints: number;
     decoded_create_events: number;
     matches: number;
+    create_matches: number;
     unmatched_direct: number;
     unmatched_pumpportal: number;
     conflicts: number;
@@ -377,6 +379,7 @@ export interface SolanaLogsVerificationReport {
   unmatched_direct: Array<Record<string, unknown>>;
   unmatched_pumpportal: Array<Record<string, unknown>>;
   conflicts: Array<Record<string, unknown>>;
+  failed_direct_events: Array<Record<string, unknown>>;
   direct_events: Array<Record<string, unknown>>;
   source_soak: SourceSoakSummary;
   operator_action: string;

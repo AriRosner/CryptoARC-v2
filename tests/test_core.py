@@ -3,6 +3,7 @@ import base64
 import inspect
 import json
 import sqlite3
+import struct
 import unittest
 from collections import deque
 from datetime import datetime, timedelta
@@ -7199,6 +7200,114 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("program_data_text", evidence)
             self.assertTrue(evidence["program_data_decoded"])
 
+    def test_solana_logs_verification_decodes_official_pump_create_event_borsh(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            mint = Keypair().pubkey()
+            bonding_curve = Keypair().pubkey()
+            user = Keypair().pubkey()
+            creator = Keypair().pubkey()
+            token_program = Keypair().pubkey()
+            quote_mint = Keypair().pubkey()
+
+            def borsh_string(value: str) -> bytes:
+                encoded = value.encode("utf-8")
+                return struct.pack("<I", len(encoded)) + encoded
+
+            create_event = b"".join(
+                [
+                    bytes([27, 114, 169, 77, 222, 235, 99, 118]),
+                    borsh_string("Arc Binary"),
+                    borsh_string("ARCB"),
+                    borsh_string("https://example.com/arc-binary.json"),
+                    bytes(mint),
+                    bytes(bonding_curve),
+                    bytes(user),
+                    bytes(creator),
+                    struct.pack("<qQQQQ", 1_754_000_000, 1_000, 2_000, 3_000, 4_000),
+                    bytes(token_program),
+                    b"\x00\x01",
+                    bytes(quote_mint),
+                    struct.pack("<Q", 5_000),
+                ]
+            )
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_solana_borsh_create",
+                    source="solana_logs",
+                    received_at=utc_now(),
+                    raw_payload={
+                        "result": {
+                            "context": {"slot": 702},
+                            "value": {
+                                "signature": "SigBorshCreate111",
+                                "err": None,
+                                "logs": [
+                                    "Program log: Instruction: CreateV2",
+                                    f"Program data: {base64.b64encode(create_event).decode('ascii')}",
+                                ],
+                            },
+                        }
+                    },
+                    status="raw",
+                )
+            )
+
+            report = state.solana_logs_verification_report(limit=20)
+            evidence = report["direct_events"][0]["create_evidence"]
+
+            self.assertEqual(report["summary"]["direct_create_hints"], 1)
+            self.assertEqual(report["summary"]["decoded_create_events"], 1)
+            self.assertEqual(evidence["fields"]["name"], "Arc Binary")
+            self.assertEqual(evidence["fields"]["symbol"], "ARCB")
+            self.assertEqual(evidence["fields"]["metadata_uri"], "https://example.com/arc-binary.json")
+            self.assertEqual(evidence["fields"]["mint"], str(mint))
+            self.assertEqual(evidence["fields"]["bonding_curve"], str(bonding_curve))
+            self.assertEqual(evidence["fields"]["creator"], str(creator))
+            self.assertTrue(evidence["program_data_decoded"])
+
+    def test_solana_logs_verification_rejects_truncated_pump_create_event_borsh(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            truncated = bytes([27, 114, 169, 77, 222, 235, 99, 118]) + struct.pack("<I", 4_096)
+            state.storage.save_source_event(
+                SourceEvent(
+                    id="src_solana_truncated_borsh_create",
+                    source="solana_logs",
+                    received_at=utc_now(),
+                    raw_payload={
+                        "result": {
+                            "context": {"slot": 703},
+                            "value": {
+                                "signature": "SigTruncatedBorshCreate111",
+                                "err": None,
+                                "logs": [
+                                    "Program log: Instruction: CreateV2",
+                                    f"Program data: {base64.b64encode(truncated).decode('ascii')}",
+                                ],
+                            },
+                        }
+                    },
+                    status="raw",
+                )
+            )
+
+            report = state.solana_logs_verification_report(limit=20)
+            evidence = report["direct_events"][0]["create_evidence"]
+
+            self.assertEqual(report["summary"]["direct_create_hints"], 1)
+            self.assertEqual(report["summary"]["decoded_create_events"], 0)
+            self.assertEqual(evidence["fields"], {})
+            self.assertFalse(evidence["program_data_decoded"])
+
     def test_solana_logs_verification_does_not_treat_token_account_setup_as_pump_create(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(
@@ -7384,9 +7493,19 @@ class CoreLogicTests(unittest.TestCase):
             report = state.solana_logs_verification_report(limit=20)
 
             self.assertEqual(report["summary"]["direct_events"], 20)
+            self.assertEqual(report["summary"]["direct_create_hints"], 1)
             self.assertEqual(report["summary"]["pumpportal_events"], 1)
             self.assertEqual(report["summary"]["matches"], 1)
+            self.assertEqual(report["summary"]["create_matches"], 1)
             self.assertEqual(report["matches"][0]["match_type"], "signature")
+            self.assertEqual(report["source_soak"]["direct_events"], 1)
+            self.assertEqual(report["source_soak"]["matches"], 1)
+            self.assertEqual(report["source_soak"]["match_rate"], 1.0)
+
+            acceptance = state.source_soak_acceptance_report(limit=20)
+            direct_sample_gate = next(gate for gate in acceptance["gates"] if gate["id"] == "direct_samples")
+            self.assertEqual(direct_sample_gate["status"], "fail")
+            self.assertEqual(direct_sample_gate["value"], 1)
 
     def test_source_soak_acceptance_requires_matched_direct_samples(self) -> None:
         with TemporaryDirectory() as directory:

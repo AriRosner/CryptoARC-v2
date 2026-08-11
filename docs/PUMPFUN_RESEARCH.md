@@ -10,6 +10,10 @@ Chainstack documents a current approach for detecting newly created Pump.fun tok
 
 Source: https://docs.chainstack.com/docs/solana-listening-to-pumpfun-token-mint-using-only-logssubscribe
 
+The authoritative event discriminator and Borsh field order come from Pump's public IDL. CryptoARC validates the eight-byte `CreateEvent` discriminator before decoding bounded strings and public keys, and treats other `Program data` payloads as unrelated events.
+
+Source: https://github.com/pump-fun/pump-public-docs/blob/main/idl/pump.json
+
 Pros:
 
 - Direct on-chain path.

@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import secrets
+import struct
 import time
 import uuid
 import urllib.error
@@ -3182,6 +3183,8 @@ class BotState:
             status = "no_matches"
 
         direct_create_hints = [row for row in direct_rows if row.get("create_hint")]
+        direct_create_ids = {str(row["event_id"]) for row in direct_create_hints}
+        create_matches = [match for match in matches if str(match["direct_event_id"]) in direct_create_ids]
         decoded_create_rows = [
             row
             for row in direct_rows
@@ -3223,6 +3226,7 @@ class BotState:
                 "direct_create_hints": len(direct_create_hints),
                 "decoded_create_events": len(decoded_create_rows),
                 "matches": len(matches),
+                "create_matches": len(create_matches),
                 "unmatched_direct": len(unmatched_direct),
                 "unmatched_pumpportal": len(unmatched_portal),
                 "conflicts": len(conflicts),
@@ -3234,11 +3238,11 @@ class BotState:
             "failed_direct_events": failed_direct_rows[:50],
             "direct_events": direct_rows[:100],
             "source_soak": self._source_soak_from_verification(
-                len(direct_rows),
+                len(direct_create_hints),
                 len(portal_rows),
                 len(direct_create_hints),
                 len(decoded_create_rows),
-                len(matches),
+                len(create_matches),
                 len(unmatched_direct),
                 len(unmatched_portal),
                 len(conflicts),
@@ -3326,11 +3330,11 @@ class BotState:
             ),
             self._promotion_gate(
                 "direct_samples",
-                "Direct log samples",
-                verification.get("summary", {}).get("direct_events", 0),
+                "Direct create samples",
+                verification.get("summary", {}).get("direct_create_hints", 0),
                 ">= 20",
-                int(verification.get("summary", {}).get("direct_events", 0) or 0) >= 20,
-                "Collect enough direct Solana log notifications for source-soak confidence.",
+                int(verification.get("summary", {}).get("direct_create_hints", 0) or 0) >= 20,
+                "Collect enough direct Pump create notifications for source-soak confidence.",
             ),
             self._promotion_gate(
                 "direct_matches",
@@ -3567,9 +3571,10 @@ class BotState:
 
     def _solana_create_evidence(self, payload: dict[str, object], logs: list[str], mints: list[str]) -> dict[str, object]:
         text = "\n".join(logs)
+        binary_fields = self._decoded_pump_create_event_fields(logs)
         decoded_program_data = self._decoded_program_data_strings(logs)
         combined = "\n".join([text, *decoded_program_data])
-        fields: dict[str, str] = {}
+        fields: dict[str, str] = dict(binary_fields)
         patterns = {
             "name": r"(?i)(?:name|tokenName)\s*[:=]\s*([^\n\r,|]{2,80}?)(?=\s+(?:symbol|ticker|uri|metadataUri|metadata_uri|creator|user|owner|traderPublicKey|bondingCurveKey|bondingCurve|bonding_curve|mint|tokenMint)\s*[:=]|\s*$)",
             "symbol": r"(?i)(?:symbol|ticker)\s*[:=]\s*([A-Za-z0-9_$.-]{1,16})",
@@ -3580,22 +3585,84 @@ class BotState:
         }
         for field, pattern in patterns.items():
             match = re.search(pattern, combined)
-            if match:
+            if match and field not in fields:
                 fields[field] = match.group(1).strip().strip('"').strip("'")
         if mints and "mint" not in fields:
             fields["mint"] = mints[0]
         field_count = len(fields)
-        confidence = round(min(1.0, 0.2 + field_count * 0.16 + (0.12 if decoded_program_data else 0.0)), 2) if field_count else 0.0
+        program_data_decoded = bool(binary_fields or decoded_program_data)
+        confidence = round(min(1.0, 0.2 + field_count * 0.16 + (0.12 if program_data_decoded else 0.0)), 2) if field_count else 0.0
         missing = [field for field in ("mint", "name", "symbol", "metadata_uri", "creator", "bonding_curve") if field not in fields]
         return {
             "fields": fields,
             "field_count": field_count,
             "missing_fields": missing,
             "confidence": confidence,
-            "program_data_decoded": bool(decoded_program_data),
+            "program_data_decoded": program_data_decoded,
+            "program_data_format": "pump_create_event_borsh" if binary_fields else ("text" if decoded_program_data else ""),
             "program_data_text": decoded_program_data[:3],
             "operator_action": "Direct create metadata is rich enough for comparison." if confidence >= 0.65 else "Keep direct create evidence as a timing/log hint until more fields decode.",
         }
+
+    def _decoded_pump_create_event_fields(self, logs: list[str]) -> dict[str, str]:
+        discriminator = bytes([27, 114, 169, 77, 222, 235, 99, 118])
+        for log in logs:
+            match = re.search(r"(?i)Program data:\s*([A-Za-z0-9+/=_-]{12,})", log)
+            if not match:
+                continue
+            encoded = match.group(1).strip().replace("-", "+").replace("_", "/")
+            padded = encoded + ("=" * ((4 - len(encoded) % 4) % 4))
+            try:
+                raw = base64.b64decode(padded, validate=False)
+            except Exception:
+                continue
+            if not raw.startswith(discriminator):
+                continue
+            offset = len(discriminator)
+
+            def read_string(max_length: int) -> str:
+                nonlocal offset
+                if offset + 4 > len(raw):
+                    raise ValueError("missing Borsh string length")
+                length = struct.unpack_from("<I", raw, offset)[0]
+                offset += 4
+                if length > max_length or offset + length > len(raw):
+                    raise ValueError("invalid Borsh string length")
+                value = raw[offset : offset + length].decode("utf-8")
+                offset += length
+                return value
+
+            def read_pubkey() -> str:
+                nonlocal offset
+                if offset + 32 > len(raw):
+                    raise ValueError("missing Borsh public key")
+                value = str(Pubkey.from_bytes(raw[offset : offset + 32]))
+                offset += 32
+                return value
+
+            try:
+                name = read_string(80)
+                symbol = read_string(16)
+                metadata_uri = read_string(500)
+                mint = read_pubkey()
+                bonding_curve = read_pubkey()
+                read_pubkey()  # user
+                creator = read_pubkey()
+                if len(raw) - offset < 114:
+                    raise ValueError("truncated Pump CreateEvent payload")
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if not name.strip() or not symbol.strip() or not metadata_uri.strip():
+                continue
+            return {
+                "name": name.strip(),
+                "symbol": symbol.strip(),
+                "metadata_uri": metadata_uri.strip(),
+                "mint": mint,
+                "bonding_curve": bonding_curve,
+                "creator": creator,
+            }
+        return {}
 
     def _decoded_program_data_strings(self, logs: list[str]) -> list[str]:
         decoded: list[str] = []
@@ -3612,6 +3679,8 @@ class BotState:
                 try:
                     raw = base64.b64decode(padded, validate=False)
                 except Exception:
+                    continue
+                if raw.startswith(bytes([27, 114, 169, 77, 222, 235, 99, 118])):
                     continue
                 text = raw.decode("utf-8", errors="ignore")
                 cleaned = "".join(char if char.isprintable() or char in "\n\r\t" else " " for char in text)
