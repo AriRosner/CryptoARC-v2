@@ -199,6 +199,8 @@ Each source event includes derived `event_kind` and `parser_result` fields for i
 
 `GET /api/source-health` also includes `quality_history`, a recent bucketed source-soak view with event counts, normalized/raw/trade counts, malformed counts, unique mints, normalized ratio, and per-bucket trust state. `GET /api/source-health/export` downloads a source-health history artifact with current trust, bucket summary, source event counts, recent source rows, source-related operator events, and a privacy note. The Data & Intelligence page renders the history as a compact strip with an export action.
 
+Primary-source health ratios are calculated only from rows belonging to the active launch source. Evidence-only `solana_logs` rows remain available in verification reports and exports but do not count as PumpPortal normalization failures.
+
 ### Source adapters
 
 `GET /api/source-adapters` reports the configured launch-data adapters. PumpPortal is the fast path. `solana_logs` is the direct-chain verification adapter; it is enabled only when both `SOLANA_WSS_ENDPOINT` and `SOLANA_LOGS_MENTIONS_ADDRESS` are set. It advertises `logsSubscribe`, `single_address_mentions_filter`, `raw_event_archive`, `direct_chain_verification`, and `paper_create_normalization` capabilities. While the bot is running, the companion verifier archives Solana log notifications as `solana_logs` source events. By default these remain evidence-only; when `direct_solana_paper_enabled` is true, rich create evidence at or above `direct_solana_min_confidence` can enter paper monitoring only.

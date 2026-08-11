@@ -4093,7 +4093,7 @@ class BotState:
         return [session.to_dict() for session in self.storage.load_trade_sessions(limit)]
 
     def source_health(self) -> dict[str, object]:
-        events = self.storage.load_source_events(300)
+        events = self.storage.load_source_events_by_source((self.source_status.source,), 300)
         normalized = [event for event in events if event.status == "normalized"]
         failures = len([event for event in events if event.status == "raw"])
         quality_events = len(normalized) + failures
