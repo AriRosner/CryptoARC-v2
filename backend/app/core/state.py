@@ -25,6 +25,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
 from app.core.models import (
+    AcceptedMarketObservation,
     BacktestRun,
     BotSettings,
     BotSnapshot,
@@ -67,7 +68,7 @@ from app.core.scoring import ScoringEngine
 from app.core.simulator import LaunchSimulator
 from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
-from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, normalize_pumpportal_new_token
+from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -2239,7 +2240,7 @@ class BotState:
             self.current_settings_version_id = settings_versions[0].id if settings_versions else ""
         self.recalculate_stats()
 
-    def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> None:
+    def record_source_event(self, source: str, raw_payload: dict[str, object], token: TokenSignal | None, message: str = "", status: str | None = None) -> SourceEvent:
         if token:
             self.last_ingested_launch_at = utc_now()
         stored_payload = dict(raw_payload)
@@ -2257,6 +2258,7 @@ class BotState:
             message=message,
         )
         self.storage.save_source_event(event)
+        return event
 
     def ingest_source_event(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> None:
         if event.kind == "trade":
@@ -2264,7 +2266,17 @@ class BotState:
                 self.source_status.pumpportal_funding_blocked = False
                 self.source_status.pumpportal_funding_message = ""
                 self.source_status.pumpportal_funding_blocked_at = None
-            self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
+                self.storage.save_source_access_evidence(
+                    {
+                        "record_id": new_id("access"),
+                        "created_at": event.received_at.isoformat(),
+                        "source": event.source,
+                        "access_state": "ready",
+                        "message": "PumpPortal trade-stream access resumed.",
+                    }
+                )
+            source_event = self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
+            self._record_accepted_market_observation(event, source_event)
             self.apply_observed_trade(event, active_tokens_loaded=active_tokens_loaded)
             return
         if event.kind in {"verification", "verification_status"}:
@@ -2294,6 +2306,15 @@ class BotState:
         self.source_status.pumpportal_funding_blocked_at = event.received_at
         if already_blocked:
             return
+        self.storage.save_source_access_evidence(
+            {
+                "record_id": new_id("access"),
+                "created_at": event.received_at.isoformat(),
+                "source": event.source,
+                "access_state": "funding_required",
+                "message": "PumpPortal paid trade-stream access unavailable.",
+            }
+        )
         self.add_event(
             "warning",
             "PumpPortal API wallet appears unfunded; paid trade-stream evidence may have stopped.",
@@ -2319,6 +2340,32 @@ class BotState:
             or "minimum balance" in text
         )
         return mentions_trade_stream and mentions_funding
+
+    def _record_accepted_market_observation(self, event: LaunchEvent, source_event: SourceEvent) -> None:
+        if not event.mint or event.observed_price is None or event.observed_price <= 0:
+            return
+        mode = getattr(self.settings.mode, "value", str(self.settings.mode))
+        item = AcceptedMarketObservation(
+            record_id=new_id("market"),
+            created_at=event.received_at,
+            schema_version=1,
+            strategy_id=self.settings.strategy_profile,
+            strategy_version=self.current_settings_version_id or "unversioned",
+            evidence_mode=mode,
+            source=event.source,
+            source_event_id=source_event.id,
+            observed_at=event.received_at,
+            received_at=event.received_at,
+            mint=event.mint,
+            price=float(event.observed_price),
+            confidence=1.0,
+            acceptance_reason="normalized_trade_price",
+            conflict_state=str(event.raw_payload.get("conflict_state") or "clear"),
+            access_state="ready",
+            fixture_only=event.raw_payload.get("fixture_only") is True,
+            direct_comparison_sample_id=str(event.raw_payload.get("direct_comparison_sample_id") or ""),
+        )
+        self.storage.save_accepted_market_observation(item)
 
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
@@ -3135,11 +3182,53 @@ class BotState:
             "privacy_note": "Report contains public Solana signatures, slots, logs, mints, and local source timing evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
         }
 
+    def genuine_source_evidence_report(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 500,
+    ) -> dict[str, object]:
+        evaluated_at = now or utc_now()
+        observations = self.storage.load_accepted_market_observations(limit=max(1, min(5000, limit)))
+        access_rows = self.storage.load_source_access_evidence(limit=1, source="pumpportal")
+        if access_rows:
+            access_state = str(access_rows[0].get("access_state") or "unknown")
+        elif observations:
+            access_state = "ready"
+        elif self.source_status.pumpportal_funding_blocked:
+            access_state = "funding_required"
+        else:
+            access_state = "unknown"
+        result = SourceEvidenceGate.evaluate(observations, access_state=access_state, now=evaluated_at)
+        stale_count = sum(
+            1
+            for item in observations
+            if item.observed_at.tzinfo is None
+            or item.observed_at.utcoffset() is None
+            or item.observed_at > evaluated_at
+            or (evaluated_at - item.observed_at).total_seconds() > 300
+        )
+        return {
+            "artifact_type": "cryptoarc_genuine_source_evidence",
+            "format_version": 1,
+            "generated_at": evaluated_at.isoformat(),
+            "access_state": access_state,
+            "accepted_price_count": result.accepted_count,
+            "genuine_price_count": result.genuine_count,
+            "fixture_price_count": result.fixture_count,
+            "conflicts": result.conflict_count,
+            "stale_or_invalid_time_count": stale_count,
+            "direct_comparison_sample_ids": list(result.direct_comparison_sample_ids),
+            "shadow_eligible": result.shadow_eligible,
+            "blockers": list(result.blockers),
+        }
+
     def source_soak_acceptance_report(self, limit: int | None = None, include_history: bool = True) -> dict[str, object]:
         verification = self.solana_logs_verification_report(limit=limit or 500)
         source = self.source_health()
         source_events = self.storage.count_source_events()
         soak = verification.get("source_soak", {}) if isinstance(verification.get("source_soak"), dict) else {}
+        genuine = self.genuine_source_evidence_report(limit=limit or 500)
         gates = [
             self._promotion_gate(
                 "source_events",
@@ -3197,6 +3286,14 @@ class BotState:
                 int(verification.get("summary", {}).get("conflicts", 0) or 0) == 0,
                 "Direct-chain error notifications or conflicts must be reviewed before source promotion.",
             ),
+            self._promotion_gate(
+                "genuine_trade_prices",
+                "Genuine accepted trade prices",
+                genuine.get("genuine_price_count", 0),
+                ">= 1 with ready access and no conflicts",
+                bool(genuine.get("shadow_eligible")),
+                "At least one attributable, fresh, non-fixture, versioned trade price is required before shadow promotion.",
+            ),
         ]
         hard_required = bool(verification.get("configured")) or int(verification.get("summary", {}).get("direct_events", 0) or 0) > 0
         blockers = [str(gate["reason"]) for gate in gates if gate["status"] == "fail" and (hard_required or gate["id"] in {"source_events", "source_trust"})]
@@ -3210,7 +3307,17 @@ class BotState:
             "hard_required": hard_required,
             "gates": gates,
             "blockers": list(dict.fromkeys(blockers)),
-            "summary": soak,
+            "summary": {
+                **soak,
+                "accepted_price_count": genuine.get("accepted_price_count", 0),
+                "genuine_price_count": genuine.get("genuine_price_count", 0),
+                "fixture_price_count": genuine.get("fixture_price_count", 0),
+                "source_price_conflicts": genuine.get("conflicts", 0),
+                "stale_or_invalid_price_times": genuine.get("stale_or_invalid_time_count", 0),
+                "access_state": genuine.get("access_state", "unknown"),
+                "direct_comparison_sample_ids": genuine.get("direct_comparison_sample_ids", []),
+            },
+            "genuine_source_evidence": genuine,
             "verification_status": verification.get("status", "unknown"),
             "operator_action": "Source-soak gate is clear for hybrid source promotion." if status == "ready" else "Collect matched direct/PumpPortal evidence before relying on hybrid source verification.",
             "privacy_note": "Source-soak acceptance contains public source timing, signature, mint, and local quality evidence only. It must not contain seed phrases, private keys, or Telegram tokens.",
@@ -10432,6 +10539,7 @@ class BotState:
             signer_mode,
             local_auth_enabled=local_auth_enabled,
         )
+
         strategy = readiness.get("strategy_promotion", {}) if isinstance(readiness, dict) else {}
         fingerprint = str(strategy.get("strategy_fingerprint") or "") if isinstance(strategy, dict) else ""
         reports = {

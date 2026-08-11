@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -37,6 +37,8 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("live_ledger_positions", "live_ledger_positions"),
     ("backup_restore_history", "backup_restore_history"),
     ("source_soak_history", "source_soak_history"),
+    ("accepted_market_observations", "accepted_market_observations"),
+    ("source_access_evidence", "source_access_evidence"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -44,7 +46,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 12
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -65,6 +67,8 @@ class Storage:
         "live_intents",
         "live_ledger_positions",
         "source_soak_history",
+        "accepted_market_observations",
+        "source_access_evidence",
     )
     BACKUP_TABLES = (
         "settings",
@@ -87,6 +91,8 @@ class Storage:
         "live_ledger_positions",
         "backup_restore_history",
         "source_soak_history",
+        "accepted_market_observations",
+        "source_access_evidence",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -213,6 +219,7 @@ class Storage:
             (9, "009_mobile_companion", "mobile companion pairing and devices", self._migration_009_mobile_companion),
             (10, "010_mobile_command_center", "scoped mobile command center persistence", self._migration_010_mobile_command_center),
             (11, "011_mobile_guarded_execution_claims", "durable guarded execution audit claims", self._migration_011_mobile_guarded_execution_claims),
+            (12, "012_genuine_source_evidence", "accepted market observations and source access evidence", self._migration_012_genuine_source_evidence),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -582,6 +589,44 @@ class Storage:
             )
             connection.execute("DROP TABLE mobile_action_receipts_010")
 
+    def _migration_012_genuine_source_evidence(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS accepted_market_observations (
+                record_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_event_id TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                received_at TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(source, source_event_id, observed_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accepted_market_observations_strategy ON accepted_market_observations(strategy_id, strategy_version, observed_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_accepted_market_observations_genuine ON accepted_market_observations(fixture_only, observed_at DESC)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS source_access_evidence (
+                record_id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                access_state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_access_evidence_source ON source_access_evidence(source, created_at DESC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -869,6 +914,81 @@ class Storage:
                 """,
                 (item_id, json.dumps(payload), created_at, status, ready),
             )
+
+    def save_accepted_market_observation(self, observation: AcceptedMarketObservation) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO accepted_market_observations (
+                    record_id, source, source_event_id, observed_at, received_at,
+                    strategy_id, strategy_version, fixture_only, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation.record_id,
+                    observation.source,
+                    observation.source_event_id,
+                    observation.observed_at.isoformat(),
+                    observation.received_at.isoformat(),
+                    observation.strategy_id,
+                    observation.strategy_version,
+                    1 if observation.fixture_only else 0,
+                    json.dumps(observation.to_dict()),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_accepted_market_observations(
+        self,
+        limit: int = 500,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> list[AcceptedMarketObservation]:
+        bounded_limit = max(1, min(5000, int(limit)))
+        clauses: list[str] = []
+        values: list[Any] = []
+        if strategy_id:
+            clauses.append("strategy_id = ?")
+            values.append(strategy_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            values.append(strategy_version)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        values.append(bounded_limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT payload FROM accepted_market_observations{where} ORDER BY observed_at DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
+        created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
+        record_id = str(payload.get("record_id") or f"source_access_{uuid.uuid4().hex}")
+        source = str(payload.get("source") or "unknown")
+        access_state = str(payload.get("access_state") or "unknown")
+        stored = {**payload, "record_id": record_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO source_access_evidence (record_id, source, access_state, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (record_id, source, access_state, created_at, json.dumps(stored)),
+            )
+
+    def load_source_access_evidence(self, limit: int = 100, *, source: str = "") -> list[dict[str, Any]]:
+        bounded_limit = max(1, min(1000, int(limit)))
+        with self._connect() as connection:
+            if source:
+                rows = connection.execute(
+                    "SELECT payload FROM source_access_evidence WHERE source = ? ORDER BY created_at DESC LIMIT ?",
+                    (source, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM source_access_evidence ORDER BY created_at DESC LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [json.loads(row["payload"]) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -3236,6 +3356,12 @@ class Storage:
         payload["observed_at"] = datetime.fromisoformat(payload["observed_at"])
         allowed = set(PriceObservation.__dataclass_fields__.keys())
         return PriceObservation(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _accepted_market_observation_from_payload(self, payload: dict[str, Any]) -> AcceptedMarketObservation:
+        for field_name in ("created_at", "observed_at", "received_at"):
+            payload[field_name] = datetime.fromisoformat(payload[field_name])
+        allowed = set(AcceptedMarketObservation.__dataclass_fields__.keys())
+        return AcceptedMarketObservation(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

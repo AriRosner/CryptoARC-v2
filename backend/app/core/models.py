@@ -593,6 +593,35 @@ class PriceObservation:
 
 
 @dataclass(slots=True)
+class AcceptedMarketObservation:
+    record_id: str
+    created_at: datetime
+    schema_version: int
+    strategy_id: str
+    strategy_version: str
+    evidence_mode: str
+    source: str
+    source_event_id: str
+    observed_at: datetime
+    received_at: datetime
+    mint: str
+    price: float | None
+    confidence: float
+    acceptance_reason: str
+    conflict_state: str = "clear"
+    access_state: str = "ready"
+    fixture_only: bool = False
+    direct_comparison_sample_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["observed_at"] = self.observed_at.isoformat()
+        payload["received_at"] = self.received_at.isoformat()
+        return payload
+
+
+@dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str
     token_id: str

@@ -12,6 +12,12 @@ This runbook separates software verification from genuine source, shadow, deploy
 
 These labels remain until the corresponding authoritative campaign is separately authorized and captured. They are blockers, not estimates.
 
+## Genuine source evidence contract
+
+Accepted market observations are additive records keyed by source, source event ID, and observed timestamp. Each record carries observed/received time, price, confidence, access state, conflict state, strategy identity, evidence mode, and an explicit `fixture_only` marker. Fixture rows, missing/future/naive/stale timestamps, duplicate identities, unavailable funded access, source conflicts, and strategy mismatches remain ineligible for shadow promotion.
+
+Access failures are recorded separately from accepted observations so an unavailable paid stream cannot manufacture a zero-price sample. Direct Solana comparison sample IDs remain attributable. The seven-day source soak and funded or replacement trade-price access are still `DEFERRED` and require separate operator coordination; no credential is requested or configured by the software implementation.
+
 ## Capture exact Git state
 
 Use a clean isolated worktree. This capture is Git-only: it does not start the backend, open the application database, connect to a source, inspect a wallet, or call a signer.
