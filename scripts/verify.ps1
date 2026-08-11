@@ -16,6 +16,10 @@ Set-Location $root
 
 Write-Host "Running setup diagnostics"
 & (Join-Path $PSScriptRoot "doctor.ps1") -Strict
+$doctorExitCode = $LASTEXITCODE
+if ($doctorExitCode -ne 0) {
+  throw "Setup diagnostics failed with exit code ${doctorExitCode}."
+}
 
 Write-Host "Running backend import smoke test"
 $env:PYTHONPATH = "backend"

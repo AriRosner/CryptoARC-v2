@@ -521,6 +521,16 @@ class ScriptSafetyTests(unittest.TestCase):
         self.assertLess(frontend_block.index(execution_readiness_check), frontend_block.index(frontend_build))
         self.assertLess(frontend_block.index(polling_check), frontend_block.index(frontend_build))
 
+    def test_verify_diagnostics_honor_configured_python_and_fail_closed(self) -> None:
+        doctor = (ROOT / "scripts" / "doctor.ps1").read_text(encoding="utf-8")
+        verify = (ROOT / "scripts" / "verify.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("$configuredPython = Resolve-ExistingPath", doctor)
+        self.assertIn("$env:CRYPTOARC_PYTHON", doctor)
+        self.assertIn("Test-CryptoArcPythonImport $configuredPython", doctor)
+        self.assertIn("$doctorExitCode = $LASTEXITCODE", verify)
+        self.assertIn("if ($doctorExitCode -ne 0)", verify)
+
     def test_start_dev_records_dynamic_ports_and_frontend_api_base(self) -> None:
         script = (ROOT / "scripts" / "start-dev.ps1").read_text(encoding="utf-8")
 
