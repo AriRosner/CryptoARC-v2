@@ -622,6 +622,71 @@ class AcceptedMarketObservation:
 
 
 @dataclass(slots=True)
+class ShadowCostBreakdown:
+    base_fee_sol: float = 0.0
+    priority_fee_sol: float = 0.0
+    inclusion_tip_sol: float = 0.0
+    rent_setup_sol: float = 0.0
+    failed_attempt_sol: float = 0.0
+    entry_slippage_sol: float = 0.0
+    exit_slippage_sol: float = 0.0
+
+    def fixed_total_sol(self) -> float:
+        return float(self.base_fee_sol) + float(self.rent_setup_sol)
+
+    def variable_total_sol(self) -> float:
+        return sum(
+            float(value)
+            for value in (
+                self.priority_fee_sol,
+                self.inclusion_tip_sol,
+                self.failed_attempt_sol,
+                self.entry_slippage_sol,
+                self.exit_slippage_sol,
+            )
+        )
+
+    def total_sol(self) -> float:
+        return self.fixed_total_sol() + self.variable_total_sol()
+
+    def stressed_total_sol(self) -> float:
+        return self.fixed_total_sol() + (2 * self.variable_total_sol())
+
+
+@dataclass(slots=True)
+class ShadowComparison:
+    record_id: str
+    created_at: datetime
+    schema_version: int
+    strategy_id: str
+    strategy_version: str
+    evidence_mode: str
+    completed_at: datetime
+    regime: str
+    gross_pnl_sol: float
+    costs: ShadowCostBreakdown
+    held_out: bool
+    source_evidence_ids: tuple[str, ...]
+    quote_id: str
+    landing_status: str
+    fixture_only: bool = False
+    contaminated: bool = False
+    exit_reason: str = ""
+    hold_seconds: int = 0
+
+    def net_pnl_sol(self, *, cost_stress: bool = False) -> float:
+        costs = self.costs.stressed_total_sol() if cost_stress else self.costs.total_sol()
+        return float(self.gross_pnl_sol) - costs
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["completed_at"] = self.completed_at.isoformat()
+        payload["source_evidence_ids"] = list(self.source_evidence_ids)
+        return payload
+
+
+@dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str
     token_id: str

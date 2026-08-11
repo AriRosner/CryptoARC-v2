@@ -1725,6 +1725,11 @@ async def evidence_inventory_report(
     )
 
 
+@app.get("/api/reports/economic-validation", dependencies=[Depends(require_auth)])
+async def economic_validation_report(strategy_version: str = "") -> dict:
+    return state.economic_validation_report(strategy_version=strategy_version)
+
+
 @app.get("/api/reports/evidence-mode-separation/export", dependencies=[Depends(require_auth)])
 async def evidence_mode_separation_report_export() -> JSONResponse:
     return JSONResponse(

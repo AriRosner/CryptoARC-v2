@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 
 
@@ -41,6 +41,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("accepted_market_observations", "accepted_market_observations"),
     ("source_access_evidence", "source_access_evidence"),
     ("sniper_strategy_versions", "sniper_strategy_versions"),
+    ("shadow_economic_comparisons", "shadow_economic_comparisons"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -48,7 +49,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 13
+    SCHEMA_VERSION = 14
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -72,6 +73,7 @@ class Storage:
         "accepted_market_observations",
         "source_access_evidence",
         "sniper_strategy_versions",
+        "shadow_economic_comparisons",
     )
     BACKUP_TABLES = (
         "settings",
@@ -97,6 +99,7 @@ class Storage:
         "accepted_market_observations",
         "source_access_evidence",
         "sniper_strategy_versions",
+        "shadow_economic_comparisons",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -225,6 +228,7 @@ class Storage:
             (11, "011_mobile_guarded_execution_claims", "durable guarded execution audit claims", self._migration_011_mobile_guarded_execution_claims),
             (12, "012_genuine_source_evidence", "accepted market observations and source access evidence", self._migration_012_genuine_source_evidence),
             (13, "013_sniper_strategy_versions", "immutable versioned sniper strategy contracts", self._migration_013_sniper_strategy_versions),
+            (14, "014_shadow_economic_comparisons", "all-cost versioned shadow comparisons", self._migration_014_shadow_economic_comparisons),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -649,6 +653,26 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_sniper_strategy_versions_created_at ON sniper_strategy_versions(created_at DESC)"
         )
 
+    def _migration_014_shadow_economic_comparisons(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_economic_comparisons (
+                record_id TEXT PRIMARY KEY,
+                strategy_version TEXT NOT NULL,
+                completed_at TEXT NOT NULL,
+                evidence_mode TEXT NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_economic_strategy ON shadow_economic_comparisons(strategy_version, completed_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_economic_mode ON shadow_economic_comparisons(evidence_mode, fixture_only, completed_at DESC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1042,6 +1066,49 @@ class Storage:
                 (bounded_limit,),
             ).fetchall()
         return [SniperStrategyVersion.from_dict(json.loads(row["canonical_json"])) for row in rows]
+
+    def save_shadow_comparison(self, comparison: ShadowComparison) -> bool:
+        serialized = json.dumps(comparison.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM shadow_economic_comparisons WHERE record_id = ?",
+                (comparison.record_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("shadow comparison record already exists with different content")
+                return False
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO shadow_economic_comparisons (
+                    record_id, strategy_version, completed_at, evidence_mode, fixture_only, payload
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    comparison.record_id,
+                    comparison.strategy_version,
+                    comparison.completed_at.isoformat(),
+                    comparison.evidence_mode,
+                    1 if comparison.fixture_only else 0,
+                    serialized,
+                ),
+            )
+        return True
+
+    def load_shadow_comparisons(self, limit: int = 500, *, strategy_version: str = "") -> list[ShadowComparison]:
+        bounded_limit = max(1, min(5000, int(limit)))
+        with self._connect() as connection:
+            if strategy_version:
+                rows = connection.execute(
+                    "SELECT payload FROM shadow_economic_comparisons WHERE strategy_version = ? ORDER BY completed_at ASC LIMIT ?",
+                    (strategy_version, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM shadow_economic_comparisons ORDER BY completed_at ASC LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [self._shadow_comparison_from_payload(json.loads(row["payload"])) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -3415,6 +3482,14 @@ class Storage:
             payload[field_name] = datetime.fromisoformat(payload[field_name])
         allowed = set(AcceptedMarketObservation.__dataclass_fields__.keys())
         return AcceptedMarketObservation(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _shadow_comparison_from_payload(self, payload: dict[str, Any]) -> ShadowComparison:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        payload["source_evidence_ids"] = tuple(payload.get("source_evidence_ids") or ())
+        payload["costs"] = ShadowCostBreakdown(**dict(payload.get("costs") or {}))
+        allowed = set(ShadowComparison.__dataclass_fields__.keys())
+        return ShadowComparison(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

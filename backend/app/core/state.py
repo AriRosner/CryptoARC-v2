@@ -70,6 +70,7 @@ from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
 from app.core.strategy_contract import SniperStrategyVersion
+from app.core.shadow_evaluation import EconomicValidator
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -10599,6 +10600,28 @@ class BotState:
             dirty=repo_state.get("dirty") if isinstance(repo_state.get("dirty"), bool) else None,
             reports=reports,
         )
+
+    def economic_validation_report(
+        self,
+        strategy_version: str = "",
+        *,
+        now: datetime | None = None,
+        limit: int = 5000,
+    ) -> dict[str, object]:
+        version = strategy_version or self.current_settings_version_id or "unversioned"
+        comparisons = self.storage.load_shadow_comparisons(limit=max(1, min(5000, limit)))
+        report = EconomicValidator.evaluate(version, comparisons, now or utc_now())
+        return {
+            "artifact_type": "cryptoarc_economic_validation",
+            "format_version": 1,
+            **report.to_dict(),
+            "physical_campaign_status": "DEFERRED" if not report.ready else "captured",
+            "operator_action": (
+                "Review the attributable all-cost campaign before any manual-live authorization."
+                if report.ready
+                else "Collect 100 genuine version-matched completed shadows over at least seven days; fixtures and quotes do not qualify."
+            ),
+        }
 
     def evidence_mode_separation_report(self) -> dict[str, object]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
