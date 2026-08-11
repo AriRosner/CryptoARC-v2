@@ -205,6 +205,10 @@ class PilotRiskPolicyRequest(BaseModel):
     initial_slippage_pct: str = Field(default="3", min_length=1, max_length=20)
 
 
+class ProductionRehearsalRequest(BaseModel):
+    evidence: dict[str, object]
+
+
 class PaperRecoveryRequest(BaseModel):
     note: str = Field(default="operator stopped run", max_length=160)
 
@@ -1448,6 +1452,16 @@ async def create_pilot_risk_policy(payload: PilotRiskPolicyRequest) -> dict:
         )
     except (ArithmeticError, ValueError) as exc:
         raise HTTPException(status_code=409 if "active session" in str(exc).lower() else 400, detail=str(exc)) from exc
+
+
+@app.get("/api/production-rehearsal/status", dependencies=[Depends(require_auth)])
+async def production_rehearsal_status() -> dict:
+    return state.production_rehearsal_status()
+
+
+@app.post("/api/production-rehearsal/evaluate", dependencies=[Depends(require_auth)])
+async def evaluate_production_rehearsal(payload: ProductionRehearsalRequest) -> dict:
+    return state.evaluate_production_rehearsal(payload.evidence)
 
 
 @app.get("/api/sentinel/current", dependencies=[Depends(require_auth)])

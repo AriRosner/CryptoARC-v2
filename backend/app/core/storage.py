@@ -55,6 +55,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("strategy_promotions", "strategy_promotions"),
     ("pilot_risk_policies", "pilot_risk_policies"),
     ("pilot_loss_ledger", "pilot_loss_ledger"),
+    ("production_rehearsal_reports", "production_rehearsal_reports"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -62,7 +63,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 18
+    SCHEMA_VERSION = 19
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -100,6 +101,7 @@ class Storage:
         "strategy_validation_campaigns",
         "pilot_risk_policies",
         "pilot_loss_ledger",
+        "production_rehearsal_reports",
     )
     BACKUP_TABLES = (
         "settings",
@@ -139,6 +141,7 @@ class Storage:
         "strategy_validation_campaigns",
         "pilot_risk_policies",
         "pilot_loss_ledger",
+        "production_rehearsal_reports",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -288,6 +291,7 @@ class Storage:
             (16, "016_trade_grading", "durable deterministic trade grading queue", self._migration_016_trade_grading),
             (17, "017_strategy_candidates", "immutable strategy candidates and gated promotion", self._migration_017_strategy_candidates),
             (18, "018_pilot_risk", "immutable micro-pilot risk policy and cumulative loss ledger", self._migration_018_pilot_risk),
+            (19, "019_production_rehearsal", "append-only production gate rehearsal reports", self._migration_019_production_rehearsal),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -924,6 +928,22 @@ class Storage:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_loss_policy ON pilot_loss_ledger(policy_id, created_at ASC)")
+
+    def _migration_019_production_rehearsal(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS production_rehearsal_reports (
+                report_id TEXT PRIMARY KEY,
+                ready INTEGER NOT NULL,
+                fixture_only INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_production_rehearsal_created ON production_rehearsal_reports(created_at DESC)"
+        )
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1806,6 +1826,24 @@ class Storage:
         entries = [json.loads(row["payload"]) for row in rows]
         cumulative = sum((Decimal(str(item["loss_sol"])) for item in entries), Decimal("0"))
         return {"policy_id": policy_id, "cumulative_loss_sol": str(cumulative), "entries": entries}
+
+    def save_production_rehearsal_report(self, report: dict[str, Any]) -> dict[str, Any]:
+        created_at = datetime.now(timezone.utc).isoformat()
+        report_id = f"production_rehearsal_{uuid.uuid4().hex}"
+        payload = {**report, "report_id": report_id, "created_at": created_at}
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO production_rehearsal_reports (report_id, ready, fixture_only, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (report_id, int(bool(report.get("ready"))), int(bool(report.get("fixture_only", True))), created_at, json.dumps(payload, sort_keys=True)),
+            )
+        return payload
+
+    def load_latest_production_rehearsal_report(self) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM production_rehearsal_reports ORDER BY created_at DESC, report_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])

@@ -62,6 +62,12 @@ The future sequence remains:
 
 No step guarantees profit. Changed or stale market conditions return the strategy to source-connected paper and shadow validation.
 
+## Production rehearsal evidence boundary
+
+`GET /api/production-rehearsal/status` returns the latest append-only aggregate and `POST /api/production-rehearsal/evaluate` evaluates already-captured evidence. Both are authenticated and neither changes execution authority. Unknown fields, including credential-like fields, are omitted from persisted report evidence.
+
+The default `scripts/rehearse-production-gates.ps1 -FixtureOnly` run is a local/temp-database check and can never qualify the gate. Actual tailnet exposure, authentication restart, wallet/signer lifecycle, source-loss, recovery, backup/restore, notification disclosure, and build-risk evidence remain `DEFERRED` until a separately authorized physical window. The current `image-size` risk acceptance must carry an expiry; stale acceptance fails closed.
+
 ## Optional narrative classification boundary
 
 The durable grading worker always publishes its deterministic grade first. Optional model classification is disabled by default and has no bundled provider dependency or client. Enabling the policy without separately injecting a reviewed client still makes no external call.

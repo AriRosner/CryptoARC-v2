@@ -79,6 +79,7 @@ from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
 from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskState
+from app.core.production_rehearsal import ProductionGateRehearsal
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -10757,6 +10758,30 @@ class BotState:
             "ledger": ledger,
             "authority_changed": False,
             "operator_action": "Review the immutable reference and caps; this policy does not enable or arm live trading.",
+        }
+
+    def evaluate_production_rehearsal(self, evidence: dict[str, object]) -> dict[str, object]:
+        report = ProductionGateRehearsal.evaluate(evidence).to_dict()
+        report["local_observations"] = {
+            "schema": self.storage.schema_status(),
+            "backup_restore": self.storage.backup_restore_status(),
+            "hot_wallet": self.hot_wallet.rehearsal_status(self.settings.live_active_wallet_public_key),
+            "live_backend_armed": bool(self.settings.live_active_backend_armed),
+            "kill_switch_enabled": bool(self.settings.kill_switch_enabled),
+        }
+        return self.storage.save_production_rehearsal_report(report)
+
+    def production_rehearsal_status(self) -> dict[str, object]:
+        latest = self.storage.load_latest_production_rehearsal_report()
+        if latest is not None:
+            return latest
+        return {
+            "status": "not_run",
+            "ready": False,
+            "fixture_only": True,
+            "blockers": ["physical_rehearsal_required"],
+            "authority_changed": False,
+            "operator_action": "Run the fixture-only rehearsal, then separately authorize any physical window.",
         }
 
     def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
