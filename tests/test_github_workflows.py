@@ -24,9 +24,13 @@ class GitHubWorkflowContractTests(unittest.TestCase):
 
         self.assertIn("pull-requests: write", workflow)
         self.assertIn("gh pr create", workflow)
-        self.assertIn("gh pr merge", workflow)
+        self.assertIn(
+            "gh pr merge $prNumber --auto --squash --delete-branch",
+            workflow,
+        )
         self.assertIn("automation/code-line-badge-${{ github.run_id }}", workflow)
         self.assertNotIn("git push origin HEAD:${{ github.ref_name }}", workflow)
+        self.assertNotIn("[skip ci]", workflow)
 
     def test_mobile_audit_exception_is_checked_weekly(self) -> None:
         workflow_path = ROOT / ".github" / "workflows" / "mobile-audit-exception.yml"

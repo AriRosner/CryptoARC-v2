@@ -147,7 +147,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c $env:BADGE_BRANCH
           git add badges/code-lines.json README.md
-          git commit -m "Update code line badge [skip ci]"
+          git commit -m "Update code line badge"
           git push origin "HEAD:refs/heads/$env:BADGE_BRANCH"
           "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
@@ -162,8 +162,7 @@ jobs:
           $body = @'
           Automated source-line badge refresh from workflow run ${{ github.run_id }}.
 
-          The generated commit uses `[skip ci]` because this pull request changes only
-          `README.md` and `badges/code-lines.json`.
+          Required pull-request checks run before the automated squash merge.
           '@
           $prUrl = gh pr create `
             --base main `
@@ -171,4 +170,4 @@ jobs:
             --title "Update code line badge" `
             --body $body
           $prNumber = gh pr view $prUrl --json number --jq '.number'
-          gh pr merge $prNumber --squash --delete-branch
+          gh pr merge $prNumber --auto --squash --delete-branch
