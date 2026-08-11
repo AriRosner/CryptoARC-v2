@@ -3103,21 +3103,30 @@ class BotState:
 
     def solana_logs_verification_report(self, limit: int | None = None) -> dict[str, object]:
         limit = max(1, min(5000, int(limit or 500)))
+        create_limit = max(500, limit)
         direct_sources = ("solana_logs", "solana_logs_subscribe", "solana")
         direct_events = self.storage.load_source_events_by_source(direct_sources, limit)
         direct_create_events = self.storage.load_source_events_by_source_payload_contains(
             direct_sources,
             "Instruction: Create",
-            limit,
+            create_limit,
         )
         portal_events = self.storage.load_source_events_by_source(("pumpportal",), limit)
+        portal_create_events = self.storage.load_source_events_by_source_payload_contains(
+            ("pumpportal",),
+            '"txType": "create"',
+            create_limit,
+        )
         all_direct_rows = [self._solana_log_evidence(event) for event in direct_events]
         direct_rows = [row for row in all_direct_rows if not row.get("err")]
         failed_direct_rows = [row for row in all_direct_rows if row.get("err")]
         portal_rows = [self._portal_source_evidence(event) for event in portal_events]
+        portal_create_rows = [self._portal_source_evidence(event) for event in portal_create_events]
+        portal_match_rows_by_id = {str(row["event_id"]): row for row in [*portal_rows, *portal_create_rows]}
+        portal_match_rows = list(portal_match_rows_by_id.values())
         portal_by_mint: dict[str, list[dict[str, object]]] = {}
         portal_by_signature: dict[str, list[dict[str, object]]] = {}
-        for row in portal_rows:
+        for row in portal_match_rows:
             for mint in row["mints"]:
                 portal_by_mint.setdefault(str(mint), []).append(row)
             signature = str(row.get("signature") or "")
@@ -3189,7 +3198,7 @@ class BotState:
         }
         unmatched_portal = [
             row
-            for row in portal_rows
+            for row in portal_match_rows
             if row["mints"] and str(row["event_id"]) not in matched_portal_ids
         ][:50]
         status = "unknown"
@@ -3238,6 +3247,7 @@ class BotState:
             "format_version": 1,
             "generated_at": utc_now().isoformat(),
             "limit": limit,
+            "create_limit": create_limit,
             "status": status,
             "configured": bool(self.solana_wss_endpoint and self.solana_logs_mentions_address),
             "wss_configured": bool(self.solana_wss_endpoint),
@@ -3246,6 +3256,7 @@ class BotState:
                 "direct_events": len(direct_rows),
                 "failed_direct_events": len(failed_direct_rows),
                 "pumpportal_events": len(portal_rows),
+                "pumpportal_create_events": len(portal_create_rows),
                 "direct_create_hints": len(direct_create_hints),
                 "decoded_create_events": len(decoded_create_rows),
                 "matches": len(matches),
@@ -3261,6 +3272,7 @@ class BotState:
             "failed_direct_events": failed_direct_rows[:50],
             "direct_events": direct_rows[:100],
             "direct_create_events": direct_create_hints[:100],
+            "pumpportal_create_events": portal_create_rows[:100],
             "source_soak": self._source_soak_from_verification(
                 len(direct_create_hints),
                 len(portal_rows),

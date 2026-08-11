@@ -313,6 +313,7 @@ export interface SourceParserReplayReport {
   format_version: number;
   generated_at: string;
   limit: number;
+  create_limit: number;
   profile: string;
   date_from: string;
   date_to: string;
@@ -367,6 +368,7 @@ export interface SolanaLogsVerificationReport {
     direct_events: number;
     failed_direct_events: number;
     pumpportal_events: number;
+    pumpportal_create_events: number;
     direct_create_hints: number;
     decoded_create_events: number;
     matches: number;
@@ -382,6 +384,7 @@ export interface SolanaLogsVerificationReport {
   failed_direct_events: Array<Record<string, unknown>>;
   direct_events: Array<Record<string, unknown>>;
   direct_create_events: Array<Record<string, unknown>>;
+  pumpportal_create_events: Array<Record<string, unknown>>;
   source_soak: SourceSoakSummary;
   operator_action: string;
   action_items: string[];
