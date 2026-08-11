@@ -1,8 +1,9 @@
 import base64
 import json
 import sqlite3
+import time
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -345,6 +346,28 @@ class MobileNotificationTests(unittest.TestCase):
                 updated_at=(first_at + timedelta(seconds=33)).isoformat(),
             )
         )
+
+    def test_delivery_claim_waits_for_brief_writer_contention(self) -> None:
+        storage = self.state.storage
+        attempted_at = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc).isoformat()
+
+        with closing(sqlite3.connect(storage.path)) as writer:
+            writer.execute("BEGIN IMMEDIATE")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                claim = executor.submit(
+                    storage.reserve_mobile_notification_delivery,
+                    delivery_id="delivery-contended",
+                    attempt_id="attempt-contended",
+                    event_id="evt-contended",
+                    device_id="mdev-contended",
+                    channel="critical",
+                    registration_id="registration-contended",
+                    attempted_at=attempted_at,
+                    lease_seconds=30,
+                )
+                time.sleep(0.25)
+                writer.rollback()
+                self.assertEqual(claim.result(timeout=1), "attempt-contended")
 
     def test_delivery_revalidates_device_lifecycle_and_alert_scope(self) -> None:
         sender = Mock(return_value={"status": "sent"})

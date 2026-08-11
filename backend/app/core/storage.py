@@ -2384,6 +2384,7 @@ class Storage:
             attempted + timedelta(seconds=max(1, int(lease_seconds)))
         ).isoformat()
         with self._connect() as connection:
+            connection.execute("PRAGMA busy_timeout = 500")
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
