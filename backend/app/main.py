@@ -598,7 +598,7 @@ async def live_audit_poll_loop() -> None:
         try:
             state.poll_live_audits(config.live_trading_enabled)
         except Exception as exc:
-            state.add_event("warning", f"Live audit poller warning: {exc.__class__.__name__}: {exc}")
+            state.add_event("warning", _safe_failure_message("Live audit poller", exc))
         await asyncio.sleep(15)
 
 
@@ -611,7 +611,7 @@ async def latency_probe_loop() -> None:
                 {
                     "updated_at": time.time(),
                     "pumpportal_state": "error",
-                    "pumpportal_error": f"{exc.__class__.__name__}: {exc}",
+                    "pumpportal_error": _safe_failure_message("PumpPortal latency probe", exc),
                 }
             )
         await asyncio.sleep(30)
@@ -634,7 +634,7 @@ async def update_latency_status() -> dict[str, object]:
             pumpportal_state = "connected"
         except Exception as exc:
             pumpportal_state = "error"
-            pumpportal_error = f"{exc.__class__.__name__}: {exc}"
+            pumpportal_error = _safe_failure_message("PumpPortal latency probe", exc)
     source_connection = state.source_health().get("connection", {})
     latency_status.update(
         {
@@ -1312,7 +1312,7 @@ async def apply_tuning_suggestion(payload: ApplyTuningSuggestionRequest) -> dict
     try:
         result = state.apply_tuning_suggestion(payload.setting, payload.suggested_value)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Tuning suggestion could not be applied.") from exc
     await broadcast_snapshot()
     return result
 
@@ -1349,7 +1349,7 @@ async def correct_trade_grade(grade_id: str, payload: TradeGradeCorrectionReques
     try:
         return state.correct_trade_grade(grade_id, payload.operator_intent_id, payload.patch, payload.note)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Trade grade correction could not be applied.") from exc
 
 
 @app.get("/api/strategy-candidates", dependencies=[Depends(require_auth)])
@@ -1362,7 +1362,7 @@ async def propose_strategy_candidate(payload: StrategyCandidateRequest) -> dict:
     try:
         return state.propose_strategy_candidate(payload.base_version, payload.patch, payload.evidence_ids)
     except (TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Strategy candidate request is invalid.") from exc
 
 
 @app.post("/api/strategy-candidates/{candidate_id}/promote", dependencies=[Depends(require_auth)])
@@ -1457,7 +1457,8 @@ async def create_pilot_risk_policy(payload: PilotRiskPolicyRequest) -> dict:
             payload.initial_slippage_pct,
         )
     except (ArithmeticError, ValueError) as exc:
-        raise HTTPException(status_code=409 if "active session" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 409 if "active session" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Pilot risk policy could not be created.") from exc
 
 
 @app.get("/api/production-rehearsal/status", dependencies=[Depends(require_auth)])
@@ -1528,7 +1529,7 @@ async def live_intent_create(payload: LiveIntentPayload) -> dict:
             payload.score,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Live intent request is invalid.") from exc
 
 
 @app.post("/api/live/intents/generate", dependencies=[Depends(require_auth)])
@@ -1541,7 +1542,8 @@ async def live_intent_cancel(intent_id: str) -> dict:
     try:
         return state.cancel_live_intent(intent_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live intent could not be cancelled.") from exc
 
 
 @app.post("/api/live/intents/{intent_id}/quote", dependencies=[Depends(require_auth)])
@@ -1549,7 +1551,8 @@ async def live_intent_quote(intent_id: str, payload: LiveIntentQuotePayload) -> 
     try:
         return state.quote_live_intent(config.live_trading_enabled, intent_id, payload.slippage_pct, payload.priority_fee_sol, payload.pool)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live intent could not be quoted.") from exc
 
 
 @app.post("/api/live/intents/{intent_id}/simulate", dependencies=[Depends(require_auth)])
@@ -1557,7 +1560,8 @@ async def live_intent_simulate(intent_id: str, payload: LiveSimulationPayload) -
     try:
         return state.live_simulate(payload.audit_id, payload.ok, payload.warning, payload.error, payload.result)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live simulation could not be recorded.") from exc
 
 
 @app.post("/api/live/intents/{intent_id}/submit", dependencies=[Depends(require_auth)])
@@ -1565,7 +1569,8 @@ async def live_intent_submit(intent_id: str, payload: LiveSubmitPayload) -> dict
     try:
         return state.live_submit(payload.audit_id, payload.signature)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live submission could not be completed.") from exc
 
 
 @app.post("/api/live/intents/{intent_id}/confirm", dependencies=[Depends(require_auth)])
@@ -1573,7 +1578,8 @@ async def live_intent_confirm(intent_id: str, payload: LiveConfirmPayload) -> di
     try:
         return state.live_confirm(payload.audit_id, payload.confirmation_status, payload.error)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live confirmation could not be recorded.") from exc
 
 
 @app.post("/api/live/intents/{intent_id}/reconcile", dependencies=[Depends(require_auth)])
@@ -1581,7 +1587,8 @@ async def live_intent_reconcile(intent_id: str) -> dict:
     try:
         return state.reconcile_live_intent(intent_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live intent could not be reconciled.") from exc
 
 
 @app.get("/api/live/ledger", dependencies=[Depends(require_auth)])
@@ -1609,7 +1616,7 @@ async def live_hot_wallet_import(payload: LiveHotWalletImportPayload) -> dict:
     try:
         return state.import_hot_wallet(payload.private_key, payload.password, payload.label)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Hot wallet import was rejected.") from exc
 
 
 @app.post("/api/live/hot-wallet/unlock", dependencies=[Depends(require_auth)])
@@ -1617,7 +1624,7 @@ async def live_hot_wallet_unlock(payload: LiveHotWalletUnlockPayload) -> dict:
     try:
         return state.unlock_hot_wallet(payload.password)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Hot wallet unlock was rejected.") from exc
 
 
 @app.post("/api/live/hot-wallet/lock", dependencies=[Depends(require_auth)])
@@ -1645,7 +1652,7 @@ async def live_backend_arm(payload: LiveBackendArmPayload) -> dict:
             local_auth_enabled=auth.enabled,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Live backend could not be armed.") from exc
 
 
 @app.post("/api/live/backend/disarm", dependencies=[Depends(require_auth)])
@@ -1670,7 +1677,8 @@ async def live_expert_override(payload: LiveExpertOverridePayload) -> dict:
             payload.signer_mode,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=403 if "auth" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 403 if "auth" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live execution request was rejected.") from exc
 
 
 @app.post("/api/live/session/acknowledge", dependencies=[Depends(require_auth)])
@@ -1695,7 +1703,7 @@ async def live_quote(payload: LiveQuotePayload) -> dict:
             shadow_only=payload.shadow_only,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Live quote request was rejected.") from exc
 
 
 @app.post("/api/live/simulate", dependencies=[Depends(require_auth)])
@@ -1703,7 +1711,8 @@ async def live_simulate(payload: LiveSimulationPayload) -> dict:
     try:
         return state.live_simulate(payload.audit_id, payload.ok, payload.warning, payload.error, payload.result)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live simulation could not be recorded.") from exc
 
 
 @app.post("/api/live/submit", dependencies=[Depends(require_auth)])
@@ -1711,7 +1720,8 @@ async def live_submit(payload: LiveSubmitPayload) -> dict:
     try:
         return state.live_submit(payload.audit_id, payload.signature)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live submission could not be completed.") from exc
 
 
 @app.post("/api/live/confirm", dependencies=[Depends(require_auth)])
@@ -1719,7 +1729,8 @@ async def live_confirm(payload: LiveConfirmPayload) -> dict:
     try:
         return state.live_confirm(payload.audit_id, payload.confirmation_status, payload.error)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live confirmation could not be recorded.") from exc
 
 
 @app.get("/api/live/positions", dependencies=[Depends(require_auth)])
@@ -1737,7 +1748,7 @@ async def live_rent_recovery(wallet_public_key: str) -> dict:
     try:
         return state.live_rent_recovery_scan(wallet_public_key)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Rent-recovery scan was rejected.") from exc
 
 
 @app.post("/api/live/rent-recovery/preview", dependencies=[Depends(require_auth)])
@@ -1745,7 +1756,7 @@ async def live_rent_recovery_preview(payload: LiveRentRecoveryPreviewPayload) ->
     try:
         return state.live_rent_recovery_preview(payload.wallet_public_key, payload.token_accounts)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Rent-recovery preview was rejected.") from exc
 
 
 @app.get("/api/live/profit-sweeps", dependencies=[Depends(require_auth)])
@@ -1763,7 +1774,8 @@ async def live_audit_recover(audit_id: str) -> dict:
     try:
         return state.recover_live_audit(audit_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live audit recovery was rejected.") from exc
 
 
 @app.post("/api/live/manual-request", dependencies=[Depends(require_auth)])
@@ -1778,8 +1790,8 @@ async def review_live_request(request_id: str, payload: LiveExecutionReviewPaylo
     try:
         result = state.review_live_request(request_id, payload.status, payload.note)
     except ValueError as exc:
-        message = str(exc)
-        raise HTTPException(status_code=404 if "not found" in message.lower() else 400, detail=message) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Live execution request could not be reviewed.") from exc
     await broadcast_snapshot()
     return result
 
@@ -1960,7 +1972,7 @@ async def record_post_pilot_decision(review_id: str, payload: PostPilotDecisionR
     try:
         return state.record_post_pilot_decision(review_id, payload.decision, payload.rationale, payload.authorization_id)
     except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail="Post-pilot decision could not be recorded.") from exc
 
 
 @app.get("/api/reports/post-run-review", dependencies=[Depends(require_auth)])
@@ -1994,7 +2006,8 @@ async def live_incident_export(audit_id: str) -> JSONResponse:
     try:
         content = state.incident_export(audit_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Incident export could not be created.") from exc
     return JSONResponse(
         content=content,
         headers={"Content-Disposition": f'attachment; filename="cryptoarc-live-incident-{audit_id}.json"'},
@@ -2006,7 +2019,8 @@ async def record_incident_export_review(audit_id: str, payload: IncidentExportRe
     try:
         return state.record_incident_export_review(audit_id, payload.exported, payload.reviewed, payload.note)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Incident export review could not be recorded.") from exc
 
 
 @app.get("/api/source-adapters", dependencies=[Depends(require_auth)])
@@ -2029,7 +2043,7 @@ async def restore_smoke_test() -> dict:
     try:
         result = state.restore_smoke_test()
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Restore smoke test was rejected.") from exc
     await broadcast_snapshot()
     return result
 
@@ -2039,7 +2053,7 @@ async def preview_restore_artifact(payload: RestoreArtifactPayload) -> dict:
     try:
         return state.preview_restore_artifact(payload.artifact)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Restore preview was rejected.") from exc
 
 
 @app.post("/api/data/restore/confirm", dependencies=[Depends(require_auth)])
@@ -2047,7 +2061,7 @@ async def confirm_restore_artifact(payload: RestoreArtifactPayload) -> dict:
     try:
         result = state.confirm_restore_artifact(payload.artifact)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Restore request was rejected.") from exc
     await invalidate_all_mobile_connections("credentials_replaced")
     await broadcast_snapshot()
     return result
@@ -2058,7 +2072,8 @@ async def backup_restore_export(entry_id: str = "") -> JSONResponse:
     try:
         content = state.backup_restore_export(entry_id)
     except ValueError as exc:
-        raise HTTPException(status_code=404 if "not found" in str(exc).lower() else 400, detail=str(exc)) from exc
+        status_code = 404 if "not found" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail="Backup or restore export could not be created.") from exc
     suffix = entry_id or "latest"
     return JSONResponse(
         content=content,
@@ -2090,7 +2105,7 @@ async def clear_data(target: Literal["tokens", "events", "source_events", "backt
     try:
         result = state.clear_data(target)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail="Data clear request was rejected.") from exc
     await broadcast_snapshot()
     return result
 

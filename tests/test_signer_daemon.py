@@ -240,6 +240,19 @@ class LocalSignerDaemonTests(unittest.TestCase):
         self.assertTrue(successful["ok"])
         self.assertEqual(successful["error"], "")
 
+    def test_simulation_failure_does_not_expose_internal_exception_detail(self) -> None:
+        secret = "private-rpc-token-and-stack-detail"
+
+        class FailingSimulationRpc:
+            def rpc(self, method: str, params: list[object]) -> object:
+                raise RuntimeError(secret)
+
+        simulation = simulate_transaction(FailingSimulationRpc(), "signed")
+
+        self.assertFalse(simulation["ok"])
+        self.assertEqual(simulation["error"], "RPC simulation failed.")
+        self.assertNotIn(secret, json.dumps(simulation))
+
     def test_config_requires_strong_auth_for_key_or_submit_mode(self) -> None:
         unsafe_configs = (
             {"keypair": Keypair()},
