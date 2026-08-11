@@ -1,4 +1,4 @@
-import type { AlertStatus, AutonomousPilotStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, ManualLiveProofReport, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PilotRiskStatus, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SentinelVerdict, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyCandidate, StrategyCandidatePromotionResult, StrategyDecisionRecord, StrategyPreset, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
+import type { AlertStatus, AutonomousPilotStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, ManualLiveProofReport, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PilotRiskStatus, PostPilotReviewReport, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SentinelVerdict, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyCandidate, StrategyCandidatePromotionResult, StrategyDecisionRecord, StrategyPreset, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -573,6 +573,23 @@ export async function fetchAutonomousPilotStatus(): Promise<AutonomousPilotStatu
   return request("/api/autonomous-pilot/status");
 }
 
+export async function fetchPostPilotReview(): Promise<PostPilotReviewReport> {
+  return request("/api/reports/post-pilot-review");
+}
+
+export async function recordPostPilotDecision(
+  reviewId: string,
+  decision: "scale" | "hold" | "revise" | "stop",
+  rationale: string,
+  authorizationId: string,
+): Promise<NonNullable<PostPilotReviewReport["decision"]>> {
+  return request(`/api/reports/post-pilot-review/${encodeURIComponent(reviewId)}/decision`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ decision, rationale, authorization_id: authorizationId }),
+  });
+}
+
 export async function fetchWorkloadPressure(): Promise<WorkloadPressure> {
   return request("/api/monitoring/workload-pressure");
 }
@@ -784,6 +801,10 @@ export function pilotReadinessExportUrl(walletPublicKey = "", signerMode = "brow
 
 export function manualLiveProofExportUrl(): string {
   return `${API_BASE}/api/reports/manual-live-proof/export`;
+}
+
+export function postPilotReviewExportUrl(): string {
+  return `${API_BASE}/api/reports/post-pilot-review/export`;
 }
 
 export function setupReadinessExportUrl(): string {

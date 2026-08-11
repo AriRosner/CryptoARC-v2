@@ -82,6 +82,7 @@ from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskStat
 from app.core.production_rehearsal import ProductionGateRehearsal
 from app.core.manual_live_proof import ManualLiveProof
 from app.core.autonomous_pilot import AutonomousPilotGate, PilotStopEvaluator
+from app.core.post_pilot_review import PilotReview
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -10825,7 +10826,19 @@ class BotState:
         policy: dict[str, object],
         manual_proof: dict[str, object],
     ) -> dict[str, object]:
-        window = AutonomousPilotGate.open_window(authorization, readiness_snapshot, policy, manual_proof)
+        readiness = dict(readiness_snapshot)
+        prior_window = self.storage.load_latest_autonomous_pilot_window()
+        if prior_window is not None:
+            prior_review = self.storage.load_post_pilot_review()
+            prior_decision = self.storage.load_pilot_operator_decision(str(prior_review.get("review_id") or "")) if prior_review else None
+            readiness["prior_pilot_window_id"] = str(prior_window.get("window_id") or "")
+            readiness["prior_post_pilot_review_clear"] = bool(
+                prior_review
+                and prior_review.get("window_id") == prior_window.get("window_id")
+                and prior_review.get("clear") is True
+                and prior_decision
+            )
+        window = AutonomousPilotGate.open_window(authorization, readiness, policy, manual_proof)
         return self.storage.save_autonomous_pilot_window(window.to_dict())
 
     def autonomous_pilot_status(self) -> dict[str, object]:
@@ -10844,6 +10857,47 @@ class BotState:
 
     def evaluate_autonomous_pilot_stop(self, event: dict[str, object]) -> dict[str, object]:
         return PilotStopEvaluator.evaluate(event, self.autonomous_pilot_status()).to_dict()
+
+    def close_post_pilot_review(
+        self,
+        window: dict[str, object],
+        audits: list[dict[str, object]],
+        ledger: dict[str, object],
+        grades: list[dict[str, object]],
+        performance: dict[str, object],
+    ) -> dict[str, object]:
+        review = PilotReview.close(window, audits, ledger, grades, performance)
+        return self.storage.save_post_pilot_review(review.to_dict())
+
+    def post_pilot_review_status(self) -> dict[str, object]:
+        review = self.storage.load_post_pilot_review()
+        if review is None:
+            return {
+                "status": "DEFERRED",
+                "clear": False,
+                "next_pilot_blocked": True,
+                "blockers": ["closed_pilot_window_required"],
+                "allowed_decisions": [],
+                "decision": None,
+                "automatic_scaling_applied": False,
+                "authority_changed": False,
+                "operator_action": "A complete closed pilot window is required before post-pilot review.",
+            }
+        decision = self.storage.load_pilot_operator_decision(str(review.get("review_id") or ""))
+        return {**review, "decision": decision}
+
+    def record_post_pilot_decision(self, review_id: str, decision: str, rationale: str, authorization_id: str) -> dict[str, object]:
+        review = self.storage.load_post_pilot_review(review_id)
+        if review is None:
+            raise ValueError("post-pilot review was not found")
+        record = PilotReview.record_operator_decision(
+            review_id,
+            decision,
+            rationale,
+            authorization_id,
+            allowed_decisions=list(review.get("allowed_decisions") or []),
+        )
+        return self.storage.save_pilot_operator_decision(record.to_dict())
 
     def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
         positions = self.storage.load_live_ledger_positions(500)

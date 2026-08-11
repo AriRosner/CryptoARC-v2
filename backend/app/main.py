@@ -209,6 +209,12 @@ class ProductionRehearsalRequest(BaseModel):
     evidence: dict[str, object]
 
 
+class PostPilotDecisionRequest(BaseModel):
+    decision: Literal["scale", "hold", "revise", "stop"]
+    rationale: str = Field(min_length=1, max_length=2000)
+    authorization_id: str = Field(min_length=1, max_length=200)
+
+
 class PaperRecoveryRequest(BaseModel):
     note: str = Field(default="operator stopped run", max_length=160)
 
@@ -1934,6 +1940,27 @@ async def manual_live_proof_report_export() -> JSONResponse:
 @app.get("/api/autonomous-pilot/status", dependencies=[Depends(require_auth)])
 async def autonomous_pilot_status() -> dict:
     return state.autonomous_pilot_status()
+
+
+@app.get("/api/reports/post-pilot-review", dependencies=[Depends(require_auth)])
+async def post_pilot_review_status() -> dict:
+    return state.post_pilot_review_status()
+
+
+@app.get("/api/reports/post-pilot-review/export", dependencies=[Depends(require_auth)])
+async def post_pilot_review_export() -> JSONResponse:
+    return JSONResponse(
+        content=state.post_pilot_review_status(),
+        headers={"Content-Disposition": 'attachment; filename="cryptoarc-post-pilot-review.json"'},
+    )
+
+
+@app.post("/api/reports/post-pilot-review/{review_id}/decision", dependencies=[Depends(require_auth)])
+async def record_post_pilot_decision(review_id: str, payload: PostPilotDecisionRequest) -> dict:
+    try:
+        return state.record_post_pilot_decision(review_id, payload.decision, payload.rationale, payload.authorization_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/api/reports/post-run-review", dependencies=[Depends(require_auth)])

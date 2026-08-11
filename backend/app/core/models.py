@@ -326,6 +326,7 @@ class LiveSession:
     autonomous_pilot_window_id: str = ""
     autonomous_authorization_id: str = ""
     attended: bool = False
+    post_pilot_review_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

@@ -58,6 +58,8 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("production_rehearsal_reports", "production_rehearsal_reports"),
     ("manual_live_proof_reports", "manual_live_proof_reports"),
     ("autonomous_pilot_windows", "autonomous_pilot_windows"),
+    ("post_pilot_reviews", "post_pilot_reviews"),
+    ("pilot_operator_decisions", "pilot_operator_decisions"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -65,7 +67,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 21
+    SCHEMA_VERSION = 22
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -106,6 +108,8 @@ class Storage:
         "production_rehearsal_reports",
         "manual_live_proof_reports",
         "autonomous_pilot_windows",
+        "post_pilot_reviews",
+        "pilot_operator_decisions",
     )
     BACKUP_TABLES = (
         "settings",
@@ -148,6 +152,8 @@ class Storage:
         "production_rehearsal_reports",
         "manual_live_proof_reports",
         "autonomous_pilot_windows",
+        "post_pilot_reviews",
+        "pilot_operator_decisions",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -300,6 +306,7 @@ class Storage:
             (19, "019_production_rehearsal", "append-only production gate rehearsal reports", self._migration_019_production_rehearsal),
             (20, "020_manual_live_proof", "append-only manual live proof qualification reports", self._migration_020_manual_live_proof),
             (21, "021_autonomous_pilot", "append-only attended autonomous pilot window evaluations", self._migration_021_autonomous_pilot),
+            (22, "022_post_pilot_review", "append-only post-pilot reviews and operator decisions", self._migration_022_post_pilot_review),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -981,6 +988,32 @@ class Storage:
             """
         )
         connection.execute("CREATE INDEX IF NOT EXISTS idx_autonomous_pilot_created ON autonomous_pilot_windows(created_at DESC)")
+
+    def _migration_022_post_pilot_review(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS post_pilot_reviews (
+                review_id TEXT PRIMARY KEY,
+                window_id TEXT NOT NULL,
+                clear INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_post_pilot_reviews_created ON post_pilot_reviews(created_at DESC)")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pilot_operator_decisions (
+                decision_id TEXT PRIMARY KEY,
+                review_id TEXT NOT NULL UNIQUE,
+                decision TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_pilot_decisions_created ON pilot_operator_decisions(created_at DESC)")
 
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
@@ -1926,6 +1959,59 @@ class Storage:
             row = connection.execute(
                 "SELECT payload FROM autonomous_pilot_windows ORDER BY created_at DESC, window_id DESC LIMIT 1"
             ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_post_pilot_review(self, review: dict[str, Any]) -> dict[str, Any]:
+        review_id = str(review.get("review_id") or "").strip()
+        if not review_id:
+            raise ValueError("post-pilot review ID is required")
+        created_at = datetime.now(timezone.utc).isoformat()
+        payload = {**review, "created_at": created_at}
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM post_pilot_reviews WHERE review_id = ?", (review_id,)).fetchone()
+            if existing:
+                existing_payload = json.loads(existing["payload"])
+                comparable = {key: value for key, value in existing_payload.items() if key != "created_at"}
+                if json.dumps(comparable, sort_keys=True) != json.dumps(review, sort_keys=True):
+                    raise ValueError("post-pilot review already exists with different content")
+                return existing_payload
+            connection.execute(
+                "INSERT INTO post_pilot_reviews (review_id, window_id, clear, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (review_id, str(review.get("window_id") or ""), int(bool(review.get("clear"))), created_at, serialized),
+            )
+        return payload
+
+    def load_post_pilot_review(self, review_id: str = "") -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            if review_id:
+                row = connection.execute("SELECT payload FROM post_pilot_reviews WHERE review_id = ?", (review_id,)).fetchone()
+            else:
+                row = connection.execute("SELECT payload FROM post_pilot_reviews ORDER BY created_at DESC, review_id DESC LIMIT 1").fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def save_pilot_operator_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
+        decision_id = str(decision.get("decision_id") or "").strip()
+        review_id = str(decision.get("review_id") or "").strip()
+        if not decision_id or not review_id:
+            raise ValueError("pilot decision and review IDs are required")
+        serialized = json.dumps(decision, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM pilot_operator_decisions WHERE review_id = ?", (review_id,)).fetchone()
+            if existing:
+                existing_payload = json.loads(existing["payload"])
+                if json.dumps(existing_payload, sort_keys=True) != serialized:
+                    raise ValueError("post-pilot review already has a different operator decision")
+                return existing_payload
+            connection.execute(
+                "INSERT INTO pilot_operator_decisions (decision_id, review_id, decision, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (decision_id, review_id, str(decision.get("decision") or ""), str(decision.get("created_at") or datetime.now(timezone.utc).isoformat()), serialized),
+            )
+        return decision
+
+    def load_pilot_operator_decision(self, review_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute("SELECT payload FROM pilot_operator_decisions WHERE review_id = ?", (review_id,)).fetchone()
         return json.loads(row["payload"]) if row else None
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:

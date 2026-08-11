@@ -152,6 +152,8 @@ class AutonomousPilotGate:
             block("backup_stale")
         if readiness_snapshot.get("kill_switch_available") is not True:
             block("kill_switch_unavailable")
+        if readiness_snapshot.get("prior_pilot_window_id") and readiness_snapshot.get("prior_post_pilot_review_clear") is not True:
+            block("post_pilot_review_required")
 
         identities = (readiness_snapshot, manual_proof)
         if not wallet or any(str(item.get("wallet_public_key") or "") != wallet for item in identities):

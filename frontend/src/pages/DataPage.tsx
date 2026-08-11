@@ -21,7 +21,7 @@ import { Button } from "../components/Button";
 import { Badge } from "../components/Badge";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import { exportUrl, backupDatabase, backupRestoreExportUrl, confirmRestoreArtifact, createBackupArtifact, downloadAuthenticatedExport, evidenceModeSeparationExportUrl, fetchEvidenceModeSeparation, fetchManualLiveProof, fetchOperatorLogs, fetchOutcomeExplanations, fetchPilotReadiness, fetchPostRunReview, fetchReleaseReadiness, fetchSessionReport, fetchSetupReadiness, fetchSolanaLogsVerification, fetchSourceParserReplay, fetchSourceSoakAcceptance, incidentExportUrl, manualLiveProofExportUrl, operatorLogsExportUrl, outcomeExplanationsExportUrl, pilotReadinessExportUrl, postRunReviewExportUrl, previewRestoreArtifact, recordIncidentExportReview, recordReleaseVerification, recordSourceSoakSnapshot, releaseReadinessExportUrl, runRestoreSmokeTest, sessionReportExportUrl, setupReadinessExportUrl, solanaLogsVerificationExportUrl, sourceHealthExportUrl, sourceParserReplayExportUrl, sourceSoakAcceptanceExportUrl } from "../api";
+import { exportUrl, backupDatabase, backupRestoreExportUrl, confirmRestoreArtifact, createBackupArtifact, downloadAuthenticatedExport, evidenceModeSeparationExportUrl, fetchEvidenceModeSeparation, fetchManualLiveProof, fetchOperatorLogs, fetchOutcomeExplanations, fetchPilotReadiness, fetchPostPilotReview, fetchPostRunReview, fetchReleaseReadiness, fetchSessionReport, fetchSetupReadiness, fetchSolanaLogsVerification, fetchSourceParserReplay, fetchSourceSoakAcceptance, incidentExportUrl, manualLiveProofExportUrl, operatorLogsExportUrl, outcomeExplanationsExportUrl, pilotReadinessExportUrl, postPilotReviewExportUrl, postRunReviewExportUrl, previewRestoreArtifact, recordIncidentExportReview, recordReleaseVerification, recordSourceSoakSnapshot, releaseReadinessExportUrl, runRestoreSmokeTest, sessionReportExportUrl, setupReadinessExportUrl, solanaLogsVerificationExportUrl, sourceHealthExportUrl, sourceParserReplayExportUrl, sourceSoakAcceptanceExportUrl } from "../api";
 import type { 
   BackupRestoreHistoryEntry,
   DataSummary, 
@@ -50,6 +50,7 @@ import type {
   PilotReadinessReport,
   ManualLiveProofReport,
   PostRunReviewReport,
+  PostPilotReviewReport,
   SetupReadinessReport,
   SourceAdapterStatus, 
   SolanaLogsVerificationReport,
@@ -261,6 +262,8 @@ export const DataPage: React.FC<DataPageProps> = ({
   const [releaseVerificationBusy, setReleaseVerificationBusy] = React.useState(false);
   const [postRunReview, setPostRunReview] = React.useState<PostRunReviewReport | null>(null);
   const [postRunReviewError, setPostRunReviewError] = React.useState("");
+  const [postPilotReview, setPostPilotReview] = React.useState<PostPilotReviewReport | null>(null);
+  const [postPilotReviewError, setPostPilotReviewError] = React.useState("");
   const [reviewingIncidentAuditId, setReviewingIncidentAuditId] = React.useState("");
   const [sessionReport, setSessionReport] = React.useState<OperatorSessionReport | null>(null);
   const [sessionReportError, setSessionReportError] = React.useState("");
@@ -363,6 +366,15 @@ export const DataPage: React.FC<DataPageProps> = ({
       setManualLiveProofError("");
     } catch (error) {
       setManualLiveProofError(error instanceof Error ? error.message : "Manual-live proof report failed");
+    }
+  }
+
+  async function refreshPostPilotReview() {
+    try {
+      setPostPilotReview(await fetchPostPilotReview());
+      setPostPilotReviewError("");
+    } catch (error) {
+      setPostPilotReviewError(error instanceof Error ? error.message : "Post-pilot review failed");
     }
   }
 
@@ -519,6 +531,7 @@ export const DataPage: React.FC<DataPageProps> = ({
   React.useEffect(() => {
     void refreshPilotReadiness();
     void refreshManualLiveProof();
+    void refreshPostPilotReview();
     void refreshSetupReadiness();
     void refreshReleaseReadiness();
     void refreshPostRunReview();
@@ -532,7 +545,7 @@ export const DataPage: React.FC<DataPageProps> = ({
   }, []);
 
   async function refreshAll() {
-    await Promise.all([onRefresh(), refreshPilotReadiness(), refreshManualLiveProof(), refreshSetupReadiness(), refreshReleaseReadiness(), refreshPostRunReview(), refreshSessionReport(), refreshEvidenceModeSeparation(), refreshOperatorLogs(), refreshOutcomeExplanations(), refreshSourceParserReplay(), refreshSolanaLogsVerification(), refreshSourceSoakAcceptance()]);
+    await Promise.all([onRefresh(), refreshPilotReadiness(), refreshManualLiveProof(), refreshPostPilotReview(), refreshSetupReadiness(), refreshReleaseReadiness(), refreshPostRunReview(), refreshSessionReport(), refreshEvidenceModeSeparation(), refreshOperatorLogs(), refreshOutcomeExplanations(), refreshSourceParserReplay(), refreshSolanaLogsVerification(), refreshSourceSoakAcceptance()]);
   }
 
   function downloadSourceEventBundle() {
@@ -1095,6 +1108,18 @@ export const DataPage: React.FC<DataPageProps> = ({
               </div>
             )}
             {postRunReviewError ? <p className="mt-2 text-xs text-rose-300">{postRunReviewError}</p> : null}
+            <div className="mt-3 rounded-lg border border-white/5 bg-white/[0.03] p-3 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-black uppercase tracking-widest text-zinc-400">Post-pilot decision</span>
+                <div className="flex items-center gap-3">
+                  <Badge variant={postPilotReview?.clear ? "success" : "warning"}>{postPilotReview?.status ?? "loading"}</Badge>
+                  <button type="button" className="text-[10px] font-black uppercase tracking-widest text-amber-300 hover:text-amber-200" onClick={() => downloadExport(postPilotReviewExportUrl(), "cryptoarc-post-pilot-review.json")}>Export</button>
+                </div>
+              </div>
+              <p className="mt-2 text-zinc-400">{postPilotReview?.operator_action ?? "Waiting for a closed attended pilot."}</p>
+              <p className="mt-1 text-zinc-500">{postPilotReview?.decision ? `Recorded: ${postPilotReview.decision.decision}; no scaling applied.` : "No operator decision recorded."}</p>
+              {postPilotReviewError ? <p className="mt-1 text-rose-300">{postPilotReviewError}</p> : null}
+            </div>
           </div>
           <div className="w-full max-w-xl rounded-xl border border-white/5 bg-black/20 p-3">
             <div className="mb-2 flex items-center justify-between">

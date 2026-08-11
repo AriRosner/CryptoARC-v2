@@ -1335,6 +1335,32 @@ export interface AutonomousPilotStatus {
   operator_action: string;
 }
 
+export interface PostPilotReviewReport {
+  review_id?: string;
+  window_id?: string;
+  created_at?: string;
+  status: "CLEAR" | "BLOCKED" | "DEFERRED";
+  clear: boolean;
+  blockers: string[];
+  next_pilot_blocked: boolean;
+  allowed_decisions: Array<"scale" | "hold" | "revise" | "stop">;
+  audit_ids?: string[];
+  transaction_signatures?: string[];
+  grade_count?: number;
+  cumulative_loss_usd?: string;
+  decision?: {
+    decision_id: string;
+    decision: "scale" | "hold" | "revise" | "stop";
+    rationale: string;
+    authorization_id: string;
+    scaling_applied: false;
+    authority_changed: false;
+  } | null;
+  automatic_scaling_applied: false;
+  authority_changed: false;
+  operator_action: string;
+}
+
 export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
 
 export interface SentinelVerdict {
