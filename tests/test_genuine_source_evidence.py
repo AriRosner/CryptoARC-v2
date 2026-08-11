@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.core.models import AcceptedMarketObservation
-from app.core.sources import SourceEvidenceGate
+from app.core.models import AcceptedMarketObservation, TokenSignal, TokenStatus
+from app.core.sources import SourceEvidenceGate, normalize_pumpportal_trade
 from app.core.state import BotState
 from app.core.storage import Storage
 
@@ -180,6 +180,29 @@ class GenuineSourceEvidenceTests(unittest.TestCase):
         )
         self.assertTrue(fixture["fixture_only"])
         self.assertEqual(fixture["conflict_state"], "primary_direct_conflict")
+
+    def test_rejected_first_tick_jump_never_becomes_genuine_source_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "source.db"))
+            token = TokenSignal(
+                id="token-jump", symbol="JUMP", name="Jump", mint="mint-jump", creator="creator",
+                detected_at=NOW, status=TokenStatus.MONITORING, entry_price=0.00001, current_price=0.00001,
+            )
+            state.tokens.appendleft(token)
+            state.storage.save_token(token)
+            event = normalize_pumpportal_trade(
+                {"txType": "buy", "mint": token.mint, "price": 0.01},
+                NOW,
+            )
+            assert event is not None
+
+            state.ingest_source_event(event, active_tokens_loaded=True)
+
+            self.assertEqual(state.storage.load_accepted_market_observations(limit=10), [])
+            rejected = state.storage.load_price_observations(limit=10)
+            self.assertEqual(len(rejected), 1)
+            self.assertFalse(rejected[0].accepted)
+            self.assertIn("first observed move", rejected[0].reason)
 
 
 if __name__ == "__main__":

@@ -681,6 +681,7 @@ class ShadowComparison:
     contaminated: bool = False
     exit_reason: str = ""
     hold_seconds: int = 0
+    reference_usd_per_sol: float = 0.0
 
     def net_pnl_sol(self, *, cost_stress: bool = False) -> float:
         costs = self.costs.stressed_total_sol() if cost_stress else self.costs.total_sol()

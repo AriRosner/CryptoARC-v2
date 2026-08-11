@@ -2291,8 +2291,9 @@ class BotState:
                     }
                 )
             source_event = self.record_source_event(event.source, event.raw_payload, None, event.message, status="trade")
-            self._record_accepted_market_observation(event, source_event)
-            self.apply_observed_trade(event, active_tokens_loaded=active_tokens_loaded)
+            observation = self.apply_observed_trade(event, active_tokens_loaded=active_tokens_loaded)
+            if observation is not None and observation.accepted and observation.price:
+                self._record_accepted_market_observation(event, source_event, observation)
             return
         if event.kind in {"verification", "verification_status"}:
             token = self._direct_solana_token_from_event(event) if event.kind == "verification" else None
@@ -2356,8 +2357,13 @@ class BotState:
         )
         return mentions_trade_stream and mentions_funding
 
-    def _record_accepted_market_observation(self, event: LaunchEvent, source_event: SourceEvent) -> None:
-        if not event.mint or event.observed_price is None or event.observed_price <= 0:
+    def _record_accepted_market_observation(
+        self,
+        event: LaunchEvent,
+        source_event: SourceEvent,
+        observation: PriceObservation,
+    ) -> None:
+        if not event.mint or not observation.accepted or observation.price is None or observation.price <= 0:
             return
         mode = getattr(self.settings.mode, "value", str(self.settings.mode))
         item = AcceptedMarketObservation(
@@ -2369,12 +2375,12 @@ class BotState:
             evidence_mode=mode,
             source=event.source,
             source_event_id=source_event.id,
-            observed_at=event.received_at,
+            observed_at=observation.observed_at,
             received_at=event.received_at,
             mint=event.mint,
-            price=float(event.observed_price),
-            confidence=1.0,
-            acceptance_reason="normalized_trade_price",
+            price=float(observation.price),
+            confidence=float(observation.confidence),
+            acceptance_reason=f"{observation.price_source}: {observation.reason}",
             conflict_state=str(event.raw_payload.get("conflict_state") or "clear"),
             access_state="ready",
             fixture_only=event.raw_payload.get("fixture_only") is True,
@@ -2386,9 +2392,9 @@ class BotState:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
         return mint in PUMPPORTAL_NON_LAUNCH_MINTS
 
-    def apply_observed_trade(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> None:
+    def apply_observed_trade(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> PriceObservation | None:
         if not self.settings.use_observed_prices or not event.mint:
-            return
+            return None
         if not active_tokens_loaded:
             self._ensure_active_tokens_loaded()
         observation = self.price_pipeline.observe(
@@ -2409,7 +2415,7 @@ class BotState:
                     token.decision_log.append(f"Price observation rejected: {observation.reason}")
                     self.storage.save_token(token)
                     break
-            return
+            return observation
         for token in self.tokens:
             if token.mint != event.mint:
                 continue
@@ -2441,7 +2447,7 @@ class BotState:
                     )
                     self.storage.save_token(token)
                     self.storage.save_price_observation(observation)
-                    break
+                    return observation
             observation = self.price_pipeline.validate_first_tick(token, observation, self.settings)
             if not observation.accepted or not observation.price:
                 token.price_reject_reason = observation.reason
@@ -2449,7 +2455,7 @@ class BotState:
                 token.decision_log.append(f"Price observation rejected: {observation.reason}")
                 self.storage.save_token(token)
                 self.storage.save_price_observation(observation)
-                break
+                return observation
             observed_price = observation.price
             token.current_price = observed_price
             token.price_source = observation.price_source
@@ -2469,7 +2475,8 @@ class BotState:
             token.decision_log.append(f"Observed {event.trade_side} trade updated price from {old_price:.8f} to {observed_price:.8f} ({observation.price_source}, {observation.confidence:.2f})")
             self.storage.save_token(token)
             self.storage.save_price_observation(observation)
-            break
+            return observation
+        return observation
 
     def tick(self, *, build_snapshot: bool = True) -> BotSnapshot | None:
         self._ensure_active_tokens_loaded()
@@ -8846,12 +8853,15 @@ class BotState:
 
     def run_live_autonomy(self, env_live_enabled: bool, *, local_auth_enabled: bool = False) -> dict[str, object]:
         pilot_window = self.autonomous_pilot_status()
-        if pilot_window.get("opened") is not True:
+        if pilot_window.get("opened") is not True or str(pilot_window.get("status") or "").upper() not in {"OPEN", "OPENED"}:
             return {
                 "status": "disabled",
                 "reason": "no separately authorized attended autonomous pilot window is open",
                 "pilot_window": pilot_window,
             }
+        stopped = self._enforce_pilot_runtime_guard()
+        if stopped is not None:
+            return stopped
         if not local_auth_enabled:
             return {"status": "disabled", "reason": "dashboard password/local auth is required for live autonomy"}
         if not env_live_enabled:
@@ -8870,6 +8880,9 @@ class BotState:
         ]
         executed = []
         for intent in intents[:3]:
+            stopped = self._enforce_pilot_runtime_guard()
+            if stopped is not None:
+                return {**stopped, "generated": len(generated), "executed": executed}
             blockers = self._live_execution_blockers(env_live_enabled, intent.action, wallet, signer_mode, autonomous=True)
             if blockers:
                 intent.autonomy_blocked = True
@@ -8885,6 +8898,9 @@ class BotState:
                 continue
             try:
                 audit = self.quote_live_intent(env_live_enabled, intent.id, self.settings.live_max_slippage_pct, self.settings.live_priority_fee_cap_sol, "pump")
+                stopped = self._enforce_pilot_runtime_guard()
+                if stopped is not None:
+                    return {**stopped, "generated": len(generated), "executed": executed}
                 stored_audit = self.storage.load_live_execution_audit(str(audit.get("id") or ""))
                 preflight_blockers = self._live_audit_preflight_blockers(stored_audit) if stored_audit else ["missing live audit preflight evidence"]
                 if preflight_blockers:
@@ -8901,6 +8917,9 @@ class BotState:
                         operator_action="Review live audit preflight evidence before unattended execution.",
                     )
                     continue
+                stopped = self._enforce_pilot_runtime_guard()
+                if stopped is not None:
+                    return {**stopped, "generated": len(generated), "executed": executed}
                 result = self.live_submit(str(audit["id"]), "")
                 executed.append({"intent_id": intent.id, "audit_id": str(result.get("id") or audit["id"]), "status": str(result.get("status") or "")})
                 if intent.action == "buy":
@@ -8908,6 +8927,120 @@ class BotState:
             except Exception as exc:
                 self.add_event("warning", f"Autonomous {intent.action} failed for {intent.symbol or intent.mint[:8]}: {exc}", subsystem="live")
         return {"status": "ok", "generated": len(generated), "executed": executed}
+
+    def _pilot_runtime_blockers(
+        self,
+        window: dict[str, object],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        checked_at = (now or utc_now()).astimezone(timezone.utc)
+        blockers: list[str] = []
+
+        def block(value: str) -> None:
+            if value not in blockers:
+                blockers.append(value)
+
+        if window.get("opened") is not True or str(window.get("status") or "").upper() not in {"OPEN", "OPENED"}:
+            block("inactive_window")
+        ends_at = self._parse_iso_datetime(str(window.get("ends_at") or ""))
+        if ends_at is None or ends_at <= checked_at:
+            block("window_expired")
+        if window.get("attended") is not True:
+            block("attended_operator_lost")
+        if self.settings.kill_switch_enabled:
+            block("kill_switch")
+
+        wallet = str(window.get("wallet_public_key") or "")
+        signer_mode = str(window.get("signer_mode") or "")
+        if (
+            not self.settings.live_active_backend_armed
+            or self.settings.live_active_wallet_public_key != wallet
+            or self.settings.live_signer_mode != signer_mode
+        ):
+            block("identity_mismatch")
+        signer = self.signer_status(signer_mode, wallet)
+        if not signer.get("connected") or not signer.get("healthy") or not signer.get("can_unattended_sign"):
+            block("signer_loss")
+        if str(signer.get("wallet_public_key") or "") != wallet:
+            block("identity_mismatch")
+
+        policy = self.storage.load_latest_pilot_risk_policy()
+        if (
+            policy is None
+            or policy.policy_id != str(window.get("policy_id") or "")
+            or policy.settings_version != self.current_settings_version_id
+        ):
+            block("policy_drift")
+        else:
+            risk = self._pilot_risk_state(policy, wallet, now=checked_at)
+            if risk.session_pnl_sol <= -policy.session_loss_stop_sol:
+                block("session_loss_stop")
+            if risk.daily_pnl_sol <= -policy.daily_loss_stop_sol:
+                block("daily_loss_stop")
+            if risk.cumulative_loss_sol >= policy.cumulative_loss_freeze_sol:
+                block("cumulative_loss_freeze")
+            if risk.consecutive_losses >= policy.consecutive_loss_stop:
+                block("consecutive_loss_stop")
+
+        source_blocker = self._source_live_entry_blocker(self.source_health())
+        if source_blocker:
+            block("source_loss" if "connected" in source_blocker or "recent" in source_blocker else "source_conflict")
+
+        manual = self.manual_live_proof_status()
+        if (
+            manual.get("qualified") is not True
+            or str(manual.get("proof_id") or "") != str(window.get("manual_proof_id") or "")
+            or str(manual.get("wallet_public_key") or "") != wallet
+            or str(manual.get("signer_mode") or "") != signer_mode
+            or str(manual.get("signer_identity_id") or "") != str(window.get("signer_identity_id") or "")
+        ):
+            block("identity_mismatch")
+        rehearsal = self.production_rehearsal_status()
+        if rehearsal.get("ready") is not True or rehearsal.get("fixture_only") is not False:
+            block("preflight_failed")
+        sentinel = self.sentinel_current(refresh=False)
+        if sentinel.get("status") != "pilot_eligible" or sentinel.get("stale") is not False:
+            block("preflight_failed")
+        economic = self.economic_validation_report()
+        if economic.get("ready") is not True:
+            block("drawdown_stop" if "max_drawdown_above_10_percent" in list(economic.get("blockers") or []) else "preflight_failed")
+        return blockers
+
+    def _enforce_pilot_runtime_guard(self, *, now: datetime | None = None) -> dict[str, object] | None:
+        window = self.autonomous_pilot_status()
+        blockers = self._pilot_runtime_blockers(window, now=now)
+        if not blockers:
+            return None
+        stopped_at = (now or utc_now()).astimezone(timezone.utc)
+        stopped_settings = replace(
+            self.settings,
+            kill_switch_enabled=True,
+            live_active_backend_armed=False,
+            live_active_wallet_public_key="",
+        )
+        closed = self.storage.stop_autonomous_pilot_window(
+            str(window.get("window_id") or ""),
+            stopped_settings,
+            blockers,
+            stopped_at,
+        )
+        self.settings = stopped_settings
+        self.active_live_session_id = ""
+        decision = PilotStopEvaluator.evaluate({"type": blockers[0]}, window).to_dict()
+        self.add_event(
+            "danger",
+            f"Autonomous pilot stopped: {', '.join(blockers)}",
+            subsystem="live",
+            operator_action="Keep the backend disarmed and complete reconciliation plus post-pilot review before any new authorization.",
+        )
+        return {
+            "status": "stopped",
+            "reason": "pilot runtime authority was revoked",
+            "blockers": blockers,
+            "pilot_window": closed,
+            "stop_decision": decision,
+        }
 
     def recover_live_audit(self, audit_id: str) -> dict[str, object]:
         audit = self._require_live_audit(audit_id)
@@ -10185,7 +10318,55 @@ class BotState:
         audit.updated_at = utc_now()
         self.storage.save_live_ledger_position(position)
         self.storage.save_live_execution_audit(audit)
+        self._record_reconciled_pilot_outcome(audit, position)
         return position
+
+    def _record_reconciled_pilot_outcome(
+        self,
+        audit: LiveExecutionAudit,
+        position: LiveLedgerPosition,
+    ) -> bool:
+        if (
+            audit.action != "sell"
+            or audit.reconciliation_status != "matched"
+            or position.reconciliation_status != "matched"
+        ):
+            return False
+        policy = self.storage.load_latest_pilot_risk_policy()
+        window = self.storage.load_latest_autonomous_pilot_window()
+        if (
+            policy is None
+            or window is None
+            or window.get("opened") is not True
+            or str(window.get("status") or "").upper() not in {"OPEN", "OPENED"}
+            or str(window.get("policy_id") or "") != policy.policy_id
+            or audit.pilot_risk_policy_id != policy.policy_id
+            or str(window.get("wallet_public_key") or "") != audit.wallet_public_key
+        ):
+            return False
+        event = next(
+            (
+                item
+                for item in reversed(position.realized_pnl_events)
+                if str(item.get("audit_id") or "") == audit.id
+                and item.get("provenance") == "transaction_meta"
+            ),
+            None,
+        )
+        if event is None:
+            return False
+        try:
+            pnl_sol = Decimal(str(event["realized_pnl_delta_sol"]))
+            recorded_at = self._parse_iso_datetime(str(event.get("recorded_at") or "")) or audit.updated_at
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self.storage.append_pilot_outcome(
+            policy.policy_id,
+            str(window.get("window_id") or ""),
+            audit.id,
+            pnl_sol,
+            recorded_at,
+        )
 
     def _live_ledger_positions(self, wallet_public_key: str = "") -> list[LiveLedgerPosition]:
         positions = self.storage.load_live_ledger_positions(500)
@@ -10906,18 +11087,42 @@ class BotState:
         )
         return self.storage.save_pilot_operator_decision(record.to_dict())
 
-    def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
+    def _pilot_risk_state(
+        self,
+        policy: PilotRiskPolicy,
+        wallet_public_key: str = "",
+        *,
+        now: datetime | None = None,
+    ) -> PilotRiskState:
         positions = self.storage.load_live_ledger_positions(500)
         relevant = [item for item in positions if not wallet_public_key or item.wallet_public_key == wallet_public_key]
-        pnl = sum((Decimal(str(item.realized_pnl_sol)) + Decimal(str(item.unrealized_pnl_sol)) for item in relevant), Decimal("0"))
         ledger = self.storage.pilot_loss_ledger(policy.policy_id)
         entries = list(ledger.get("entries") or [])
+        checked_at = (now or utc_now()).astimezone(timezone.utc)
+        day_start = checked_at.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        def timestamp(item: dict[str, object]) -> datetime | None:
+            return self._parse_iso_datetime(str(item.get("created_at") or ""))
+
+        def pnl(item: dict[str, object]) -> Decimal:
+            if "pnl_sol" in item:
+                return Decimal(str(item.get("pnl_sol") or "0"))
+            return -Decimal(str(item.get("loss_sol") or "0"))
+
+        session_entries = [item for item in entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= policy.created_at]
+        daily_entries = [item for item in session_entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= day_start]
+        consecutive_losses = 0
+        for item in reversed(session_entries):
+            if pnl(item) < 0:
+                consecutive_losses += 1
+            else:
+                break
         return PilotRiskState(
             open_positions=len([item for item in relevant if item.status == "open" and item.token_balance > 0]),
-            session_pnl_sol=pnl,
-            daily_pnl_sol=pnl,
+            session_pnl_sol=sum((pnl(item) for item in session_entries), Decimal("0")),
+            daily_pnl_sol=sum((pnl(item) for item in daily_entries), Decimal("0")),
             cumulative_loss_sol=Decimal(str(ledger.get("cumulative_loss_sol") or "0")),
-            consecutive_losses=min(len(entries), policy.consecutive_loss_stop),
+            consecutive_losses=consecutive_losses,
             stopped=bool(self.settings.kill_switch_enabled),
         )
 

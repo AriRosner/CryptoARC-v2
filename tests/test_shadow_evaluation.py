@@ -31,6 +31,7 @@ def comparison(
     fixture_only: bool = False,
     landing_status: str = "evaluated",
     contaminated: bool = False,
+    reference_usd_per_sol: float = 1.0,
 ) -> ShadowComparison:
     completed_at = NOW - timedelta(days=6 - day, minutes=index)
     return ShadowComparison(
@@ -60,6 +61,7 @@ def comparison(
         contaminated=contaminated,
         exit_reason="take_profit" if gross > 0 else "stop_loss",
         hold_seconds=30,
+        reference_usd_per_sol=reference_usd_per_sol,
     )
 
 
@@ -160,6 +162,30 @@ class ShadowEvaluationTests(unittest.TestCase):
         report = EconomicValidator.evaluate("sniper-v1", rows, NOW)
 
         self.assertIn("walk_forward_collapse", report.blockers)
+
+    def test_drawdown_is_a_percent_of_modeled_one_hundred_dollar_equity(self) -> None:
+        cases = (
+            (9.99, False),
+            (10.00, False),
+            (10.01, True),
+        )
+        for drawdown_usd, blocked in cases:
+            with self.subTest(drawdown_usd=drawdown_usd):
+                row = comparison(
+                    gross=-(drawdown_usd / 200), base=0, variable=0,
+                    reference_usd_per_sol=200,
+                )
+                metrics = EconomicValidator._metrics([row], cost_stress=False)
+                self.assertAlmostEqual(metrics.max_drawdown, drawdown_usd, places=6)
+                self.assertEqual(metrics.max_drawdown > EconomicValidator.MAX_DRAWDOWN_PERCENT, blocked)
+
+    def test_missing_sol_usd_reference_fails_closed(self) -> None:
+        report = EconomicValidator.evaluate(
+            "sniper-v1",
+            [comparison(reference_usd_per_sol=0)],
+            NOW,
+        )
+        self.assertIn("sol_usd_reference_missing", report.blockers)
 
     def test_comparisons_round_trip_with_cost_identity(self) -> None:
         with TemporaryDirectory() as directory:

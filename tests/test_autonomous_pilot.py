@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from app.core.autonomous_pilot import AutonomousPilotGate, PilotStopEvaluator
+from app.core.pilot_risk import PilotRiskPolicy
 from app.core.state import BotState
 
 
@@ -147,6 +149,39 @@ class PilotStopEvaluatorTests(unittest.TestCase):
 
 
 class AutonomousPilotIntegrationTests(unittest.TestCase):
+    def configured_runtime(self, temp_dir: str) -> tuple[BotState, dict[str, object], PilotRiskPolicy]:
+        state = BotState(str(Path(temp_dir) / "pilot.db"))
+        policy = PilotRiskPolicy.create(
+            Decimal("200"), Decimal("0.4"), NOW - timedelta(minutes=10),
+            reference_observation_id="price-1", settings_version=state.current_settings_version_id,
+            operator_intent_id="intent-1",
+        )
+        state.storage.save_pilot_risk_policy(policy)
+        window = {
+            "window_id": "runtime-window", "status": "OPEN", "eligible": True, "opened": True,
+            "wallet_public_key": WALLET, "signer_mode": SIGNER_MODE, "signer_identity_id": SIGNER_ID,
+            "policy_id": policy.policy_id, "manual_proof_id": "manual-proof-1", "attended": True,
+            "starts_at": (NOW - timedelta(minutes=2)).isoformat(), "ends_at": (NOW + timedelta(minutes=20)).isoformat(),
+        }
+        state.storage.save_autonomous_pilot_window(window)
+        state.settings.live_active_backend_armed = True
+        state.settings.live_active_wallet_public_key = WALLET
+        state.settings.live_signer_mode = SIGNER_MODE
+        state.settings.kill_switch_enabled = False
+        state.storage.save_settings(state.settings)
+        state.signer_status = lambda mode, wallet: {
+            "connected": True, "healthy": True, "can_unattended_sign": True, "wallet_public_key": WALLET,
+        }
+        state.source_health = lambda: {"status": "connected", "trust_state": "trusted", "last_event_age_seconds": 0, "live_entry_blocked": False}
+        state.manual_live_proof_status = lambda: {
+            "qualified": True, "proof_id": "manual-proof-1", "wallet_public_key": WALLET,
+            "signer_mode": SIGNER_MODE, "signer_identity_id": SIGNER_ID,
+        }
+        state.production_rehearsal_status = lambda: {"ready": True, "fixture_only": False}
+        state.sentinel_current = lambda refresh=False: {"status": "pilot_eligible", "stale": False}
+        state.economic_validation_report = lambda: {"ready": True, "blockers": []}
+        return state, window, policy
+
     def test_live_autonomy_refuses_to_run_without_an_open_pilot_window(self) -> None:
         with TemporaryDirectory() as temp_dir:
             state = BotState(str(Path(temp_dir) / "pilot.db"))
@@ -154,6 +189,52 @@ class AutonomousPilotIntegrationTests(unittest.TestCase):
         self.assertEqual(result["status"], "disabled")
         self.assertIn("no separately authorized attended", result["reason"])
         self.assertFalse(result["pilot_window"]["opened"])
+
+    def test_runtime_guard_revalidates_expiry_source_signer_identity_and_policy(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state, window, policy = self.configured_runtime(temp_dir)
+            self.assertEqual(state._pilot_runtime_blockers(window, now=NOW), [])
+
+            expired = {**window, "ends_at": (NOW - timedelta(seconds=1)).isoformat()}
+            self.assertIn("window_expired", state._pilot_runtime_blockers(expired, now=NOW))
+
+            state.source_health = lambda: {"status": "connected", "trust_state": "conflicting", "last_event_age_seconds": 0, "live_entry_blocked": True}
+            self.assertIn("source_conflict", state._pilot_runtime_blockers(window, now=NOW))
+            state.source_health = lambda: {"status": "connected", "trust_state": "trusted", "last_event_age_seconds": 0, "live_entry_blocked": False}
+
+            state.signer_status = lambda mode, wallet: {"connected": False, "healthy": False, "can_unattended_sign": False, "wallet_public_key": WALLET}
+            self.assertIn("signer_loss", state._pilot_runtime_blockers(window, now=NOW))
+            state.signer_status = lambda mode, wallet: {"connected": True, "healthy": True, "can_unattended_sign": True, "wallet_public_key": WALLET}
+
+            state.settings.live_active_wallet_public_key = "different-wallet"
+            self.assertIn("identity_mismatch", state._pilot_runtime_blockers(window, now=NOW))
+            state.settings.live_active_wallet_public_key = WALLET
+
+            newer = PilotRiskPolicy.create(
+                Decimal("200"), Decimal("0.4"), NOW - timedelta(minutes=1),
+                reference_observation_id="price-2", settings_version=state.current_settings_version_id,
+                operator_intent_id="intent-2",
+            )
+            state.storage.save_pilot_risk_policy(newer)
+            self.assertNotEqual(newer.policy_id, policy.policy_id)
+            self.assertIn("policy_drift", state._pilot_runtime_blockers(window, now=NOW))
+
+    def test_runtime_stop_atomically_closes_window_enables_kill_and_disarms(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            state, _window, _policy = self.configured_runtime(temp_dir)
+            state.settings.kill_switch_enabled = True
+            result = state._enforce_pilot_runtime_guard(now=NOW)
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result["status"], "stopped")
+            self.assertIn("kill_switch", result["blockers"])
+            persisted_window = state.storage.load_latest_autonomous_pilot_window()
+            persisted_settings = state.storage.load_settings()
+            self.assertEqual(persisted_window["status"], "CLOSED")
+            self.assertFalse(persisted_window["active"])
+            self.assertTrue(persisted_settings.kill_switch_enabled)
+            self.assertFalse(persisted_settings.live_active_backend_armed)
+            self.assertEqual(persisted_settings.live_active_wallet_public_key, "")
 
 
 if __name__ == "__main__":

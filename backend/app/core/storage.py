@@ -1869,23 +1869,45 @@ class Storage:
             ).fetchone()
         return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
 
+    def append_pilot_outcome(
+        self,
+        policy_id: str,
+        window_id: str,
+        outcome_id: str,
+        pnl_sol: Decimal,
+        created_at: datetime,
+    ) -> bool:
+        amount = Decimal(pnl_sol)
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("pilot outcome timestamp must be timezone-aware")
+        loss = max(Decimal("0"), -amount)
+        payload = {
+            "loss_id": outcome_id,
+            "outcome_id": outcome_id,
+            "policy_id": policy_id,
+            "window_id": window_id,
+            "pnl_sol": str(amount),
+            "loss_sol": str(loss),
+            "created_at": created_at.astimezone(timezone.utc).isoformat(),
+        }
+        serialized = json.dumps(payload, sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute("SELECT payload FROM pilot_loss_ledger WHERE loss_id = ?", (outcome_id,)).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("pilot outcome already exists with different content")
+                return False
+            connection.execute(
+                "INSERT INTO pilot_loss_ledger (loss_id, policy_id, loss_sol, created_at, payload) VALUES (?, ?, ?, ?, ?)",
+                (outcome_id, policy_id, str(loss), payload["created_at"], serialized),
+            )
+        return True
+
     def append_pilot_loss(self, policy_id: str, loss_id: str, loss_sol: Decimal, created_at: datetime) -> bool:
         amount = Decimal(loss_sol)
         if amount <= 0:
             raise ValueError("pilot loss ledger accepts positive loss magnitudes only")
-        payload = {"loss_id": loss_id, "policy_id": policy_id, "loss_sol": str(amount), "created_at": created_at.isoformat()}
-        serialized = json.dumps(payload, sort_keys=True)
-        with self._connect() as connection:
-            existing = connection.execute("SELECT payload FROM pilot_loss_ledger WHERE loss_id = ?", (loss_id,)).fetchone()
-            if existing:
-                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
-                    raise ValueError("pilot loss entry already exists with different content")
-                return False
-            connection.execute(
-                "INSERT INTO pilot_loss_ledger (loss_id, policy_id, loss_sol, created_at, payload) VALUES (?, ?, ?, ?, ?)",
-                (loss_id, policy_id, str(amount), created_at.isoformat(), serialized),
-            )
-        return True
+        return self.append_pilot_outcome(policy_id, "legacy-unscoped", loss_id, -amount, created_at)
 
     def pilot_loss_ledger(self, policy_id: str) -> dict[str, Any]:
         with self.read_connection() as connection:
@@ -1894,7 +1916,7 @@ class Storage:
                 (policy_id,),
             ).fetchall()
         entries = [json.loads(row["payload"]) for row in rows]
-        cumulative = sum((Decimal(str(item["loss_sol"])) for item in entries), Decimal("0"))
+        cumulative = sum((Decimal(str(item.get("loss_sol") or "0")) for item in entries), Decimal("0"))
         return {"policy_id": policy_id, "cumulative_loss_sol": str(cumulative), "entries": entries}
 
     def save_production_rehearsal_report(self, report: dict[str, Any]) -> dict[str, Any]:
@@ -1960,6 +1982,43 @@ class Storage:
                 "SELECT payload FROM autonomous_pilot_windows ORDER BY created_at DESC, window_id DESC LIMIT 1"
             ).fetchone()
         return json.loads(row["payload"]) if row else None
+
+    def stop_autonomous_pilot_window(
+        self,
+        window_id: str,
+        settings: BotSettings,
+        blockers: list[str],
+        stopped_at: datetime,
+    ) -> dict[str, Any]:
+        if stopped_at.tzinfo is None or stopped_at.utcoffset() is None:
+            raise ValueError("pilot stop timestamp must be timezone-aware")
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_pilot_windows WHERE window_id = ?",
+                (window_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("autonomous pilot window was not found")
+            payload = json.loads(row["payload"])
+            payload.update(
+                {
+                    "status": "CLOSED",
+                    "active": False,
+                    "stop_blockers": list(dict.fromkeys(str(item) for item in blockers if item)),
+                    "stopped_at": stopped_at.astimezone(timezone.utc).isoformat(),
+                    "automatic_restart_allowed": False,
+                    "requires_post_run_review": True,
+                }
+            )
+            connection.execute(
+                "UPDATE autonomous_pilot_windows SET payload = ? WHERE window_id = ?",
+                (json.dumps(payload, sort_keys=True), window_id),
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO settings (id, payload) VALUES (1, ?)",
+                (json.dumps(asdict(settings)),),
+            )
+        return payload
 
     def save_post_pilot_review(self, review: dict[str, Any]) -> dict[str, Any]:
         review_id = str(review.get("review_id") or "").strip()

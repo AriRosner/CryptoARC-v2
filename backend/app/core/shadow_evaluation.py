@@ -39,7 +39,8 @@ class EconomicValidator:
     MIN_SAMPLES = 100
     MIN_CALENDAR_DAYS = 7
     MIN_PROFIT_FACTOR = 1.20
-    MAX_DRAWDOWN = 10.0
+    MODELED_EQUITY_USD = 100.0
+    MAX_DRAWDOWN_PERCENT = 10.0
     STRESS_CATASTROPHE = -10.0
 
     @classmethod
@@ -77,6 +78,9 @@ class EconomicValidator:
             if not item.source_evidence_ids or not item.quote_id:
                 blockers.append("source_evidence_missing")
                 item_blocked = True
+            if item.reference_usd_per_sol <= 0:
+                blockers.append("sol_usd_reference_missing")
+                item_blocked = True
             if not item_blocked:
                 valid.append(item)
 
@@ -99,7 +103,7 @@ class EconomicValidator:
             blockers.append("aggregate_net_pnl_not_positive")
         if standard.profit_factor < cls.MIN_PROFIT_FACTOR:
             blockers.append("profit_factor_below_1_20")
-        if standard.max_drawdown > cls.MAX_DRAWDOWN:
+        if standard.max_drawdown > cls.MAX_DRAWDOWN_PERCENT:
             blockers.append("max_drawdown_above_10_percent")
         if not held_out_rows or held_out.net_pnl <= 0:
             blockers.append("held_out_result_not_positive")
@@ -135,13 +139,14 @@ class EconomicValidator:
         wins = sum(value for value in pnls if value > 0)
         losses = abs(sum(value for value in pnls if value < 0))
         profit_factor = wins / losses if losses else (99.0 if wins > 0 else 0.0)
-        running = 0.0
-        peak = 0.0
+        running_usd = 0.0
+        peak_usd = 0.0
         drawdown = 0.0
-        for value in pnls:
-            running += value
-            peak = max(peak, running)
-            drawdown = max(drawdown, peak - running)
+        for item, value in zip(rows, pnls):
+            running_usd += value * float(item.reference_usd_per_sol)
+            peak_usd = max(peak_usd, running_usd)
+            drawdown_usd = peak_usd - running_usd
+            drawdown = max(drawdown, (drawdown_usd / EconomicValidator.MODELED_EQUITY_USD) * 100.0)
         return EconomicMetrics(
             net_pnl=round(sum(pnls), 9),
             profit_factor=round(profit_factor, 4),
