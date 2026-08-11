@@ -10728,6 +10728,13 @@ class BotState:
                 "fingerprint": fingerprint or "unknown",
             },
         }
+        return EvidenceInventory.build(
+            repo_head=str(repo_state.get("head") or ""),
+            origin_main=str(repo_state.get("origin_main") or ""),
+            merge_base=str(repo_state.get("merge_base") or ""),
+            dirty=repo_state.get("dirty") if isinstance(repo_state.get("dirty"), bool) else None,
+            reports=reports,
+        )
 
     def create_pilot_risk_policy(
         self,
@@ -10931,13 +10938,6 @@ class BotState:
         state = self._pilot_risk_state(policy, wallet_public_key)
         decision = policy.evaluate_entry(request, state) if action == "buy" else policy.evaluate_exit(request, state)
         return policy, decision.to_dict()
-        return EvidenceInventory.build(
-            repo_head=str(repo_state.get("head") or ""),
-            origin_main=str(repo_state.get("origin_main") or ""),
-            merge_base=str(repo_state.get("merge_base") or ""),
-            dirty=repo_state.get("dirty") if isinstance(repo_state.get("dirty"), bool) else None,
-            reports=reports,
-        )
 
     def economic_validation_report(
         self,
