@@ -184,6 +184,40 @@ class SourceEventBatchTests(unittest.TestCase):
             self.assertTrue(queue.empty())
             self.assertEqual(state.storage.count_source_events(), 1)
 
+    def test_drain_processes_only_one_bounded_batch_per_tick(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+
+            async def run_single_tick() -> tuple[int, int]:
+                previous_state = main_app.state
+                previous_queue = main_app.launch_queue
+                queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+                main_app.state = state
+                main_app.launch_queue = queue
+                try:
+                    for sequence in range(64):
+                        queue.put_nowait(
+                            LaunchEvent(
+                                "solana_logs",
+                                utc_now(),
+                                {"sequence": sequence},
+                                None,
+                                "verification",
+                                kind="verification",
+                            )
+                        )
+                    await main_app.drain_launch_queue()
+                    return queue.qsize(), state.storage.count_source_events()
+                finally:
+                    main_app.clear_launch_queue()
+                    main_app.state = previous_state
+                    main_app.launch_queue = previous_queue
+
+            queued, persisted = asyncio.run(run_single_tick())
+
+            self.assertEqual(queued, 14)
+            self.assertEqual(persisted, 50)
+
 
 if __name__ == "__main__":
     unittest.main()

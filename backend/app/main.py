@@ -416,6 +416,7 @@ clients: set[WebSocket] = set()
 mobile_clients: dict[WebSocket, str] = {}
 mobile_realtime_sequence = 0
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+SOURCE_EVENT_DRAIN_BATCH_SIZE = 50
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
 solana_logs_task: asyncio.Task | None = None
@@ -868,7 +869,9 @@ async def drain_launch_queue() -> None:
         return
 
     active_tokens_loaded = False
-    while not launch_queue.empty():
+    for _ in range(SOURCE_EVENT_DRAIN_BATCH_SIZE):
+        if launch_queue.empty():
+            break
         if state.status.value != "running":
             clear_launch_queue()
             return
