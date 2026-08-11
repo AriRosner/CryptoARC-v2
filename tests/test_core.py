@@ -6490,6 +6490,42 @@ class CoreLogicTests(unittest.TestCase):
             self.assertNotIn("normalization ratio is below 35%", health["trust_blockers"])
             self.assertFalse(any("duplicate mint" in warning.lower() for warning in health["trust_warnings"]))
 
+    def test_source_health_does_not_treat_direct_verifier_evidence_as_primary_failures(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            state.status = BotStatus.RUNNING
+            state.source_status.status = "connected"
+            state.source_status.last_event_at = now
+            for index in range(3):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_primary_norm_{index}",
+                        source="pumpportal",
+                        received_at=now,
+                        raw_payload={"mint": f"MintPrimary{index}", "txType": "create"},
+                        normalized_token_id=f"tok_primary_{index}",
+                        status="normalized",
+                    )
+                )
+            for index in range(50):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_direct_verifier_{index}",
+                        source="solana_logs",
+                        received_at=now + timedelta(milliseconds=index),
+                        raw_payload={"signature": f"SigDirect{index}"},
+                        status="raw",
+                    )
+                )
+
+            health = state.source_health()
+
+            self.assertEqual(health["normalization_failures"], 0)
+            self.assertEqual(health["normalized_ratio"], 1.0)
+            self.assertEqual(health["trust_state"], "trusted")
+            self.assertNotIn("normalization ratio is below 35%", health["trust_blockers"])
+
     def test_source_health_treats_fresh_reconnect_as_warning_not_failure(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
