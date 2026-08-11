@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import shutil
 import subprocess
 import unittest
@@ -264,6 +265,51 @@ class EvidenceInventoryTests(unittest.TestCase):
             self.assertNotEqual(dirty.returncode, 0)
             self.assertIn("requires a clean worktree", output)
             self.assertNotIn("Not a Git worktree", output)
+
+    def test_capture_script_recognizes_a_detached_git_worktree(self) -> None:
+        powershell = shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
+        self.assertIsNotNone(powershell, "PowerShell is required to exercise the evidence inventory script")
+        with TemporaryDirectory() as directory:
+            fixture_root = Path(directory)
+            repository = fixture_root / "repository"
+            detached_worktree = fixture_root / "detached"
+            scripts = repository / "scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(
+                ROOT / "scripts" / "capture-evidence-inventory.ps1",
+                scripts / "capture-evidence-inventory.ps1",
+            )
+            for command in (
+                ["git", "init", "-q", str(repository)],
+                ["git", "-C", str(repository), "config", "user.email", "fixture@example.invalid"],
+                ["git", "-C", str(repository), "config", "user.name", "Fixture"],
+                ["git", "-C", str(repository), "add", "scripts/capture-evidence-inventory.ps1"],
+                ["git", "-C", str(repository), "commit", "-q", "-m", "fixture"],
+                ["git", "-C", str(repository), "worktree", "add", "-q", "--detach", str(detached_worktree), "HEAD"],
+            ):
+                subprocess.run(command, check=True, capture_output=True, text=True)
+
+            output_path = fixture_root / "detached.json"
+            capture = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-File",
+                    str(detached_worktree / "scripts" / "capture-evidence-inventory.ps1"),
+                    "-BaseRef",
+                    "HEAD",
+                    "-OutputPath",
+                    str(output_path),
+                ],
+                cwd=detached_worktree,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(capture.returncode, 0, capture.stderr)
+            payload = json.loads(output_path.read_text(encoding="utf-8-sig"))
+            self.assertEqual(payload["code_state"]["branch"], "(detached)")
 
 
 if __name__ == "__main__":

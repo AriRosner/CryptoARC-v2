@@ -45,6 +45,9 @@ $branch = $branchLines | Select-Object -First 1
 if ($branchExit -ne 0) {
   throw 'Unable to resolve the current branch.'
 }
+if ([string]::IsNullOrWhiteSpace([string]$branch)) {
+  $branch = '(detached)'
+}
 
 $report = [ordered]@{
   artifact_type = 'cryptoarc_evidence_inventory'
