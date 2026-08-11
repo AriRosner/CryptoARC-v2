@@ -7452,6 +7452,20 @@ class CoreLogicTests(unittest.TestCase):
                     status="normalized",
                 )
             )
+            for index in range(25):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_portal_noise_{index}",
+                        source="pumpportal",
+                        received_at=now + timedelta(seconds=30 + index),
+                        raw_payload={
+                            "txType": "create",
+                            "mint": f"MintPortalNoise{index:03d}",
+                            "signature": f"SigPortalNoise{index:03d}",
+                        },
+                        status="normalized",
+                    )
+                )
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_balanced_direct",
@@ -7494,7 +7508,7 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(report["summary"]["direct_events"], 20)
             self.assertEqual(report["summary"]["direct_create_hints"], 1)
-            self.assertEqual(report["summary"]["pumpportal_events"], 1)
+            self.assertEqual(report["summary"]["pumpportal_events"], 20)
             self.assertEqual(report["summary"]["matches"], 1)
             self.assertEqual(report["summary"]["create_matches"], 1)
             self.assertEqual(report["matches"][0]["match_type"], "signature")
