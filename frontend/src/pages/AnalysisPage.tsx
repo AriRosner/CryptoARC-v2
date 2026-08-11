@@ -16,6 +16,7 @@ import { Button } from "../components/Button";
 import { PnlChart } from "../components/PnlChart";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
+import { fetchSentinelCurrent } from "../api";
 import type { 
   TokenSignal, 
   TradeRecord, 
@@ -24,7 +25,8 @@ import type {
   PriceDiagnostics, 
   PumpFunReport, 
   SafetyStatus, 
-  ReadinessStatus 
+  ReadinessStatus,
+  SentinelVerdict
 } from "../types";
 
 interface AnalysisPageProps {
@@ -84,6 +86,19 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   onTimeframeChange,
   onApplySuggestion
 }) => {
+  const [sentinel, setSentinel] = React.useState<SentinelVerdict | null>(null);
+  const [sentinelError, setSentinelError] = React.useState("");
+  React.useEffect(() => {
+    let active = true;
+    fetchSentinelCurrent()
+      .then((value) => {
+        if (active) setSentinel(value);
+      })
+      .catch((error: unknown) => {
+        if (active) setSentinelError(error instanceof Error ? error.message : "Sentinel unavailable");
+      });
+    return () => { active = false; };
+  }, []);
   const loadingAnalytics = !analytics || !priceDiagnostics || !pumpfunReport || !safetyStatus || !readinessStatus;
   const closed = trades.filter(t => t.lifecycle_status === "closed" && t.pnl_sol !== null);
   const timeframePnl = closed.reduce((total, t) => total + (t.pnl_sol || 0), 0);
@@ -99,6 +114,14 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   const execution = readinessStatus?.execution_readiness;
   const executionTone = execution?.can_shadow ? "success" : execution?.status === "not_enough_quote_data" ? "warning" : "danger";
   const quoteEvidenceWindowLabel = execution ? `${execution.quote_evidence_window_hours}h` : "24h";
+  const sentinelExpired = sentinel ? sentinel.stale || new Date(sentinel.expires_at).getTime() <= Date.now() : false;
+  const sentinelTone = !sentinel || sentinelExpired || sentinel.status === "insufficient_evidence"
+    ? "warning"
+    : sentinel.status === "pilot_eligible"
+      ? "success"
+      : sentinel.status === "unfavorable"
+        ? "danger"
+        : "warning";
 
   return (
     <div className="space-y-6">
@@ -217,6 +240,37 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
         </div>
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 2xl:grid-cols-1">
+          <Card className="p-6" hover={false}>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <h3 className="flex items-center gap-2 text-sm font-black uppercase tracking-widest text-zinc-500">
+                <Activity size={16} />
+                Market Session Sentinel
+              </h3>
+              <Badge variant={sentinelTone}>
+                {sentinelExpired ? "expired" : sentinel?.status.replace(/_/g, " ") ?? "loading"}
+              </Badge>
+            </div>
+            <p className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] font-bold text-amber-100">
+              Conditions assessment—not authorization. This verdict cannot arm, start, sign, or submit anything.
+            </p>
+            {sentinelError ? (
+              <p className="rounded-xl border border-rose-500/20 bg-rose-500/10 p-3 text-[11px] text-rose-200">{sentinelError}</p>
+            ) : !sentinel ? (
+              <div className="space-y-3"><Skeleton className="h-12 w-full" /><Skeleton className="h-12 w-full" /></div>
+            ) : (
+              <div className="space-y-3 text-[11px]">
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-xl bg-white/[0.02] p-3"><span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">Confidence</span><span className="font-black text-white">{Math.round(sentinel.confidence * 100)}%</span></div>
+                  <div className="rounded-xl bg-white/[0.02] p-3"><span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">Samples</span><span className="font-black text-white">{sentinel.sample_size}</span></div>
+                  <div className="rounded-xl bg-white/[0.02] p-3"><span className="block text-[9px] font-black uppercase tracking-widest text-zinc-600">Expires</span><span className={cn("font-black", sentinelExpired ? "text-rose-400" : "text-zinc-300")}>{new Date(sentinel.expires_at).toLocaleTimeString()}</span></div>
+                </div>
+                <p className="rounded-xl border border-white/5 bg-white/[0.02] p-3 text-zinc-300">{sentinel.reasons[0] ?? "No reason recorded"}</p>
+                {[...sentinel.blockers, ...sentinel.warnings].slice(0, 4).map((reason) => <div key={reason} className="rounded-lg bg-black/20 p-2 text-zinc-400">{reason}</div>)}
+                <div className="text-[10px] text-zinc-600">Strategy {sentinel.strategy_version} · input {sentinel.input_version.slice(0, 10)} · authority {sentinel.authority}</div>
+              </div>
+            )}
+          </Card>
+
           <Card className="p-6" hover={false}>
             <div className="mb-4 flex items-center justify-between gap-3">
               <h3 className="text-sm font-black uppercase tracking-widest text-zinc-500 flex items-center gap-2">

@@ -41,6 +41,9 @@ from app.core.models import (
     LiveExecutionRequest,
     LiveSession,
     LiveSimulation,
+    SentinelEvidence,
+    SentinelInputs,
+    SentinelThresholds,
     SettingsVersion,
     SignerStatus,
     SourceStatus,
@@ -71,6 +74,7 @@ from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
 from app.core.strategy_contract import SniperStrategyVersion
 from app.core.shadow_evaluation import EconomicValidator
+from app.core.sentinel import Sentinel
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -10622,6 +10626,116 @@ class BotState:
                 else "Collect 100 genuine version-matched completed shadows over at least seven days; fixtures and quotes do not qualify."
             ),
         }
+
+    def refresh_sentinel_verdict(self, now: datetime | None = None) -> dict[str, object]:
+        """Assess bounded immutable evidence and publish no authority-bearing state."""
+        assessed_at = now or utc_now()
+        strategy_version = self.current_settings_version_id or "unversioned"
+        observations = self.storage.load_accepted_market_observations(
+            limit=100,
+            strategy_version=strategy_version,
+        )
+        comparisons = self.storage.load_shadow_comparisons(
+            limit=500,
+            strategy_version=strategy_version,
+        )
+        economic = EconomicValidator.evaluate(strategy_version, comparisons, assessed_at)
+        readiness = self._recent_readiness_status()
+
+        source_latest = max((item.observed_at for item in observations), default=assessed_at - timedelta(days=3650))
+        source_ids = tuple(item.record_id for item in observations[:100])
+        source_conflict = any(item.conflict_state != "clear" for item in observations)
+        source_ready = bool(observations) and not source_conflict and all(
+            item.access_state == "ready" and not item.fixture_only for item in observations
+        )
+        comparison_latest = max((item.completed_at for item in comparisons), default=assessed_at - timedelta(days=3650))
+        comparison_ids = tuple(item.record_id for item in comparisons[-100:])
+        readiness_ready = readiness.get("status") == "ready" and bool(readiness.get("entries_allowed"))
+
+        evidence = (
+            SentinelEvidence(
+                name="source",
+                observed_at=source_latest,
+                sample_size=len(observations),
+                status="ready" if source_ready else "blocker",
+                value=len(observations),
+                threshold=10,
+                evidence_ids=source_ids,
+                conflicting=source_conflict,
+                reason="genuine accepted source evidence is unavailable or blocked" if not source_ready else "",
+            ),
+            SentinelEvidence(
+                name="economics",
+                observed_at=comparison_latest,
+                sample_size=economic.sample_count,
+                status="ready" if economic.ready else "blocker",
+                value=economic.net_pnl,
+                threshold=0.0,
+                evidence_ids=comparison_ids,
+                reason="version-matched all-cost shadow economics are not ready" if not economic.ready else "",
+            ),
+            SentinelEvidence(
+                name="operations",
+                observed_at=assessed_at,
+                sample_size=sum(
+                    int(value or 0)
+                    for value in (readiness.get("sample_size") or {}).values()
+                    if isinstance(value, (int, float))
+                ),
+                status="ready" if readiness_ready else "warning",
+                value=readiness.get("score", 0),
+                threshold=100,
+                evidence_ids=(f"readiness:{readiness.get('engine_version', 'unknown')}",),
+                reason="operational readiness is not fully clear" if not readiness_ready else "",
+            ),
+        )
+        identity_payload = [
+            {
+                "name": item.name,
+                "observed_at": item.observed_at.isoformat(),
+                "sample_size": item.sample_size,
+                "status": item.status,
+                "ids": item.evidence_ids,
+            }
+            for item in evidence
+        ]
+        input_version = hashlib.sha256(
+            json.dumps(identity_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        verdict = Sentinel.evaluate(
+            SentinelInputs(
+                strategy_id=self.settings.strategy_profile,
+                strategy_version=strategy_version,
+                input_version=input_version,
+                evidence=evidence,
+            ),
+            SentinelThresholds(),
+            assessed_at,
+        )
+        published = self.storage.publish_sentinel_verdict(
+            verdict,
+            active_strategy_version=strategy_version,
+            current_input_version=input_version,
+        )
+        return {**verdict.to_dict(), "published": published, "stale": False, "authority": "none"}
+
+    def sentinel_current(self, *, refresh: bool = True) -> dict[str, object]:
+        if refresh:
+            return self.refresh_sentinel_verdict()
+        verdict = self.storage.load_current_sentinel_verdict()
+        if verdict is None:
+            return self.refresh_sentinel_verdict()
+        payload = verdict.to_dict()
+        payload["stale"] = verdict.expires_at <= utc_now()
+        payload["authority"] = "none"
+        return payload
+
+    def sentinel_history(self, limit: int = 100) -> list[dict[str, object]]:
+        now = utc_now()
+        return [
+            {**item.to_dict(), "stale": item.expires_at <= now, "authority": "none"}
+            for item in self.storage.load_sentinel_history(limit=max(1, min(100, limit)))
+        ]
 
     def evidence_mode_separation_report(self) -> dict[str, object]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]

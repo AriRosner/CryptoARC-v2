@@ -1362,6 +1362,16 @@ async def readiness_status() -> dict:
     return state.readiness_status()
 
 
+@app.get("/api/sentinel/current", dependencies=[Depends(require_auth)])
+async def sentinel_current() -> dict:
+    return state.sentinel_current()
+
+
+@app.get("/api/sentinel/history", dependencies=[Depends(require_auth)])
+async def sentinel_history(limit: int = Query(default=20, ge=1, le=100)) -> list[dict]:
+    return state.sentinel_history(limit)
+
+
 @app.get("/api/watchdog/status", dependencies=[Depends(require_auth)])
 async def watchdog_status() -> dict:
     return state.watchdog_status()

@@ -1270,6 +1270,27 @@ export interface ReadinessStatus {
   min_readiness_score: number;
 }
 
+export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
+
+export interface SentinelVerdict {
+  verdict_id: string;
+  status: SentinelVerdictStatus;
+  created_at: string;
+  expires_at: string;
+  strategy_id: string;
+  strategy_version: string;
+  input_version: string;
+  inputs: Record<string, unknown>;
+  thresholds: Record<string, number>;
+  sample_size: number;
+  confidence: number;
+  blockers: string[];
+  warnings: string[];
+  reasons: string[];
+  stale: boolean;
+  authority: "none";
+}
+
 export interface OperationalMonitoring {
   backend: Record<string, string | number | boolean>;
   source: SourceHealth;

@@ -14,7 +14,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeLabel, TradeRecord, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 
 
@@ -42,6 +42,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("source_access_evidence", "source_access_evidence"),
     ("sniper_strategy_versions", "sniper_strategy_versions"),
     ("shadow_economic_comparisons", "shadow_economic_comparisons"),
+    ("sentinel_verdicts", "sentinel_verdicts"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -49,7 +50,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 14
+    SCHEMA_VERSION = 15
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -74,6 +75,7 @@ class Storage:
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
+        "sentinel_verdicts",
     )
     BACKUP_TABLES = (
         "settings",
@@ -100,6 +102,7 @@ class Storage:
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
+        "sentinel_verdicts",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -229,6 +232,7 @@ class Storage:
             (12, "012_genuine_source_evidence", "accepted market observations and source access evidence", self._migration_012_genuine_source_evidence),
             (13, "013_sniper_strategy_versions", "immutable versioned sniper strategy contracts", self._migration_013_sniper_strategy_versions),
             (14, "014_shadow_economic_comparisons", "all-cost versioned shadow comparisons", self._migration_014_shadow_economic_comparisons),
+            (15, "015_sentinel_verdicts", "immutable expiring market sentinel verdicts", self._migration_015_sentinel_verdicts),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -673,6 +677,28 @@ class Storage:
             "CREATE INDEX IF NOT EXISTS idx_shadow_economic_mode ON shadow_economic_comparisons(evidence_mode, fixture_only, completed_at DESC)"
         )
 
+    def _migration_015_sentinel_verdicts(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sentinel_verdicts (
+                verdict_id TEXT PRIMARY KEY,
+                strategy_version TEXT NOT NULL,
+                input_version TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                UNIQUE(strategy_version, input_version, created_at)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sentinel_verdicts_current ON sentinel_verdicts(created_at DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sentinel_verdicts_identity ON sentinel_verdicts(strategy_version, input_version, created_at DESC)"
+        )
+
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1109,6 +1135,61 @@ class Storage:
                     (bounded_limit,),
                 ).fetchall()
         return [self._shadow_comparison_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def publish_sentinel_verdict(
+        self,
+        verdict: SentinelVerdict,
+        *,
+        active_strategy_version: str,
+        current_input_version: str,
+    ) -> bool:
+        """Publish only while the caller's immutable read snapshot is still current."""
+        if verdict.strategy_version != active_strategy_version or verdict.input_version != current_input_version:
+            return False
+        serialized = json.dumps(verdict.to_dict(), sort_keys=True)
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM sentinel_verdicts WHERE verdict_id = ?",
+                (verdict.verdict_id,),
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("sentinel verdict already exists with different content")
+                return False
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO sentinel_verdicts (
+                    verdict_id, strategy_version, input_version, status,
+                    created_at, expires_at, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    verdict.verdict_id,
+                    verdict.strategy_version,
+                    verdict.input_version,
+                    verdict.status,
+                    verdict.created_at.isoformat(),
+                    verdict.expires_at.isoformat(),
+                    serialized,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def load_current_sentinel_verdict(self) -> SentinelVerdict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM sentinel_verdicts ORDER BY created_at DESC, verdict_id DESC LIMIT 1"
+            ).fetchone()
+        return self._sentinel_verdict_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_sentinel_history(self, limit: int = 100) -> list[SentinelVerdict]:
+        bounded_limit = max(1, min(100, int(limit)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload FROM sentinel_verdicts ORDER BY created_at DESC, verdict_id DESC LIMIT ?",
+                (bounded_limit,),
+            ).fetchall()
+        return [self._sentinel_verdict_from_payload(json.loads(row["payload"])) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
@@ -3490,6 +3571,14 @@ class Storage:
         payload["costs"] = ShadowCostBreakdown(**dict(payload.get("costs") or {}))
         allowed = set(ShadowComparison.__dataclass_fields__.keys())
         return ShadowComparison(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _sentinel_verdict_from_payload(self, payload: dict[str, Any]) -> SentinelVerdict:
+        payload["created_at"] = datetime.fromisoformat(payload["created_at"])
+        payload["expires_at"] = datetime.fromisoformat(payload["expires_at"])
+        for field_name in ("blockers", "warnings", "reasons"):
+            payload[field_name] = tuple(payload.get(field_name) or ())
+        allowed = set(SentinelVerdict.__dataclass_fields__.keys())
+        return SentinelVerdict(**{key: value for key, value in payload.items() if key in allowed})
 
     def _settings_version_from_payload(self, payload: dict[str, Any]) -> SettingsVersion:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])

@@ -686,6 +686,80 @@ class ShadowComparison:
         return payload
 
 
+@dataclass(frozen=True, slots=True)
+class SentinelEvidence:
+    name: str
+    observed_at: datetime
+    sample_size: int
+    status: str
+    value: float | int | str | bool | None = None
+    threshold: float | int | str | bool | None = None
+    evidence_ids: tuple[str, ...] = ()
+    conflicting: bool = False
+    expires_at: datetime | None = None
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["observed_at"] = self.observed_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
+        payload["evidence_ids"] = list(self.evidence_ids)
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelInputs:
+    strategy_id: str
+    strategy_version: str
+    input_version: str
+    evidence: tuple[SentinelEvidence, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "strategy_id": self.strategy_id,
+            "strategy_version": self.strategy_version,
+            "input_version": self.input_version,
+            "evidence": [item.to_dict() for item in self.evidence],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelThresholds:
+    min_sample_size: int = 10
+    max_evidence_age_seconds: int = 300
+    validity_seconds: int = 60
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class SentinelVerdict:
+    verdict_id: str
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    strategy_id: str
+    strategy_version: str
+    input_version: str
+    inputs: dict[str, Any]
+    thresholds: dict[str, Any]
+    sample_size: int
+    confidence: float
+    blockers: tuple[str, ...]
+    warnings: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["expires_at"] = self.expires_at.isoformat()
+        payload["blockers"] = list(self.blockers)
+        payload["warnings"] = list(self.warnings)
+        payload["reasons"] = list(self.reasons)
+        return payload
+
+
 @dataclass(slots=True)
 class StrategyDecisionRecord:
     id: str
