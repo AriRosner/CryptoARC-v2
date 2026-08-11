@@ -56,6 +56,7 @@ import {
   fetchMonitorPnlSummary,
   fetchMonitorTokens,
   fetchOperationalMonitoring,
+  fetchWorkloadPressure,
   fetchPerformanceAnalytics,
   fetchPriceDiagnostics,
   fetchPriceObservations,
@@ -115,7 +116,7 @@ import {
   updatePassword,
   verifyTotp
 } from "./api";
-import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus } from "./types";
+import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, BotSettings, DataIntegrityReport, DataSummary, ExperimentRun, HotWalletStatus, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, MonitorPnlSummary, OperationalMonitoring, PerformanceAnalytics, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, SafetyStatus, SecurityStatus, SettingsVersion, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, StrategyDecisionRecord, StrategyPreset, TokenSignal, TradeEvent, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
 import "./styles.css";
 
 import { AppLayout } from "./components/AppLayout";
@@ -586,6 +587,9 @@ function App() {
   const [safetyStatus, setSafetyStatus] = React.useState<SafetyStatus | null>(null);
   const [readinessStatus, setReadinessStatus] = React.useState<ReadinessStatus | null>(null);
   const [opsMonitoring, setOpsMonitoring] = React.useState<OperationalMonitoring | null>(null);
+  const [workloadPressure, setWorkloadPressure] = React.useState<WorkloadPressure | null>(null);
+  const [projectionFocused, setProjectionFocused] = React.useState(() => document.visibilityState === "visible");
+  const [projectionConnected, setProjectionConnected] = React.useState(() => navigator.onLine);
   const [backtestV3Result, setBacktestV3Result] = React.useState<BacktestV3Result | null>(null);
   const [experiments, setExperiments] = React.useState<ExperimentRun[]>([]);
   const [tradeLabels, setTradeLabels] = React.useState<TradeLabel[]>([]);
@@ -677,6 +681,19 @@ function App() {
 
   const pushSuccessToast = React.useCallback((message: string) => pushToast(message, "success"), [pushToast]);
   const pushErrorToast = React.useCallback((message: string) => pushToast(message, "danger"), [pushToast]);
+
+  React.useEffect(() => {
+    const updateFocus = () => setProjectionFocused(document.visibilityState === "visible");
+    const updateOnline = () => setProjectionConnected(navigator.onLine);
+    document.addEventListener("visibilitychange", updateFocus);
+    window.addEventListener("online", updateOnline);
+    window.addEventListener("offline", updateOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", updateFocus);
+      window.removeEventListener("online", updateOnline);
+      window.removeEventListener("offline", updateOnline);
+    };
+  }, []);
 
   React.useEffect(() => {
     if (!toasts.length) return;
@@ -1192,17 +1209,19 @@ function App() {
   }, [liveWalletOpen, selectedLivePnlWallet]);
 
   const refreshAnalysisData = React.useCallback(async () => {
+    if (document.visibilityState !== "visible" || !navigator.onLine) return;
     if (analysisRefreshInFlight.current) return;
     analysisRefreshInFlight.current = true;
     try {
-      const [analytics, suggestions, integrity, price, pumpfun, safety, readiness] = await Promise.all([
+      const [analytics, suggestions, integrity, price, pumpfun, safety, readiness, pressure] = await Promise.all([
         fetchPerformanceAnalytics(),
         fetchTuningSuggestions(),
         fetchDataIntegrity(),
         fetchPriceDiagnostics(),
         fetchPumpFunReport(),
         fetchSafetyStatus(),
-        fetchReadinessStatus()
+        fetchReadinessStatus(),
+        fetchWorkloadPressure()
       ]);
       setPerformanceAnalytics(analytics);
       setTuningSuggestions(suggestions);
@@ -1211,6 +1230,7 @@ function App() {
       setPumpfunReport(pumpfun);
       setSafetyStatus(safety);
       setReadinessStatus(readiness);
+      setWorkloadPressure(pressure);
     } finally {
       analysisRefreshInFlight.current = false;
     }
@@ -1242,18 +1262,21 @@ function App() {
   }, []);
 
   const refreshReviewData = React.useCallback(async () => {
+    if (document.visibilityState !== "visible" || !navigator.onLine) return;
     if (reviewRefreshInFlight.current) return;
     reviewRefreshInFlight.current = true;
     setReviewLoading(true);
     try {
-      const [tradeRows, labels, queue] = await Promise.all([
+      const [tradeRows, labels, queue, pressure] = await Promise.all([
         fetchTrades(),
         fetchTradeLabels(),
-        fetchTradeReviewQueue()
+        fetchTradeReviewQueue(),
+        fetchWorkloadPressure()
       ]);
       setTrades(tradeRows);
       setTradeLabels(labels);
       setTradeReviewQueue(queue);
+      setWorkloadPressure(pressure);
       setReviewLoading(false);
 
       const [versions, analytics, suggestions] = await Promise.all([
@@ -1271,10 +1294,11 @@ function App() {
   }, []);
 
   const refreshDataPageData = React.useCallback(async () => {
+    if (document.visibilityState !== "visible" || !navigator.onLine) return;
     if (dataRefreshInFlight.current) return;
     dataRefreshInFlight.current = true;
     try {
-      const [summary, health, security, alerts, integrity, price, pumpfun, safety, readiness, ops, adapters, watchdog, solana, liveRows, audits, events, observations, decisions, sessions, versions, tradeRows] = await Promise.all([
+      const [summary, health, security, alerts, integrity, price, pumpfun, safety, readiness, ops, pressure, adapters, watchdog, solana, liveRows, audits, events, observations, decisions, sessions, versions, tradeRows] = await Promise.all([
         fetchDataSummary(),
         fetchSourceHealth(),
         fetchSecurityStatus(),
@@ -1285,6 +1309,7 @@ function App() {
         fetchSafetyStatus(),
         fetchReadinessStatus(),
         fetchOperationalMonitoring(),
+        fetchWorkloadPressure(),
         fetchSourceAdapters(),
         fetchWatchdogStatus(),
         fetchSolanaStatus(),
@@ -1307,6 +1332,7 @@ function App() {
       setSafetyStatus(safety);
       setReadinessStatus(readiness);
       setOpsMonitoring(ops);
+      setWorkloadPressure(pressure);
       setSourceAdapters(adapters);
       setWatchdogStatus(watchdog);
       setSolanaStatus(solana);
@@ -1984,6 +2010,7 @@ function App() {
   }, [effectiveBotStatus, liveWalletOpen, refreshLiveWalletCoreData, refreshWorkspaceData, workspacePage]);
 
   React.useEffect(() => {
+    if (!projectionFocused || !projectionConnected) return;
     if (liveWalletOpen) {
       refreshLiveWalletCoreData().catch(() => undefined);
       refreshLiveWalletDetailData(true).catch(() => undefined);
@@ -1991,7 +2018,7 @@ function App() {
     if (workspacePage !== "monitor") {
       refreshWorkspaceData(workspacePage).catch(() => undefined);
     }
-  }, [liveWalletOpen, refreshLiveWalletCoreData, refreshLiveWalletDetailData, refreshWorkspaceData, workspacePage]);
+  }, [liveWalletOpen, projectionConnected, projectionFocused, refreshLiveWalletCoreData, refreshLiveWalletDetailData, refreshWorkspaceData, workspacePage]);
 
   React.useEffect(() => {
     if (!liveWalletOpen) return;
@@ -2095,6 +2122,7 @@ function App() {
             pumpfunReport={pumpfunReport}
             safetyStatus={safetyStatus}
             readinessStatus={readinessStatus}
+            workloadPressure={workloadPressure}
             pnlTimeframe={pnlTimeframe}
             onTimeframeChange={setPnlTimeframe}
             onApplySuggestion={handleApplyTuningSuggestion}
@@ -2142,6 +2170,7 @@ function App() {
             detail={tradeReviewDetail}
             labels={tradeLabels}
             reviewQueue={tradeReviewQueue}
+            workloadPressure={workloadPressure}
             loading={reviewLoading}
             onApplySuggestion={handleApplyTuningSuggestion}
             onLabelTrade={async (tokenId, label) => {
@@ -2173,6 +2202,7 @@ function App() {
             safetyStatus={safetyStatus}
             readinessStatus={readinessStatus}
             opsMonitoring={opsMonitoring}
+            workloadPressure={workloadPressure}
             sourceAdapters={sourceAdapters}
             watchdogStatus={watchdogStatus}
             solanaStatus={solanaStatus}

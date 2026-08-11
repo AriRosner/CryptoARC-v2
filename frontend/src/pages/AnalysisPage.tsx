@@ -27,6 +27,7 @@ import type {
   SafetyStatus, 
   ReadinessStatus,
   SentinelVerdict
+  , WorkloadPressure
 } from "../types";
 
 interface AnalysisPageProps {
@@ -39,6 +40,7 @@ interface AnalysisPageProps {
   pumpfunReport: PumpFunReport | null;
   safetyStatus: SafetyStatus | null;
   readinessStatus: ReadinessStatus | null;
+  workloadPressure: WorkloadPressure | null;
   pnlTimeframe: string;
   onTimeframeChange: (t: any) => void;
   onApplySuggestion: (suggestion: TuningSuggestion) => Promise<void>;
@@ -82,6 +84,7 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
   pumpfunReport,
   safetyStatus,
   readinessStatus,
+  workloadPressure,
   pnlTimeframe,
   onTimeframeChange,
   onApplySuggestion
@@ -146,6 +149,12 @@ export const AnalysisPage: React.FC<AnalysisPageProps> = ({
           ))}
         </div>
       </PageHeader>
+
+      {workloadPressure?.status === "degraded_observability" ? (
+        <div data-critical-projection="analysis" className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+          Degraded observability: {workloadPressure.disabled_tiers.join(", ").replace(/_/g, " ")} are shed. Core safety paths remain available.
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8">
         <AnalysisMetric label="Range P&L" value={`${timeframePnl.toFixed(4)} SOL`} color={timeframePnl >= 0 ? "text-emerald-500" : "text-rose-500"} />

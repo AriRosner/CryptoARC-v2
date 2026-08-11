@@ -77,6 +77,7 @@ from app.core.strategy_contract import SniperStrategyVersion
 from app.core.shadow_evaluation import EconomicValidator
 from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
+from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -179,6 +180,7 @@ class BotState:
         alert_router: AlertRouter | None = None,
     ) -> None:
         self.storage = Storage(database_path)
+        self.workload_governor = WorkloadGovernor()
         database_file = self.storage.path
         self.hot_wallet = HotWalletVault(str(database_file.with_suffix(".hotwallet.json")))
         self.solana_wss_endpoint = default_solana_wss_endpoint.strip()
@@ -10789,11 +10791,22 @@ class BotState:
         return {**verdict.to_dict(), "published": published, "stale": False, "authority": "none"}
 
     def sentinel_current(self, *, refresh: bool = True) -> dict[str, object]:
-        if refresh:
+        if refresh and self.workload_governor.allowed("sentinel"):
             return self.refresh_sentinel_verdict()
         verdict = self.storage.load_current_sentinel_verdict()
         if verdict is None:
-            return self.refresh_sentinel_verdict()
+            selection = self.storage.load_active_strategy_selection() or {}
+            shed = Sentinel.evaluate(
+                SentinelInputs(
+                    strategy_id=self.settings.strategy_profile,
+                    strategy_version=str(selection.get("strategy_version") or self.current_settings_version_id or "unversioned"),
+                    input_version="workload-pressure-no-cache",
+                    evidence=(),
+                ),
+                SentinelThresholds(),
+                utc_now(),
+            )
+            return {**shed.to_dict(), "stale": True, "authority": "none", "published": False}
         payload = verdict.to_dict()
         payload["stale"] = verdict.expires_at <= utc_now()
         payload["authority"] = "none"
@@ -10805,6 +10818,34 @@ class BotState:
             {**item.to_dict(), "stale": item.expires_at <= now, "authority": "none"}
             for item in self.storage.load_sentinel_history(limit=max(1, min(100, limit)))
         ]
+
+    def workload_pressure(self, *, connections: int = 0, focused: bool = True, connected: bool = True) -> dict[str, object]:
+        queue = self.storage.trade_review_queue_stats()
+        source_loss = self.source_status.status not in {"connected", "live", "ready"}
+        version = max(self.workload_governor.current().snapshot_version + 1, int(time.time() * 1000))
+        metrics = CriticalMetrics(
+            observed_at=utc_now(),
+            snapshot_version=version,
+            queue_depth=queue["queued"] + queue["processing"],
+            db_lock_wait_p99_ms=0.0,
+            source_loss=source_loss,
+            source_to_decision_p99_ms=0.0,
+            intent_to_quote_p99_ms=0.0,
+            memory_pct=0.0,
+            connections=max(0, connections),
+            focused=focused,
+            connected=connected,
+        )
+        state = self.workload_governor.observe(metrics)
+        return {
+            "artifact_type": "cryptoarc_workload_pressure",
+            "format_version": 1,
+            **state.to_dict(),
+            "metrics": metrics.to_payload(),
+            "queue": queue,
+            "core_tiers_shed": False,
+            "operator_action": "Non-critical projections are shed; ingestion, risk, kill switch, reconciliation, and protective exits remain available." if state.disabled_tiers else "Critical-path pressure is within configured bounds.",
+        }
 
     def evidence_mode_separation_report(self) -> dict[str, object]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]

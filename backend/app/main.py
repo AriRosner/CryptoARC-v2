@@ -401,6 +401,7 @@ source_key: tuple[str, float, int] | None = None
 solana_logs_task: asyncio.Task | None = None
 solana_logs_key: tuple[str, str] | None = None
 last_broadcast_payload: str | None = None
+broadcast_snapshot_lock = asyncio.Lock()
 latency_status: dict[str, object] = {
     "artifact_type": "cryptoarc_latency_status",
     "format_version": 1,
@@ -420,22 +421,23 @@ def websocket_snapshot_payload() -> dict:
 
 async def broadcast_snapshot(force: bool = False) -> None:
     global last_broadcast_payload
-    if not clients:
+    if not clients or broadcast_snapshot_lock.locked():
         return
-    payload = websocket_snapshot_payload()
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    if not force and serialized == last_broadcast_payload:
-        return
-    last_broadcast_payload = serialized
-    disconnected: list[WebSocket] = []
-    for websocket in list(clients):
-        try:
-            await websocket.send_json(payload)
-        except Exception:
-            disconnected.append(websocket)
+    async with broadcast_snapshot_lock:
+        payload = websocket_snapshot_payload()
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if not force and serialized == last_broadcast_payload:
+            return
+        last_broadcast_payload = serialized
+        disconnected: list[WebSocket] = []
+        for websocket in list(clients):
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                disconnected.append(websocket)
 
-    for websocket in disconnected:
-        clients.discard(websocket)
+        for websocket in disconnected:
+            clients.discard(websocket)
 
 
 def _next_mobile_realtime_sequence() -> int:
@@ -1735,6 +1737,11 @@ async def review_live_request(request_id: str, payload: LiveExecutionReviewPaylo
 @app.get("/api/monitoring/ops", dependencies=[Depends(require_auth)])
 async def operational_monitoring() -> dict:
     return state.operational_monitoring()
+
+
+@app.get("/api/monitoring/workload-pressure", dependencies=[Depends(require_auth)])
+async def workload_pressure() -> dict:
+    return state.workload_pressure(connections=len(clients) + len(mobile_clients))
 
 
 @app.get("/api/reports/operator-logs", dependencies=[Depends(require_auth)])

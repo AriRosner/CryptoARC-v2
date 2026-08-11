@@ -15,7 +15,7 @@ import { Button } from "../components/Button";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
 import { fetchStrategyCandidates, fetchTradeGrades, promoteStrategyCandidate } from "../api";
-import type { PerformanceAnalytics, SettingsVersion, StrategyCandidate, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion } from "../types";
+import type { PerformanceAnalytics, SettingsVersion, StrategyCandidate, TokenSignal, TradeGrade, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TuningSuggestion, WorkloadPressure } from "../types";
 
 interface ReviewPageProps {
   trades: TradeRecord[];
@@ -28,6 +28,7 @@ interface ReviewPageProps {
   detail: TradeReviewDetail | null;
   labels: TradeLabel[];
   reviewQueue: TradeReviewQueue | null;
+  workloadPressure: WorkloadPressure | null;
   loading: boolean;
   onLabelTrade: (tokenId: string, label: string) => Promise<void>;
   onSelectTrade: (tokenId: string) => void;
@@ -161,6 +162,7 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
   detail,
   labels,
   reviewQueue,
+  workloadPressure,
   loading,
   onLabelTrade,
   onSelectTrade,
@@ -256,6 +258,12 @@ export const ReviewPage: React.FC<ReviewPageProps> = ({
         title="Trade Review"
         description="Inspect paper executions, decision evidence, and tuning opportunities trade by trade."
       />
+
+      {workloadPressure?.status === "degraded_observability" ? (
+        <div data-critical-projection="review" className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+          Review analytics are backed off under pressure. Durable queues remain intact; ingestion and protective controls are not shed.
+        </div>
+      ) : null}
 
       {candidates.length ? (
         <Card className="p-4" hover={false}>

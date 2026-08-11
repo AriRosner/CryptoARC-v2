@@ -59,6 +59,7 @@ import type {
   LiveExecutionRequest, 
   LiveExecutionAudit, 
   TradeEvent 
+  , WorkloadPressure
 } from "../types";
 
 export type DataClearTarget =
@@ -85,6 +86,7 @@ interface DataPageProps {
   safetyStatus: SafetyStatus | null;
   readinessStatus: ReadinessStatus | null;
   opsMonitoring: OperationalMonitoring | null;
+  workloadPressure: WorkloadPressure | null;
   sourceAdapters: SourceAdapterStatus[];
   watchdogStatus: WatchdogStatus | null;
   solanaStatus: SolanaStatus | null;
@@ -186,6 +188,7 @@ export const DataPage: React.FC<DataPageProps> = ({
   safetyStatus,
   readinessStatus,
   opsMonitoring,
+  workloadPressure,
   sourceAdapters,
   watchdogStatus,
   solanaStatus,
@@ -1202,7 +1205,13 @@ export const DataPage: React.FC<DataPageProps> = ({
                   onChange={(event) => setSourceEventMintFilter(event.target.value)}
                   placeholder="Mint filter"
                   aria-label="Source event mint filter"
-                />
+      />
+
+      {workloadPressure?.status === "degraded_observability" ? (
+        <div data-critical-projection="data" className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-3 text-[11px] text-amber-100">
+          {workloadPressure.operator_action} Health, kill switch, positions, and alerts remain readable.
+        </div>
+      ) : null}
                 <Button variant="secondary" size="sm" onClick={downloadSourceEventBundle} disabled={!filteredSourceEvents.length}>
                   <Download size={14} className="mr-2" />
                   Export Bundle

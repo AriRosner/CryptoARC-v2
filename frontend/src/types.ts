@@ -1418,6 +1418,22 @@ export interface TradeLabel {
   note: string;
 }
 
+export interface WorkloadPressure {
+  artifact_type: "cryptoarc_workload_pressure";
+  format_version: 1;
+  status: "healthy" | "degraded_observability";
+  disabled_tiers: Array<"model" | "grading" | "sentinel" | "dashboard_analytics">;
+  failure_windows: number;
+  recovery_windows: number;
+  snapshot_version: number;
+  reasons: string[];
+  worker_failures: string[];
+  metrics: Record<string, unknown>;
+  queue: Record<string, number>;
+  core_tiers_shed: false;
+  operator_action: string;
+}
+
 export interface TradeGrade {
   grade_id: string;
   trade_id: string;

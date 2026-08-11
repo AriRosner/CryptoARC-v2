@@ -152,17 +152,32 @@ class Storage:
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path)
+        connection = sqlite3.connect(self.path, timeout=0.05)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 50")
         try:
             yield connection
             connection.commit()
         finally:
             connection.close()
 
+    @contextmanager
+    def read_connection(self) -> Iterator[sqlite3.Connection]:
+        """Short, bounded read-only connection for dashboards and observability."""
+        connection = sqlite3.connect(self.path, timeout=0.05)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 50")
+        connection.execute("PRAGMA query_only = ON")
+        try:
+            yield connection
+        finally:
+            connection.close()
+
     def _ensure_schema(self) -> None:
         try:
             with self._connect() as connection:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = NORMAL")
                 self._prepare_schema_migration_table(connection)
                 self._apply_migrations(connection)
                 self._ensure_mobile_notification_schema(connection)
@@ -1383,6 +1398,19 @@ class Storage:
                 (job_id, revision.revision_id, revision.trade_id, revision.mode, json.dumps(revision.to_dict(), sort_keys=True), now, now),
             )
         return cursor.rowcount == 1
+
+    def trade_review_queue_stats(self) -> dict[str, int]:
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM trade_review_jobs GROUP BY status"
+            ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return {
+            "queued": counts.get("queued", 0),
+            "processing": counts.get("processing", 0),
+            "dead_letter": counts.get("dead_letter", 0),
+            "completed": counts.get("completed", 0),
+        }
 
     def claim_trade_review(
         self,
