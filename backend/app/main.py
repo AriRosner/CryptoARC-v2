@@ -1712,6 +1712,19 @@ async def evidence_mode_separation_report() -> dict:
     return state.evidence_mode_separation_report()
 
 
+@app.get("/api/reports/evidence-inventory", dependencies=[Depends(require_auth)])
+async def evidence_inventory_report(
+    wallet_public_key: str = "",
+    signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet",
+) -> dict:
+    return state.evidence_inventory_report(
+        env_live_enabled=config.live_trading_enabled,
+        wallet_public_key=wallet_public_key,
+        signer_mode=signer_mode,
+        local_auth_enabled=auth.enabled,
+    )
+
+
 @app.get("/api/reports/evidence-mode-separation/export", dependencies=[Depends(require_auth)])
 async def evidence_mode_separation_report_export() -> JSONResponse:
     return JSONResponse(

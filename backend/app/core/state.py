@@ -59,6 +59,7 @@ from app.core.alerts import AlertRouter
 from app.core.paper_trader import PaperTrader
 from app.core.price_pipeline import PricePipeline
 from app.core.integrity import DataIntegrityAnalyzer
+from app.core.evidence_inventory import EvidenceInventory
 from app.core.hot_wallet import HotWalletVault
 from app.core.pumpfun_intelligence import PumpFunIntelligence
 from app.core.risk import RiskEngine
@@ -10412,6 +10413,56 @@ class BotState:
             "recent_events": [event.to_dict() for event in events[:50]],
             "action_items": list(dict.fromkeys(action_items)),
         }
+
+    def evidence_inventory_report(
+        self,
+        repo_state: dict[str, object] | None = None,
+        *,
+        env_live_enabled: bool = False,
+        wallet_public_key: str = "",
+        signer_mode: str | None = None,
+        local_auth_enabled: bool = False,
+    ) -> dict[str, object]:
+        repo_state = repo_state or {}
+        signer_mode = signer_mode or self.settings.live_signer_mode
+        readiness = self.readiness_status()
+        live = self.live_status(
+            env_live_enabled,
+            wallet_public_key,
+            signer_mode,
+            local_auth_enabled=local_auth_enabled,
+        )
+        strategy = readiness.get("strategy_promotion", {}) if isinstance(readiness, dict) else {}
+        fingerprint = str(strategy.get("strategy_fingerprint") or "") if isinstance(strategy, dict) else ""
+        reports = {
+            "readiness": readiness,
+            "live": live,
+            "evidence_mode": self.evidence_mode_separation_report(),
+            "pilot": self.pilot_readiness_report(
+                env_live_enabled,
+                wallet_public_key,
+                signer_mode,
+                local_auth_enabled=local_auth_enabled,
+            ),
+            "post_run": self.post_run_review_report("24h", wallet_public_key),
+            "source_adapters": self.source_adapters(),
+            "source": {
+                "access_state": "unknown",
+                "observations": [],
+            },
+            "active_strategy": {
+                "id": self.settings.strategy_profile,
+                "version": fingerprint or "unversioned",
+                "fingerprint": fingerprint or "unknown",
+            },
+        }
+        return EvidenceInventory.build(
+            repo_head=str(repo_state.get("head") or ""),
+            origin_main=str(repo_state.get("origin_main") or ""),
+            merge_base=str(repo_state.get("merge_base") or ""),
+            dirty=repo_state.get("dirty") if isinstance(repo_state.get("dirty"), bool) else None,
+            reports=reports,
+        )
 
     def evidence_mode_separation_report(self) -> dict[str, object]:
         trades = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
