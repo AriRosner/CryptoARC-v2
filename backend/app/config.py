@@ -31,6 +31,12 @@ class AppConfig(BaseSettings):
     mobile_pairing_ttl_seconds: int = Field(default=300, alias="MOBILE_PAIRING_TTL_SECONDS")
     mobile_token_ttl_days: int = Field(default=30, alias="MOBILE_TOKEN_TTL_DAYS")
     mobile_push_token_encryption_key: str = Field(default="", alias="MOBILE_PUSH_TOKEN_ENCRYPTION_KEY")
+    grading_model_enabled: bool = Field(default=False, alias="GRADING_MODEL_ENABLED")
+    grading_model_daily_token_budget: int = Field(default=100_000, alias="GRADING_MODEL_DAILY_TOKEN_BUDGET")
+    grading_model_daily_cost_budget: float = Field(default=10.0, alias="GRADING_MODEL_DAILY_COST_BUDGET")
+    grading_model_max_items: int = Field(default=8, alias="GRADING_MODEL_MAX_ITEMS")
+    grading_model_timeout_seconds: float = Field(default=10.0, alias="GRADING_MODEL_TIMEOUT_SECONDS")
+    grading_model_retry_limit: int = Field(default=1, alias="GRADING_MODEL_RETRY_LIMIT")
 
 
 @lru_cache

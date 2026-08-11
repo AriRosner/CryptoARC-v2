@@ -61,3 +61,11 @@ The future sequence remains:
 8. Reconcile the run and record an explicit scale, hold, revise, or stop decision.
 
 No step guarantees profit. Changed or stale market conditions return the strategy to source-connected paper and shadow validation.
+
+## Optional narrative classification boundary
+
+The durable grading worker always publishes its deterministic grade first. Optional model classification is disabled by default and has no bundled provider dependency or client. Enabling the policy without separately injecting a reviewed client still makes no external call.
+
+If a client is added later, only allowlisted deterministic grade fields are sent after recursive redaction. Batches, item size, daily tokens, daily cost, timeout, retries, and cancellation are bounded. Returned explanations are accepted only when the job, trade revision, strategy, rules, input, and schema identities still match. They may describe ambiguous narrative categories; they cannot replace objective classifications, promote a strategy, change authority, delay trade persistence, or enter any execution path.
+
+Budget exhaustion, timeout, cancellation, stale output, or client failure leaves the rule grade intact. Stop the separate worker or set `GRADING_MODEL_ENABLED=false` to roll back model use while preserving durable queued jobs and deterministic grades.

@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterator
 
 from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
+from app.core.model_classifier import ModelClassification
 
 
 DATA_SUMMARY_COUNT_TABLES = (
@@ -46,6 +47,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("trade_review_jobs", "trade_review_jobs"),
     ("trade_grades", "trade_grades"),
     ("trade_grade_corrections", "trade_grade_corrections"),
+    ("model_classifications", "model_classifications"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
     f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
@@ -82,6 +84,8 @@ class Storage:
         "trade_review_jobs",
         "trade_grades",
         "trade_grade_corrections",
+        "model_classifications",
+        "model_classification_budget",
     )
     BACKUP_TABLES = (
         "settings",
@@ -112,6 +116,8 @@ class Storage:
         "trade_review_jobs",
         "trade_grades",
         "trade_grade_corrections",
+        "model_classifications",
+        "model_classification_budget",
         "mobile_pairing_requests",
         "mobile_devices",
         "mobile_action_receipts",
@@ -147,6 +153,7 @@ class Storage:
                 self._prepare_schema_migration_table(connection)
                 self._apply_migrations(connection)
                 self._ensure_mobile_notification_schema(connection)
+                self._ensure_model_classifier_schema(connection)
             self._migration_status = {
                 "status": "ok",
                 "startup_error": "",
@@ -759,6 +766,34 @@ class Storage:
         )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_trade_grade_corrections_trade ON trade_grade_corrections(trade_id, created_at ASC)"
+        )
+        self._ensure_model_classifier_schema(connection)
+
+    def _ensure_model_classifier_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_classification_budget (
+                budget_day TEXT PRIMARY KEY,
+                tokens INTEGER NOT NULL,
+                cost REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_classifications (
+                job_id TEXT PRIMARY KEY,
+                trade_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(trade_id, revision_id)
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_model_classifications_trade ON model_classifications(trade_id, created_at DESC)"
         )
 
     def schema_status(self) -> dict[str, Any]:
@@ -1406,6 +1441,77 @@ class Storage:
                 (trade_id, max(1, min(5000, limit))),
             ).fetchall()
         return [self._trade_grade_correction_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def reserve_model_classification_budget(
+        self,
+        budget_day: str,
+        *,
+        tokens: int,
+        cost: float,
+        token_limit: int,
+        cost_limit: float,
+    ) -> bool:
+        if tokens < 0 or cost < 0 or not budget_day:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT tokens, cost FROM model_classification_budget WHERE budget_day = ?",
+                (budget_day,),
+            ).fetchone()
+            used_tokens = int(row["tokens"] if row else 0)
+            used_cost = float(row["cost"] if row else 0.0)
+            if used_tokens + tokens > max(0, token_limit) or used_cost + cost > max(0.0, cost_limit):
+                return False
+            connection.execute(
+                """
+                INSERT INTO model_classification_budget (budget_day, tokens, cost, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(budget_day) DO UPDATE SET tokens = excluded.tokens, cost = excluded.cost, updated_at = excluded.updated_at
+                """,
+                (budget_day, used_tokens + tokens, used_cost + cost, now),
+            )
+        return True
+
+    def model_classification_budget(self, budget_day: str) -> dict[str, int | float]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT tokens, cost FROM model_classification_budget WHERE budget_day = ?", (budget_day,)
+            ).fetchone()
+        return {"tokens": int(row["tokens"]), "cost": float(row["cost"])} if row else {"tokens": 0, "cost": 0.0}
+
+    def save_model_classification(self, classification: ModelClassification) -> bool:
+        payload = asdict(classification)
+        serialized = json.dumps(payload, sort_keys=True)
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT payload FROM model_classifications WHERE job_id = ?", (classification.job_id,)
+            ).fetchone()
+            if existing:
+                if json.dumps(json.loads(existing["payload"]), sort_keys=True) != serialized:
+                    raise ValueError("model classification already exists with different content")
+                return False
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO model_classifications (job_id, trade_id, revision_id, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (classification.job_id, classification.trade_id, classification.revision_id, serialized, now),
+            )
+        return cursor.rowcount == 1
+
+    def load_model_classifications(self, trade_id: str = "", limit: int = 500) -> list[ModelClassification]:
+        bounded = max(1, min(5000, limit))
+        with self._connect() as connection:
+            if trade_id:
+                rows = connection.execute(
+                    "SELECT payload FROM model_classifications WHERE trade_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (trade_id, bounded),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT payload FROM model_classifications ORDER BY created_at DESC LIMIT ?", (bounded,)
+                ).fetchall()
+        return [ModelClassification(**json.loads(row["payload"])) for row in rows]
 
     def save_mobile_pairing_request(self, payload: dict[str, Any]) -> None:
         item_id = str(payload["id"])
