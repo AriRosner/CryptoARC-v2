@@ -492,6 +492,7 @@ class LiveExecutionAudit:
     guarded_authorization: dict[str, Any] = field(default_factory=dict)
     dispatch_started_at: datetime | None = None
     pilot_risk_policy_id: str = ""
+    autonomous_pilot_window_id: str = ""
     signer_identity_id: str = ""
     manual_live_authorization_id: str = ""
     fixture_only: bool = False

@@ -1889,6 +1889,14 @@ class Storage:
             ).fetchone()
         return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
 
+    def load_pilot_risk_policy(self, policy_id: str) -> PilotRiskPolicy | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM pilot_risk_policies WHERE policy_id = ?",
+                (policy_id,),
+            ).fetchone()
+        return PilotRiskPolicy.from_dict(json.loads(row["payload"])) if row else None
+
     def append_pilot_outcome(
         self,
         policy_id: str,
@@ -2048,6 +2056,14 @@ class Storage:
         with self.read_connection() as connection:
             row = connection.execute(
                 "SELECT payload FROM autonomous_pilot_windows ORDER BY created_at DESC, window_id DESC LIMIT 1"
+            ).fetchone()
+        return json.loads(row["payload"]) if row else None
+
+    def load_autonomous_pilot_window(self, window_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as connection:
+            row = connection.execute(
+                "SELECT payload FROM autonomous_pilot_windows WHERE window_id = ?",
+                (window_id,),
             ).fetchone()
         return json.loads(row["payload"]) if row else None
 

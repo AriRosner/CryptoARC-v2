@@ -243,11 +243,11 @@ class ShadowEvaluationTests(unittest.TestCase):
             )
             state.storage.save_pilot_risk_policy(policy)
             state.storage.save_accepted_market_observation(AcceptedMarketObservation(
-                record_id="market-1", created_at=NOW - timedelta(minutes=1), schema_version=1,
+                record_id="market-exit", created_at=NOW - timedelta(minutes=1), schema_version=1,
                 strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
-                evidence_mode="shadow", source="pumpportal", source_event_id="source-1",
+                evidence_mode="shadow", source="pumpportal", source_event_id="source-exit",
                 observed_at=NOW - timedelta(minutes=1), received_at=NOW - timedelta(minutes=1),
-                mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
+                mint="mint-1", price=0.00011, confidence=0.9, acceptance_reason="direct: accepted",
             ))
             audit = LiveExecutionAudit(
                 id="audit-1", created_at=NOW - timedelta(minutes=2), updated_at=NOW,
@@ -255,17 +255,30 @@ class ShadowEvaluationTests(unittest.TestCase):
                 signer_mode="local_hot_wallet", wallet_public_key="wallet-1", quote={"id": "quote-1"},
                 shadow_comparison={
                     "status": "evaluated", "exit_observed_at": NOW.isoformat(), "gross_pnl_sol": 0.002,
+                    "quoted_at": (NOW - timedelta(minutes=2)).isoformat(),
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": state.current_settings_version_id,
                     "exit_reason": "take_profit", "hold_duration_seconds": 60,
                     "costs": {"paper_fee_drag_sol": 0.0001, "priority_fee_sol": 0.00001, "price_impact_drag_sol": 0.00002},
                 },
             )
 
+            self.assertFalse(state._persist_economic_shadow_comparison(audit))
+            state.storage.save_accepted_market_observation(AcceptedMarketObservation(
+                record_id="market-entry", created_at=NOW - timedelta(minutes=3), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                evidence_mode="shadow", source="pumpportal", source_event_id="source-entry",
+                observed_at=NOW - timedelta(minutes=3), received_at=NOW - timedelta(minutes=3),
+                mint="mint-1", price=0.0001, confidence=0.9, acceptance_reason="direct: accepted",
+            ))
             self.assertTrue(state._persist_economic_shadow_comparison(audit))
             self.assertFalse(state._persist_economic_shadow_comparison(audit))
             stored = state.storage.load_shadow_comparisons(limit=10)
-            self.assertEqual(stored[0].source_evidence_ids, ("market-1",))
+            self.assertEqual(stored[0].source_evidence_ids, ("market-entry", "market-exit"))
             self.assertEqual(stored[0].reference_usd_per_sol, 200.0)
             self.assertFalse(stored[0].fixture_only)
+            self.assertEqual(audit.shadow_comparison["economic_evidence"]["entry_market_evidence_id"], "market-entry")
+            self.assertEqual(audit.shadow_comparison["economic_evidence"]["exit_market_evidence_id"], "market-exit")
 
 
 if __name__ == "__main__":

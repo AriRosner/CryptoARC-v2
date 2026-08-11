@@ -41,6 +41,7 @@ from app.core.models import (
     LiveExecutionRequest,
     LiveSession,
     LiveSimulation,
+    PriceObservation,
     SentinelEvidence,
     SentinelInputs,
     SentinelThresholds,
@@ -5876,47 +5877,94 @@ class BotState:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
         if comparison.get("status") != "evaluated" or audit.action != "buy":
             return False
+        strategy_id = str(comparison.get("strategy_id") or "")
+        strategy_version = str(comparison.get("strategy_version") or "")
         policy = self.storage.load_latest_pilot_risk_policy()
-        if policy is None or policy.reference_usd_per_sol <= 0:
+        if (
+            policy is None
+            or policy.reference_usd_per_sol <= 0
+            or not strategy_id
+            or not strategy_version
+            or policy.settings_version != strategy_version
+        ):
             return False
-        completed_at = self._parse_iso_datetime(str(comparison.get("exit_observed_at") or ""))
-        if completed_at is None:
-            return False
-        source_rows = [
+        quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
+        market_rows = [
             item
             for item in self.storage.load_accepted_market_observations(limit=5000)
             if item.mint == audit.mint
-            and item.observed_at <= completed_at
-            and item.created_at >= audit.created_at - timedelta(minutes=5)
+            and item.strategy_id == strategy_id
+            and item.strategy_version == strategy_version
+            and item.access_state == "ready"
+            and item.price is not None
+            and item.price > 0
         ]
-        genuine = [item for item in source_rows if not item.fixture_only and item.conflict_state == "clear"]
-        if not genuine:
+        entry_candidates = [item for item in market_rows if item.observed_at <= quoted_at]
+        exit_candidates = [item for item in market_rows if item.observed_at > quoted_at]
+        if not entry_candidates or not exit_candidates:
             return False
-        costs = comparison.get("costs") if isinstance(comparison.get("costs"), dict) else {}
-        strategy_version = policy.settings_version
+        relevant_rows = [max(entry_candidates, key=lambda item: item.observed_at), *sorted(exit_candidates, key=lambda item: item.observed_at)]
+        if any(item.fixture_only or item.conflict_state != "clear" for item in relevant_rows):
+            return False
+        entry = relevant_rows[0]
+        observations = [
+            PriceObservation(
+                id=item.record_id,
+                source=item.source,
+                mint=item.mint,
+                observed_at=item.observed_at,
+                price=item.price,
+                price_source=f"accepted_market:{item.source}",
+                confidence=item.confidence,
+                accepted=True,
+                reason=item.acceptance_reason,
+            )
+            for item in relevant_rows[1:]
+        ]
+        amount_sol = self._audit_amount_sol(audit)
+        exit_price, _exit_source, completed_at, exit_reason, partial_realized = self._shadow_exit_from_observations(
+            float(entry.price), quoted_at, observations, amount_sol
+        )
+        if not exit_price or completed_at is None:
+            return False
+        used_exit_rows = [item for item in relevant_rows[1:] if item.observed_at <= completed_at]
+        exit_evidence = next((item for item in reversed(used_exit_rows) if item.observed_at == completed_at), None)
+        if exit_evidence is None:
+            return False
+        move_pct = ((exit_price - float(entry.price)) / max(float(entry.price), 0.000000001)) * 100
+        gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
+        costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
+        evidence_ids = tuple(dict.fromkeys([entry.record_id, *[item.record_id for item in used_exit_rows]]))
+        comparison["economic_evidence"] = {
+            "entry_market_evidence_id": entry.record_id,
+            "exit_market_evidence_id": exit_evidence.record_id,
+            "source_evidence_ids": list(evidence_ids),
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+        }
         shadow = ShadowComparison(
             record_id=f"economic_{audit.id}",
             created_at=completed_at,
             schema_version=self.storage.SCHEMA_VERSION,
-            strategy_id=self.settings.strategy_profile,
+            strategy_id=strategy_id,
             strategy_version=strategy_version,
             evidence_mode="shadow",
             completed_at=completed_at,
             regime=str(comparison.get("regime") or "normal"),
-            gross_pnl_sol=float(comparison.get("gross_pnl_sol") or 0.0),
+            gross_pnl_sol=gross_pnl,
             costs=ShadowCostBreakdown(
                 base_fee_sol=float(costs.get("paper_fee_drag_sol") or 0.0),
                 priority_fee_sol=float(costs.get("priority_fee_sol") or 0.0),
                 entry_slippage_sol=float(costs.get("price_impact_drag_sol") or 0.0),
             ),
             held_out=int(hashlib.sha256(audit.id.encode("utf-8")).hexdigest()[:8], 16) % 5 == 0,
-            source_evidence_ids=tuple(sorted({item.record_id for item in genuine})),
+            source_evidence_ids=evidence_ids,
             quote_id=str(audit.quote.get("id") or "") if isinstance(audit.quote, dict) else "",
             landing_status="evaluated",
             fixture_only=False,
-            contaminated=any(item.conflict_state != "clear" for item in source_rows),
-            exit_reason=str(comparison.get("exit_reason") or ""),
-            hold_seconds=int(comparison.get("hold_duration_seconds") or 0),
+            contaminated=False,
+            exit_reason=exit_reason,
+            hold_seconds=max(0, int((completed_at - quoted_at).total_seconds())),
             reference_usd_per_sol=float(policy.reference_usd_per_sol),
         )
         if not shadow.quote_id:
@@ -5951,6 +5999,8 @@ class BotState:
             "mode": "dry_run_shadow",
             "status": "waiting_for_price",
             "evaluation_model": "exit_rules_v1",
+            "strategy_id": self.settings.strategy_profile,
+            "strategy_version": self.current_settings_version_id or "unversioned",
             "audit_id": audit.id,
             "intent_id": audit.intent_id,
             "mint": audit.mint,
@@ -8302,6 +8352,7 @@ class BotState:
         wallet_public_key: str,
         signer_mode: str = "browser_wallet",
         shadow_only: bool = False,
+        autonomous_pilot_window_id: str = "",
     ) -> dict[str, object]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         status = self.live_status(env_live_enabled, wallet_public_key, signer_mode)
@@ -8311,7 +8362,7 @@ class BotState:
         if validation_error:
             blockers.append(validation_error)
         wallet_spend_estimate: dict[str, object] = {}
-        pilot_policy: PilotRiskPolicy | None = None
+        pilot_policy: PilotRiskPolicy | None = self.storage.load_latest_pilot_risk_policy() if not shadow_only else None
         pilot_decision: dict[str, object] | None = None
         if action == "buy" and denominated_in_sol:
             wallet_spend_estimate = self._estimate_live_buy_wallet_spend(amount, priority_fee_sol)
@@ -8460,6 +8511,7 @@ class BotState:
             final_status=quote.status,
             intent_id=intent.id,
             pilot_risk_policy_id=pilot_policy.policy_id if pilot_policy else "",
+            autonomous_pilot_window_id=autonomous_pilot_window_id.strip(),
             signer_identity_id=f"{signer_mode}:{wallet_public_key}",
         )
         audit.quote["shadow_only"] = bool(shadow_only)
@@ -8514,7 +8566,16 @@ class BotState:
             ],
         }
 
-    def quote_live_intent(self, env_live_enabled: bool, intent_id: str, slippage_pct: float, priority_fee_sol: float, pool: str, shadow_only: bool = False) -> dict[str, object]:
+    def quote_live_intent(
+        self,
+        env_live_enabled: bool,
+        intent_id: str,
+        slippage_pct: float,
+        priority_fee_sol: float,
+        pool: str,
+        shadow_only: bool = False,
+        autonomous_pilot_window_id: str = "",
+    ) -> dict[str, object]:
         intent = self._require_live_intent(intent_id)
         if intent.status == "cancelled":
             raise ValueError("cannot quote a cancelled intent")
@@ -8530,6 +8591,7 @@ class BotState:
             wallet_public_key=intent.wallet_public_key,
             signer_mode=intent.signer_mode,
             shadow_only=shadow_only,
+            autonomous_pilot_window_id=autonomous_pilot_window_id,
         )
         stored_audit = self.storage.load_live_execution_audit(str(audit.get("id", "")))
         if stored_audit:
@@ -8664,6 +8726,19 @@ class BotState:
             raise ValueError("shadow-only quote cannot be submitted")
         if not str(audit.quote.get("unsigned_transaction_base64", "")).strip():
             raise ValueError("cannot submit a live audit without a ready unsigned transaction")
+        if audit.autonomous_pilot_window_id:
+            captured_window = self.storage.load_autonomous_pilot_window(audit.autonomous_pilot_window_id)
+            active_window = self.storage.load_latest_autonomous_pilot_window()
+            if (
+                captured_window is None
+                or active_window is None
+                or str(active_window.get("window_id") or "") != audit.autonomous_pilot_window_id
+                or captured_window.get("opened") is not True
+                or str(captured_window.get("status") or "").upper() not in {"OPEN", "OPENED"}
+                or str(captured_window.get("wallet_public_key") or "") != audit.wallet_public_key
+                or str(captured_window.get("policy_id") or "") != audit.pilot_risk_policy_id
+            ):
+                raise ValueError("cannot submit autonomous audit after pilot window authority changed")
         active_pilot_policy = self.storage.load_latest_pilot_risk_policy()
         captured_pilot_policy = audit.caps_snapshot.get("pilot_risk_policy") if isinstance(audit.caps_snapshot, dict) else None
         if audit.action == "buy" and active_pilot_policy is not None:
@@ -8951,7 +9026,14 @@ class BotState:
                 )
                 continue
             try:
-                audit = self.quote_live_intent(env_live_enabled, intent.id, self.settings.live_max_slippage_pct, self.settings.live_priority_fee_cap_sol, "pump")
+                audit = self.quote_live_intent(
+                    env_live_enabled,
+                    intent.id,
+                    self.settings.live_max_slippage_pct,
+                    self.settings.live_priority_fee_cap_sol,
+                    "pump",
+                    autonomous_pilot_window_id=str(self.autonomous_pilot_status().get("window_id") or ""),
+                )
                 stopped = self._enforce_pilot_runtime_guard()
                 if stopped is not None:
                     return {**stopped, "generated": len(generated), "executed": executed}
@@ -9036,6 +9118,8 @@ class BotState:
                 block("cumulative_loss_freeze")
             if risk.consecutive_losses >= policy.consecutive_loss_stop:
                 block("consecutive_loss_stop")
+            if risk.unrealized_pnl_unavailable:
+                block("preflight_failed")
 
         source_blocker = self._source_live_entry_blocker(self.source_health())
         if source_blocker:
@@ -10386,13 +10470,13 @@ class BotState:
             or position.reconciliation_status != "matched"
         ):
             return False
-        policy = self.storage.load_latest_pilot_risk_policy()
-        window = self.storage.load_latest_autonomous_pilot_window()
+        if not audit.autonomous_pilot_window_id or not audit.pilot_risk_policy_id:
+            return False
+        window = self.storage.load_autonomous_pilot_window(audit.autonomous_pilot_window_id)
+        policy = self.storage.load_pilot_risk_policy(audit.pilot_risk_policy_id)
         if (
             policy is None
             or window is None
-            or window.get("opened") is not True
-            or str(window.get("status") or "").upper() not in {"OPEN", "OPENED"}
             or str(window.get("policy_id") or "") != policy.policy_id
             or audit.pilot_risk_policy_id != policy.policy_id
             or str(window.get("wallet_public_key") or "") != audit.wallet_public_key
@@ -10416,7 +10500,7 @@ class BotState:
             return False
         return self.storage.append_pilot_outcome(
             policy.policy_id,
-            str(window.get("window_id") or ""),
+            audit.autonomous_pilot_window_id,
             audit.id,
             pnl_sol,
             recorded_at,
@@ -11230,20 +11314,58 @@ class BotState:
                 return Decimal(str(item.get("pnl_sol") or "0"))
             return -Decimal(str(item.get("loss_sol") or "0"))
 
-        session_entries = [item for item in entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= policy.created_at]
-        daily_entries = [item for item in session_entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= day_start]
+        policy_entries = [item for item in entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= policy.created_at]
+        active_window = self.storage.load_latest_autonomous_pilot_window()
+        active_window_id = (
+            str(active_window.get("window_id") or "")
+            if active_window
+            and str(active_window.get("policy_id") or "") == policy.policy_id
+            and active_window.get("opened") is True
+            and str(active_window.get("status") or "").upper() in {"OPEN", "OPENED"}
+            else ""
+        )
+        session_entries = (
+            [item for item in policy_entries if str(item.get("window_id") or "") == active_window_id]
+            if active_window_id
+            else policy_entries
+        )
+        daily_entries = [item for item in policy_entries if (timestamp(item) or datetime.min.replace(tzinfo=timezone.utc)) >= day_start]
+        open_positions = [item for item in relevant if item.status == "open" and item.token_balance > 0]
+        unrealized_pnl = Decimal("0")
+        unrealized_pnl_unavailable = False
+        for position in open_positions:
+            mark_at = position.mark_price_at if isinstance(position.mark_price_at, datetime) else None
+            balance_at = position.balance_verified_at if isinstance(position.balance_verified_at, datetime) else None
+            trustworthy = (
+                position.reconciliation_status == "matched"
+                and mark_at is not None
+                and mark_at.tzinfo is not None
+                and mark_at.utcoffset() is not None
+                and balance_at is not None
+                and balance_at.tzinfo is not None
+                and balance_at.utcoffset() is not None
+                and 0 <= (checked_at - mark_at.astimezone(timezone.utc)).total_seconds() <= self.settings.source_stale_seconds
+                and 0 <= (checked_at - balance_at.astimezone(timezone.utc)).total_seconds() <= self.settings.source_stale_seconds
+                and position.mark_price_confidence >= self.settings.min_price_confidence
+                and position.unrealized_pnl_confidence not in {"unknown", "needs_review", "stale"}
+            )
+            if not trustworthy:
+                unrealized_pnl_unavailable = True
+                continue
+            unrealized_pnl += Decimal(str(position.unrealized_pnl_sol))
         consecutive_losses = 0
-        for item in reversed(session_entries):
+        for item in reversed(policy_entries):
             if pnl(item) < 0:
                 consecutive_losses += 1
             else:
                 break
         return PilotRiskState(
-            open_positions=len([item for item in relevant if item.status == "open" and item.token_balance > 0]),
-            session_pnl_sol=sum((pnl(item) for item in session_entries), Decimal("0")),
-            daily_pnl_sol=sum((pnl(item) for item in daily_entries), Decimal("0")),
+            open_positions=len(open_positions),
+            session_pnl_sol=sum((pnl(item) for item in session_entries), Decimal("0")) + unrealized_pnl,
+            daily_pnl_sol=sum((pnl(item) for item in daily_entries), Decimal("0")) + unrealized_pnl,
             cumulative_loss_sol=Decimal(str(ledger.get("cumulative_loss_sol") or "0")),
             consecutive_losses=consecutive_losses,
+            unrealized_pnl_unavailable=unrealized_pnl_unavailable,
             stopped=bool(self.settings.kill_switch_enabled),
         )
 

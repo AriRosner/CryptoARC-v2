@@ -30,6 +30,7 @@ class PilotRiskState:
     daily_pnl_sol: Decimal = Decimal("0")
     cumulative_loss_sol: Decimal = Decimal("0")
     consecutive_losses: int = 0
+    unrealized_pnl_unavailable: bool = False
     stopped: bool = False
     restart_requested: bool = False
     replenished: bool = False
@@ -147,6 +148,8 @@ class PilotRiskPolicy:
             blockers.append("cumulative_loss_freeze")
         if state.consecutive_losses >= self.consecutive_loss_stop:
             blockers.append("consecutive_losses")
+        if state.unrealized_pnl_unavailable:
+            blockers.append("unrealized_pnl_unavailable")
         if request.slippage_pct < 0 or request.slippage_pct > self.initial_slippage_pct:
             blockers.append("slippage_cap")
         if request.total_cost_sol < 0 or request.total_cost_sol > self.cost_cap_for(request.requested_sol):
