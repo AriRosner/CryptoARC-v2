@@ -7470,7 +7470,7 @@ class CoreLogicTests(unittest.TestCase):
                     status="raw",
                 )
             )
-            for index in range(19):
+            for index in range(25):
                 state.storage.save_source_event(
                     SourceEvent(
                         id=f"src_direct_noise_{index}",

@@ -15,6 +15,7 @@ All notable local release changes should be recorded here before tagging, live t
 - Added optional live Solana `logsSubscribe` raw archival behind `SOLANA_WSS_ENDPOINT` and `SOLANA_LOGS_MENTIONS_ADDRESS`.
 - Added richer direct Solana create-event evidence extraction from log text and decoded `Program data`.
 - Added bounded Borsh decoding for the official Pump `CreateEvent` layout and limited source-soak sample/match rates to genuine Pump create notifications.
+- Added a separate bounded direct-create evidence window so high-volume non-create Pump activity cannot evict rare launch samples from source-soak acceptance.
 - Added opt-in paper-only direct Solana create normalization behind confidence gates.
 - Added hybrid source-soak acceptance gates for matched PumpPortal/direct evidence before source promotion.
 - Added durable source-soak snapshots with local history, export, data-summary counts, and dashboard capture controls.
