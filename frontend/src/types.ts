@@ -381,6 +381,7 @@ export interface SolanaLogsVerificationReport {
   conflicts: Array<Record<string, unknown>>;
   failed_direct_events: Array<Record<string, unknown>>;
   direct_events: Array<Record<string, unknown>>;
+  direct_create_events: Array<Record<string, unknown>>;
   source_soak: SourceSoakSummary;
   operator_action: string;
   action_items: string[];

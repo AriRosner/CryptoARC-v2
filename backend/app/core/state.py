@@ -3103,8 +3103,11 @@ class BotState:
 
     def solana_logs_verification_report(self, limit: int | None = None) -> dict[str, object]:
         limit = max(1, min(5000, int(limit or 500)))
-        direct_events = self.storage.load_source_events_by_source(
-            ("solana_logs", "solana_logs_subscribe", "solana"),
+        direct_sources = ("solana_logs", "solana_logs_subscribe", "solana")
+        direct_events = self.storage.load_source_events_by_source(direct_sources, limit)
+        direct_create_events = self.storage.load_source_events_by_source_payload_contains(
+            direct_sources,
+            "Instruction: Create",
             limit,
         )
         portal_events = self.storage.load_source_events_by_source(("pumpportal",), limit)
@@ -3120,6 +3123,27 @@ class BotState:
             signature = str(row.get("signature") or "")
             if signature:
                 portal_by_signature.setdefault(signature, []).append(row)
+
+        def matched_portal_evidence(row: dict[str, object]) -> dict[str, object] | None:
+            signature = str(row.get("signature") or "")
+            mints = [str(mint) for mint in row.get("mints", [])]
+            signature_matches = portal_by_signature.get(signature, []) if signature else []
+            mint_matches = [match for mint in mints for match in portal_by_mint.get(mint, [])]
+            unique_matches = {str(match["event_id"]): match for match in [*signature_matches, *mint_matches]}
+            if not unique_matches:
+                return None
+            earliest_portal = min(unique_matches.values(), key=lambda item: str(item["received_at"]))
+            return {
+                "direct_event_id": row["event_id"],
+                "portal_event_ids": list(unique_matches.keys())[:10],
+                "signature": signature,
+                "mints": mints,
+                "slot": row["slot"],
+                "direct_received_at": row["received_at"],
+                "first_portal_received_at": earliest_portal["received_at"],
+                "direct_minus_portal_ms": self._iso_lag_ms(str(row["received_at"]), str(earliest_portal["received_at"])),
+                "match_type": "signature" if signature_matches else "mint",
+            }
 
         matches: list[dict[str, object]] = []
         conflicts: list[dict[str, object]] = []
@@ -3143,28 +3167,30 @@ class BotState:
                         }
                     )
                 continue
-            if unique_matches:
-                earliest_portal = min(unique_matches.values(), key=lambda item: str(item["received_at"]))
-                lag_ms = self._iso_lag_ms(str(row["received_at"]), str(earliest_portal["received_at"]))
-                matches.append(
-                    {
-                        "direct_event_id": row["event_id"],
-                        "portal_event_ids": list(unique_matches.keys())[:10],
-                        "signature": signature,
-                        "mints": mints,
-                        "slot": row["slot"],
-                        "direct_received_at": row["received_at"],
-                        "first_portal_received_at": earliest_portal["received_at"],
-                        "direct_minus_portal_ms": lag_ms,
-                        "match_type": "signature" if signature_matches else "mint",
-                    }
-                )
+            matched = matched_portal_evidence(row)
+            if matched:
+                matches.append(matched)
             elif row.get("create_hint") or mints or signature:
                 unmatched_direct.append(row)
+
+        direct_create_hints: list[dict[str, object]] = []
+        for event in direct_create_events:
+            row = self._solana_log_evidence(event)
+            if not row.get("err") and row.get("create_hint"):
+                direct_create_hints.append(row)
+        create_matches = [matched for row in direct_create_hints if (matched := matched_portal_evidence(row))]
+        matched_direct_ids = {str(match["direct_event_id"]) for match in matches}
+        matches.extend(match for match in create_matches if str(match["direct_event_id"]) not in matched_direct_ids)
+
+        matched_portal_ids = {
+            str(portal_event_id)
+            for match in matches
+            for portal_event_id in match.get("portal_event_ids", [])
+        }
         unmatched_portal = [
             row
             for row in portal_rows
-            if row["mints"] and not any(str(mint) in {candidate for direct in direct_rows for candidate in direct.get("mints", [])} for mint in row["mints"])
+            if row["mints"] and str(row["event_id"]) not in matched_portal_ids
         ][:50]
         status = "unknown"
         if not self.solana_wss_endpoint:
@@ -3182,13 +3208,10 @@ class BotState:
         else:
             status = "no_matches"
 
-        direct_create_hints = [row for row in direct_rows if row.get("create_hint")]
-        direct_create_ids = {str(row["event_id"]) for row in direct_create_hints}
-        create_matches = [match for match in matches if str(match["direct_event_id"]) in direct_create_ids]
         decoded_create_rows = [
             row
-            for row in direct_rows
-            if row.get("create_hint") and row.get("create_evidence", {}).get("field_count", 0)
+            for row in direct_create_hints
+            if row.get("create_evidence", {}).get("field_count", 0)
         ]
         action_items: list[str] = []
         if not self.solana_wss_endpoint:
@@ -3237,6 +3260,7 @@ class BotState:
             "conflicts": conflicts[:50],
             "failed_direct_events": failed_direct_rows[:50],
             "direct_events": direct_rows[:100],
+            "direct_create_events": direct_create_hints[:100],
             "source_soak": self._source_soak_from_verification(
                 len(direct_create_hints),
                 len(portal_rows),
