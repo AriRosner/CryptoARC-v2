@@ -323,6 +323,9 @@ class LiveSession:
     caps_snapshot: dict[str, Any] = field(default_factory=dict)
     acknowledged_at: datetime | None = None
     closed_at: datetime | None = None
+    autonomous_pilot_window_id: str = ""
+    autonomous_authorization_id: str = ""
+    attended: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)

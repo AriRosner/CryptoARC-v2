@@ -1,4 +1,4 @@
-import type { AlertStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, ManualLiveProofReport, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PilotRiskStatus, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SentinelVerdict, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyCandidate, StrategyCandidatePromotionResult, StrategyDecisionRecord, StrategyPreset, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
+import type { AlertStatus, AutonomousPilotStatus, BacktestResult, BacktestV3Result, BotSnapshot, DataIntegrityReport, DataSummary, EvidenceModeSeparationReport, ExperimentRun, HotWalletStatus, IncidentExportReviewAttestation, LatencyStatus, LiveExecutionAudit, LiveExecutionRequest, LiveIntent, LiveLedger, LivePosition, LiveStatus, ManualLiveProofReport, MobileDevicesResponse, MobilePairingStartResponse, MonitorPnlSummary, OperationalMonitoring, OperatorLogsReport, OperatorSessionReport, OutcomeExplanationsReport, PerformanceAnalytics, PilotReadinessReport, PilotRiskStatus, PostRunReviewReport, PriceDiagnostics, PriceObservation, PumpFunReport, ReadinessStatus, ReleaseReadinessReport, ReleaseVerificationAttestation, RentRecoveryPreview, RentRecoveryScan, ReplayTimelineEvent, RestoreArtifactPreview, RestoreSmokeTestReport, SafetyStatus, SecurityStatus, SentinelVerdict, SettingsVersion, SetupReadinessReport, SignerStatus, SimulationAccuracyReport, SolanaLogsVerificationReport, SolanaStatus, SourceAdapterStatus, SourceEvent, SourceHealth, SourceParserReplayReport, SourceSoakAcceptanceReport, StrategyCandidate, StrategyCandidatePromotionResult, StrategyDecisionRecord, StrategyPreset, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewDetail, TradeReviewQueue, TradeSession, TuningSuggestion, WatchdogStatus, WorkloadPressure } from "./types";
 
 const configuredApiBase = import.meta.env.VITE_API_BASE_URL as string | undefined;
 const localDevApiBase = `${window.location.protocol}//${window.location.hostname}:8000`;
@@ -567,6 +567,10 @@ export async function fetchOperationalMonitoring(): Promise<OperationalMonitorin
 
 export async function fetchManualLiveProof(): Promise<ManualLiveProofReport> {
   return request("/api/reports/manual-live-proof");
+}
+
+export async function fetchAutonomousPilotStatus(): Promise<AutonomousPilotStatus> {
+  return request("/api/autonomous-pilot/status");
 }
 
 export async function fetchWorkloadPressure(): Promise<WorkloadPressure> {

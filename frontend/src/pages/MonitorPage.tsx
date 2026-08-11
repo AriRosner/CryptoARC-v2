@@ -8,7 +8,8 @@ import { TokenTable } from "../components/TokenTable";
 import { Badge } from "../components/Badge";
 import { Skeleton } from "../components/Skeleton";
 import { cn } from "../components/utils";
-import type { LiveLedger } from "../types";
+import { fetchAutonomousPilotStatus } from "../api";
+import type { AutonomousPilotStatus, LiveLedger } from "../types";
 
 interface MonitorPageProps {
   stats: any;
@@ -77,6 +78,21 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
   pnlLoading = false,
   tokenLoading = false
 }) => {
+  const [pilotStatus, setPilotStatus] = React.useState<AutonomousPilotStatus | null>(null);
+  const [pilotStatusError, setPilotStatusError] = React.useState("");
+
+  React.useEffect(() => {
+    let active = true;
+    void fetchAutonomousPilotStatus()
+      .then((status) => {
+        if (active) setPilotStatus(status);
+      })
+      .catch((error: unknown) => {
+        if (active) setPilotStatusError(error instanceof Error ? error.message : "Pilot status unavailable");
+      });
+    return () => { active = false; };
+  }, []);
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -124,6 +140,18 @@ export const MonitorPage: React.FC<MonitorPageProps> = React.memo(({
         </div>
 
         <div className="space-y-6">
+          <Card className="p-6" hover={false}>
+            <div className="flex items-center justify-between gap-3">
+              <h4 className="text-sm font-black uppercase tracking-widest text-zinc-500">Attended Pilot Window</h4>
+              <Badge variant={pilotStatus?.opened ? "success" : "warning"}>{pilotStatus?.status ?? "loading"}</Badge>
+            </div>
+            <p className="mt-3 text-xs text-zinc-400">{pilotStatus?.operator_action ?? "Reading the zero-authority pilot gate."}</p>
+            <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/10 p-2 text-[11px] text-amber-100">
+              {pilotStatus?.opened ? "Attended window open; monitor every stop condition." : "No autonomous entry authority is open. Guarded exits remain separately controlled."}
+            </div>
+            {pilotStatusError ? <p className="mt-2 text-xs text-rose-300">{pilotStatusError}</p> : null}
+          </Card>
+
           <Card className="p-6" hover={false}>
             <div className="mb-6 flex items-center justify-between">
               <div>

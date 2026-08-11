@@ -1314,6 +1314,27 @@ export interface ManualLiveProofReport {
   operator_action: string;
 }
 
+export interface AutonomousPilotStatus {
+  window_id?: string;
+  status: "ELIGIBLE_DEFERRED" | "BLOCKED" | "DEFERRED";
+  eligible: boolean;
+  opened: boolean;
+  blockers: string[];
+  authorization_id?: string;
+  wallet_public_key?: string;
+  signer_mode?: string;
+  signer_identity_id?: string;
+  policy_id?: string;
+  manual_proof_id?: string;
+  starts_at?: string;
+  ends_at?: string;
+  attended?: boolean;
+  max_open_positions?: number;
+  automatic_restart_allowed: false;
+  authority_changed: false;
+  operator_action: string;
+}
+
 export type SentinelVerdictStatus = "insufficient_evidence" | "unfavorable" | "observe_only" | "pilot_eligible";
 
 export interface SentinelVerdict {

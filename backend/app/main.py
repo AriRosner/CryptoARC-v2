@@ -1931,6 +1931,11 @@ async def manual_live_proof_report_export() -> JSONResponse:
     )
 
 
+@app.get("/api/autonomous-pilot/status", dependencies=[Depends(require_auth)])
+async def autonomous_pilot_status() -> dict:
+    return state.autonomous_pilot_status()
+
+
 @app.get("/api/reports/post-run-review", dependencies=[Depends(require_auth)])
 async def post_run_review_report(timeframe: str = "24h", wallet_public_key: str = "") -> dict:
     return state.post_run_review_report(timeframe, wallet_public_key)

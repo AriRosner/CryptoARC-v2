@@ -81,6 +81,7 @@ from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
 from app.core.pilot_risk import PilotRiskPolicy, PilotRiskRequest, PilotRiskState
 from app.core.production_rehearsal import ProductionGateRehearsal
 from app.core.manual_live_proof import ManualLiveProof
+from app.core.autonomous_pilot import AutonomousPilotGate, PilotStopEvaluator
 from app.mobile.contracts import MobileScope
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -8843,6 +8844,13 @@ class BotState:
         return audit.status == "needs_review" and audit.recovery_attempts >= self.live_recovery_max_attempts
 
     def run_live_autonomy(self, env_live_enabled: bool, *, local_auth_enabled: bool = False) -> dict[str, object]:
+        pilot_window = self.autonomous_pilot_status()
+        if pilot_window.get("opened") is not True:
+            return {
+                "status": "disabled",
+                "reason": "no separately authorized attended autonomous pilot window is open",
+                "pilot_window": pilot_window,
+            }
         if not local_auth_enabled:
             return {"status": "disabled", "reason": "dashboard password/local auth is required for live autonomy"}
         if not env_live_enabled:
@@ -10809,6 +10817,33 @@ class BotState:
             "authority_changed": False,
             "operator_action": "Request a fresh separately authorized $2-$5 manual round-trip window; no live action starts here.",
         }
+
+    def evaluate_autonomous_pilot_window(
+        self,
+        authorization: dict[str, object],
+        readiness_snapshot: dict[str, object],
+        policy: dict[str, object],
+        manual_proof: dict[str, object],
+    ) -> dict[str, object]:
+        window = AutonomousPilotGate.open_window(authorization, readiness_snapshot, policy, manual_proof)
+        return self.storage.save_autonomous_pilot_window(window.to_dict())
+
+    def autonomous_pilot_status(self) -> dict[str, object]:
+        latest = self.storage.load_latest_autonomous_pilot_window()
+        if latest is not None:
+            return latest
+        return {
+            "status": "DEFERRED",
+            "eligible": False,
+            "opened": False,
+            "blockers": ["separate_attended_window_authorization_required"],
+            "authority_changed": False,
+            "automatic_restart_allowed": False,
+            "operator_action": "No attended autonomous pilot window has been opened.",
+        }
+
+    def evaluate_autonomous_pilot_stop(self, event: dict[str, object]) -> dict[str, object]:
+        return PilotStopEvaluator.evaluate(event, self.autonomous_pilot_status()).to_dict()
 
     def _pilot_risk_state(self, policy: PilotRiskPolicy, wallet_public_key: str = "") -> PilotRiskState:
         positions = self.storage.load_live_ledger_positions(500)
