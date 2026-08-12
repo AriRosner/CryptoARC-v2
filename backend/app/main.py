@@ -1030,6 +1030,7 @@ async def health_deep() -> dict:
         "live_execution_available": False,
         "database": config.database_path,
         "source": state.source_status.to_dict(),
+        "candidate_priority": state.shadow_candidate_priority_status(),
     }
 
 

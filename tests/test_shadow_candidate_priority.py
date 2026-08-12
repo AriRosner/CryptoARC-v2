@@ -214,6 +214,23 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
                 self.assertEqual(stored.audit_id, "")
                 self.assertEqual(candidate.state, "awaiting_entry")
 
+    def test_candidate_priority_status_is_redacted_and_respects_cap(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 1
+            state.generate_live_intents("WalletShadow")
+            state.source_status.active_trade_subscriptions = 1
+
+            status = state.shadow_candidate_priority_status()
+            rendered = str(status).lower()
+
+            self.assertEqual(status["configured_subscription_cap"], 1)
+            self.assertEqual(status["active_mint_prefix"], token.mint[:8])
+            self.assertTrue(status["cap_respected"])
+            self.assertNotIn("wallet", rendered)
+            self.assertNotIn("api-key", rendered)
+            self.assertNotIn(token.mint.lower(), rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2532,6 +2532,39 @@ class BotState:
         active = self.storage.load_shadow_tracking_candidates(active_only=True)
         return [active[0].mint] if active else []
 
+    def shadow_candidate_priority_status(self, now: datetime | None = None) -> dict[str, object]:
+        current = now or utc_now()
+        self._expire_shadow_tracking_candidates(current)
+        candidates = self.storage.load_shadow_tracking_candidates()
+        active = [item for item in candidates if item.state in {"awaiting_entry", "tracking_shadow"}]
+        selected = active[0] if active else None
+
+        def count(state: str) -> int:
+            return sum(1 for item in candidates if item.state == state)
+
+        expired_missing_entry = sum(
+            1 for item in candidates if item.state == "expired" and "entry" in item.reason
+        )
+        expired_missing_exit = sum(
+            1 for item in candidates if item.state == "expired" and "exit" in item.reason
+        )
+        cap = max(0, int(self.settings.max_trade_subscriptions))
+        return {
+            "state": selected.state if selected else "idle",
+            "active_mint_prefix": selected.mint[:8] if selected else "",
+            "active_age_seconds": max(0, int((current - selected.selected_at).total_seconds())) if selected else 0,
+            "deadline_at": selected.deadline_at.isoformat() if selected else None,
+            "queue_depth": len(active),
+            "awaiting_entry": count("awaiting_entry"),
+            "tracking_shadow": count("tracking_shadow"),
+            "completed": count("complete"),
+            "expired_missing_entry": expired_missing_entry,
+            "expired_missing_exit": expired_missing_exit,
+            "active_subscriptions": self.source_status.active_trade_subscriptions,
+            "configured_subscription_cap": cap,
+            "cap_respected": self.source_status.active_trade_subscriptions <= cap,
+        }
+
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
         return mint in PUMPPORTAL_NON_LAUNCH_MINTS
