@@ -34,6 +34,8 @@ class GitHubWorkflowContractTests(unittest.TestCase):
         self.assertIn("Delete stale badge branch", workflow)
         self.assertIn("--state open --head $branch", workflow)
         self.assertIn("automation/code-line-badge-${{ github.run_id }}", workflow)
+        self.assertIn("group: update-code-line-badge", workflow)
+        self.assertNotIn("group: update-code-line-badge-${{ github.ref }}", workflow)
         self.assertNotIn("git push origin HEAD:${{ github.ref_name }}", workflow)
         self.assertNotIn("[skip ci]", workflow)
 

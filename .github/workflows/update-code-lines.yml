@@ -11,7 +11,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: update-code-line-badge-${{ github.ref }}
+  group: update-code-line-badge
   cancel-in-progress: false
 
 jobs:
