@@ -8428,15 +8428,30 @@ class BotState:
 
     def generate_live_intents(self, wallet_public_key: str, signer_mode: str = "browser_wallet", include_watchlist: list[str] | None = None) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
-        existing = [intent for intent in self.storage.load_live_intents(200) if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
-        existing_keys = {(intent.action, intent.mint) for intent in existing}
-        candidates: list[LiveExecutionIntent] = []
         now = utc_now()
+        loaded_intents = self.storage.load_live_intents(200)
+        existing = [intent for intent in loaded_intents if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
+        existing_keys = {(intent.action, intent.mint) for intent in existing}
+        recent_cutoff = now - timedelta(seconds=max(1, int(self.settings.max_token_age_seconds)))
+        recently_quoted_paper_keys = {
+            (intent.action, intent.mint)
+            for intent in loaded_intents
+            if intent.source == "paper_promoted"
+            and intent.status in {"quoted", "expired", "simulation_warning", "simulated"}
+            and bool(intent.quote_id)
+            and intent.created_at >= recent_cutoff
+        }
+        candidates: list[LiveExecutionIntent] = []
         readiness = self.readiness_status()
         for token in self._live_intent_candidate_tokens(now):
             if len(existing) + len(candidates) >= 10:
                 break
-            if token.mint and token.score >= self.settings.score_threshold and ("buy", token.mint) not in existing_keys:
+            if (
+                token.mint
+                and token.score >= self.settings.score_threshold
+                and ("buy", token.mint) not in existing_keys
+                and ("buy", token.mint) not in recently_quoted_paper_keys
+            ):
                 candidates.append(
                     LiveExecutionIntent(
                         id=new_id("intent"),

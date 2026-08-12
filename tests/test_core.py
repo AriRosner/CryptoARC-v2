@@ -2604,6 +2604,38 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertEqual(intents, [])
 
+    def test_live_intent_generation_does_not_requote_recent_paper_decision(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.001
+            state.settings.trade_size_sol = 0.001
+            state.settings.max_token_age_seconds = 120
+            token = self.make_token()
+            token.id = "tok_deduped_shadow"
+            token.mint = "MintDedupedShadow"
+            token.score = 95
+            token.status = TokenStatus.PAPER_BOUGHT
+            state.tokens.appendleft(token)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            first = state.generate_live_intents("WalletShadow")
+            first_intent = next(intent for intent in first if intent["mint"] == token.mint)
+            stored = state.storage.load_live_intent(str(first_intent["id"]))
+            stored.expires_at = utc_now() - timedelta(seconds=1)
+            state.storage.save_live_intent(stored)
+            state.live_intents()
+
+            second = state.generate_live_intents("WalletShadow")
+
+            self.assertEqual(second, [])
+            matching_audits = [
+                audit
+                for audit in state.storage.load_live_execution_audits(20)
+                if audit.mint == token.mint and audit.quote.get("shadow_only")
+            ]
+            self.assertEqual(len(matching_audits), 1)
+
     def test_live_intent_readiness_warning_does_not_block_quote(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
