@@ -54,6 +54,7 @@ The future sequence remains:
 1. Capture exact Git and machine-verifiable readiness.
 2. Obtain separately authorized genuine trade-price source access.
 3. Record attributable source-soak evidence and direct-chain comparisons.
+
 4. Complete version-matched all-cost shadows over the approved sample and calendar window.
 5. Rehearse production authentication, backup, restore, signer-loss, source-loss, shutdown, restart, reconciliation, and kill-switch behavior in a coordinated window.
 6. Request separate authorization for manual-live proof.
@@ -61,6 +62,38 @@ The future sequence remains:
 8. Reconcile the run and record an explicit scale, hold, revise, or stop decision.
 
 No step guarantees profit. Changed or stale market conditions return the strategy to source-connected paper and shadow validation.
+
+## Long-running shadow-campaign operations
+
+Use `scripts/export-shadow-campaign-evidence.py` to build a deterministic,
+redacted JSON and Markdown checkpoint from the monitor status plus a read-only
+SQLite connection. The exporter never starts the bot and never invokes wallet,
+signer, simulation, submission, acknowledgement, arming, or live-session paths.
+It flags stale status, exact-head drift, counter regression, database/status
+divergence, and the fixed economic minimums of 100 genuine completed samples
+across at least seven calendar days and multiple regimes.
+
+```powershell
+python scripts/export-shadow-campaign-evidence.py `
+  --database data/shadow-campaign.db `
+  --status evidence/shadow-campaign-status.json `
+  --output-dir evidence/checkpoint `
+  --code-head (git rev-parse HEAD) `
+  --observed-at ([DateTimeOffset]::UtcNow.ToString('o'))
+```
+
+Use `scripts/test-shadow-campaign-backup.py` for a WAL-safe online backup and
+independent read-only validation. It refuses to overwrite an existing backup
+and passes only when SQLite integrity checks succeed and persisted settings are
+paper/fail-closed (paper mode, kill switch enabled, no active backend, and no
+live-session acknowledgement).
+
+```powershell
+python scripts/test-shadow-campaign-backup.py `
+  --database data/shadow-campaign.db `
+  --backup evidence/backups/shadow-campaign-YYYYMMDD-HHMMSS.db `
+  --evidence evidence/backups/shadow-campaign-YYYYMMDD-HHMMSS.json
+```
 
 ## Production rehearsal evidence boundary
 
