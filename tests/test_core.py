@@ -7700,6 +7700,73 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(direct_sample_gate["status"], "fail")
             self.assertEqual(direct_sample_gate["value"], 1)
 
+    def test_source_soak_match_rate_uses_overlapping_source_window(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            now = utc_now()
+            for index in range(20):
+                mint = f"MintAligned{index:03d}"
+                signature = f"SigAligned{index:03d}"
+                received_at = now + timedelta(seconds=index)
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_portal_aligned_{index}",
+                        source="pumpportal",
+                        received_at=received_at,
+                        raw_payload={"txType": "create", "mint": mint, "signature": signature},
+                        status="normalized",
+                    )
+                )
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_direct_aligned_{index}",
+                        source="solana_logs",
+                        received_at=received_at + timedelta(milliseconds=100),
+                        raw_payload={
+                            "result": {
+                                "context": {"slot": 9000 + index},
+                                "value": {
+                                    "signature": signature,
+                                    "err": None,
+                                    "logs": ["Program log: Instruction: Create", f"Program log: mint {mint}"],
+                                },
+                            }
+                        },
+                        status="raw",
+                    )
+                )
+            for index in range(20):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_direct_outside_window_{index}",
+                        source="solana_logs",
+                        received_at=now - timedelta(hours=2, seconds=index),
+                        raw_payload={
+                            "result": {
+                                "context": {"slot": 8000 + index},
+                                "value": {
+                                    "signature": f"SigOutsideWindow{index:03d}",
+                                    "err": None,
+                                    "logs": ["Program log: Instruction: Create"],
+                                },
+                            }
+                        },
+                        status="raw",
+                    )
+                )
+
+            report = state.solana_logs_verification_report(limit=100)
+
+            self.assertEqual(report["summary"]["direct_create_hints"], 40)
+            self.assertEqual(report["source_soak"]["direct_events"], 20)
+            self.assertEqual(report["source_soak"]["matches"], 20)
+            self.assertEqual(report["source_soak"]["match_rate"], 1.0)
+            self.assertEqual(report["source_soak"]["comparison_window"]["excluded_direct_events"], 20)
+
     def test_source_soak_acceptance_requires_matched_direct_samples(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"
