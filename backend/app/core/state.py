@@ -3187,7 +3187,25 @@ class BotState:
             row = self._solana_log_evidence(event)
             if not row.get("err") and row.get("create_hint"):
                 direct_create_hints.append(row)
-        create_matches = [matched for row in direct_create_hints if (matched := matched_portal_evidence(row))]
+        comparison_start = min(
+            (self._parse_iso_datetime(str(row["received_at"])) for row in portal_create_rows),
+            default=None,
+        )
+        comparison_end = max(
+            (self._parse_iso_datetime(str(row["received_at"])) for row in portal_create_rows),
+            default=None,
+        )
+        comparison_tolerance = timedelta(seconds=5)
+        aligned_direct_create_hints = [
+            row
+            for row in direct_create_hints
+            if comparison_start is None
+            or comparison_end is None
+            or comparison_start - comparison_tolerance
+            <= self._parse_iso_datetime(str(row["received_at"]))
+            <= comparison_end + comparison_tolerance
+        ]
+        create_matches = [matched for row in aligned_direct_create_hints if (matched := matched_portal_evidence(row))]
         matched_direct_ids = {str(match["direct_event_id"]) for match in matches}
         matches.extend(match for match in create_matches if str(match["direct_event_id"]) not in matched_direct_ids)
 
@@ -3219,7 +3237,7 @@ class BotState:
 
         decoded_create_rows = [
             row
-            for row in direct_create_hints
+            for row in aligned_direct_create_hints
             if row.get("create_evidence", {}).get("field_count", 0)
         ]
         action_items: list[str] = []
@@ -3274,14 +3292,20 @@ class BotState:
             "direct_create_events": direct_create_hints[:100],
             "pumpportal_create_events": portal_create_rows[:100],
             "source_soak": self._source_soak_from_verification(
-                len(direct_create_hints),
+                len(aligned_direct_create_hints),
                 len(portal_rows),
-                len(direct_create_hints),
+                len(aligned_direct_create_hints),
                 len(decoded_create_rows),
                 len(create_matches),
-                len(unmatched_direct),
+                len(aligned_direct_create_hints) - len(create_matches),
                 len(unmatched_portal),
                 len(conflicts),
+                comparison_window={
+                    "start": comparison_start.isoformat() if comparison_start else None,
+                    "end": comparison_end.isoformat() if comparison_end else None,
+                    "tolerance_seconds": int(comparison_tolerance.total_seconds()),
+                    "excluded_direct_events": len(direct_create_hints) - len(aligned_direct_create_hints),
+                },
             ),
             "operator_action": "Collect direct logsSubscribe evidence and compare it with PumpPortal before using source verification for live promotion.",
             "action_items": list(dict.fromkeys(action_items)),
@@ -3517,6 +3541,7 @@ class BotState:
         unmatched_direct: int,
         unmatched_pumpportal: int,
         conflicts: int,
+        comparison_window: dict[str, object] | None = None,
     ) -> dict[str, object]:
         match_rate = round(matches / max(1, direct_events), 3) if direct_events else 0.0
         decoded_rate = round(decoded_create_events / max(1, direct_create_hints), 3) if direct_create_hints else 0.0
@@ -3531,6 +3556,7 @@ class BotState:
             "unmatched_direct": unmatched_direct,
             "unmatched_pumpportal": unmatched_pumpportal,
             "conflicts": conflicts,
+            "comparison_window": comparison_window or {},
             "target": {
                 "direct_events": ">= 20",
                 "matches": ">= 10",
