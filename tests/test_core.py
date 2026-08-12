@@ -5520,6 +5520,28 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(any("kill switch" in blocker.lower() for blocker in report["blockers"]))
             self.assertIn("privacy_note", report)
 
+    def test_pilot_readiness_reuses_computed_readiness_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+
+            with (
+                patch.object(state, "readiness_status", wraps=state.readiness_status) as readiness_status,
+                patch.object(
+                    state,
+                    "source_soak_acceptance_report",
+                    wraps=state.source_soak_acceptance_report,
+                ) as source_soak,
+            ):
+                report = state.pilot_readiness_report(False, "WalletPilot", "browser_wallet")
+
+            self.assertEqual(report["artifact_type"], "cryptoarc_tiny_pilot_readiness")
+            self.assertEqual(readiness_status.call_count, 1)
+            self.assertEqual(source_soak.call_count, 1)
+            self.assertEqual(
+                report["evidence"]["source_soak"]["status"],
+                report["evidence"]["live_status"]["readiness"]["source_soak"]["status"],
+            )
+
     def test_pilot_readiness_requires_local_auth(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))

@@ -5046,13 +5046,18 @@ class BotState:
             self.storage.load_trade_labels(5000),
         )
 
-    def readiness_status(self) -> dict[str, object]:
+    def readiness_status(
+        self,
+        *,
+        source: dict[str, object] | None = None,
+        source_soak: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         closed = [trade for trade in self.storage.load_trades(5000) if trade.closed_at and trade.pnl_sol is not None]
         integrity = self.data_integrity_report()
-        source = self.source_health()
+        source = self.source_health() if source is None else source
         price = self.price_diagnostics()
         performance = self._performance_group("all trades", closed)
-        source_soak = self.source_soak_acceptance_report()
+        source_soak = self.source_soak_acceptance_report() if source_soak is None else source_soak
         closed_count = len(closed)
         source_events = int(integrity.get("source_events", 0))
         source_trust_blocks_entries = bool(source.get("live_entry_blocked")) or source.get("trust_state") in {"degraded", "stale", "conflicting"}
@@ -7981,13 +7986,22 @@ class BotState:
         )
         return event
 
-    def live_status(self, env_live_enabled: bool = False, wallet_public_key: str = "", signer_mode: str | None = None, local_auth_enabled: bool = False) -> dict[str, object]:
+    def live_status(
+        self,
+        env_live_enabled: bool = False,
+        wallet_public_key: str = "",
+        signer_mode: str | None = None,
+        local_auth_enabled: bool = False,
+        *,
+        readiness_snapshot: dict[str, object] | None = None,
+        source_health_snapshot: dict[str, object] | None = None,
+    ) -> dict[str, object]:
         signer_mode = signer_mode or self.settings.live_signer_mode
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         signer = self.signer_status(signer_mode, wallet_public_key)
         caps = self.live_caps_snapshot()
-        readiness = self._recent_readiness_status()
-        source_health = self.source_health()
+        readiness = readiness_snapshot or self._recent_readiness_status()
+        source_health = source_health_snapshot or self.source_health()
         wallet_metrics = self._wallet_live_metrics(wallet_public_key)
         audit_rows = self._normalize_live_audits(self.storage.load_live_execution_audits(200))
         unresolved = [audit for audit in audit_rows if self._is_unresolved_live_audit(audit)]
@@ -13128,10 +13142,17 @@ class BotState:
         wallet = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         source = self.source_health()
         source_soak = self.source_soak_acceptance_report()
-        readiness = self.readiness_status()
+        readiness = self.readiness_status(source=source, source_soak=source_soak)
         strategy = readiness.get("strategy_promotion") if isinstance(readiness, dict) else {}
         execution = readiness.get("execution_readiness") if isinstance(readiness, dict) else {}
-        live = self.live_status(env_live_enabled, wallet, signer_mode, local_auth_enabled)
+        live = self.live_status(
+            env_live_enabled,
+            wallet,
+            signer_mode,
+            local_auth_enabled,
+            readiness_snapshot=readiness,
+            source_health_snapshot=source,
+        )
         ledger = self.live_ledger(wallet)
         backup = self.storage.backup_restore_status()
         pre_run_backup = self._pre_run_backup_status()
