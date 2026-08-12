@@ -3871,6 +3871,9 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             now = utc_now()
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_shadow_funding_blocker",
@@ -5730,6 +5733,9 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             now = utc_now()
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_pilot_shadow_funding_blocker",
@@ -6755,6 +6761,9 @@ class CoreLogicTests(unittest.TestCase):
             state.source_status.raw_events_seen = 1
             state.source_status.normalized_events = 1
             state.source_status.active_trade_subscriptions = 5
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_trade_subscription_funding",
