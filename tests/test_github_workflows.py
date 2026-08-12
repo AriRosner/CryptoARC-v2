@@ -23,11 +23,16 @@ class GitHubWorkflowContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("pull-requests: write", workflow)
+        self.assertIn("actions: write", workflow)
         self.assertIn("gh pr create", workflow)
+        self.assertIn("actions/runs/$runId/approve", workflow)
+        self.assertIn("gh run watch $runId --exit-status", workflow)
         self.assertIn(
             "gh pr merge $prNumber --auto --squash --delete-branch",
             workflow,
         )
+        self.assertIn("Delete stale badge branch", workflow)
+        self.assertIn("--state open --head $branch", workflow)
         self.assertIn("automation/code-line-badge-${{ github.run_id }}", workflow)
         self.assertNotIn("git push origin HEAD:${{ github.ref_name }}", workflow)
         self.assertNotIn("[skip ci]", workflow)

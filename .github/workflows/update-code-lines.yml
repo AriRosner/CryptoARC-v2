@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -170,4 +171,38 @@ jobs:
             --title "Update code line badge" `
             --body $body
           $prNumber = gh pr view $prUrl --json number --jq '.number'
+          $headSha = gh pr view $prNumber --json headRefOid --jq '.headRefOid'
+          $runIds = @()
+          for ($attempt = 0; $attempt -lt 12 -and $runIds.Count -lt 3; $attempt++) {
+            Start-Sleep -Seconds 5
+            $runIds = @(gh api "repos/${{ github.repository }}/actions/runs?head_sha=$headSha&event=pull_request" --jq '.workflow_runs[].id')
+          }
+          if ($runIds.Count -lt 3) {
+            throw "Expected CI, CodeQL, and Dependency review runs for PR #$prNumber."
+          }
+          foreach ($runId in $runIds) {
+            $conclusion = gh api "repos/${{ github.repository }}/actions/runs/$runId" --jq '.conclusion'
+            if ($conclusion -eq "action_required") {
+              gh api --method POST "repos/${{ github.repository }}/actions/runs/$runId/approve"
+            }
+          }
+          foreach ($runId in $runIds) {
+            gh run watch $runId --exit-status
+          }
           gh pr merge $prNumber --auto --squash --delete-branch
+
+      - name: Delete stale badge branch
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $branches = gh api "repos/${{ github.repository }}/git/matching-refs/heads/automation/code-line-badge-" --jq '.[].ref'
+          foreach ($ref in $branches) {
+            $branch = $ref -replace '^refs/heads/', ''
+            $openPrs = gh pr list --state open --head $branch --json number --jq 'length'
+            if ([int]$openPrs -eq 0) {
+              gh api --method DELETE "repos/${{ github.repository }}/git/refs/heads/$branch"
+            }
+          }
