@@ -55,14 +55,31 @@ class _FailingCleanupWebSocket(_BlockingWebSocket):
         raise AssertionError("unreachable")
 
 
+class _TimeoutWebSocket(_BlockingWebSocket):
+    async def recv(self) -> str:
+        raise TimeoutError("paid stream timed out")
+
+
 class _WebSocketContext:
-    def __init__(self, websocket: _BlockingWebSocket) -> None:
+    def __init__(
+        self,
+        websocket: _BlockingWebSocket,
+        *,
+        entered: asyncio.Event | None = None,
+        exited: asyncio.Event | None = None,
+    ) -> None:
         self.websocket = websocket
+        self.entered = entered
+        self.exited = exited
 
     async def __aenter__(self) -> _BlockingWebSocket:
+        if self.entered is not None:
+            self.entered.set()
         return self.websocket
 
     async def __aexit__(self, *_: object) -> None:
+        if self.exited is not None:
+            self.exited.set()
         return None
 
 
@@ -160,6 +177,44 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(source._trade_subscription_can_rotate(100.0, 699.9))
         self.assertTrue(source._trade_subscription_can_rotate(100.0, 700.0))
+
+    async def test_trade_stream_reconnect_never_exceeds_subscription_cap(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid",
+            max_trade_subscriptions=1,
+        )
+        event_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        subscription_queue.put_nowait("Mint111")
+        status = SourceStatus(source="pumpportal")
+        reconnect_websocket = _BlockingWebSocket()
+        first_connection_exited = asyncio.Event()
+        reconnect_entered = asyncio.Event()
+        stream_task: asyncio.Task[None] | None = None
+
+        with (
+            patch(
+                "app.core.sources.websockets.connect",
+                side_effect=[
+                    _WebSocketContext(_TimeoutWebSocket(), exited=first_connection_exited),
+                    _WebSocketContext(reconnect_websocket, entered=reconnect_entered),
+                ],
+            ),
+            patch("app.core.sources.asyncio.sleep", return_value=None),
+        ):
+            try:
+                stream_task = asyncio.create_task(
+                    source._run_trade_stream(event_queue, status, subscription_queue)
+                )
+                await asyncio.wait_for(first_connection_exited.wait(), timeout=1)
+                subscription_queue.put_nowait("Mint222")
+                await asyncio.wait_for(reconnect_entered.wait(), timeout=1)
+
+                self.assertEqual(status.active_trade_subscriptions, 1)
+            finally:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
 
     async def test_solana_logs_source_does_not_queue_failed_transactions(self) -> None:
         failed = json.dumps(
