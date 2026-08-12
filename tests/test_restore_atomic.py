@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import sqlite3
 import unittest
+from contextlib import closing
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -92,6 +95,60 @@ class AtomicRestoreTests(unittest.TestCase):
             self.assertTrue(target.path.exists())
             self.assertEqual(target.path.read_bytes(), original_bytes)
             self.assertEqual(list(target.path.parent.glob(f"{target.path.stem}.backup-*{target.path.suffix}")), [])
+
+    def test_operator_backup_and_artifact_include_committed_wal_rows(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = Storage(str(root / "source.db"))
+            writer = sqlite3.connect(source.path)
+            try:
+                writer.execute("PRAGMA journal_mode=WAL")
+                writer.execute("PRAGMA wal_autocheckpoint=0")
+                writer.execute(
+                    "INSERT INTO events (id, payload, created_at) VALUES (?, ?, ?)",
+                    ("wal_event", '{"message":"committed in WAL"}', "2026-08-11T00:00:00+00:00"),
+                )
+                writer.commit()
+                self.assertTrue(source.path.with_name(source.path.name + "-wal").exists())
+
+                backup_result = source.backup()
+                backup_path = Path(backup_result["path"])
+                with closing(sqlite3.connect(backup_path)) as backup_connection:
+                    backup_row = backup_connection.execute(
+                        "SELECT id FROM events WHERE id = ?", ("wal_event",)
+                    ).fetchone()
+                self.assertEqual(backup_row, ("wal_event",))
+
+                artifact = source.create_backup_artifact()
+                artifact_path = root / "artifact.db"
+                artifact_path.write_bytes(base64.b64decode(str(artifact["database_base64"])))
+                with closing(sqlite3.connect(artifact_path)) as artifact_connection:
+                    artifact_row = artifact_connection.execute(
+                        "SELECT id FROM events WHERE id = ?", ("wal_event",)
+                    ).fetchone()
+                self.assertEqual(artifact_row, ("wal_event",))
+
+                preview = source.preview_restore_artifact(artifact)
+                self.assertNotIn(
+                    "Artifact metadata summary differs from the embedded database counts.",
+                    preview["warnings"],
+                )
+                self.assertEqual(preview["summary"], artifact["summary"])
+            finally:
+                writer.close()
+
+    def test_failed_artifact_snapshot_is_cleaned_and_audited(self) -> None:
+        with TemporaryDirectory() as directory:
+            source = Storage(str(Path(directory) / "source.db"))
+
+            with patch.object(source, "_write_sqlite_snapshot", side_effect=OSError("injected snapshot failure")):
+                with self.assertRaisesRegex(OSError, "injected snapshot failure"):
+                    source.create_backup_artifact()
+
+            self.assertEqual(list(source.path.parent.glob(f".{source.path.stem}.artifact-*")), [])
+            history = source.load_backup_restore_history()
+            self.assertEqual(history[0]["action"], "backup_artifact")
+            self.assertEqual(history[0]["status"], "failed")
 
     def test_post_swap_history_failure_atomically_restores_original_database(self) -> None:
         with TemporaryDirectory() as directory:

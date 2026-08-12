@@ -41,6 +41,7 @@ All notable local release changes should be recorded here before tagging, live t
 - Added explicit full-sniper gate reporting for unattended buy-and-sell readiness.
 - Added operator UI panels for setup readiness, session summaries, pilot readiness, post-run review, alerts, parser replay, restore smoke tests, and outcome explanations.
 - Added ledger/recovery/observability artifacts including PnL confidence, unresolved audit recovery, incident export bundles, backup/restore evidence, and restore smoke tests.
+- Made operator database copies and downloadable restore artifacts use consistent SQLite snapshots so committed WAL rows cannot be omitted, and aligned restore metadata counts with the embedded snapshot.
 - Tightened post-run review so an empty timeframe reports missing evidence instead of passing as clear.
 - Added incident-export review attestations and Data workspace controls so post-run review can distinguish pending incident bundles from blocked/failed audits that were exported and reviewed.
 - Added structured operator-log reports with local filters, summary counts, action items, dashboard visibility, and JSON export.

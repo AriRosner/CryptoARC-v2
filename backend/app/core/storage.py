@@ -1113,11 +1113,13 @@ class Storage:
     def backup(self) -> dict[str, str]:
         if not self.path.exists():
             return {"status": "missing", "path": ""}
-        backup_path = self.path.with_suffix(f".backup-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{self.path.suffix}")
-        backup_path.write_bytes(self.path.read_bytes())
+        backup_path = self.path.with_suffix(
+            f".backup-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}{self.path.suffix}"
+        )
+        self._write_sqlite_snapshot(backup_path)
         self.save_backup_restore_history(
             {
-                "id": f"backup_copy_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+                "id": f"backup_copy_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}",
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "action": "backup_copy",
                 "status": "created",
@@ -1130,27 +1132,77 @@ class Storage:
     def create_backup_artifact(self) -> dict[str, Any]:
         if not self.path.exists():
             raise FileNotFoundError("Database file does not exist")
-        summary = self._summary_counts()
-        artifact = {
-            "artifact_type": "cryptoarc_local_backup",
-            "format_version": self.BACKUP_FORMAT_VERSION,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "database_name": self.path.name,
-            "schema": self.schema_status(),
-            "summary": summary,
-            "database_base64": base64.b64encode(self.path.read_bytes()).decode("ascii"),
+        created_at = datetime.now(timezone.utc).isoformat()
+        history_id = f"backup_artifact_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        history_record = {
+            "id": history_id,
+            "created_at": created_at,
+            "action": "backup_artifact",
+            "status": "created",
+            "summary": self._summary_counts(),
+            "operator_action": "Store the artifact safely before trying a restore.",
         }
-        self.save_backup_restore_history(
-            {
-                "id": f"backup_artifact_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-                "created_at": artifact["created_at"],
-                "action": "backup_artifact",
-                "status": "created",
+        self.save_backup_restore_history(history_record)
+        with NamedTemporaryFile(
+            prefix=f".{self.path.stem}.artifact-",
+            suffix=self.path.suffix,
+            dir=self.path.parent,
+            delete=False,
+        ) as handle:
+            snapshot_path = Path(handle.name)
+        try:
+            self._write_sqlite_snapshot(snapshot_path)
+            inspection = self._inspect_sqlite_file(snapshot_path)
+            summary = dict(inspection.get("table_counts") or {})
+            artifact = {
+                "artifact_type": "cryptoarc_local_backup",
+                "format_version": self.BACKUP_FORMAT_VERSION,
+                "created_at": created_at,
+                "database_name": self.path.name,
+                "schema": self.schema_status(),
                 "summary": summary,
-                "operator_action": "Store the artifact safely before trying a restore.",
+                "database_base64": base64.b64encode(snapshot_path.read_bytes()).decode("ascii"),
             }
-        )
+        except Exception:
+            self.save_backup_restore_history(
+                {
+                    **history_record,
+                    "status": "failed",
+                    "operator_action": "Backup artifact creation failed; do not rely on a partial artifact.",
+                }
+            )
+            raise
+        finally:
+            self._remove_sqlite_snapshot_files(snapshot_path)
         return artifact
+
+    def _write_sqlite_snapshot(self, destination: Path) -> None:
+        self._remove_sqlite_snapshot_files(destination)
+        source: sqlite3.Connection | None = None
+        target: sqlite3.Connection | None = None
+        completed = False
+        try:
+            source = sqlite3.connect(self.path, timeout=5.0)
+            source.execute("PRAGMA busy_timeout = 5000")
+            target = sqlite3.connect(destination, timeout=5.0)
+            source.backup(target, pages=1000, sleep=0.05)
+            target.commit()
+            target.execute("PRAGMA journal_mode=DELETE")
+            target.commit()
+            completed = True
+        finally:
+            if target is not None:
+                target.close()
+            if source is not None:
+                source.close()
+            if not completed:
+                self._remove_sqlite_snapshot_files(destination)
+
+    @staticmethod
+    def _remove_sqlite_snapshot_files(path: Path) -> None:
+        path.unlink(missing_ok=True)
+        path.with_name(path.name + "-wal").unlink(missing_ok=True)
+        path.with_name(path.name + "-shm").unlink(missing_ok=True)
 
     def preview_restore_artifact(self, artifact: dict[str, Any]) -> dict[str, Any]:
         warnings: list[str] = []
@@ -1172,11 +1224,7 @@ class Storage:
             raise ValueError("Restore artifact was created by a newer schema version")
         metadata_summary = artifact.get("summary") if isinstance(artifact.get("summary"), dict) else {}
         actual_summary = inspection.get("table_counts", {})
-        current_summary = (
-            self._summary_counts()
-            if self.path.exists()
-            else {key: 0 for key in actual_summary}
-        )
+        current_summary = self._backup_table_counts() if self.path.exists() else {key: 0 for key in actual_summary}
         table_deltas = {
             key: {
                 "current": int(current_summary.get(key, 0) or 0),
@@ -4254,6 +4302,22 @@ class Storage:
                 self.count_mobile_destination_authorizations()
             ),
         }
+
+    def _backup_table_counts(self) -> dict[str, int]:
+        with self._connect() as connection:
+            tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            }
+            counts: dict[str, int] = {}
+            for table in self.BACKUP_TABLES:
+                if table not in tables:
+                    continue
+                row = connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                counts[table] = int(row["count"] if row else 0)
+        return counts
 
     def data_summary_counts(self) -> dict[str, int]:
         with self._connect() as connection:
