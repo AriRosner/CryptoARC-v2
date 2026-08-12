@@ -3871,6 +3871,9 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             now = utc_now()
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_shadow_funding_blocker",
@@ -5730,6 +5733,9 @@ class CoreLogicTests(unittest.TestCase):
             self.configure_live_caps(state)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
             now = utc_now()
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_pilot_shadow_funding_blocker",
@@ -6755,6 +6761,9 @@ class CoreLogicTests(unittest.TestCase):
             state.source_status.raw_events_seen = 1
             state.source_status.normalized_events = 1
             state.source_status.active_trade_subscriptions = 5
+            state.source_status.pumpportal_funding_blocked = True
+            state.source_status.pumpportal_funding_message = "PumpPortal trade subscriptions require a funded API key"
+            state.source_status.pumpportal_funding_blocked_at = now
             state.storage.save_source_event(
                 SourceEvent(
                     id="src_trade_subscription_funding",
@@ -6831,6 +6840,29 @@ class CoreLogicTests(unittest.TestCase):
             self.assertTrue(health["shadow_price_observations_blocked"])
             self.assertIn("PumpPortal API wallet appears unfunded", health["trust_blockers"])
             self.assertEqual(len([item for item in alerts if "PumpPortal API wallet appears unfunded" in item.message]), 1)
+
+    def test_pumpportal_trade_event_clears_historical_funding_warning(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            message = "'subscribeTokenTrade' and 'subscribeAccountTrade' methods are only available when connecting with an API key funded with at least 0.02 SOL."
+            state.ingest_source_event(LaunchEvent("pumpportal", now, {"message": message}, None, message))
+            state.ingest_source_event(
+                LaunchEvent(
+                    source="pumpportal",
+                    received_at=now + timedelta(seconds=1),
+                    raw_payload={"mint": "MintRecovered", "txType": "buy", "price": 0.01},
+                    token=None,
+                    kind="trade",
+                    mint="MintRecovered",
+                    observed_price=0.01,
+                )
+            )
+
+            health = state.source_health()
+
+            self.assertFalse(health["pumpportal_funding_blocked"])
+            self.assertFalse(health["shadow_price_observations_blocked"])
 
     def test_source_health_ignores_quote_mint_duplicates_and_min_balance_status_errors(self) -> None:
         with TemporaryDirectory() as directory:

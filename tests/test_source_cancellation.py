@@ -152,6 +152,15 @@ class _SlowCancellationSource(PumpPortalLaunchSource):
 
 
 class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
+    def test_single_trade_slot_waits_for_evidence_dwell_before_rotation(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid",
+            max_trade_subscriptions=1,
+        )
+
+        self.assertFalse(source._trade_subscription_can_rotate(100.0, 699.9))
+        self.assertTrue(source._trade_subscription_can_rotate(100.0, 700.0))
+
     async def test_solana_logs_source_does_not_queue_failed_transactions(self) -> None:
         failed = json.dumps(
             {

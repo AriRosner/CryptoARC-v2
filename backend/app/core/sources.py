@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -175,6 +176,9 @@ class PumpPortalLaunchSource(LaunchSource):
     max_trade_subscriptions: int = 60
     name: str = "pumpportal"
 
+    def _trade_subscription_can_rotate(self, subscribed_at: float, now: float) -> bool:
+        return self.max_trade_subscriptions != 1 or now - subscribed_at >= 600
+
     async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
         status.source = self.name
         subscription_queue: asyncio.Queue[str] = asyncio.Queue(maxsize=max(1, self.max_trade_subscriptions * 4 or 1))
@@ -283,6 +287,7 @@ class PumpPortalLaunchSource(LaunchSource):
     ) -> None:
         subscribed_mints: deque[str] = deque()
         subscribed_lookup: set[str] = set()
+        subscribed_at: dict[str, float] = {}
         backoff_seconds = 2
         while True:
             first_mint = await subscription_queue.get()
@@ -290,6 +295,7 @@ class PumpPortalLaunchSource(LaunchSource):
             if first_mint not in subscribed_lookup:
                 subscribed_mints.append(first_mint)
                 subscribed_lookup.add(first_mint)
+                subscribed_at[first_mint] = time.monotonic()
                 status.active_trade_subscriptions = len(subscribed_mints)
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
@@ -319,14 +325,20 @@ class PumpPortalLaunchSource(LaunchSource):
                             mint = subscribe_task.result()
                             subscription_queue.task_done()
                             if mint not in subscribed_lookup:
+                                if subscribed_mints and not self._trade_subscription_can_rotate(
+                                    subscribed_at.get(subscribed_mints[0], 0.0), time.monotonic()
+                                ):
+                                    continue
                                 while len(subscribed_mints) >= self.max_trade_subscriptions:
                                     old_mint = subscribed_mints.popleft()
                                     subscribed_lookup.discard(old_mint)
+                                    subscribed_at.pop(old_mint, None)
                                     status.dropped_trade_subscriptions += 1
                                     await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
                                 await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
                                 subscribed_mints.append(mint)
                                 subscribed_lookup.add(mint)
+                                subscribed_at[mint] = time.monotonic()
                                 status.active_trade_subscriptions = len(subscribed_mints)
                         if recv_task in done:
                             received_at = utc_now()
