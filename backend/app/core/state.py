@@ -8410,18 +8410,22 @@ class BotState:
             TokenStatus.MONITORING,
             TokenStatus.PAPER_SOLD,
         }
-        by_id = {
-            token.id: token
-            for token in self.storage.load_tokens(500)
-            if token.status in persisted_statuses and cutoff <= token.detected_at <= now
+        active_statuses = {
+            TokenStatus.BUYING,
+            TokenStatus.PAPER_BOUGHT,
+            TokenStatus.MONITORING,
         }
-        by_id.update({token.id: token for token in self.tokens})
+        by_id: dict[str, TokenSignal] = {}
+        for token in [*self.storage.load_tokens(500), *self.tokens]:
+            if token.status in persisted_statuses and cutoff <= token.detected_at <= now:
+                by_id[token.id] = token
         return sorted(
             by_id.values(),
             key=lambda token: (
+                1 if token.status in active_statuses else 0,
+                token.detected_at.timestamp(),
                 int(token.score or 0),
                 float(token.price_confidence or 0.0),
-                token.detected_at.timestamp(),
             ),
             reverse=True,
         )

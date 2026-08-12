@@ -2537,6 +2537,7 @@ class CoreLogicTests(unittest.TestCase):
                 token.id = f"tok_live_{index}"
                 token.mint = f"MintLive{index}"
                 token.score = 90 - index
+                token.status = TokenStatus.PAPER_BOUGHT
                 state.tokens.append(token)
 
             intents = state.generate_live_intents("Wallet111")
@@ -2599,10 +2600,35 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_token(stale)
             state.storage.save_token(skipped)
             state.tokens.clear()
+            state.tokens.extend([stale, skipped])
 
             intents = state.generate_live_intents("WalletShadow")
 
             self.assertEqual(intents, [])
+
+    def test_live_intent_candidates_prioritize_active_paper_positions(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            for index in range(10):
+                sold = self.make_token()
+                sold.id = f"tok_sold_candidate_{index}"
+                sold.mint = f"MintSoldCandidate{index}"
+                sold.score = 99
+                sold.status = TokenStatus.PAPER_SOLD
+                sold.detected_at = now - timedelta(seconds=10 + index)
+                state.tokens.append(sold)
+            active = self.make_token()
+            active.id = "tok_active_candidate"
+            active.mint = "MintActiveCandidate"
+            active.score = 70
+            active.status = TokenStatus.PAPER_BOUGHT
+            active.detected_at = now - timedelta(seconds=1)
+            state.tokens.append(active)
+
+            candidates = state._live_intent_candidate_tokens(now)
+
+            self.assertEqual(candidates[0].id, active.id)
 
     def test_live_intent_generation_does_not_requote_recent_paper_decision(self) -> None:
         with TemporaryDirectory() as directory:
@@ -3162,6 +3188,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintAuto"
             token.symbol = "AUTO"
             token.score = 95
+            token.status = TokenStatus.PAPER_BOUGHT
             state.tokens.appendleft(token)
 
             result = state.run_live_autonomy(True, local_auth_enabled=True)
@@ -3220,6 +3247,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintAutoPreflight"
             token.symbol = "APRE"
             token.score = 95
+            token.status = TokenStatus.PAPER_BOUGHT
             state.tokens.appendleft(token)
 
             result = state.run_live_autonomy(True, local_auth_enabled=True)
