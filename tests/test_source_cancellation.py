@@ -258,7 +258,7 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
-    async def test_candidate_preference_does_not_churn_until_released(self) -> None:
+    async def test_candidate_slot_moves_to_next_authoritative_preference(self) -> None:
         preferred = ["CandidateOne"]
         source = PumpPortalLaunchSource(
             ws_url="wss://example.invalid",
@@ -277,10 +277,15 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(websocket.sent_event.wait(), timeout=1)
                 preferred[:] = ["CandidateTwo"]
-                await asyncio.sleep(0.05)
+                for _ in range(20):
+                    if {"method": "subscribeTokenTrade", "keys": ["CandidateTwo"]} in websocket.sent:
+                        break
+                    websocket.sent_event.clear()
+                    await asyncio.wait_for(websocket.sent_event.wait(), timeout=1)
 
                 self.assertIn({"method": "subscribeTokenTrade", "keys": ["CandidateOne"]}, websocket.sent)
-                self.assertNotIn({"method": "subscribeTokenTrade", "keys": ["CandidateTwo"]}, websocket.sent)
+                self.assertIn({"method": "unsubscribeTokenTrade", "keys": ["CandidateOne"]}, websocket.sent)
+                self.assertIn({"method": "subscribeTokenTrade", "keys": ["CandidateTwo"]}, websocket.sent)
                 self.assertLessEqual(status.active_trade_subscriptions, 1)
             finally:
                 task.cancel()

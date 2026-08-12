@@ -384,7 +384,7 @@ class PumpPortalLaunchSource(LaunchSource):
                                 self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
                         if preference_task in done:
                             preferred = self._preferred_trade_mint()
-                            if preferred and not active_preferred:
+                            if preferred and preferred != active_preferred:
                                 while subscribed_mints:
                                     old_mint = subscribed_mints.popleft()
                                     await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
