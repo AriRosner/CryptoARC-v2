@@ -347,6 +347,13 @@ class ShadowEvaluationTests(unittest.TestCase):
             audit = state.storage.load_live_execution_audit(str(quoted["id"]))
             self.assertIsNotNone(audit)
 
+            # The campaign may close the paper token before the paid stream emits
+            # the shadow exit tick. Accepted market evidence must still drive the
+            # shadow evaluator even though the active-token price table no longer
+            # receives that tick.
+            token.status = TokenStatus.PAPER_SOLD
+            state.storage.save_token(token)
+
             for index in range(501):
                 unrelated_at = audit.created_at + timedelta(milliseconds=index + 1)
                 state.storage.save_live_execution_audit(LiveExecutionAudit(
@@ -371,6 +378,38 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(len({item.source_event_id for item in accepted}), 2)
             self.assertEqual(len(materialized), 1)
             self.assertEqual(set(materialized[0].source_evidence_ids), {item.record_id for item in accepted})
+
+    def test_evaluated_shadow_capture_stays_pending_until_economic_evidence_persists(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            version_id = state.ensure_settings_version("pending economic evidence", [])
+            now = utc_now()
+            audit = LiveExecutionAudit(
+                id="pending-economic-audit", created_at=now, updated_at=now,
+                action="buy", mint="pending-economic-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="PendingWallet",
+                quote={"id": "pending-economic-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "evaluated",
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": version_id,
+                    "entry_price": 1.0, "quoted_at": now.isoformat(),
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, None)
+
+            state._evaluate_shadow_comparison = lambda item: item.shadow_comparison
+            state._persist_economic_shadow_comparison = lambda item: False
+
+            state._refresh_shadow_comparisons([audit])
+
+            with state.storage._connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM pending_shadow_audit_captures WHERE audit_id = ?",
+                    (audit.id,),
+                ).fetchone()["status"]
+            self.assertEqual(status, "pending")
+            self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
 
     def test_shadow_capture_rolls_back_if_audit_persistence_fails(self) -> None:
         with TemporaryDirectory() as directory:
