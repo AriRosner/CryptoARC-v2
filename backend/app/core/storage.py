@@ -1525,6 +1525,22 @@ class Storage:
             ).fetchall()
         return [json.loads(row["payload"]) for row in rows]
 
+    def load_bound_accepted_market_observations(self, audit_id: str) -> list[AcceptedMarketObservation]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT observations.payload
+                FROM shadow_market_evidence_bindings AS bindings
+                JOIN accepted_market_observations AS observations
+                  ON observations.record_id = bindings.market_observation_id
+                WHERE bindings.audit_id = ?
+                  AND bindings.evidence_mode = 'shadow'
+                ORDER BY observations.observed_at ASC
+                """,
+                (audit_id,),
+            ).fetchall()
+        return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
     def save_pending_shadow_audit_capture(
         self,
         *,
@@ -1794,6 +1810,14 @@ class Storage:
                 ),
             )
         return True
+
+    def has_shadow_comparison(self, record_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM shadow_economic_comparisons WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+        return row is not None
 
     def load_shadow_comparisons(self, limit: int = 500, *, strategy_version: str = "") -> list[ShadowComparison]:
         bounded_limit = max(1, min(5000, int(limit)))

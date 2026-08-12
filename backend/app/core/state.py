@@ -6044,8 +6044,8 @@ class BotState:
                 audit.shadow_comparison = self._build_shadow_comparison(audit)
             if audit.shadow_comparison:
                 audit.shadow_comparison = self._evaluate_shadow_comparison(audit)
-                self._persist_economic_shadow_comparison(audit)
-                if audit.shadow_comparison.get("status") == "evaluated":
+                economic_persisted = self._persist_economic_shadow_comparison(audit)
+                if economic_persisted:
                     self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=utc_now())
             updated = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
             if updated != original:
@@ -6180,7 +6180,8 @@ class BotState:
         )
         if not shadow.quote_id:
             return False
-        return self.storage.save_shadow_comparison(shadow)
+        inserted = self.storage.save_shadow_comparison(shadow)
+        return inserted or self.storage.has_shadow_comparison(shadow.record_id)
 
     def _shadow_quote_cost_breakdown(
         self,
@@ -6260,7 +6261,13 @@ class BotState:
         if entry_price <= 0:
             return comparison
         quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
-        observations = self._shadow_observations_after(audit.mint, quoted_at)
+        observations = self._shadow_observations_after(
+            audit.mint,
+            quoted_at,
+            audit_id=audit.id,
+            strategy_id=str(comparison.get("strategy_id") or ""),
+            strategy_version=str(comparison.get("strategy_version") or ""),
+        )
         latest_price, latest_source, latest_at = self._shadow_price_from_observation(observations[-1]) if observations else (None, "", None)
         if not latest_price or not latest_at:
             comparison["status"] = "waiting_for_price"
@@ -6291,17 +6298,41 @@ class BotState:
                 "cost_adjusted_pnl_sol": estimated_pnl,
                 "estimated_pnl_sol": estimated_pnl,
                 "outcome": self._classify_pnl(estimated_pnl),
-                "landing_windows": self._shadow_landing_windows(audit, entry_price, quoted_at),
+                "landing_windows": self._shadow_landing_windows(
+                    audit,
+                    entry_price,
+                    quoted_at,
+                    strategy_id=str(comparison.get("strategy_id") or ""),
+                    strategy_version=str(comparison.get("strategy_version") or ""),
+                ),
                 "reason": "Shadow outcome estimated from accepted price observations and configured exit rules; no transaction was submitted.",
             }
         )
         return comparison
 
-    def _shadow_landing_windows(self, audit: LiveExecutionAudit, immediate_entry_price: float, quoted_at: datetime) -> list[dict[str, object]]:
+    def _shadow_landing_windows(
+        self,
+        audit: LiveExecutionAudit,
+        immediate_entry_price: float,
+        quoted_at: datetime,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> list[dict[str, object]]:
         windows = []
         for delay_ms in self._shadow_delay_windows_ms():
             landing_at = quoted_at + timedelta(milliseconds=delay_ms)
-            windows.append(self._shadow_landing_window(audit, immediate_entry_price, quoted_at, landing_at, delay_ms))
+            windows.append(
+                self._shadow_landing_window(
+                    audit,
+                    immediate_entry_price,
+                    quoted_at,
+                    landing_at,
+                    delay_ms,
+                    strategy_id=strategy_id,
+                    strategy_version=strategy_version,
+                )
+            )
         return windows
 
     def _shadow_delay_windows_ms(self) -> list[int]:
@@ -6446,6 +6477,9 @@ class BotState:
         quoted_at: datetime,
         landing_at: datetime,
         delay_ms: int,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
     ) -> dict[str, object]:
         quote_expires_at = self._parse_iso_datetime(str(audit.quote.get("expires_at") or "")) if isinstance(audit.quote, dict) else None
         window = {
@@ -6472,12 +6506,24 @@ class BotState:
         if quote_expires_at and landing_at >= quote_expires_at:
             window.update({"status": "stale_quote", "fill_status": "missed", "outcome": "missed", "reason": "Landing delay is beyond quote expiry."})
             return window
-        observations = self._shadow_observations_after(audit.mint, landing_at - timedelta(microseconds=1))
+        observations = self._shadow_observations_after(
+            audit.mint,
+            landing_at - timedelta(microseconds=1),
+            audit_id=audit.id,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
         if delay_ms == 0:
             entry_price = immediate_entry_price
             entry_source = "immediate_quote_entry"
             entry_at = quoted_at
-            path = self._shadow_observations_after(audit.mint, quoted_at)
+            path = self._shadow_observations_after(
+                audit.mint,
+                quoted_at,
+                audit_id=audit.id,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+            )
         elif observations:
             entry = observations[0]
             entry_price = float(entry.price or 0.0)
@@ -6625,7 +6671,41 @@ class BotState:
             return None, "", None
         return self._shadow_price_from_observation(observations[-1])
 
-    def _shadow_observations_after(self, mint: str, at: datetime) -> list[PriceObservation]:
+    def _shadow_observations_after(
+        self,
+        mint: str,
+        at: datetime,
+        *,
+        audit_id: str = "",
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> list[PriceObservation]:
+        bound_evidence = self.storage.load_bound_accepted_market_observations(audit_id) if audit_id else []
+        comparison_evidence = [
+            PriceObservation(
+                id=item.record_id,
+                source=item.source,
+                mint=item.mint,
+                observed_at=item.observed_at,
+                price=item.price,
+                price_source=f"accepted_market:{item.source}",
+                confidence=item.confidence,
+                accepted=True,
+                reason=item.acceptance_reason,
+            )
+            for item in bound_evidence
+            if item.mint == mint
+            and (not strategy_id or item.strategy_id == strategy_id)
+            and (not strategy_version or item.strategy_version == strategy_version)
+            and item.observed_at > at
+            and not item.fixture_only
+            and item.conflict_state == "clear"
+            and item.access_state == "ready"
+            and item.price is not None
+            and item.price > 0
+        ]
+        if comparison_evidence:
+            return sorted(comparison_evidence, key=lambda item: item.observed_at)
         return [item for item in self.storage.load_price_observations(1000, mint=mint) if item.accepted and item.price and item.observed_at > at]
 
     def _shadow_price_from_observation(self, observation: PriceObservation) -> tuple[float | None, str, datetime | None]:
