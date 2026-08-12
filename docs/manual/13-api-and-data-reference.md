@@ -259,6 +259,10 @@ Live execution audits include `preflight_checks`, an ordered list of quote-readi
 
 Ready dry-run buy quotes add `shadow_comparison` to their live audit. The comparison records the would-submit timestamp, entry price, later accepted price, simulated exit price, exit reason, hold duration, move percentage, estimated PnL, and outcome. The evaluator applies configured exit rules such as minimum hold, take profit, stop loss, trailing stop, break-even, stalled trade, max hold, and max ticks.
 
+Promoted paper candidates use candidate-priority evidence collection before creating the dry-run quote. `awaiting_entry` means the existing paid trade-subscription capacity is following a strategy-qualified mint but has not yet received a genuine accepted entry observation. `tracking_shadow` means a versioned entry is bound and the same capacity is collecting later path evidence. Neither state is a completed economic sample. Candidate priority reallocates the configured paid scope and never raises `max_trade_subscriptions`; fixture, conflicted, blocked-access, wrong-mint, wrong-version, and nonpositive observations remain ineligible.
+
+`GET /health/deep` includes a redacted `candidate_priority` block with state, mint prefix, age, deadline, queue and lifecycle counts, active subscription count, configured cap, and a cap-respected flag. It contains no credentials, wallet details, provider transactions, or full mint.
+
 Each comparison also includes `landing_windows` for immediate, 250ms, 500ms, 1000ms, and 2000ms delayed fills. These windows estimate whether a delayed submit would have filled, missed, or gone stale before quote expiry. They are evidence only; they do not submit, sign, or confirm a transaction.
 
 Submitted and confirmed live audits include `execution_timing` when timing is available. New submit/confirm flows record quote-to-submit, submit-to-confirm, and quote-to-confirm milliseconds. Execution readiness uses those samples to add calibrated delay windows alongside the fixed defaults, and reports p50/p90/p99 globally plus `by_signer_mode`, `by_pool`, and `by_quote_source` timing groups.

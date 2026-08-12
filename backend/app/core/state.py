@@ -48,6 +48,7 @@ from app.core.models import (
     SentinelThresholds,
     ShadowComparison,
     ShadowCostBreakdown,
+    ShadowTrackingCandidate,
     SettingsVersion,
     SignerStatus,
     SourceStatus,
@@ -2390,6 +2391,7 @@ class BotState:
         )
         if self.storage.save_accepted_market_observation(item):
             self._bind_accepted_market_observation_to_pending_shadows(item)
+            self._activate_waiting_shadow_candidate(item)
 
     def _shadow_entry_market_evidence(self, audit: LiveExecutionAudit) -> AcceptedMarketObservation | None:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
@@ -2416,6 +2418,186 @@ class BotState:
         observation: AcceptedMarketObservation,
     ) -> int:
         return self.storage.bind_accepted_market_observation_to_pending_shadows(observation)
+
+    def _observation_matches_shadow_candidate(
+        self,
+        observation: AcceptedMarketObservation,
+        candidate: ShadowTrackingCandidate,
+    ) -> bool:
+        return bool(
+            observation.mint == candidate.mint
+            and observation.strategy_id == candidate.strategy_id
+            and observation.strategy_version == candidate.strategy_version
+            and observation.price is not None
+            and observation.price > 0
+            and not observation.fixture_only
+            and observation.conflict_state == "clear"
+            and observation.access_state == "ready"
+        )
+
+    def _latest_eligible_candidate_entry(
+        self,
+        mint: str,
+        selected_at: datetime,
+        *,
+        strategy_id: str,
+        strategy_version: str,
+    ) -> AcceptedMarketObservation | None:
+        candidates = [
+            item
+            for item in self.storage.load_accepted_market_observations(
+                limit=5000,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+            )
+            if item.mint == mint
+            and item.observed_at <= selected_at
+            and item.price is not None
+            and item.price > 0
+            and not item.fixture_only
+            and item.conflict_state == "clear"
+            and item.access_state == "ready"
+        ]
+        return max(candidates, key=lambda item: item.observed_at) if candidates else None
+
+    def _candidate_tracking_window_seconds(self, strategy_version: str) -> int:
+        captured = self.storage.load_settings_version(strategy_version)
+        max_hold = int((captured.settings if captured else {}).get("max_hold_time_seconds") or self.settings.max_hold_time_seconds)
+        return max(1, max_hold) + 30
+
+    def _activate_waiting_shadow_candidate(self, observation: AcceptedMarketObservation) -> None:
+        now = utc_now()
+        self._expire_shadow_tracking_candidates(now)
+        for candidate in self.storage.load_shadow_tracking_candidates(active_only=True):
+            if candidate.state != "awaiting_entry" or not self._observation_matches_shadow_candidate(observation, candidate):
+                continue
+            intent = self.storage.load_live_intent(candidate.intent_id)
+            if intent is None:
+                self.storage.transition_shadow_tracking_candidate(
+                    candidate.candidate_id,
+                    expected_state="awaiting_entry",
+                    state="expired",
+                    audit_id="",
+                    deadline_at=now,
+                    reason="intent missing before entry activation",
+                )
+                continue
+            try:
+                if not intent.audit_id:
+                    self.quote_live_intent(
+                        False,
+                        intent.id,
+                        self.settings.live_max_slippage_pct,
+                        self.settings.live_priority_fee_cap_sol,
+                        "pump",
+                        shadow_only=True,
+                    )
+                    intent = self.storage.load_live_intent(intent.id) or intent
+                audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
+                invalid_audit = (
+                    audit is None
+                    or audit.status != "ready"
+                    or not bool(audit.quote.get("shadow_only"))
+                    or not isinstance(audit.shadow_comparison, dict)
+                    or self.storage.count_pending_shadow_audit_captures(audit.id) != 1
+                    or not any(
+                        row.get("role") == "entry"
+                        for row in self.storage.load_shadow_market_evidence_bindings(audit.id)
+                    )
+                )
+                if invalid_audit and intent.audit_id:
+                    intent.audit_id = ""
+                    intent.quote_id = ""
+                    intent.status = "open"
+                    intent.updated_at = now
+                    self.storage.save_live_intent(intent)
+                    self.quote_live_intent(
+                        False,
+                        intent.id,
+                        self.settings.live_max_slippage_pct,
+                        self.settings.live_priority_fee_cap_sol,
+                        "pump",
+                        shadow_only=True,
+                    )
+                    intent = self.storage.load_live_intent(intent.id) or intent
+                    audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
+                    invalid_audit = (
+                        audit is None
+                        or audit.status != "ready"
+                        or not bool(audit.quote.get("shadow_only"))
+                        or not isinstance(audit.shadow_comparison, dict)
+                        or self.storage.count_pending_shadow_audit_captures(audit.id) != 1
+                        or not any(row.get("role") == "entry" for row in self.storage.load_shadow_market_evidence_bindings(audit.id))
+                    )
+                if invalid_audit:
+                    continue
+                self.storage.transition_shadow_tracking_candidate(
+                    candidate.candidate_id,
+                    expected_state="awaiting_entry",
+                    state="tracking_shadow",
+                    audit_id=audit.id,
+                    deadline_at=audit.created_at + timedelta(seconds=self._candidate_tracking_window_seconds(candidate.strategy_version)),
+                    reason="accepted entry evidence bound",
+                )
+            except Exception:
+                intent.warnings.append("Automatic shadow quote failed.")
+                intent.updated_at = utc_now()
+                self.storage.save_live_intent(intent)
+                self._record_shadow_quote_failure_for_token(candidate.mint, "Shadow quote provider request failed.")
+
+    def _expire_shadow_tracking_candidates(self, now: datetime) -> None:
+        for candidate in self.storage.load_shadow_tracking_candidates(active_only=True):
+            version_mismatch = candidate.strategy_version != self.current_settings_version_id
+            deadline_passed = candidate.deadline_at <= now
+            if not version_mismatch and not deadline_passed:
+                continue
+            missing = "entry" if candidate.state == "awaiting_entry" else "exit"
+            reason = "strategy version changed" if version_mismatch else f"missing {missing} evidence before deadline"
+            self.storage.expire_shadow_tracking_candidate(
+                candidate.candidate_id,
+                expected_state=candidate.state,
+                closed_at=now,
+                reason=reason,
+            )
+
+    def preferred_shadow_trade_mints(self, now: datetime | None = None) -> list[str]:
+        self._expire_shadow_tracking_candidates(now or utc_now())
+        active = self.storage.load_shadow_tracking_candidates(active_only=True)
+        active.sort(key=lambda item: (item.selected_at, item.candidate_id))
+        return [active[0].mint] if active else []
+
+    def shadow_candidate_priority_status(self, now: datetime | None = None) -> dict[str, object]:
+        current = now or utc_now()
+        self._expire_shadow_tracking_candidates(current)
+        candidates = self.storage.load_shadow_tracking_candidates()
+        active = [item for item in candidates if item.state in {"awaiting_entry", "tracking_shadow"}]
+        selected = active[0] if active else None
+
+        def count(state: str) -> int:
+            return sum(1 for item in candidates if item.state == state)
+
+        expired_missing_entry = sum(
+            1 for item in candidates if item.state == "expired" and "entry" in item.reason
+        )
+        expired_missing_exit = sum(
+            1 for item in candidates if item.state == "expired" and "exit" in item.reason
+        )
+        cap = max(0, int(self.settings.max_trade_subscriptions))
+        return {
+            "state": selected.state if selected else "idle",
+            "active_mint_prefix": selected.mint[:8] if selected else "",
+            "active_age_seconds": max(0, int((current - selected.selected_at).total_seconds())) if selected else 0,
+            "deadline_at": selected.deadline_at.isoformat() if selected else None,
+            "queue_depth": len(active),
+            "awaiting_entry": count("awaiting_entry"),
+            "tracking_shadow": count("tracking_shadow"),
+            "completed": count("complete"),
+            "expired_missing_entry": expired_missing_entry,
+            "expired_missing_exit": expired_missing_exit,
+            "active_subscriptions": self.source_status.active_trade_subscriptions,
+            "configured_subscription_cap": cap,
+            "cap_respected": self.source_status.active_trade_subscriptions <= cap,
+        }
 
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
@@ -6052,6 +6234,16 @@ class BotState:
                 economic_persisted = self._persist_economic_shadow_comparison(audit)
                 if economic_persisted:
                     self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=utc_now())
+                    for candidate in self.storage.load_shadow_tracking_candidates(active_only=True):
+                        if candidate.audit_id == audit.id and candidate.state == "tracking_shadow":
+                            self.storage.transition_shadow_tracking_candidate(
+                                candidate.candidate_id,
+                                expected_state="tracking_shadow",
+                                state="complete",
+                                audit_id=audit.id,
+                                deadline_at=utc_now(),
+                                reason="economic shadow comparison persisted",
+                            )
             updated = json.dumps(audit.shadow_comparison, sort_keys=True) if audit.shadow_comparison else ""
             if updated != original:
                 audit.updated_at = utc_now()
@@ -8571,6 +8763,10 @@ class BotState:
             and bool(intent.quote_id)
             and intent.created_at >= recent_cutoff
         }
+        tracked_paper_keys = {
+            ("buy", candidate.mint)
+            for candidate in self.storage.load_shadow_tracking_candidates(active_only=True)
+        }
         candidates: list[LiveExecutionIntent] = []
         readiness = self.readiness_status()
         for token in self._live_intent_candidate_tokens(now):
@@ -8581,6 +8777,7 @@ class BotState:
                 and token.score >= self.settings.score_threshold
                 and ("buy", token.mint) not in existing_keys
                 and ("buy", token.mint) not in recently_quoted_paper_keys
+                and ("buy", token.mint) not in tracked_paper_keys
             ):
                 candidates.append(
                     LiveExecutionIntent(
@@ -8668,22 +8865,25 @@ class BotState:
             self._decorate_live_intent(intent, readiness)
             self.storage.save_live_intent(intent)
             if intent.source == "paper_promoted":
-                try:
-                    self.quote_live_intent(
-                        False,
-                        intent.id,
-                        self.settings.live_max_slippage_pct,
-                        self.settings.live_priority_fee_cap_sol,
-                        "pump",
-                        shadow_only=True,
-                    )
-                    updated_candidates.append(self.storage.load_live_intent(intent.id) or intent)
-                except Exception:
-                    intent.warnings.append("Automatic shadow quote failed.")
-                    intent.updated_at = utc_now()
-                    self.storage.save_live_intent(intent)
-                    self._record_shadow_quote_failure_for_token(intent.mint, "Shadow quote provider request failed.")
-                    updated_candidates.append(intent)
+                candidate = ShadowTrackingCandidate(
+                    candidate_id=f"shadow_candidate_{intent.id}",
+                    intent_id=intent.id,
+                    mint=intent.mint,
+                    strategy_id=self.settings.strategy_profile,
+                    strategy_version=self.current_settings_version_id,
+                    selected_at=now,
+                    deadline_at=now + timedelta(seconds=max(1, int(self.settings.max_token_age_seconds))),
+                )
+                self.storage.save_shadow_tracking_candidate(candidate)
+                entry = self._latest_eligible_candidate_entry(
+                    intent.mint,
+                    now,
+                    strategy_id=candidate.strategy_id,
+                    strategy_version=candidate.strategy_version,
+                )
+                if entry is not None:
+                    self._activate_waiting_shadow_candidate(entry)
+                updated_candidates.append(self.storage.load_live_intent(intent.id) or intent)
             else:
                 updated_candidates.append(intent)
         ranked = self._rank_live_intents(self._decorate_live_intents(existing + updated_candidates, readiness))[:10]
