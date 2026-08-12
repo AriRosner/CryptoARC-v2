@@ -181,7 +181,7 @@ class PumpPortalLaunchSource(LaunchSource):
     def _trade_subscription_can_rotate(self, subscribed_at: float, now: float) -> bool:
         return self.max_trade_subscriptions != 1 or now - subscribed_at >= 600
 
-    def _preferred_trade_mint(self) -> str:
+    def _preferred_trade_mint(self) -> str | None:
         if self.preferred_trade_mints is None:
             return ""
         try:
@@ -190,7 +190,7 @@ class PumpPortalLaunchSource(LaunchSource):
                 "",
             )
         except Exception:
-            return ""
+            return None
 
     def _set_trade_subscription_status(
         self,
@@ -198,10 +198,7 @@ class PumpPortalLaunchSource(LaunchSource):
         active_preferred: str,
         subscribed_lookup: set[str],
     ) -> None:
-        status.active_trade_subscriptions = min(
-            len(subscribed_lookup),
-            max(0, self.max_trade_subscriptions),
-        )
+        status.active_trade_subscriptions = len(subscribed_lookup)
         status.trade_subscription_priority = "shadow_candidate" if active_preferred else "ordinary_launch"
         status.preferred_trade_mint_prefix = active_preferred[:8] if active_preferred else ""
 
@@ -384,8 +381,17 @@ class PumpPortalLaunchSource(LaunchSource):
                                 self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
                         if preference_task in done:
                             preferred = self._preferred_trade_mint()
+                            if preferred is None:
+                                self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
+                                continue
                             if preferred and preferred != active_preferred:
-                                while subscribed_mints:
+                                if active_preferred and active_preferred in subscribed_lookup:
+                                    subscribed_mints.remove(active_preferred)
+                                    subscribed_lookup.discard(active_preferred)
+                                    subscribed_at.pop(active_preferred, None)
+                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [active_preferred]}))
+                                    status.dropped_trade_subscriptions += 1
+                                while len(subscribed_mints) >= self.max_trade_subscriptions:
                                     old_mint = subscribed_mints.popleft()
                                     await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
                                     subscribed_lookup.discard(old_mint)
@@ -397,11 +403,11 @@ class PumpPortalLaunchSource(LaunchSource):
                                 subscribed_at[preferred] = time.monotonic()
                                 active_preferred = preferred
                             elif active_preferred and not preferred:
-                                while subscribed_mints:
-                                    old_mint = subscribed_mints.popleft()
-                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
-                                    subscribed_lookup.discard(old_mint)
-                                    subscribed_at.pop(old_mint, None)
+                                if active_preferred in subscribed_lookup:
+                                    subscribed_mints.remove(active_preferred)
+                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [active_preferred]}))
+                                    subscribed_lookup.discard(active_preferred)
+                                    subscribed_at.pop(active_preferred, None)
                                 active_preferred = ""
                             self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
                         if recv_task in done:

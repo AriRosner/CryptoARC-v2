@@ -231,6 +231,70 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
             self.assertNotIn("api-key", rendered)
             self.assertNotIn(token.mint.lower(), rendered)
 
+    def test_oldest_active_candidate_keeps_subscription_ownership(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, first = self.make_state(directory)
+            state.generate_live_intents("WalletShadow")
+            second = TokenSignal(
+                id="tok_candidate_2", symbol="TWO", name="Second", mint="MintCandidate222",
+                creator="creator", detected_at=utc_now() + timedelta(seconds=1), age_seconds=1,
+                buy_velocity=0.9, sell_pressure=0.1, metadata_score=0.9, current_price=0.00001,
+                score=94, status=TokenStatus.PAPER_BOUGHT, price_confidence=0.9,
+            )
+            second_candidate = ShadowTrackingCandidate(
+                candidate_id="shadow_candidate_second", intent_id="intent_second", mint=second.mint,
+                strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                selected_at=utc_now() + timedelta(seconds=1), deadline_at=utc_now() + timedelta(seconds=600),
+            )
+            state.storage.save_shadow_tracking_candidate(second_candidate)
+            state.storage.transition_shadow_tracking_candidate(
+                second_candidate.candidate_id, expected_state="awaiting_entry", state="tracking_shadow",
+                audit_id="audit_second", deadline_at=utc_now() + timedelta(seconds=600), reason="test",
+            )
+
+            self.assertEqual(state.preferred_shadow_trade_mints(), [first.mint])
+
+    def test_blocked_quote_does_not_promote_candidate_to_tracking(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            state._pumpportal_local_transaction = lambda **kwargs: ({}, "", "provider blocked")
+            intent = next(item for item in state.generate_live_intents("WalletShadow") if item["mint"] == token.mint)
+            observation = self.accepted_observation(state, token)
+
+            state._activate_waiting_shadow_candidate(observation)
+
+            candidate = state.storage.load_shadow_tracking_candidate(f"shadow_candidate_{intent['id']}")
+            self.assertEqual(candidate.state, "awaiting_entry")
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(candidate.audit_id), 0)
+
+    def test_expired_tracking_candidate_rejects_late_economic_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            intent = next(item for item in state.generate_live_intents("WalletShadow") if item["mint"] == token.mint)
+            entry = self.accepted_observation(state, token)
+            state.storage.save_accepted_market_observation(entry)
+            state._activate_waiting_shadow_candidate(entry)
+            stored_intent = state.storage.load_live_intent(str(intent["id"]))
+            candidate = state.storage.load_shadow_tracking_candidate(f"shadow_candidate_{stored_intent.id}")
+            candidate.deadline_at = utc_now() - timedelta(seconds=1)
+            state.storage.transition_shadow_tracking_candidate(
+                candidate.candidate_id, expected_state="tracking_shadow", state="tracking_shadow",
+                audit_id=candidate.audit_id, deadline_at=candidate.deadline_at, reason="deadline forced",
+            )
+
+            state._expire_shadow_tracking_candidates(utc_now())
+            late = self.accepted_observation(state, token)
+            late.record_id = "market_late"
+            late.observed_at = utc_now() + timedelta(seconds=1)
+            late.received_at = late.observed_at
+            state.storage.save_accepted_market_observation(late)
+            inserted = state.storage.bind_accepted_market_observation_to_pending_shadows(late)
+            audit = state.storage.load_live_execution_audit(stored_intent.audit_id)
+
+            self.assertEqual(inserted, 0)
+            self.assertFalse(state._persist_economic_shadow_comparison(audit))
+
 
 if __name__ == "__main__":
     unittest.main()

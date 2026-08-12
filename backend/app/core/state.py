@@ -2494,7 +2494,17 @@ class BotState:
                     )
                     intent = self.storage.load_live_intent(intent.id) or intent
                 audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
-                if audit is None:
+                if (
+                    audit is None
+                    or audit.status != "ready"
+                    or not bool(audit.quote.get("shadow_only"))
+                    or not isinstance(audit.shadow_comparison, dict)
+                    or self.storage.count_pending_shadow_audit_captures(audit.id) != 1
+                    or not any(
+                        row.get("role") == "entry"
+                        for row in self.storage.load_shadow_market_evidence_bindings(audit.id)
+                    )
+                ):
                     continue
                 self.storage.transition_shadow_tracking_candidate(
                     candidate.candidate_id,
@@ -2526,10 +2536,13 @@ class BotState:
                 deadline_at=now,
                 reason=reason,
             )
+            if candidate.state == "tracking_shadow" and candidate.audit_id:
+                self.storage.close_pending_shadow_audit_capture(candidate.audit_id, closed_at=now)
 
     def preferred_shadow_trade_mints(self, now: datetime | None = None) -> list[str]:
         self._expire_shadow_tracking_candidates(now or utc_now())
         active = self.storage.load_shadow_tracking_candidates(active_only=True)
+        active.sort(key=lambda item: (item.selected_at, item.candidate_id))
         return [active[0].mint] if active else []
 
     def shadow_candidate_priority_status(self, now: datetime | None = None) -> dict[str, object]:
