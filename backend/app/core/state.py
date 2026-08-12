@@ -6180,7 +6180,8 @@ class BotState:
         )
         if not shadow.quote_id:
             return False
-        return self.storage.save_shadow_comparison(shadow)
+        inserted = self.storage.save_shadow_comparison(shadow)
+        return inserted or self.storage.has_shadow_comparison(shadow.record_id)
 
     def _shadow_quote_cost_breakdown(
         self,
@@ -6297,17 +6298,41 @@ class BotState:
                 "cost_adjusted_pnl_sol": estimated_pnl,
                 "estimated_pnl_sol": estimated_pnl,
                 "outcome": self._classify_pnl(estimated_pnl),
-                "landing_windows": self._shadow_landing_windows(audit, entry_price, quoted_at),
+                "landing_windows": self._shadow_landing_windows(
+                    audit,
+                    entry_price,
+                    quoted_at,
+                    strategy_id=str(comparison.get("strategy_id") or ""),
+                    strategy_version=str(comparison.get("strategy_version") or ""),
+                ),
                 "reason": "Shadow outcome estimated from accepted price observations and configured exit rules; no transaction was submitted.",
             }
         )
         return comparison
 
-    def _shadow_landing_windows(self, audit: LiveExecutionAudit, immediate_entry_price: float, quoted_at: datetime) -> list[dict[str, object]]:
+    def _shadow_landing_windows(
+        self,
+        audit: LiveExecutionAudit,
+        immediate_entry_price: float,
+        quoted_at: datetime,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> list[dict[str, object]]:
         windows = []
         for delay_ms in self._shadow_delay_windows_ms():
             landing_at = quoted_at + timedelta(milliseconds=delay_ms)
-            windows.append(self._shadow_landing_window(audit, immediate_entry_price, quoted_at, landing_at, delay_ms))
+            windows.append(
+                self._shadow_landing_window(
+                    audit,
+                    immediate_entry_price,
+                    quoted_at,
+                    landing_at,
+                    delay_ms,
+                    strategy_id=strategy_id,
+                    strategy_version=strategy_version,
+                )
+            )
         return windows
 
     def _shadow_delay_windows_ms(self) -> list[int]:
@@ -6452,6 +6477,9 @@ class BotState:
         quoted_at: datetime,
         landing_at: datetime,
         delay_ms: int,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
     ) -> dict[str, object]:
         quote_expires_at = self._parse_iso_datetime(str(audit.quote.get("expires_at") or "")) if isinstance(audit.quote, dict) else None
         window = {
@@ -6478,12 +6506,24 @@ class BotState:
         if quote_expires_at and landing_at >= quote_expires_at:
             window.update({"status": "stale_quote", "fill_status": "missed", "outcome": "missed", "reason": "Landing delay is beyond quote expiry."})
             return window
-        observations = self._shadow_observations_after(audit.mint, landing_at - timedelta(microseconds=1))
+        observations = self._shadow_observations_after(
+            audit.mint,
+            landing_at - timedelta(microseconds=1),
+            audit_id=audit.id,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
         if delay_ms == 0:
             entry_price = immediate_entry_price
             entry_source = "immediate_quote_entry"
             entry_at = quoted_at
-            path = self._shadow_observations_after(audit.mint, quoted_at)
+            path = self._shadow_observations_after(
+                audit.mint,
+                quoted_at,
+                audit_id=audit.id,
+                strategy_id=strategy_id,
+                strategy_version=strategy_version,
+            )
         elif observations:
             entry = observations[0]
             entry_price = float(entry.price or 0.0)

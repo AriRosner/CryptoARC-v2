@@ -298,7 +298,7 @@ class ShadowEvaluationTests(unittest.TestCase):
             state.settings.take_profit_pct = 50
             state.settings.paper_fee_bps = 900
             self.assertTrue(state._persist_economic_shadow_comparison(audit))
-            self.assertFalse(state._persist_economic_shadow_comparison(audit))
+            self.assertTrue(state._persist_economic_shadow_comparison(audit))
             stored = state.storage.load_shadow_comparisons(limit=10)
             self.assertEqual(stored[0].source_evidence_ids, ("market-entry", "market-exit"))
             self.assertEqual(stored[0].reference_usd_per_sol, 200.0)
@@ -373,6 +373,10 @@ class ShadowEvaluationTests(unittest.TestCase):
             materialized = state.storage.load_shadow_comparisons(limit=10)
 
             self.assertEqual(refreshed.shadow_comparison["status"], "evaluated")
+            self.assertTrue(refreshed.shadow_comparison["landing_windows"])
+            immediate_window = next(item for item in refreshed.shadow_comparison["landing_windows"] if item["delay_ms"] == 0)
+            self.assertEqual(immediate_window["status"], "evaluated")
+            self.assertEqual(immediate_window["move_pct"], refreshed.shadow_comparison["move_pct"])
             self.assertEqual({item["role"] for item in bindings}, {"entry", "path"})
             self.assertEqual({item.evidence_mode for item in accepted}, {"paper"})
             self.assertEqual(len({item.source_event_id for item in accepted}), 2)
@@ -410,6 +414,62 @@ class ShadowEvaluationTests(unittest.TestCase):
                 ).fetchone()["status"]
             self.assertEqual(status, "pending")
             self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
+
+    def test_existing_economic_record_closes_pending_capture_on_retry(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 50
+            state.settings.paper_fee_bps = 100
+            state.storage.save_settings(state.settings)
+            version_id = state.ensure_settings_version("retry economic close", ["take_profit_pct", "paper_fee_bps"])
+            now = utc_now()
+            state.storage.save_pilot_risk_policy(PilotRiskPolicy.create(
+                Decimal("200"), Decimal("0.4"), now - timedelta(minutes=1),
+                reference_observation_id="sol-usd-retry", settings_version=version_id,
+                operator_intent_id="intent-retry",
+            ))
+            entry = AcceptedMarketObservation(
+                record_id="retry-entry", created_at=now - timedelta(seconds=1), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=version_id,
+                evidence_mode="paper", source="pumpportal", source_event_id="retry-entry-source",
+                observed_at=now - timedelta(seconds=1), received_at=now - timedelta(seconds=1),
+                mint="retry-mint", price=1.0, confidence=0.9, acceptance_reason="direct: accepted",
+            )
+            exit_observation = AcceptedMarketObservation(
+                record_id="retry-exit", created_at=now + timedelta(seconds=1), schema_version=1,
+                strategy_id=state.settings.strategy_profile, strategy_version=version_id,
+                evidence_mode="paper", source="pumpportal", source_event_id="retry-exit-source",
+                observed_at=now + timedelta(seconds=1), received_at=now + timedelta(seconds=1),
+                mint="retry-mint", price=1.1, confidence=0.9, acceptance_reason="direct: accepted",
+            )
+            state.storage.save_accepted_market_observation(entry)
+            state.storage.save_accepted_market_observation(exit_observation)
+            audit = LiveExecutionAudit(
+                id="retry-audit", created_at=now, updated_at=now,
+                action="buy", mint="retry-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="RetryWallet",
+                quote={"id": "retry-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "evaluated", "entry_price": 1.0,
+                    "quoted_at": now.isoformat(), "amount_sol": 0.01, "regime": "normal",
+                    "strategy_id": state.settings.strategy_profile, "strategy_version": version_id,
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, entry)
+            state.storage.save_shadow_market_evidence_binding(
+                audit_id=audit.id, market_observation_id=exit_observation.record_id,
+                strategy_id=state.settings.strategy_profile, strategy_version=version_id,
+                role="path", created_at=now + timedelta(seconds=1),
+            )
+            self.assertTrue(state._persist_economic_shadow_comparison(audit))
+
+            state._refresh_shadow_comparisons([audit])
+
+            with state.storage._connect() as connection:
+                status = connection.execute(
+                    "SELECT status FROM pending_shadow_audit_captures WHERE audit_id = ?", (audit.id,)
+                ).fetchone()["status"]
+            self.assertEqual(status, "closed")
 
     def test_shadow_capture_rolls_back_if_audit_persistence_fails(self) -> None:
         with TemporaryDirectory() as directory:

@@ -1811,6 +1811,14 @@ class Storage:
             )
         return True
 
+    def has_shadow_comparison(self, record_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM shadow_economic_comparisons WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+        return row is not None
+
     def load_shadow_comparisons(self, limit: int = 500, *, strategy_version: str = "") -> list[ShadowComparison]:
         bounded_limit = max(1, min(5000, int(limit)))
         with self._connect() as connection:
