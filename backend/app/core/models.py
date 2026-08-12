@@ -631,6 +631,28 @@ class AcceptedMarketObservation:
 
 
 @dataclass(slots=True)
+class ShadowTrackingCandidate:
+    candidate_id: str
+    intent_id: str
+    mint: str
+    strategy_id: str
+    strategy_version: str
+    selected_at: datetime
+    deadline_at: datetime
+    state: str = "awaiting_entry"
+    audit_id: str = ""
+    reason: str = "waiting for accepted entry evidence"
+    updated_at: datetime | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["selected_at"] = self.selected_at.isoformat()
+        payload["deadline_at"] = self.deadline_at.isoformat()
+        payload["updated_at"] = (self.updated_at or self.selected_at).isoformat()
+        return payload
+
+
+@dataclass(slots=True)
 class ShadowCostBreakdown:
     base_fee_sol: float = 0.0
     priority_fee_sol: float = 0.0

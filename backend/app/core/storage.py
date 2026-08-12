@@ -15,7 +15,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Callable, Iterator
 
-from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, CandidateValidation, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, SourceEvent, StrategyCandidate, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
+from app.core.models import AcceptedMarketObservation, BacktestRun, BotMode, BotSettings, CandidateValidation, ExperimentRun, LiveExecutionAudit, LiveExecutionIntent, LiveExecutionRequest, LiveLedgerPosition, LiveSession, MobileActionReceipt, MobileDestinationAuthorization, MobilePushRegistration, PriceObservation, SentinelVerdict, SettingsVersion, ShadowComparison, ShadowCostBreakdown, ShadowTrackingCandidate, SourceEvent, StrategyCandidate, StrategyDecisionRecord, StrategyPreset, TokenSignal, TokenStatus, TradeEvent, TradeGrade, TradeGradeCorrection, TradeLabel, TradeRecord, TradeReviewJob, TradeRevision, TradeSession
 from app.core.strategy_contract import SniperStrategyVersion
 from app.core.model_classifier import ModelClassification
 from app.core.pilot_risk import PilotRiskPolicy
@@ -44,6 +44,7 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("accepted_market_observations", "accepted_market_observations"),
     ("shadow_market_evidence_bindings", "shadow_market_evidence_bindings"),
     ("pending_shadow_audit_captures", "pending_shadow_audit_captures"),
+    ("shadow_tracking_candidates", "shadow_tracking_candidates"),
     ("source_access_evidence", "source_access_evidence"),
     ("sniper_strategy_versions", "sniper_strategy_versions"),
     ("shadow_economic_comparisons", "shadow_economic_comparisons"),
@@ -70,7 +71,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 25
+    SCHEMA_VERSION = 26
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -94,6 +95,7 @@ class Storage:
         "accepted_market_observations",
         "shadow_market_evidence_bindings",
         "pending_shadow_audit_captures",
+        "shadow_tracking_candidates",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -141,6 +143,7 @@ class Storage:
         "accepted_market_observations",
         "shadow_market_evidence_bindings",
         "pending_shadow_audit_captures",
+        "shadow_tracking_candidates",
         "source_access_evidence",
         "sniper_strategy_versions",
         "shadow_economic_comparisons",
@@ -319,6 +322,7 @@ class Storage:
             (23, "023_production_rehearsal_evidence", "append-only scoped production rehearsal evidence", self._migration_023_production_rehearsal_evidence),
             (24, "024_shadow_market_evidence_bindings", "append-only shadow audit bindings to accepted market observations", self._migration_024_shadow_market_evidence_bindings),
             (25, "025_pending_shadow_audit_captures", "indexed pending shadow audit capture registry", self._migration_025_pending_shadow_audit_captures),
+            (26, "026_shadow_tracking_candidates", "restart-safe shadow candidate evidence lifecycle", self._migration_026_shadow_tracking_candidates),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -1086,6 +1090,31 @@ class Storage:
             """
         )
 
+    def _migration_026_shadow_tracking_candidates(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS shadow_tracking_candidates (
+                candidate_id TEXT PRIMARY KEY,
+                intent_id TEXT NOT NULL UNIQUE,
+                mint TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                state TEXT NOT NULL,
+                selected_at TEXT NOT NULL,
+                deadline_at TEXT NOT NULL,
+                audit_id TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_shadow_tracking_candidate_priority
+            ON shadow_tracking_candidates(state, selected_at, deadline_at)
+            """
+        )
     def schema_status(self) -> dict[str, Any]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -1724,6 +1753,92 @@ class Storage:
                     "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures"
                 ).fetchone()
         return int(row["count"] if row else 0)
+
+    def save_shadow_tracking_candidate(self, candidate: ShadowTrackingCandidate) -> None:
+        payload = candidate.to_dict()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shadow_tracking_candidates (
+                    candidate_id, intent_id, mint, strategy_id, strategy_version,
+                    state, selected_at, deadline_at, audit_id, reason, updated_at, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    candidate.candidate_id,
+                    candidate.intent_id,
+                    candidate.mint,
+                    candidate.strategy_id,
+                    candidate.strategy_version,
+                    candidate.state,
+                    candidate.selected_at.isoformat(),
+                    candidate.deadline_at.isoformat(),
+                    candidate.audit_id,
+                    candidate.reason,
+                    str(payload["updated_at"]),
+                    json.dumps(payload),
+                ),
+            )
+
+    def load_shadow_tracking_candidate(self, candidate_id: str) -> ShadowTrackingCandidate | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM shadow_tracking_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        return self._shadow_tracking_candidate_from_payload(json.loads(row["payload"])) if row else None
+
+    def load_shadow_tracking_candidates(self, *, active_only: bool = False) -> list[ShadowTrackingCandidate]:
+        where = "WHERE state IN ('awaiting_entry', 'tracking_shadow')" if active_only else ""
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT payload FROM shadow_tracking_candidates
+                {where}
+                ORDER BY CASE state WHEN 'tracking_shadow' THEN 0 WHEN 'awaiting_entry' THEN 1 ELSE 2 END,
+                         selected_at ASC, candidate_id ASC
+                """
+            ).fetchall()
+        return [self._shadow_tracking_candidate_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def transition_shadow_tracking_candidate(
+        self,
+        candidate_id: str,
+        *,
+        expected_state: str,
+        state: str,
+        audit_id: str,
+        deadline_at: datetime,
+        reason: str,
+    ) -> bool:
+        candidate = self.load_shadow_tracking_candidate(candidate_id)
+        if candidate is None or candidate.state != expected_state:
+            return False
+        candidate.state = state
+        candidate.audit_id = audit_id
+        candidate.deadline_at = deadline_at
+        candidate.reason = reason
+        candidate.updated_at = datetime.now(timezone.utc)
+        payload = candidate.to_dict()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE shadow_tracking_candidates
+                SET state = ?, audit_id = ?, deadline_at = ?, reason = ?, updated_at = ?, payload = ?
+                WHERE candidate_id = ? AND state = ?
+                """,
+                (
+                    state,
+                    audit_id,
+                    deadline_at.isoformat(),
+                    reason,
+                    str(payload["updated_at"]),
+                    json.dumps(payload),
+                    candidate_id,
+                    expected_state,
+                ),
+            )
+        return cursor.rowcount == 1
 
     def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
         created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
@@ -5001,6 +5116,13 @@ class Storage:
             payload[field_name] = datetime.fromisoformat(payload[field_name])
         allowed = set(AcceptedMarketObservation.__dataclass_fields__.keys())
         return AcceptedMarketObservation(**{key: value for key, value in payload.items() if key in allowed})
+
+    def _shadow_tracking_candidate_from_payload(self, payload: dict[str, Any]) -> ShadowTrackingCandidate:
+        for field_name in ("selected_at", "deadline_at"):
+            payload[field_name] = datetime.fromisoformat(payload[field_name])
+        payload["updated_at"] = datetime.fromisoformat(payload["updated_at"]) if payload.get("updated_at") else None
+        allowed = set(ShadowTrackingCandidate.__dataclass_fields__.keys())
+        return ShadowTrackingCandidate(**{key: value for key, value in payload.items() if key in allowed})
 
     def _shadow_comparison_from_payload(self, payload: dict[str, Any]) -> ShadowComparison:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
