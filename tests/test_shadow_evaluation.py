@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -462,6 +463,21 @@ class ShadowEvaluationTests(unittest.TestCase):
                 role="path", created_at=now + timedelta(seconds=1),
             )
             self.assertTrue(state._persist_economic_shadow_comparison(audit))
+
+            # Persisted economic evidence is immutable. A later storage-schema
+            # migration must reuse it instead of rebuilding the same record
+            # with a new schema_version and raising a content conflict.
+            with state.storage._connect() as connection:
+                row = connection.execute(
+                    "SELECT payload FROM shadow_economic_comparisons WHERE record_id = ?",
+                    (f"economic_{audit.id}",),
+                ).fetchone()
+                payload = json.loads(row["payload"])
+                payload["schema_version"] = state.storage.SCHEMA_VERSION - 1
+                connection.execute(
+                    "UPDATE shadow_economic_comparisons SET payload = ? WHERE record_id = ?",
+                    (json.dumps(payload), f"economic_{audit.id}"),
+                )
 
             state._refresh_shadow_comparisons([audit])
 

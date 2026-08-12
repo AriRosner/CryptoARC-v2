@@ -6254,6 +6254,9 @@ class BotState:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
         if comparison.get("status") != "evaluated" or audit.action != "buy":
             return False
+        record_id = f"economic_{audit.id}"
+        if self.storage.has_shadow_comparison(record_id):
+            return True
         strategy_id = str(comparison.get("strategy_id") or "")
         strategy_version = str(comparison.get("strategy_version") or "")
         policy = self.storage.load_latest_pilot_risk_policy()
@@ -6351,7 +6354,7 @@ class BotState:
             "strategy_version": strategy_version,
         }
         shadow = ShadowComparison(
-            record_id=f"economic_{audit.id}",
+            record_id=record_id,
             created_at=completed_at,
             schema_version=self.storage.SCHEMA_VERSION,
             strategy_id=strategy_id,
