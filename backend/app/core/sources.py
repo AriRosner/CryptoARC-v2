@@ -315,6 +315,8 @@ class PumpPortalLaunchSource(LaunchSource):
         backoff_seconds = 2
         while True:
             preferred = self._preferred_trade_mint()
+            if preferred is None:
+                preferred = active_preferred
             if preferred:
                 first_mint = preferred
                 active_preferred = preferred
@@ -338,7 +340,11 @@ class PumpPortalLaunchSource(LaunchSource):
                     backoff_seconds = 2
                     while True:
                         recv_task = asyncio.create_task(websocket.recv())
-                        subscribe_task = asyncio.create_task(subscription_queue.get()) if not active_preferred else None
+                        subscribe_task = (
+                            asyncio.create_task(subscription_queue.get())
+                            if len(subscribed_mints) < self.max_trade_subscriptions or not active_preferred
+                            else None
+                        )
                         preference_task = asyncio.create_task(
                             asyncio.sleep(max(0.01, self.preference_poll_seconds))
                         )
@@ -392,7 +398,11 @@ class PumpPortalLaunchSource(LaunchSource):
                                     await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [active_preferred]}))
                                     status.dropped_trade_subscriptions += 1
                                 while len(subscribed_mints) >= self.max_trade_subscriptions:
-                                    old_mint = subscribed_mints.popleft()
+                                    old_mint = next(
+                                        (item for item in subscribed_mints if item != active_preferred),
+                                        subscribed_mints[0],
+                                    )
+                                    subscribed_mints.remove(old_mint)
                                     await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
                                     subscribed_lookup.discard(old_mint)
                                     subscribed_at.pop(old_mint, None)

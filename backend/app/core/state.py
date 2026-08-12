@@ -2494,7 +2494,7 @@ class BotState:
                     )
                     intent = self.storage.load_live_intent(intent.id) or intent
                 audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
-                if (
+                invalid_audit = (
                     audit is None
                     or audit.status != "ready"
                     or not bool(audit.quote.get("shadow_only"))
@@ -2504,7 +2504,32 @@ class BotState:
                         row.get("role") == "entry"
                         for row in self.storage.load_shadow_market_evidence_bindings(audit.id)
                     )
-                ):
+                )
+                if invalid_audit and intent.audit_id:
+                    intent.audit_id = ""
+                    intent.quote_id = ""
+                    intent.status = "open"
+                    intent.updated_at = now
+                    self.storage.save_live_intent(intent)
+                    self.quote_live_intent(
+                        False,
+                        intent.id,
+                        self.settings.live_max_slippage_pct,
+                        self.settings.live_priority_fee_cap_sol,
+                        "pump",
+                        shadow_only=True,
+                    )
+                    intent = self.storage.load_live_intent(intent.id) or intent
+                    audit = self.storage.load_live_execution_audit(intent.audit_id) if intent.audit_id else None
+                    invalid_audit = (
+                        audit is None
+                        or audit.status != "ready"
+                        or not bool(audit.quote.get("shadow_only"))
+                        or not isinstance(audit.shadow_comparison, dict)
+                        or self.storage.count_pending_shadow_audit_captures(audit.id) != 1
+                        or not any(row.get("role") == "entry" for row in self.storage.load_shadow_market_evidence_bindings(audit.id))
+                    )
+                if invalid_audit:
                     continue
                 self.storage.transition_shadow_tracking_candidate(
                     candidate.candidate_id,
@@ -2528,16 +2553,12 @@ class BotState:
                 continue
             missing = "entry" if candidate.state == "awaiting_entry" else "exit"
             reason = "strategy version changed" if version_mismatch else f"missing {missing} evidence before deadline"
-            self.storage.transition_shadow_tracking_candidate(
+            self.storage.expire_shadow_tracking_candidate(
                 candidate.candidate_id,
                 expected_state=candidate.state,
-                state="expired",
-                audit_id=candidate.audit_id,
-                deadline_at=now,
+                closed_at=now,
                 reason=reason,
             )
-            if candidate.state == "tracking_shadow" and candidate.audit_id:
-                self.storage.close_pending_shadow_audit_capture(candidate.audit_id, closed_at=now)
 
     def preferred_shadow_trade_mints(self, now: datetime | None = None) -> list[str]:
         self._expire_shadow_tracking_candidates(now or utc_now())

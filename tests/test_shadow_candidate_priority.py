@@ -267,6 +267,25 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
             self.assertEqual(candidate.state, "awaiting_entry")
             self.assertEqual(state.storage.count_pending_shadow_audit_captures(candidate.audit_id), 0)
 
+    def test_blocked_quote_retries_after_provider_recovers(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            provider_ready = False
+            def provider(**kwargs):
+                return ({"ok": True}, "dHgi", "") if provider_ready else ({}, "", "provider blocked")
+            state._pumpportal_local_transaction = provider
+            intent = next(item for item in state.generate_live_intents("WalletShadow") if item["mint"] == token.mint)
+            observation = self.accepted_observation(state, token)
+            state.storage.save_accepted_market_observation(observation)
+            state._activate_waiting_shadow_candidate(observation)
+            provider_ready = True
+
+            state._activate_waiting_shadow_candidate(observation)
+
+            candidate = state.storage.load_shadow_tracking_candidate(f"shadow_candidate_{intent['id']}")
+            self.assertEqual(candidate.state, "tracking_shadow")
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(candidate.audit_id), 1)
+
     def test_expired_tracking_candidate_rejects_late_economic_evidence(self) -> None:
         with TemporaryDirectory() as directory:
             state, token = self.make_state(directory)

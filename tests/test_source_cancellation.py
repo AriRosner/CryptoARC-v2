@@ -348,6 +348,29 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 task.cancel(); await asyncio.gather(task, return_exceptions=True)
 
+    async def test_candidate_present_at_startup_fills_spare_ordinary_slot(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid", max_trade_subscriptions=2,
+            preferred_trade_mints=lambda: ["CandidateMint"], preference_poll_seconds=0.01,
+        )
+        queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscriptions: asyncio.Queue[str] = asyncio.Queue()
+        subscriptions.put_nowait("OrdinaryOne")
+        status = SourceStatus(source="pumpportal")
+        websocket = _BlockingWebSocket()
+        with patch("app.core.sources.websockets.connect", return_value=_WebSocketContext(websocket)):
+            task = asyncio.create_task(source._run_trade_stream(queue, status, subscriptions))
+            try:
+                for _ in range(20):
+                    if {"method": "subscribeTokenTrade", "keys": ["OrdinaryOne"]} in websocket.sent:
+                        break
+                    websocket.sent_event.clear(); await asyncio.wait_for(websocket.sent_event.wait(), timeout=1)
+                self.assertIn({"method": "subscribeTokenTrade", "keys": ["CandidateMint"]}, websocket.sent)
+                self.assertIn({"method": "subscribeTokenTrade", "keys": ["OrdinaryOne"]}, websocket.sent)
+                self.assertEqual(status.active_trade_subscriptions, 2)
+            finally:
+                task.cancel(); await asyncio.gather(task, return_exceptions=True)
+
     async def test_solana_logs_source_does_not_queue_failed_transactions(self) -> None:
         failed = json.dumps(
             {

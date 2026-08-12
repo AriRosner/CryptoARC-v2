@@ -1840,6 +1840,48 @@ class Storage:
             )
         return cursor.rowcount == 1
 
+    def expire_shadow_tracking_candidate(
+        self,
+        candidate_id: str,
+        *,
+        expected_state: str,
+        closed_at: datetime,
+        reason: str,
+    ) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT payload FROM shadow_tracking_candidates WHERE candidate_id = ? AND state = ?",
+                (candidate_id, expected_state),
+            ).fetchone()
+            if row is None:
+                return False
+            candidate = self._shadow_tracking_candidate_from_payload(json.loads(row["payload"]))
+            candidate.state = "expired"
+            candidate.deadline_at = closed_at
+            candidate.reason = reason
+            candidate.updated_at = closed_at
+            payload = candidate.to_dict()
+            cursor = connection.execute(
+                """
+                UPDATE shadow_tracking_candidates
+                SET state = 'expired', deadline_at = ?, reason = ?, updated_at = ?, payload = ?
+                WHERE candidate_id = ? AND state = ?
+                """,
+                (closed_at.isoformat(), reason, closed_at.isoformat(), json.dumps(payload), candidate_id, expected_state),
+            )
+            if cursor.rowcount != 1:
+                return False
+            if candidate.audit_id:
+                connection.execute(
+                    """
+                    UPDATE pending_shadow_audit_captures
+                    SET status = 'closed', closed_at = ?
+                    WHERE audit_id = ? AND status = 'pending'
+                    """,
+                    (closed_at.isoformat(), candidate.audit_id),
+                )
+        return True
+
     def save_source_access_evidence(self, payload: dict[str, Any]) -> None:
         created_at = str(payload.get("created_at") or datetime.now(timezone.utc).isoformat())
         record_id = str(payload.get("record_id") or f"source_access_{uuid.uuid4().hex}")
