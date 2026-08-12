@@ -1778,7 +1778,7 @@ class CoreLogicTests(unittest.TestCase):
         state.autonomous_pilot_status = lambda: {"opened": True, "status": "OPEN"}  # type: ignore[method-assign]
         state._enforce_pilot_runtime_guard = lambda **_kwargs: None  # type: ignore[method-assign]
 
-    def seed_genuine_market_observation(self, state: BotState, *, now: datetime | None = None) -> None:
+    def seed_genuine_market_observation(self, state: BotState, *, now: datetime | None = None, mint: str = "MintSoak000") -> None:
         observed_at = now or utc_now()
         state.storage.save_accepted_market_observation(
             AcceptedMarketObservation(
@@ -1792,7 +1792,7 @@ class CoreLogicTests(unittest.TestCase):
                 source_event_id="src_pump_soak_000",
                 observed_at=observed_at,
                 received_at=observed_at,
-                mint="MintSoak000",
+                mint=mint,
                 price=0.00001,
                 confidence=1.0,
                 acceptance_reason="test_genuine_trade_price",
@@ -2571,6 +2571,7 @@ class CoreLogicTests(unittest.TestCase):
             state.storage.save_token(persisted)
             state.tokens.clear()
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            self.seed_genuine_market_observation(state, mint=persisted.mint)
 
             intents = state.generate_live_intents("WalletShadow")
 
@@ -2654,13 +2655,16 @@ class CoreLogicTests(unittest.TestCase):
 
             second = state.generate_live_intents("WalletShadow")
 
-            self.assertEqual(second, [])
+            self.assertEqual(len([item for item in second if item["mint"] == token.mint]), 1)
+            self.assertEqual(second[0]["id"], first_intent["id"])
             matching_audits = [
                 audit
                 for audit in state.storage.load_live_execution_audits(20)
                 if audit.mint == token.mint and audit.quote.get("shadow_only")
             ]
-            self.assertEqual(len(matching_audits), 1)
+            self.assertEqual(len(matching_audits), 0)
+            tracking = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual(len([item for item in tracking if item.mint == token.mint]), 1)
 
     def test_live_intent_readiness_warning_does_not_block_quote(self) -> None:
         with TemporaryDirectory() as directory:
@@ -2698,6 +2702,7 @@ class CoreLogicTests(unittest.TestCase):
                 return {"ok": True}, "dHgi", ""
 
             state._pumpportal_local_transaction = fake_local_transaction
+            self.seed_genuine_market_observation(state, mint=token.mint)
 
             intents = state.generate_live_intents("WalletShadow")
             promoted = next(intent for intent in intents if intent["mint"] == "MintShadowQuote")
@@ -2754,6 +2759,7 @@ class CoreLogicTests(unittest.TestCase):
                 raise RuntimeError("quote provider unavailable")
 
             state._pumpportal_local_transaction = fail_local_transaction
+            self.seed_genuine_market_observation(state, mint=token.mint)
 
             intents = state.generate_live_intents("WalletShadow")
             promoted = next(intent for intent in intents if intent["mint"] == "MintShadowFailure")

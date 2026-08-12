@@ -5,7 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from app.core.models import ShadowTrackingCandidate
+from app.core.models import AcceptedMarketObservation, ShadowTrackingCandidate, TokenSignal, TokenStatus, utc_now
+from app.core.state import BotState
 from app.core.storage import Storage
 
 
@@ -89,6 +90,129 @@ class ShadowCandidatePriorityStorageTests(unittest.TestCase):
             active = storage.load_shadow_tracking_candidates(active_only=True)
 
             self.assertEqual([item.candidate_id for item in active], [tracking.candidate_id, waiting.candidate_id])
+
+
+class ShadowCandidatePriorityStateTests(unittest.TestCase):
+    def make_state(self, directory: str) -> tuple[BotState, TokenSignal]:
+        state = BotState(database_path=str(Path(directory) / "state.db"))
+        state.settings.live_max_trade_sol = 0.001
+        state.settings.trade_size_sol = 0.001
+        state.settings.live_max_slippage_pct = 5
+        state.settings.live_priority_fee_cap_sol = 0.0001
+        state.settings.max_token_age_seconds = 120
+        state.storage.save_settings(state.settings)
+        state.current_settings_version_id = state.ensure_settings_version(
+            "candidate priority test",
+            ["live_max_trade_sol", "trade_size_sol", "max_token_age_seconds"],
+        )
+        token = TokenSignal(
+            id="tok_candidate",
+            symbol="CAND",
+            name="Candidate",
+            mint="MintCandidate111",
+            creator="creator",
+            detected_at=utc_now(),
+            age_seconds=1,
+            buy_velocity=0.9,
+            sell_pressure=0.1,
+            metadata_score=0.9,
+            current_price=0.00001,
+            score=95,
+            status=TokenStatus.PAPER_BOUGHT,
+            price_confidence=0.9,
+        )
+        state.tokens.appendleft(token)
+        return state, token
+
+    def accepted_observation(
+        self,
+        state: BotState,
+        token: TokenSignal,
+        *,
+        mint: str | None = None,
+        strategy_version: str | None = None,
+        fixture_only: bool = False,
+        conflict_state: str = "clear",
+        access_state: str = "ready",
+        price: float = 0.00001,
+    ) -> AcceptedMarketObservation:
+        now = utc_now()
+        return AcceptedMarketObservation(
+            record_id="market_candidate_entry",
+            created_at=now,
+            schema_version=Storage.SCHEMA_VERSION,
+            strategy_id=state.settings.strategy_profile,
+            strategy_version=strategy_version or state.current_settings_version_id,
+            evidence_mode="paper",
+            source="pumpportal",
+            source_event_id="source_candidate_entry",
+            observed_at=now,
+            received_at=now,
+            mint=mint or token.mint,
+            price=price,
+            confidence=0.9,
+            acceptance_reason="test accepted trade",
+            fixture_only=fixture_only,
+            conflict_state=conflict_state,
+            access_state=access_state,
+        )
+
+    def test_promoted_candidate_waits_for_genuine_entry_before_shadow_quote(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            calls: list[dict[str, object]] = []
+            state._pumpportal_local_transaction = lambda **kwargs: (calls.append(kwargs) or ({"ok": True}, "dHgi", ""))
+
+            intents = state.generate_live_intents("WalletShadow")
+            intent = next(item for item in intents if item["mint"] == token.mint)
+
+            self.assertEqual(intent["status"], "open")
+            self.assertEqual(intent["audit_id"], "")
+            self.assertEqual(calls, [])
+            self.assertEqual(state.preferred_shadow_trade_mints(), [token.mint])
+
+    def test_first_accepted_entry_creates_exactly_one_shadow_audit(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, token = self.make_state(directory)
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            intent_data = next(item for item in state.generate_live_intents("WalletShadow") if item["mint"] == token.mint)
+            observation = self.accepted_observation(state, token)
+            self.assertTrue(state.storage.save_accepted_market_observation(observation))
+
+            state._activate_waiting_shadow_candidate(observation)
+            state._activate_waiting_shadow_candidate(observation)
+
+            stored_intent = state.storage.load_live_intent(str(intent_data["id"]))
+            candidate = state.storage.load_shadow_tracking_candidate(f"shadow_candidate_{stored_intent.id}")
+            bindings = state.storage.load_shadow_market_evidence_bindings(stored_intent.audit_id)
+            self.assertEqual(candidate.state, "tracking_shadow")
+            self.assertEqual(len([row for row in bindings if row["role"] == "entry"]), 1)
+            self.assertEqual(
+                len([audit for audit in state.storage.load_live_execution_audits(20) if audit.mint == token.mint]),
+                1,
+            )
+
+    def test_ineligible_entry_observations_do_not_activate_candidate(self) -> None:
+        cases = (
+            {"mint": "WrongMint"},
+            {"strategy_version": "set_wrong"},
+            {"fixture_only": True},
+            {"conflict_state": "conflict"},
+            {"access_state": "blocked"},
+            {"price": 0.0},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides), TemporaryDirectory() as directory:
+                state, token = self.make_state(directory)
+                state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+                intent = next(item for item in state.generate_live_intents("WalletShadow") if item["mint"] == token.mint)
+
+                state._activate_waiting_shadow_candidate(self.accepted_observation(state, token, **overrides))
+
+                stored = state.storage.load_live_intent(str(intent["id"]))
+                candidate = state.storage.load_shadow_tracking_candidate(f"shadow_candidate_{stored.id}")
+                self.assertEqual(stored.audit_id, "")
+                self.assertEqual(candidate.state, "awaiting_entry")
 
 
 if __name__ == "__main__":
