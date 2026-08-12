@@ -8402,6 +8402,30 @@ class BotState:
         self.storage.save_live_intent(intent)
         return intent.to_dict()
 
+    def _live_intent_candidate_tokens(self, now: datetime) -> list[TokenSignal]:
+        cutoff = now - timedelta(seconds=max(1, int(self.settings.max_token_age_seconds)))
+        persisted_statuses = {
+            TokenStatus.BUYING,
+            TokenStatus.PAPER_BOUGHT,
+            TokenStatus.MONITORING,
+            TokenStatus.PAPER_SOLD,
+        }
+        by_id = {
+            token.id: token
+            for token in self.storage.load_tokens(500)
+            if token.status in persisted_statuses and cutoff <= token.detected_at <= now
+        }
+        by_id.update({token.id: token for token in self.tokens})
+        return sorted(
+            by_id.values(),
+            key=lambda token: (
+                int(token.score or 0),
+                float(token.price_confidence or 0.0),
+                token.detected_at.timestamp(),
+            ),
+            reverse=True,
+        )
+
     def generate_live_intents(self, wallet_public_key: str, signer_mode: str = "browser_wallet", include_watchlist: list[str] | None = None) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         existing = [intent for intent in self.storage.load_live_intents(200) if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
@@ -8409,7 +8433,7 @@ class BotState:
         candidates: list[LiveExecutionIntent] = []
         now = utc_now()
         readiness = self.readiness_status()
-        for token in self.tokens:
+        for token in self._live_intent_candidate_tokens(now):
             if len(existing) + len(candidates) >= 10:
                 break
             if token.mint and token.score >= self.settings.score_threshold and ("buy", token.mint) not in existing_keys:

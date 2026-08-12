@@ -2553,6 +2553,57 @@ class CoreLogicTests(unittest.TestCase):
             stale = next(item for item in state.live_intents() if item["id"] == first["id"])
             self.assertTrue(stale["stale"])
 
+    def test_live_intent_generation_uses_recent_persisted_paper_decisions(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.live_max_trade_sol = 0.001
+            state.settings.trade_size_sol = 0.001
+            state.settings.max_token_age_seconds = 120
+            persisted = self.make_token()
+            persisted.id = "tok_persisted_shadow"
+            persisted.mint = "MintPersistedShadow"
+            persisted.symbol = "PSHDW"
+            persisted.score = 95
+            persisted.status = TokenStatus.PAPER_BOUGHT
+            persisted.price_confidence = 0.9
+            state.storage.save_token(persisted)
+            state.tokens.clear()
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            intents = state.generate_live_intents("WalletShadow")
+
+            promoted = next(intent for intent in intents if intent["mint"] == persisted.mint)
+            audit = state.storage.load_live_execution_audit(str(promoted["audit_id"]))
+            self.assertEqual(promoted["source"], "paper_promoted")
+            self.assertEqual(promoted["status"], "quoted")
+            self.assertEqual(audit.status, "ready")
+            self.assertTrue(audit.quote["shadow_only"])
+
+    def test_live_intent_generation_rejects_stale_or_skipped_persisted_tokens(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            self.configure_live_caps(state)
+            state.settings.max_token_age_seconds = 120
+            stale = self.make_token()
+            stale.id = "tok_stale_persisted_shadow"
+            stale.mint = "MintStalePersistedShadow"
+            stale.score = 95
+            stale.status = TokenStatus.PAPER_SOLD
+            stale.detected_at = utc_now() - timedelta(seconds=121)
+            skipped = self.make_token()
+            skipped.id = "tok_skipped_persisted_shadow"
+            skipped.mint = "MintSkippedPersistedShadow"
+            skipped.score = 95
+            skipped.status = TokenStatus.SKIPPED
+            state.storage.save_token(stale)
+            state.storage.save_token(skipped)
+            state.tokens.clear()
+
+            intents = state.generate_live_intents("WalletShadow")
+
+            self.assertEqual(intents, [])
+
     def test_live_intent_readiness_warning_does_not_block_quote(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
