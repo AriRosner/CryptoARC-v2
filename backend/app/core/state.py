@@ -3301,7 +3301,16 @@ class BotState:
         evaluated_at = now or utc_now()
         observations = self.storage.load_accepted_market_observations(limit=max(1, min(5000, limit)))
         access_rows = self.storage.load_source_access_evidence(limit=1, source="pumpportal")
+        latest_observation_at = max((item.observed_at for item in observations), default=None)
+        latest_access_at = None
         if access_rows:
+            try:
+                latest_access_at = datetime.fromisoformat(str(access_rows[0].get("created_at") or "").replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                latest_access_at = None
+        if latest_observation_at is not None and (latest_access_at is None or latest_observation_at > latest_access_at):
+            access_state = "ready"
+        elif access_rows:
             access_state = str(access_rows[0].get("access_state") or "unknown")
         elif observations:
             access_state = "ready"
@@ -4376,10 +4385,7 @@ class BotState:
             warnings.append(f"{malformed} recent source events are missing a mint")
         if duplicate_mints:
             warnings.append("recent duplicate mint events detected")
-        trade_subscription_funding_message = self.source_status.pumpportal_funding_blocked or any(
-            self._is_pumpportal_funding_message(event.raw_payload, event.message)
-            for event in events
-        )
+        trade_subscription_funding_message = self.source_status.pumpportal_funding_blocked
         if trade_subscription_funding_message:
             if self.source_status.pumpportal_funding_blocked:
                 trust_state = "degraded"

@@ -174,6 +174,23 @@ class GenuineSourceEvidenceTests(unittest.TestCase):
         self.assertFalse(report["shadow_eligible"])
         self.assertIn("funded_trade_price_access_unavailable", report["blockers"])
 
+    def test_fresh_trade_observation_recovers_from_older_access_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "source.db"))
+            state.storage.save_source_access_evidence(
+                {
+                    "record_id": "access-earlier",
+                    "created_at": (NOW - timedelta(seconds=30)).isoformat(),
+                    "source": "pumpportal",
+                    "access_state": "funding_required",
+                }
+            )
+            state.storage.save_accepted_market_observation(observation(observed_at=NOW - timedelta(seconds=1)))
+            report = state.genuine_source_evidence_report(now=NOW)
+
+        self.assertEqual(report["access_state"], "ready")
+        self.assertTrue(report["shadow_eligible"])
+
     def test_conflict_fixture_is_explicitly_ineligible(self) -> None:
         fixture = json.loads(
             (ROOT / "tests" / "fixtures" / "evidence_gated" / "source_conflicts.json").read_text(encoding="utf-8")

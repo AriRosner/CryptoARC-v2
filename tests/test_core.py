@@ -6832,6 +6832,29 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIn("PumpPortal API wallet appears unfunded", health["trust_blockers"])
             self.assertEqual(len([item for item in alerts if "PumpPortal API wallet appears unfunded" in item.message]), 1)
 
+    def test_pumpportal_trade_event_clears_historical_funding_warning(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            message = "'subscribeTokenTrade' and 'subscribeAccountTrade' methods are only available when connecting with an API key funded with at least 0.02 SOL."
+            state.ingest_source_event(LaunchEvent("pumpportal", now, {"message": message}, None, message))
+            state.ingest_source_event(
+                LaunchEvent(
+                    source="pumpportal",
+                    received_at=now + timedelta(seconds=1),
+                    raw_payload={"mint": "MintRecovered", "txType": "buy", "price": 0.01},
+                    token=None,
+                    kind="trade",
+                    mint="MintRecovered",
+                    observed_price=0.01,
+                )
+            )
+
+            health = state.source_health()
+
+            self.assertFalse(health["pumpportal_funding_blocked"])
+            self.assertFalse(health["shadow_price_observations_blocked"])
+
     def test_source_health_ignores_quote_mint_duplicates_and_min_balance_status_errors(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
