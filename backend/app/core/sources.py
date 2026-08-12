@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
@@ -174,10 +174,36 @@ class MockLaunchSource(LaunchSource):
 class PumpPortalLaunchSource(LaunchSource):
     ws_url: str
     max_trade_subscriptions: int = 60
+    preferred_trade_mints: Callable[[], list[str]] | None = None
+    preference_poll_seconds: float = 1.0
     name: str = "pumpportal"
 
     def _trade_subscription_can_rotate(self, subscribed_at: float, now: float) -> bool:
         return self.max_trade_subscriptions != 1 or now - subscribed_at >= 600
+
+    def _preferred_trade_mint(self) -> str:
+        if self.preferred_trade_mints is None:
+            return ""
+        try:
+            return next(
+                (str(mint).strip() for mint in self.preferred_trade_mints() if str(mint).strip()),
+                "",
+            )
+        except Exception:
+            return ""
+
+    def _set_trade_subscription_status(
+        self,
+        status: SourceStatus,
+        active_preferred: str,
+        subscribed_lookup: set[str],
+    ) -> None:
+        status.active_trade_subscriptions = min(
+            len(subscribed_lookup),
+            max(0, self.max_trade_subscriptions),
+        )
+        status.trade_subscription_priority = "shadow_candidate" if active_preferred else "ordinary_launch"
+        status.preferred_trade_mint_prefix = active_preferred[:8] if active_preferred else ""
 
     async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
         status.source = self.name
@@ -288,10 +314,16 @@ class PumpPortalLaunchSource(LaunchSource):
         subscribed_mints: deque[str] = deque()
         subscribed_lookup: set[str] = set()
         subscribed_at: dict[str, float] = {}
+        active_preferred = ""
         backoff_seconds = 2
         while True:
-            first_mint = await subscription_queue.get()
-            subscription_queue.task_done()
+            preferred = self._preferred_trade_mint()
+            if preferred:
+                first_mint = preferred
+                active_preferred = preferred
+            else:
+                first_mint = await subscription_queue.get()
+                subscription_queue.task_done()
             if first_mint not in subscribed_lookup:
                 while len(subscribed_mints) >= self.max_trade_subscriptions:
                     old_mint = subscribed_mints.popleft()
@@ -301,7 +333,7 @@ class PumpPortalLaunchSource(LaunchSource):
                 subscribed_mints.append(first_mint)
                 subscribed_lookup.add(first_mint)
                 subscribed_at[first_mint] = time.monotonic()
-                status.active_trade_subscriptions = len(subscribed_mints)
+                self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
             try:
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
                     for mint in subscribed_mints:
@@ -309,8 +341,13 @@ class PumpPortalLaunchSource(LaunchSource):
                     backoff_seconds = 2
                     while True:
                         recv_task = asyncio.create_task(websocket.recv())
-                        subscribe_task = asyncio.create_task(subscription_queue.get())
-                        wait_tasks = {recv_task, subscribe_task}
+                        subscribe_task = asyncio.create_task(subscription_queue.get()) if not active_preferred else None
+                        preference_task = asyncio.create_task(
+                            asyncio.sleep(max(0.01, self.preference_poll_seconds))
+                        )
+                        wait_tasks = {recv_task, preference_task}
+                        if subscribe_task is not None:
+                            wait_tasks.add(subscribe_task)
                         try:
                             done, pending = await asyncio.wait(
                                 wait_tasks,
@@ -326,7 +363,7 @@ class PumpPortalLaunchSource(LaunchSource):
                             task.cancel()
                         results = await asyncio.gather(*pending, return_exceptions=True)
                         _log_cleanup_failures("PumpPortal trade stream", results)
-                        if subscribe_task in done:
+                        if subscribe_task is not None and subscribe_task in done:
                             mint = subscribe_task.result()
                             subscription_queue.task_done()
                             if mint not in subscribed_lookup:
@@ -344,7 +381,29 @@ class PumpPortalLaunchSource(LaunchSource):
                                 subscribed_mints.append(mint)
                                 subscribed_lookup.add(mint)
                                 subscribed_at[mint] = time.monotonic()
-                                status.active_trade_subscriptions = len(subscribed_mints)
+                                self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
+                        if preference_task in done:
+                            preferred = self._preferred_trade_mint()
+                            if preferred and not active_preferred:
+                                while subscribed_mints:
+                                    old_mint = subscribed_mints.popleft()
+                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
+                                    subscribed_lookup.discard(old_mint)
+                                    subscribed_at.pop(old_mint, None)
+                                    status.dropped_trade_subscriptions += 1
+                                await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [preferred]}))
+                                subscribed_mints.append(preferred)
+                                subscribed_lookup.add(preferred)
+                                subscribed_at[preferred] = time.monotonic()
+                                active_preferred = preferred
+                            elif active_preferred and not preferred:
+                                while subscribed_mints:
+                                    old_mint = subscribed_mints.popleft()
+                                    await websocket.send(json.dumps({"method": "unsubscribeTokenTrade", "keys": [old_mint]}))
+                                    subscribed_lookup.discard(old_mint)
+                                    subscribed_at.pop(old_mint, None)
+                                active_preferred = ""
+                            self._set_trade_subscription_status(status, active_preferred, subscribed_lookup)
                         if recv_task in done:
                             received_at = utc_now()
                             payload = json.loads(recv_task.result())
@@ -446,9 +505,19 @@ def solana_logs_subscribe_payload(mentions_address: str, commitment: str = "conf
     }
 
 
-def make_source(name: str, launch_interval_seconds: float, pumpportal_ws_url: str, max_trade_subscriptions: int = 60) -> LaunchSource:
+def make_source(
+    name: str,
+    launch_interval_seconds: float,
+    pumpportal_ws_url: str,
+    max_trade_subscriptions: int = 60,
+    preferred_trade_mints: Callable[[], list[str]] | None = None,
+) -> LaunchSource:
     if name == "pumpportal":
-        return PumpPortalLaunchSource(ws_url=pumpportal_ws_url, max_trade_subscriptions=max_trade_subscriptions)
+        return PumpPortalLaunchSource(
+            ws_url=pumpportal_ws_url,
+            max_trade_subscriptions=max_trade_subscriptions,
+            preferred_trade_mints=preferred_trade_mints,
+        )
     return MockLaunchSource(launch_interval_seconds=launch_interval_seconds)
 
 

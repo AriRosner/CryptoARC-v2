@@ -1050,6 +1050,8 @@ class SourceStatus:
     failed_events_seen: int = 0
     active_trade_subscriptions: int = 0
     dropped_trade_subscriptions: int = 0
+    trade_subscription_priority: str = "ordinary_launch"
+    preferred_trade_mint_prefix: str = ""
     connection_requested_at: datetime | None = None
     connected_at: datetime | None = None
     first_event_at: datetime | None = None
