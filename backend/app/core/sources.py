@@ -293,6 +293,11 @@ class PumpPortalLaunchSource(LaunchSource):
             first_mint = await subscription_queue.get()
             subscription_queue.task_done()
             if first_mint not in subscribed_lookup:
+                while len(subscribed_mints) >= self.max_trade_subscriptions:
+                    old_mint = subscribed_mints.popleft()
+                    subscribed_lookup.discard(old_mint)
+                    subscribed_at.pop(old_mint, None)
+                    status.dropped_trade_subscriptions += 1
                 subscribed_mints.append(first_mint)
                 subscribed_lookup.add(first_mint)
                 subscribed_at[first_mint] = time.monotonic()
