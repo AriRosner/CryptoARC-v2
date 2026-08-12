@@ -22,6 +22,8 @@ def main() -> int:
     source_path = Path(args.database).resolve()
     backup_path = Path(args.backup).resolve()
     evidence_path = Path(args.evidence).resolve()
+    if len({source_path, backup_path, evidence_path}) != 3:
+        parser.error("database, backup, and evidence paths must be distinct")
     if backup_path.exists():
         parser.error(f"backup already exists: {backup_path}")
     backup_path.parent.mkdir(parents=True, exist_ok=True)

@@ -79,6 +79,50 @@ class ShadowCampaignBackupTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(backup.read_bytes(), b"preserve")
 
+    def test_cli_rejects_evidence_path_that_aliases_source_or_backup(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "campaign.db"
+            sqlite3.connect(source).close()
+            original = source.read_bytes()
+
+            source_alias = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/test-shadow-campaign-backup.py",
+                    "--database",
+                    str(source),
+                    "--backup",
+                    str(root / "backup.db"),
+                    "--evidence",
+                    str(source),
+                ],
+                cwd=Path(__file__).parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(source_alias.returncode, 0)
+            self.assertEqual(source.read_bytes(), original)
+
+            backup = root / "second-backup.db"
+            backup_alias = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/test-shadow-campaign-backup.py",
+                    "--database",
+                    str(source),
+                    "--backup",
+                    str(backup),
+                    "--evidence",
+                    str(backup),
+                ],
+                cwd=Path(__file__).parents[1],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(backup_alias.returncode, 0)
+            self.assertFalse(backup.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

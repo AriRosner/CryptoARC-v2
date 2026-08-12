@@ -64,7 +64,8 @@ class SoakEvidenceTests(unittest.TestCase):
         payload = {
             "api_key": "secret",
             "nested": {"private_key": "secret", "public_key": "safe"},
-            "items": [{"token": "secret"}],
+            "items": [{"access_token": "secret"}],
+            "tokens": 42,
         }
 
         redacted = redact_sensitive_values(payload)
@@ -72,7 +73,29 @@ class SoakEvidenceTests(unittest.TestCase):
         self.assertEqual(redacted["api_key"], "[REDACTED]")
         self.assertEqual(redacted["nested"]["private_key"], "[REDACTED]")
         self.assertEqual(redacted["nested"]["public_key"], "safe")
-        self.assertEqual(redacted["items"][0]["token"], "[REDACTED]")
+        self.assertEqual(redacted["items"][0]["access_token"], "[REDACTED]")
+        self.assertEqual(redacted["tokens"], 42)
+
+    def test_future_monitor_timestamp_is_stale(self) -> None:
+        from app.core.soak_evidence import build_campaign_evidence
+
+        observed_at = datetime(2026, 8, 12, 18, 30, tzinfo=timezone.utc)
+        artifact = build_campaign_evidence(
+            status={
+                "generated_at": (observed_at + timedelta(minutes=2)).isoformat(),
+                "code_head": "abc",
+                "mode": "paper",
+                "live_trading_enabled": False,
+                "live_execution_available": False,
+                "economic_progress": {},
+            },
+            database_counts={},
+            database_safety={"mode": "paper", "kill_switch_enabled": True},
+            code_head="abc",
+            observed_at=observed_at,
+        )
+
+        self.assertIn("monitor_stale", {item["id"] for item in artifact["anomalies"]})
 
     def test_cli_reads_database_without_writing_and_emits_json_and_markdown(self) -> None:
         with TemporaryDirectory() as directory:

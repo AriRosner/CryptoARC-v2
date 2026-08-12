@@ -7,7 +7,18 @@ from pathlib import Path
 from typing import Any
 
 
-SENSITIVE_KEY_PARTS = ("api_key", "secret", "private_key", "seed", "mnemonic", "token", "password")
+SENSITIVE_KEY_PARTS = (
+    "api_key",
+    "secret",
+    "private_key",
+    "seed",
+    "mnemonic",
+    "access_token",
+    "auth_token",
+    "bearer_token",
+    "refresh_token",
+    "password",
+)
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -98,7 +109,8 @@ def build_campaign_evidence(
     anomalies: list[dict[str, str]] = []
     if str(status.get("code_head") or "") != code_head:
         anomalies.append(_finding("code_head_drift", "error", "Monitor code head differs from the inspected checkout."))
-    if status_time is None or (observed_at - status_time).total_seconds() > 300:
+    status_age_seconds = (observed_at - status_time).total_seconds() if status_time is not None else None
+    if status_age_seconds is None or status_age_seconds > 300 or status_age_seconds < -30:
         anomalies.append(_finding("monitor_stale", "error", "Monitor status is more than five minutes old or has no valid timestamp."))
     for name, value in sorted(status_counts.items()):
         if name in database_counts and int(database_counts[name]) < int(value or 0):
