@@ -1038,6 +1038,13 @@ class SourceStatus:
     events_received: int = 0
     last_event_at: datetime | None = None
     reconnect_attempts: int = 0
+    trade_reconnect_attempts: int = 0
+    reconnect_events: int = 0
+    trade_reconnect_events: int = 0
+    last_disconnect_at: datetime | None = None
+    last_recovered_at: datetime | None = None
+    last_disconnect_stream: str = ""
+    last_recovered_stream: str = ""
     raw_events_seen: int = 0
     normalized_events: int = 0
     normalization_failures: int = 0
@@ -1065,6 +1072,8 @@ class SourceStatus:
         payload["connection_requested_at"] = self.connection_requested_at.isoformat() if self.connection_requested_at else None
         payload["connected_at"] = self.connected_at.isoformat() if self.connected_at else None
         payload["first_event_at"] = self.first_event_at.isoformat() if self.first_event_at else None
+        payload["last_disconnect_at"] = self.last_disconnect_at.isoformat() if self.last_disconnect_at else None
+        payload["last_recovered_at"] = self.last_recovered_at.isoformat() if self.last_recovered_at else None
         payload["pumpportal_funding_blocked_at"] = self.pumpportal_funding_blocked_at.isoformat() if self.pumpportal_funding_blocked_at else None
         return payload
 

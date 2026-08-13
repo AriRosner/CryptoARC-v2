@@ -6942,6 +6942,32 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(health["connection"]["state"], "connected")
             self.assertIn("connected_at", health["connection"])
 
+    def test_source_health_includes_reconnect_lifecycle_telemetry(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            now = utc_now()
+            state.status = BotStatus.RUNNING
+            state.source_status.status = "connected"
+            state.source_status.last_event_at = now
+            state.source_status.reconnect_attempts = 0
+            state.source_status.trade_reconnect_attempts = 0
+            state.source_status.reconnect_events = 2
+            state.source_status.trade_reconnect_events = 3
+            state.source_status.last_disconnect_at = now - timedelta(seconds=5)
+            state.source_status.last_recovered_at = now
+            state.source_status.last_disconnect_stream = "trade"
+            state.source_status.last_recovered_stream = "trade"
+
+            health = state.source_health()
+
+            self.assertEqual(health["reconnect_attempts"], 0)
+            self.assertEqual(health["trade_reconnect_attempts"], 0)
+            self.assertEqual(health["reconnect_events"], 2)
+            self.assertEqual(health["trade_reconnect_events"], 3)
+            self.assertEqual(health["last_disconnect_at"], state.source_status.last_disconnect_at.isoformat())
+            self.assertEqual(health["last_recovered_at"], now.isoformat())
+            self.assertEqual(health["last_recovered_stream"], "trade")
+
     def test_source_health_does_not_report_stale_first_event_before_current_connection(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
