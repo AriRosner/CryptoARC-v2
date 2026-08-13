@@ -8697,7 +8697,7 @@ class BotState:
                 and not audit.transaction_signature
                 and isinstance(audit.quote, dict)
                 and audit.quote.get("shadow_only") is True
-                and not self.storage.has_active_shadow_tracking_candidate(audit.id)
+                and self._shadow_capture_window_expired(audit, now)
             ):
                 self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=now)
             expires_at = audit.quote.get("expires_at") if isinstance(audit.quote, dict) else None
@@ -8719,6 +8719,21 @@ class BotState:
                     audit.updated_at = now
                     self.storage.save_live_execution_audit(audit)
         return audits
+
+    def _shadow_capture_window_expired(self, audit: LiveExecutionAudit, now: datetime) -> bool:
+        if self.storage.has_active_shadow_tracking_candidate(audit.id):
+            return False
+        comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
+        strategy_version = str(comparison.get("strategy_version") or "")
+        settings_version = self.storage.load_settings_version(strategy_version) if strategy_version else None
+        if settings_version is None:
+            return False
+        quoted_at = self._parse_iso_datetime(str(comparison.get("quoted_at") or "")) or audit.created_at
+        max_hold_seconds = int(
+            settings_version.settings.get("max_hold_time_seconds")
+            or self.settings.max_hold_time_seconds
+        )
+        return now >= quoted_at + timedelta(seconds=max_hold_seconds + 30)
 
     def _is_unresolved_live_audit(self, audit: LiveExecutionAudit) -> bool:
         if isinstance(audit.quote, dict) and audit.quote.get("shadow_only"):
