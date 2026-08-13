@@ -4743,6 +4743,18 @@ class Storage:
     def load_all_tokens(self, limit: int = 5000) -> list[TokenSignal]:
         return self.load_tokens(limit)
 
+    def load_token_payloads_by_ids(self, token_ids: set[str]) -> dict[str, dict[str, object]]:
+        normalized_ids = tuple(sorted(token_id for token_id in token_ids if token_id))
+        if not normalized_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in normalized_ids)
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                f"SELECT id, payload FROM tokens WHERE id IN ({placeholders})",
+                normalized_ids,
+            ).fetchall()
+        return {str(row["id"]): json.loads(row["payload"]) for row in rows}
+
     def count_tokens(self) -> int:
         with self._connect() as connection:
             row = connection.execute("SELECT COUNT(*) AS count FROM tokens").fetchone()

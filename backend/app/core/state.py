@@ -2714,6 +2714,7 @@ class BotState:
 
     def tick(self, *, build_snapshot: bool = True) -> BotSnapshot | None:
         self._ensure_active_tokens_loaded()
+        persisted_token_payloads = self.storage.load_token_payloads_by_ids({token.id for token in self.tokens})
         self.last_bot_tick_at = utc_now()
         self.last_tick_error = ""
         self.bot_loop_iterations += 1
@@ -2724,7 +2725,13 @@ class BotState:
             tokens_seen += 1
             token.age_seconds = max(0, int((utc_now() - token.detected_at).total_seconds()))
             if token.status not in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING}:
-                self.storage.save_token(token)
+                stored_payload = persisted_token_payloads.get(token.id)
+                current_payload = token.to_dict()
+                if stored_payload is not None:
+                    stored_payload.pop("age_seconds", None)
+                    current_payload.pop("age_seconds", None)
+                if stored_payload != current_payload:
+                    self.storage.save_token(token)
                 continue
 
             active_tokens += 1
