@@ -1517,6 +1517,61 @@ class CoreLogicTests(unittest.TestCase):
             self.assertIsNotNone(watchdog["last_tick_completed_at"])
             datetime.fromisoformat(str(watchdog["last_tick_completed_at"]))
 
+    def test_tick_does_not_rewrite_inactive_tokens_for_derived_age_only(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            inactive = self.make_token()
+            inactive.status = TokenStatus.SKIPPED
+            state.storage.save_token(inactive)
+            state.tokens.append(inactive)
+
+            with patch.object(state.storage, "save_token", wraps=state.storage.save_token) as save_token:
+                state.tick(build_snapshot=False)
+
+            save_token.assert_not_called()
+            self.assertGreaterEqual(inactive.age_seconds, 0)
+
+    def test_tick_retries_inactive_transition_when_storage_payload_is_stale(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.status = TokenStatus.MONITORING
+            token.opened_at = utc_now()
+            token.amount_sol = 0.1
+            state.storage.save_token(token)
+            token.status = TokenStatus.PAPER_SOLD
+            token.closed_at = utc_now()
+            state.tokens.append(token)
+
+            state.tick(build_snapshot=False)
+
+            persisted = next(saved for saved in state.storage.load_all_tokens(20) if saved.id == token.id)
+            self.assertEqual(persisted.status, TokenStatus.PAPER_SOLD)
+            self.assertIsNotNone(persisted.closed_at)
+
+    def test_tick_does_not_rewrite_old_persisted_inactive_token_outside_recent_window(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            old = self.make_token()
+            old.id = "tok_old"
+            old.detected_at = utc_now() - timedelta(days=1)
+            old.status = TokenStatus.PAPER_SOLD
+            old.closed_at = utc_now() - timedelta(hours=23)
+            state.storage.save_token(old)
+            for index in range(80):
+                newer = self.make_token()
+                newer.id = f"tok_new_{index}"
+                newer.detected_at = utc_now() + timedelta(seconds=index)
+                newer.status = TokenStatus.SKIPPED
+                state.storage.save_token(newer)
+            state.tokens.append(old)
+
+            with patch.object(state.storage, "save_token", wraps=state.storage.save_token) as save_token:
+                state.tick(build_snapshot=False)
+                state.tick(build_snapshot=False)
+
+            save_token.assert_not_called()
+
     def test_tick_failure_keeps_last_completed_telemetry_snapshot(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
