@@ -157,6 +157,81 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
             access_state=access_state,
         )
 
+    def second_token(self, *, suffix: str = "222", score: int = 94) -> TokenSignal:
+        return TokenSignal(
+            id=f"tok_candidate_{suffix}",
+            symbol=f"C{suffix}",
+            name=f"Candidate {suffix}",
+            mint=f"MintCandidate{suffix}",
+            creator=f"creator_{suffix}",
+            detected_at=utc_now(),
+            age_seconds=1,
+            buy_velocity=0.9,
+            sell_pressure=0.1,
+            metadata_score=0.9,
+            current_price=0.00001,
+            score=score,
+            status=TokenStatus.PAPER_BOUGHT,
+            price_confidence=0.9,
+        )
+
+    def test_one_paid_slot_persists_only_one_candidate_with_five_minute_entry_window(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, first = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 1
+            second = self.second_token()
+            state.tokens.appendleft(second)
+            state.storage.save_token(second)
+            before = utc_now()
+
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+
+            active = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].mint, first.mint)
+            self.assertGreaterEqual((active[0].deadline_at - before).total_seconds(), 299)
+            self.assertLessEqual((active[0].deadline_at - before).total_seconds(), 301)
+
+    def test_active_candidate_prevents_another_candidate_until_it_expires(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, first = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 1
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+            second = self.second_token()
+            state.tokens.appendleft(second)
+            state.storage.save_token(second)
+
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+            active = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual([item.mint for item in active], [first.mint])
+
+            state.storage.expire_shadow_tracking_candidate(
+                active[0].candidate_id,
+                expected_state="awaiting_entry",
+                closed_at=utc_now(),
+                reason="test expiry",
+            )
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+            active = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual(len(active), 1)
+            self.assertEqual(active[0].mint, second.mint)
+
+    def test_candidate_admission_respects_configured_cap_above_one(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, _first = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 2
+            second = self.second_token()
+            third = self.second_token(suffix="333", score=93)
+            state.tokens.appendleft(second)
+            state.tokens.appendleft(third)
+            state.storage.save_token(second)
+            state.storage.save_token(third)
+
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+
+            active = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual(len(active), 2)
+
     def test_promoted_candidate_waits_for_genuine_entry_before_shadow_quote(self) -> None:
         with TemporaryDirectory() as directory:
             state, token = self.make_state(directory)

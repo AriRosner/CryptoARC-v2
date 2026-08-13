@@ -103,6 +103,7 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BotState:
+    SHADOW_ENTRY_WINDOW_SECONDS = 300
     MOBILE_MONITOR_SCOPE = MobileScope.MONITOR
     MOBILE_CONTROL_SCOPE = MobileScope.CONTROL
     MOBILE_DEFAULT_SCOPES = (MOBILE_MONITOR_SCOPE, MOBILE_CONTROL_SCOPE)
@@ -8901,6 +8902,12 @@ class BotState:
     ) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         now = utc_now()
+        self._expire_shadow_tracking_candidates(now)
+        active_shadow_candidates = self.storage.load_shadow_tracking_candidates(active_only=True)
+        available_shadow_slots = max(
+            0,
+            max(0, int(self.settings.max_trade_subscriptions)) - len(active_shadow_candidates),
+        )
         loaded_intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
         existing = [
             intent
@@ -8923,6 +8930,7 @@ class BotState:
             for candidate in self.storage.load_shadow_tracking_candidates(active_only=True)
         }
         candidates: list[LiveExecutionIntent] = []
+        shadow_candidates_selected = 0
         readiness = readiness_snapshot or (
             {"status": "blocked", "score": 0, "gates": [], "entries_allowed": False}
             if shadow_collection_only
@@ -8931,6 +8939,8 @@ class BotState:
         shadow_collection_blockers = ["shadow collection only"] if shadow_collection_only else None
         for token in self._live_intent_candidate_tokens(now):
             if len(active_existing) + len(candidates) >= 10:
+                break
+            if shadow_candidates_selected >= available_shadow_slots:
                 break
             if (
                 token.mint
@@ -8960,6 +8970,7 @@ class BotState:
                         priority_reason=f"Paper edge score {token.score} with price confidence {float(token.price_confidence or 0):.2f}",
                     )
                 )
+                shadow_candidates_selected += 1
         for mint in include_watchlist or []:
             if len(active_existing) + len(candidates) >= 10:
                 break
@@ -9034,7 +9045,7 @@ class BotState:
                     strategy_id=self.settings.strategy_profile,
                     strategy_version=self.current_settings_version_id,
                     selected_at=now,
-                    deadline_at=now + timedelta(seconds=max(1, int(self.settings.max_token_age_seconds))),
+                    deadline_at=now + timedelta(seconds=self.SHADOW_ENTRY_WINDOW_SECONDS),
                 )
                 self.storage.save_shadow_tracking_candidate(candidate)
                 entry = self._latest_eligible_candidate_entry(
