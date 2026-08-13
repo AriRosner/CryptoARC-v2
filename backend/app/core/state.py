@@ -8912,9 +8912,9 @@ class BotState:
             by_id.values(),
             key=lambda token: (
                 1 if token.status in active_statuses else 0,
-                token.detected_at.timestamp(),
                 int(token.score or 0),
                 float(token.price_confidence or 0.0),
+                token.detected_at.timestamp(),
             ),
             reverse=True,
         )

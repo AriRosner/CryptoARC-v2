@@ -247,6 +247,20 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
             self.assertGreaterEqual((active[0].deadline_at - before).total_seconds(), 299)
             self.assertLessEqual((active[0].deadline_at - before).total_seconds(), 301)
 
+    def test_single_candidate_slot_selects_stronger_score_before_newer_detection(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, stronger = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 1
+            newer = self.second_token(score=94)
+            newer.detected_at = stronger.detected_at + timedelta(seconds=1)
+            state.tokens.appendleft(newer)
+            state.storage.save_token(newer)
+
+            state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+
+            active = state.storage.load_shadow_tracking_candidates(active_only=True)
+            self.assertEqual([item.mint for item in active], [stronger.mint])
+
     def test_active_candidate_prevents_another_candidate_until_it_expires(self) -> None:
         with TemporaryDirectory() as directory:
             state, first = self.make_state(directory)
