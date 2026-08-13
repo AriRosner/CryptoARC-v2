@@ -241,6 +241,7 @@ class BotState:
         self.creator_history = Counter(token.creator for token in self.storage.load_all_tokens())
         self.current_settings_version_id = self.ensure_settings_version("startup", [])
         self._recover_orphaned_open_tokens()
+        self._reconcile_expired_shadow_captures()
         self.last_bot_tick_at: datetime | None = None
         self.last_ingested_launch_at: datetime | None = None
         self.last_tick_error: str = ""
@@ -8719,6 +8720,9 @@ class BotState:
                     audit.updated_at = now
                     self.storage.save_live_execution_audit(audit)
         return audits
+
+    def _reconcile_expired_shadow_captures(self) -> None:
+        self._normalize_live_audits(self.storage.load_live_execution_audits(None))
 
     def _shadow_capture_window_expired(self, audit: LiveExecutionAudit, now: datetime) -> bool:
         if self.storage.has_active_shadow_tracking_candidate(audit.id):
