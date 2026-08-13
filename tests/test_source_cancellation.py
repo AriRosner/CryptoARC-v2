@@ -218,6 +218,96 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(reconnect_entered.wait(), timeout=1)
 
                 self.assertEqual(status.active_trade_subscriptions, 1)
+                self.assertEqual(status.trade_reconnect_events, 1)
+                self.assertEqual(status.trade_reconnect_attempts, 0)
+                self.assertEqual(status.last_disconnect_stream, "trade")
+                self.assertEqual(status.last_recovered_stream, "trade")
+                self.assertEqual(status.pumpportal_funding_message, "")
+                self.assertIsNotNone(status.last_disconnect_at)
+                self.assertIsNotNone(status.last_recovered_at)
+                assert status.last_disconnect_at is not None
+                assert status.last_recovered_at is not None
+                self.assertGreaterEqual(status.last_recovered_at, status.last_disconnect_at)
+                self.assertEqual(reconnect_websocket.sent[0], {"method": "subscribeTokenTrade", "keys": ["Mint111"]})
+            finally:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
+
+    async def test_launch_stream_retains_recovered_disconnect_evidence(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid?api-key=redacted",
+            max_trade_subscriptions=0,
+        )
+        event_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        status = SourceStatus(source="pumpportal")
+        reconnect_entered = asyncio.Event()
+        recovered_websocket = _StreamingWebSocket([])
+        stream_task: asyncio.Task[None] | None = None
+
+        with (
+            patch(
+                "app.core.sources.websockets.connect",
+                side_effect=[
+                    TimeoutError("network changed"),
+                    _WebSocketContext(recovered_websocket, entered=reconnect_entered),
+                ],
+            ),
+            patch("app.core.sources.asyncio.sleep", return_value=None),
+        ):
+            try:
+                stream_task = asyncio.create_task(
+                    source._run_launch_stream(event_queue, status, subscription_queue)
+                )
+                await asyncio.wait_for(reconnect_entered.wait(), timeout=1)
+
+                self.assertEqual(status.status, "connected")
+                self.assertEqual(status.reconnect_attempts, 0)
+                self.assertEqual(status.reconnect_events, 1)
+                self.assertEqual(status.last_disconnect_stream, "launch")
+                self.assertEqual(status.last_recovered_stream, "launch")
+                self.assertIsNotNone(status.last_disconnect_at)
+                self.assertIsNotNone(status.last_recovered_at)
+                assert status.last_disconnect_at is not None
+                assert status.last_recovered_at is not None
+                self.assertGreaterEqual(status.last_recovered_at, status.last_disconnect_at)
+            finally:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
+
+    async def test_launch_retries_count_one_incident_until_recovery(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid?api-key=redacted",
+            max_trade_subscriptions=0,
+        )
+        event_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        status = SourceStatus(source="pumpportal")
+        reconnect_entered = asyncio.Event()
+        stream_task: asyncio.Task[None] | None = None
+
+        with (
+            patch(
+                "app.core.sources.websockets.connect",
+                side_effect=[
+                    TimeoutError("network unavailable"),
+                    TimeoutError("network unavailable"),
+                    _WebSocketContext(_StreamingWebSocket([]), entered=reconnect_entered),
+                ],
+            ),
+            patch("app.core.sources.asyncio.sleep", return_value=None),
+        ):
+            try:
+                stream_task = asyncio.create_task(
+                    source._run_launch_stream(event_queue, status, subscription_queue)
+                )
+                await asyncio.wait_for(reconnect_entered.wait(), timeout=1)
+
+                self.assertEqual(status.reconnect_events, 1)
+                self.assertEqual(status.reconnect_attempts, 0)
+                self.assertEqual(status.last_recovered_stream, "launch")
             finally:
                 if stream_task is not None:
                     stream_task.cancel()

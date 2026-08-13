@@ -224,6 +224,7 @@ class PumpPortalLaunchSource(LaunchSource):
         subscription_queue: asyncio.Queue[str],
     ) -> None:
         backoff_seconds = 2
+        recovering = False
         while True:
             try:
                 status.status = "connecting"
@@ -237,6 +238,10 @@ class PumpPortalLaunchSource(LaunchSource):
                     status.message = "PumpPortal new-token stream active"
                     status.connected_at = utc_now()
                     status.reconnect_attempts = 0
+                    if recovering:
+                        status.last_recovered_at = utc_now()
+                        status.last_recovered_stream = "launch"
+                        recovering = False
                     backoff_seconds = 2
                     async for message in websocket:
                         if status.first_event_at is None:
@@ -274,6 +279,11 @@ class PumpPortalLaunchSource(LaunchSource):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                status.last_disconnect_at = utc_now()
+                status.last_disconnect_stream = "launch"
+                if not recovering:
+                    status.reconnect_events += 1
+                recovering = True
                 status.status = "reconnecting"
                 status.message = f"PumpPortal reconnecting in {backoff_seconds}s: {exc.__class__.__name__}"
                 status.reconnect_attempts += 1
@@ -313,6 +323,7 @@ class PumpPortalLaunchSource(LaunchSource):
         subscribed_at: dict[str, float] = {}
         active_preferred = ""
         backoff_seconds = 2
+        recovering = False
         while True:
             preferred = self._preferred_trade_mint()
             if preferred is None:
@@ -320,6 +331,8 @@ class PumpPortalLaunchSource(LaunchSource):
             if preferred:
                 first_mint = preferred
                 active_preferred = preferred
+            elif subscribed_mints:
+                first_mint = subscribed_mints[0]
             else:
                 first_mint = await subscription_queue.get()
                 subscription_queue.task_done()
@@ -337,6 +350,12 @@ class PumpPortalLaunchSource(LaunchSource):
                 async with websockets.connect(self.ws_url, ping_interval=20, ping_timeout=20) as websocket:
                     for mint in subscribed_mints:
                         await websocket.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
+                    if recovering:
+                        status.last_recovered_at = utc_now()
+                        status.last_recovered_stream = "trade"
+                        status.trade_reconnect_attempts = 0
+                        status.pumpportal_funding_message = ""
+                        recovering = False
                     backoff_seconds = 2
                     while True:
                         recv_task = asyncio.create_task(websocket.recv())
@@ -434,6 +453,12 @@ class PumpPortalLaunchSource(LaunchSource):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                status.last_disconnect_at = utc_now()
+                status.last_disconnect_stream = "trade"
+                if not recovering:
+                    status.trade_reconnect_events += 1
+                status.trade_reconnect_attempts += 1
+                recovering = True
                 status.pumpportal_funding_message = f"PumpPortal trade stream reconnecting in {backoff_seconds}s: {exc.__class__.__name__}"
                 await asyncio.sleep(backoff_seconds)
                 backoff_seconds = min(30, backoff_seconds * 2)
