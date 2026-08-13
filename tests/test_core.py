@@ -2671,6 +2671,25 @@ class CoreLogicTests(unittest.TestCase):
 
             self.assertTrue(intents)
 
+    def test_shadow_collection_generation_skips_live_readiness_and_stays_blocked(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.score = 99
+            token.status = TokenStatus.PAPER_BOUGHT
+            token.detected_at = utc_now()
+            state.tokens.append(token)
+
+            with patch.object(state, "readiness_status", side_effect=AssertionError("must not load live readiness")), patch.object(
+                state, "_live_execution_blockers", side_effect=AssertionError("must not inspect live execution")
+            ):
+                intents = state.generate_live_intents("WalletShadow", shadow_collection_only=True)
+
+            generated = next(item for item in intents if item["mint"] == token.mint)
+            self.assertTrue(generated["autonomy_blocked"])
+            self.assertIn("shadow collection only", generated["autonomy_blockers"])
+            self.assertEqual(generated["operator_recommendation"], "Shadow evidence collection only; execution is disabled.")
+
     def test_live_audit_snapshot_is_a_pure_persisted_projection(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
