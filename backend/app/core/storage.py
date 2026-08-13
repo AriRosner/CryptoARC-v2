@@ -66,7 +66,13 @@ DATA_SUMMARY_COUNT_TABLES = (
     ("pilot_operator_decisions", "pilot_operator_decisions"),
 )
 DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
-    f"(SELECT COUNT(*) FROM {table}) AS {key}" for key, table in DATA_SUMMARY_COUNT_TABLES
+    (
+        "(SELECT COUNT(*) FROM pending_shadow_audit_captures WHERE status = 'pending') "
+        "AS pending_shadow_audit_captures"
+        if key == "pending_shadow_audit_captures"
+        else f"(SELECT COUNT(*) FROM {table}) AS {key}"
+    )
+    for key, table in DATA_SUMMARY_COUNT_TABLES
 )
 
 
@@ -1756,12 +1762,12 @@ class Storage:
         with self._connect() as connection:
             if audit_id:
                 row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures WHERE audit_id = ?",
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures WHERE audit_id = ? AND status = 'pending'",
                     (audit_id,),
                 ).fetchone()
             else:
                 row = connection.execute(
-                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures"
+                    "SELECT COUNT(*) AS count FROM pending_shadow_audit_captures WHERE status = 'pending'"
                 ).fetchone()
         return int(row["count"] if row else 0)
 

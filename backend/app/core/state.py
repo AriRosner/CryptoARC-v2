@@ -8692,6 +8692,13 @@ class BotState:
     def _normalize_live_audits(self, audits: list[LiveExecutionAudit]) -> list[LiveExecutionAudit]:
         now = utc_now()
         for audit in audits:
+            if (
+                audit.status == "stale"
+                and not audit.transaction_signature
+                and isinstance(audit.quote, dict)
+                and audit.quote.get("shadow_only") is True
+            ):
+                self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=now)
             expires_at = audit.quote.get("expires_at") if isinstance(audit.quote, dict) else None
             if expires_at and audit.status in {"ready", "simulated", "simulation_warning"} and not audit.transaction_signature:
                 try:
