@@ -11,7 +11,7 @@ from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient
 
 from app.auth import AuthManager
-from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown, TokenSignal, TokenStatus, utc_now
+from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown, ShadowTrackingCandidate, TokenSignal, TokenStatus, utc_now
 from app.core.pilot_risk import PilotRiskPolicy
 from app.core.shadow_evaluation import EconomicValidator
 from app.core.sources import LaunchEvent
@@ -415,6 +415,115 @@ class ShadowEvaluationTests(unittest.TestCase):
                 ).fetchone()["status"]
             self.assertEqual(status, "pending")
             self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
+
+    def test_stale_shadow_audit_closes_legacy_pending_capture(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            version_id = state.ensure_settings_version("stale capture reconciliation", [])
+            now = utc_now()
+            audit = LiveExecutionAudit(
+                id="stale-shadow-audit", created_at=now - timedelta(minutes=20), updated_at=now,
+                action="buy", mint="stale-shadow-mint", amount="0.01", status="stale", final_status="stale",
+                signer_mode="browser_wallet", wallet_public_key="StaleWallet",
+                quote={"id": "stale-shadow-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "waiting_for_price",
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": version_id,
+                    "quoted_at": (now - timedelta(minutes=20)).isoformat(),
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, None)
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+            state._normalize_live_audits([audit])
+
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 0)
+            with state.storage._connect() as connection:
+                row = connection.execute(
+                    "SELECT status, closed_at FROM pending_shadow_audit_captures WHERE audit_id = ?",
+                    (audit.id,),
+                ).fetchone()
+            self.assertEqual(row["status"], "closed")
+            self.assertIsNotNone(row["closed_at"])
+
+    def test_recent_direct_stale_shadow_capture_stays_open_for_evaluation_window(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.max_hold_time_seconds = 600
+            version_id = state.ensure_settings_version("direct stale window", ["max_hold_time_seconds"])
+            now = utc_now()
+            audit = LiveExecutionAudit(
+                id="direct-stale-audit", created_at=now - timedelta(minutes=1), updated_at=now,
+                action="buy", mint="direct-stale-mint", amount="0.01", status="stale", final_status="stale",
+                signer_mode="browser_wallet", wallet_public_key="DirectWallet",
+                quote={"id": "direct-stale-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "waiting_for_price",
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": version_id,
+                    "quoted_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, None)
+
+            state._normalize_live_audits([audit])
+
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+    def test_stale_quote_keeps_capture_open_for_active_tracking_candidate(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            version_id = state.ensure_settings_version("active stale quote", [])
+            now = utc_now()
+            audit = LiveExecutionAudit(
+                id="active-stale-audit", created_at=now - timedelta(minutes=1), updated_at=now,
+                action="buy", mint="active-stale-mint", amount="0.01", status="stale", final_status="stale",
+                signer_mode="browser_wallet", wallet_public_key="ActiveWallet",
+                quote={"id": "active-stale-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "waiting_for_price",
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": version_id,
+                    "quoted_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, None)
+            candidate = ShadowTrackingCandidate(
+                candidate_id="active-stale-candidate", intent_id="active-stale-intent",
+                mint=audit.mint, strategy_id=state.settings.strategy_profile,
+                strategy_version=version_id, state="tracking_shadow",
+                selected_at=now - timedelta(minutes=1), deadline_at=now + timedelta(minutes=9),
+                audit_id=audit.id, reason="tracking later paper observation", updated_at=now,
+            )
+            state.storage.save_shadow_tracking_candidate(candidate)
+
+            state._normalize_live_audits([audit])
+
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+    def test_data_summary_counts_only_open_shadow_captures(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            version_id = state.ensure_settings_version("pending summary", [])
+            now = utc_now()
+            for audit_id in ("open-capture", "closed-capture"):
+                audit = LiveExecutionAudit(
+                    id=audit_id, created_at=now, updated_at=now,
+                    action="buy", mint=f"{audit_id}-mint", amount="0.01", status="ready",
+                    signer_mode="browser_wallet", wallet_public_key="SummaryWallet",
+                    quote={"id": f"{audit_id}-quote", "shadow_only": True},
+                    shadow_comparison={
+                        "mode": "dry_run_shadow", "status": "waiting_for_price",
+                        "strategy_id": state.settings.strategy_profile,
+                        "strategy_version": version_id, "quoted_at": now.isoformat(),
+                    },
+                )
+                state.storage.save_shadow_quote_audit_capture(audit, None)
+            state.storage.close_pending_shadow_audit_capture("closed-capture", closed_at=now)
+
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(), 1)
+            self.assertEqual(state.data_summary()["pending_shadow_audit_captures"], 1)
 
     def test_existing_economic_record_closes_pending_capture_on_retry(self) -> None:
         with TemporaryDirectory() as directory:
