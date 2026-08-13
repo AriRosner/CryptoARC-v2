@@ -8126,6 +8126,61 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(report["source_soak"]["match_rate"], 0.7)
             self.assertEqual(report["source_soak"]["comparison_window"]["rate_basis"], "pumpportal_create_coverage")
 
+    def test_source_soak_match_rate_counts_unique_portal_creates(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            now = utc_now()
+            for index in range(100):
+                signature = f"SigUniquePortalCoverage{index:03d}"
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_portal_unique_coverage_{index}",
+                        source="pumpportal",
+                        received_at=now + timedelta(milliseconds=index),
+                        raw_payload={"txType": "create", "signature": signature},
+                        status="normalized",
+                    )
+                )
+                if index < 60:
+                    for duplicate in range(2):
+                        state.storage.save_source_event(
+                            SourceEvent(
+                                id=f"src_direct_unique_coverage_{index}_{duplicate}",
+                                source="solana_logs",
+                                received_at=now + timedelta(milliseconds=100 + index + duplicate),
+                                raw_payload={
+                                    "result": {
+                                        "context": {"slot": 35_000 + index},
+                                        "value": {
+                                            "signature": signature,
+                                            "err": None,
+                                            "logs": ["Program log: Instruction: Create"],
+                                        },
+                                    }
+                                },
+                                status="raw",
+                            )
+                        )
+
+            report = state.solana_logs_verification_report(limit=100)
+
+            self.assertEqual(report["source_soak"]["direct_events"], 120)
+            self.assertEqual(report["source_soak"]["matches"], 60)
+            self.assertEqual(report["source_soak"]["match_rate"], 0.6)
+            self.assertEqual(report["source_soak"]["unmatched_pumpportal"], 40)
+            self.assertEqual(
+                report["source_soak"]["comparison_window"]["matched_pumpportal_create_events"],
+                60,
+            )
+            self.assertEqual(
+                report["source_soak"]["comparison_window"]["pumpportal_create_events"],
+                100,
+            )
+
     def test_source_soak_acceptance_requires_matched_direct_samples(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"

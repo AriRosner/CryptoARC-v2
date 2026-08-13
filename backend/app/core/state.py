@@ -3515,6 +3515,13 @@ class BotState:
             <= comparison_end + comparison_tolerance
         ]
         create_matches = [matched for row in aligned_direct_create_hints if (matched := matched_portal_evidence(row))]
+        portal_create_ids = {str(row["event_id"]) for row in portal_create_rows}
+        matched_portal_create_ids = {
+            str(portal_event_id)
+            for match in create_matches
+            for portal_event_id in match.get("portal_event_ids", [])
+            if str(portal_event_id) in portal_create_ids
+        }
         matched_direct_ids = {str(match["direct_event_id"]) for match in matches}
         matches.extend(match for match in create_matches if str(match["direct_event_id"]) not in matched_direct_ids)
 
@@ -3527,7 +3534,7 @@ class BotState:
             row
             for row in portal_match_rows
             if row["mints"] and str(row["event_id"]) not in matched_portal_ids
-        ][:50]
+        ]
         status = "unknown"
         if not self.solana_wss_endpoint:
             status = "not_configured"
@@ -3588,13 +3595,14 @@ class BotState:
                 "decoded_create_events": len(decoded_create_rows),
                 "matches": len(matches),
                 "create_matches": len(create_matches),
+                "matched_pumpportal_create_events": len(matched_portal_create_ids),
                 "unmatched_direct": len(unmatched_direct),
                 "unmatched_pumpportal": len(unmatched_portal),
                 "conflicts": len(conflicts),
             },
             "matches": matches[:50],
             "unmatched_direct": unmatched_direct[:50],
-            "unmatched_pumpportal": unmatched_portal,
+            "unmatched_pumpportal": unmatched_portal[:50],
             "conflicts": conflicts[:50],
             "failed_direct_events": failed_direct_rows[:50],
             "direct_events": direct_rows[:100],
@@ -3605,9 +3613,9 @@ class BotState:
                 len(portal_rows),
                 len(aligned_direct_create_hints),
                 len(decoded_create_rows),
-                len(create_matches),
+                len(matched_portal_create_ids),
                 len(aligned_direct_create_hints) - len(create_matches),
-                len(unmatched_portal),
+                len(portal_create_rows) - len(matched_portal_create_ids),
                 len(conflicts),
                 match_rate_denominator=len(portal_create_rows),
                 comparison_window={
@@ -3616,6 +3624,8 @@ class BotState:
                     "tolerance_seconds": int(comparison_tolerance.total_seconds()),
                     "excluded_direct_events": len(direct_create_hints) - len(aligned_direct_create_hints),
                     "rate_basis": "pumpportal_create_coverage",
+                    "matched_pumpportal_create_events": len(matched_portal_create_ids),
+                    "pumpportal_create_events": len(portal_create_rows),
                 },
             ),
             "operator_action": "Collect direct logsSubscribe evidence and compare it with PumpPortal before using source verification for live promotion.",
