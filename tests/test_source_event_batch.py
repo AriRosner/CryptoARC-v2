@@ -351,6 +351,48 @@ class SourceEventBatchTests(unittest.TestCase):
 
             self.assertTrue(asyncio.run(run_backlog()))
 
+    def test_fresh_launch_burst_yields_after_each_event(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+
+            async def run_burst() -> int:
+                previous_state = main_app.state
+                previous_queue = main_app.launch_queue
+                queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+                main_app.state = state
+                main_app.launch_queue = queue
+                sentinel_runs = 0
+                sentinel_active = True
+
+                async def sentinel() -> None:
+                    nonlocal sentinel_runs
+                    while sentinel_active:
+                        await asyncio.sleep(0)
+                        sentinel_runs += 1
+
+                try:
+                    for sequence in range(10):
+                        token = self.make_token(f"tok_fresh_{sequence}", f"mint_fresh_{sequence}")
+                        queue.put_nowait(
+                            LaunchEvent(
+                                "pumpportal",
+                                utc_now(),
+                                {"sequence": sequence},
+                                token,
+                            )
+                        )
+                    sentinel_task = asyncio.create_task(sentinel())
+                    await main_app.drain_launch_queue()
+                    sentinel_active = False
+                    await sentinel_task
+                    return sentinel_runs
+                finally:
+                    main_app.clear_launch_queue()
+                    main_app.state = previous_state
+                    main_app.launch_queue = previous_queue
+
+            self.assertGreaterEqual(asyncio.run(run_burst()), 9)
+
 
 if __name__ == "__main__":
     unittest.main()

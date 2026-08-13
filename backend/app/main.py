@@ -895,7 +895,7 @@ async def drain_launch_queue() -> None:
             if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
                 active_tokens_loaded = True
         launch_queue.task_done()
-        if (index + 1) % SOURCE_EVENT_DRAIN_BATCH_SIZE == 0 and index + 1 < drain_limit:
+        if index + 1 < drain_limit:
             await asyncio.sleep(0)
 
 
