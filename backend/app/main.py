@@ -418,6 +418,8 @@ mobile_realtime_sequence = 0
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 SOURCE_EVENT_DRAIN_BATCH_SIZE = 50
 SOURCE_EVENT_DRAIN_MAX_SIZE = 1_000
+SOURCE_EVENT_IO_FAIRNESS_SECONDS = 0.001
+SOURCE_EVENT_IO_FAIRNESS_CADENCE = 5
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
 solana_logs_task: asyncio.Task | None = None
@@ -895,8 +897,8 @@ async def drain_launch_queue() -> None:
             if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
                 active_tokens_loaded = True
         launch_queue.task_done()
-        if index + 1 < drain_limit:
-            await asyncio.sleep(0)
+        if index + 1 < drain_limit and (index + 1) % SOURCE_EVENT_IO_FAIRNESS_CADENCE == 0:
+            await asyncio.sleep(SOURCE_EVENT_IO_FAIRNESS_SECONDS)
 
 
 def clear_launch_queue() -> int:
