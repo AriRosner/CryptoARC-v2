@@ -190,6 +190,26 @@ class SourceEventBatchTests(unittest.TestCase):
         self.assertEqual(main_app.source_event_drain_limit(64), 64)
         self.assertEqual(main_app.source_event_drain_limit(1_200), 1_000)
 
+    def test_launch_expiration_uses_token_detection_time_not_envelope_time(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            previous_state = main_app.state
+            main_app.state = state
+            try:
+                now = utc_now()
+                old = now - timedelta(seconds=state.settings.max_token_age_seconds + 1)
+                fresh_token = self.make_token("tok_fresh_time", "mint_fresh_time")
+                fresh_token.detected_at = now
+                fresh_in_old_envelope = LaunchEvent("pumpportal", old, {}, fresh_token)
+                stale_token = self.make_token("tok_stale_time", "mint_stale_time")
+                stale_token.detected_at = old
+                stale_in_fresh_envelope = LaunchEvent("pumpportal", now, {}, stale_token)
+
+                self.assertFalse(main_app.source_event_is_expired_launch(fresh_in_old_envelope, now))
+                self.assertTrue(main_app.source_event_is_expired_launch(stale_in_fresh_envelope, now))
+            finally:
+                main_app.state = previous_state
+
     def test_drain_clears_a_small_burst_in_one_tick(self) -> None:
         with TemporaryDirectory() as directory:
             state = self.make_state(directory)
@@ -288,6 +308,48 @@ class SourceEventBatchTests(unittest.TestCase):
             stored_ids = {token.id for token in state.storage.load_all_tokens(5000)}
             self.assertNotIn(stale_token.id, stored_ids)
             self.assertIn(fresh_token.id, stored_ids)
+
+    def test_large_stale_launch_discard_yields_to_other_event_loop_work(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+
+            async def run_backlog() -> bool:
+                previous_state = main_app.state
+                previous_queue = main_app.launch_queue
+                queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+                main_app.state = state
+                main_app.launch_queue = queue
+                yielded = False
+
+                async def sentinel() -> None:
+                    nonlocal yielded
+                    await asyncio.sleep(0)
+                    yielded = True
+
+                try:
+                    stale_at = utc_now() - timedelta(seconds=state.settings.max_token_age_seconds + 1)
+                    for sequence in range(1_000):
+                        token = self.make_token(f"tok_stale_{sequence}", f"mint_stale_{sequence}")
+                        token.detected_at = stale_at
+                        queue.put_nowait(
+                            LaunchEvent(
+                                "pumpportal",
+                                stale_at,
+                                {"sequence": sequence},
+                                token,
+                            )
+                        )
+                    sentinel_task = asyncio.create_task(sentinel())
+                    await main_app.drain_launch_queue()
+                    observed_before_waiting = yielded
+                    await sentinel_task
+                    return observed_before_waiting
+                finally:
+                    main_app.clear_launch_queue()
+                    main_app.state = previous_state
+                    main_app.launch_queue = previous_queue
+
+            self.assertTrue(asyncio.run(run_backlog()))
 
 
 if __name__ == "__main__":

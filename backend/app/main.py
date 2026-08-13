@@ -873,7 +873,7 @@ def source_event_is_expired_launch(event: LaunchEvent, now: datetime) -> bool:
     if event.kind != "launch" or event.token is None:
         return False
     cutoff = now - timedelta(seconds=max(1, int(state.settings.max_token_age_seconds)))
-    return event.received_at < cutoff
+    return event.token.detected_at < cutoff
 
 
 async def drain_launch_queue() -> None:
@@ -890,12 +890,10 @@ async def drain_launch_queue() -> None:
             clear_launch_queue()
             return
         event = await launch_queue.get()
-        if source_event_is_expired_launch(event, utc_now()):
-            launch_queue.task_done()
-            continue
-        state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
-        if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
-            active_tokens_loaded = True
+        if not source_event_is_expired_launch(event, utc_now()):
+            state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
+            if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
+                active_tokens_loaded = True
         launch_queue.task_done()
         if (index + 1) % SOURCE_EVENT_DRAIN_BATCH_SIZE == 0 and index + 1 < drain_limit:
             await asyncio.sleep(0)
