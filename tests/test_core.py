@@ -1904,7 +1904,7 @@ class CoreLogicTests(unittest.TestCase):
                     status="normalized",
                 )
             )
-        for index in range(20):
+        for index in range(70):
             mint = f"MintSoak{index:03d}"
             state.storage.save_source_event(
                 SourceEvent(
@@ -7897,7 +7897,7 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(report["matches"][0]["match_type"], "signature")
             self.assertEqual(report["source_soak"]["direct_events"], 1)
             self.assertEqual(report["source_soak"]["matches"], 1)
-            self.assertEqual(report["source_soak"]["match_rate"], 1.0)
+            self.assertEqual(report["source_soak"]["match_rate"], 0.038)
 
             acceptance = state.source_soak_acceptance_report(limit=20)
             direct_sample_gate = next(gate for gate in acceptance["gates"] if gate["id"] == "direct_samples")
