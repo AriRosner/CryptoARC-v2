@@ -3367,16 +3367,42 @@ class BotState:
         create_limit = max(500, limit)
         direct_sources = ("solana_logs", "solana_logs_subscribe", "solana")
         direct_events = self.storage.load_source_events_by_source(direct_sources, limit)
-        direct_create_events = self.storage.load_source_events_by_source_payload_contains(
-            direct_sources,
-            "Instruction: Create",
-            create_limit,
-        )
         portal_events = self.storage.load_source_events_by_source(("pumpportal",), limit)
         portal_create_events = self.storage.load_source_events_by_source_payload_contains(
             ("pumpportal",),
             '"txType": "create"',
             create_limit,
+        )
+        comparison_tolerance = timedelta(seconds=5)
+        comparison_start = min(
+            (event.received_at for event in portal_create_events),
+            default=None,
+        )
+        comparison_end = max(
+            (event.received_at for event in portal_create_events),
+            default=None,
+        )
+        recent_direct_create_events = self.storage.load_source_events_by_source_payload_contains(
+            direct_sources,
+            "Instruction: Create",
+            create_limit,
+        )
+        window_direct_create_events = (
+            self.storage.load_source_events_by_source_payload_contains_between(
+                direct_sources,
+                "Instruction: Create",
+                comparison_start - comparison_tolerance,
+                comparison_end + comparison_tolerance,
+                create_limit,
+            )
+            if comparison_start is not None and comparison_end is not None
+            else []
+        )
+        direct_create_events = list(
+            {
+                event.id: event
+                for event in [*recent_direct_create_events, *window_direct_create_events]
+            }.values()
         )
         all_direct_rows = [self._solana_log_evidence(event) for event in direct_events]
         direct_rows = [row for row in all_direct_rows if not row.get("err")]
@@ -3448,15 +3474,6 @@ class BotState:
             row = self._solana_log_evidence(event)
             if not row.get("err") and row.get("create_hint"):
                 direct_create_hints.append(row)
-        comparison_start = min(
-            (self._parse_iso_datetime(str(row["received_at"])) for row in portal_create_rows),
-            default=None,
-        )
-        comparison_end = max(
-            (self._parse_iso_datetime(str(row["received_at"])) for row in portal_create_rows),
-            default=None,
-        )
-        comparison_tolerance = timedelta(seconds=5)
         aligned_direct_create_hints = [
             row
             for row in direct_create_hints
