@@ -276,6 +276,11 @@ class PumpPortalLaunchSource(LaunchSource):
                         status.launch_events_seen += 1
                         status.normalized_events += 1
                         status.last_event_at = utc_now()
+                    status.last_disconnect_at = utc_now()
+                    status.last_disconnect_stream = "launch"
+                    if not recovering:
+                        status.reconnect_events += 1
+                    recovering = True
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -105,6 +105,14 @@ class _StreamingWebSocket:
             raise AssertionError("unreachable")
 
 
+class _ClosingStreamingWebSocket(_StreamingWebSocket):
+    async def __anext__(self) -> str:
+        try:
+            return next(self.messages)
+        except StopIteration:
+            raise StopAsyncIteration
+
+
 class _RuntimeState:
     def __init__(self) -> None:
         self.status = SimpleNamespace(value="running")
@@ -272,6 +280,40 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 assert status.last_disconnect_at is not None
                 assert status.last_recovered_at is not None
                 self.assertGreaterEqual(status.last_recovered_at, status.last_disconnect_at)
+            finally:
+                if stream_task is not None:
+                    stream_task.cancel()
+                    await asyncio.gather(stream_task, return_exceptions=True)
+
+    async def test_launch_stream_records_clean_websocket_close_before_recovery(self) -> None:
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid?api-key=redacted",
+            max_trade_subscriptions=0,
+        )
+        event_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        status = SourceStatus(source="pumpportal")
+        reconnect_entered = asyncio.Event()
+        stream_task: asyncio.Task[None] | None = None
+
+        with patch(
+            "app.core.sources.websockets.connect",
+            side_effect=[
+                _WebSocketContext(_ClosingStreamingWebSocket([])),
+                _WebSocketContext(_StreamingWebSocket([]), entered=reconnect_entered),
+            ],
+        ):
+            try:
+                stream_task = asyncio.create_task(
+                    source._run_launch_stream(event_queue, status, subscription_queue)
+                )
+                await asyncio.wait_for(reconnect_entered.wait(), timeout=1)
+
+                self.assertEqual(status.reconnect_events, 1)
+                self.assertEqual(status.last_disconnect_stream, "launch")
+                self.assertEqual(status.last_recovered_stream, "launch")
+                self.assertIsNotNone(status.last_disconnect_at)
+                self.assertIsNotNone(status.last_recovered_at)
             finally:
                 if stream_task is not None:
                     stream_task.cancel()
