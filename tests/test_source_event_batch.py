@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest import mock
 from time import monotonic
 from datetime import timedelta
 from pathlib import Path
@@ -95,6 +96,69 @@ class SourceEventBatchTests(unittest.TestCase):
             )
 
             self.assertEqual(len(calls), 1)
+
+    def test_launch_batch_defers_repeated_stats_recalculation(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            events = [
+                LaunchEvent(
+                    source="pumpportal",
+                    received_at=utc_now(),
+                    raw_payload={"sequence": sequence, "mint": f"mint_{sequence}", "txType": "create"},
+                    token=self.make_token(f"tok_{sequence}", f"mint_{sequence}"),
+                )
+                for sequence in range(3)
+            ]
+
+            with mock.patch.object(state, "recalculate_stats") as recalculate:
+                asyncio.run(self.drain(state, events))
+
+            recalculate.assert_not_called()
+
+    def test_direct_launch_ingest_still_recalculates_stats(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+
+            with mock.patch.object(state, "recalculate_stats") as recalculate:
+                state.ingest_launch(self.make_token("tok_direct", "mint_direct"))
+
+            recalculate.assert_called_once_with()
+
+    def test_direct_solana_launch_batch_defers_stats_recalculation(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            state.settings.direct_solana_paper_enabled = True
+            state.settings.direct_solana_min_confidence = 0.65
+            event = LaunchEvent(
+                source="solana_logs",
+                received_at=utc_now(),
+                raw_payload={
+                    "method": "logsNotification",
+                    "params": {
+                        "result": {
+                            "context": {"slot": 42},
+                            "value": {
+                                "signature": "SigDirectBatch111",
+                                "err": None,
+                                "logs": [
+                                    "Program log: Instruction: Create",
+                                    "Program log: mint MintDirectBatch111",
+                                    "Program log: name=Direct Batch symbol=DIRB uri=https://example.com/direct.json creator=CreatorDirectBatch111 bondingCurveKey=CurveDirectBatch111",
+                                ],
+                            },
+                        }
+                    },
+                },
+                token=None,
+                message="Solana logsSubscribe notification",
+                kind="verification",
+            )
+
+            with mock.patch.object(state, "recalculate_stats") as recalculate:
+                asyncio.run(self.drain(state, [event]))
+
+            recalculate.assert_not_called()
+            self.assertEqual(state.storage.count_tokens(), 1)
 
     def test_mixed_batch_preserves_event_order_evidence_and_observed_price_update(self) -> None:
         with TemporaryDirectory() as directory:

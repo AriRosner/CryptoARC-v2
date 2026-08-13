@@ -893,7 +893,11 @@ async def drain_launch_queue() -> None:
             return
         event = await launch_queue.get()
         if not source_event_is_expired_launch(event, utc_now()):
-            state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
+            state.ingest_source_event(
+                event,
+                active_tokens_loaded=active_tokens_loaded,
+                defer_stats=True,
+            )
             if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
                 active_tokens_loaded = True
         launch_queue.task_done()

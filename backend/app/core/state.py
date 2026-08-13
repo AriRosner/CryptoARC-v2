@@ -2278,7 +2278,13 @@ class BotState:
         self.storage.save_source_event(event)
         return event
 
-    def ingest_source_event(self, event: LaunchEvent, *, active_tokens_loaded: bool = False) -> None:
+    def ingest_source_event(
+        self,
+        event: LaunchEvent,
+        *,
+        active_tokens_loaded: bool = False,
+        defer_stats: bool = False,
+    ) -> None:
         if event.kind == "trade":
             if event.source == "pumpportal" and self.source_status.pumpportal_funding_blocked:
                 self.source_status.pumpportal_funding_blocked = False
@@ -2302,7 +2308,7 @@ class BotState:
             token = self._direct_solana_token_from_event(event) if event.kind == "verification" else None
             self.record_source_event(event.source, event.raw_payload, token, event.message, status="status" if event.kind == "verification_status" else ("normalized" if token else "raw"))
             if token:
-                self.ingest_launch(token)
+                self.ingest_launch(token, defer_stats=defer_stats)
             return
         self._handle_source_status_message(event)
         event_status = None
@@ -2313,7 +2319,7 @@ class BotState:
                 event_status = "status"
         self.record_source_event(event.source, event.raw_payload, event.token, event.message, status=event_status)
         if event.token:
-            self.ingest_launch(event.token)
+            self.ingest_launch(event.token, defer_stats=defer_stats)
 
     def _handle_source_status_message(self, event: LaunchEvent) -> None:
         if event.source != "pumpportal" or not self._is_pumpportal_funding_message(event.raw_payload, event.message):
@@ -2789,7 +2795,7 @@ class BotState:
             "operator_action": "Review recovered paper positions before the next paper run." if closed_tokens else "No recovery action was needed.",
         }
 
-    def ingest_launch(self, token: TokenSignal) -> None:
+    def ingest_launch(self, token: TokenSignal, *, defer_stats: bool = False) -> None:
         if self.status != BotStatus.RUNNING or not self.settings.detect_new_tokens:
             return
 
@@ -2807,7 +2813,8 @@ class BotState:
             self.tokens.appendleft(token)
             self.creator_history[token.creator] += 1
             self.storage.save_token(token)
-            self.recalculate_stats()
+            if not defer_stats:
+                self.recalculate_stats()
             return
         decision = self.strategy.evaluate(token, self.settings, self.stats, open_positions)
         token.decision_log.extend(decision.log)
@@ -2836,7 +2843,8 @@ class BotState:
         self.tokens.appendleft(token)
         self.creator_history[token.creator] += 1
         self.storage.save_token(token)
-        self.recalculate_stats()
+        if not defer_stats:
+            self.recalculate_stats()
 
     def enrich_token_intelligence(self, token: TokenSignal) -> None:
         previous_launches = self.creator_history[token.creator]
