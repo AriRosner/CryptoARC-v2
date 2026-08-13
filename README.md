@@ -1,6 +1,6 @@
 # CryptoARC v2
 
-![Source lines](https://img.shields.io/badge/source%20lines-96.2k-blue)
+![Source lines](https://img.shields.io/badge/source%20lines-96.3k-blue)
 
 CryptoARC v2 is a local-first FastAPI + React dashboard for Pump.fun and PumpPortal monitoring, research, backtesting, paper trading, and carefully gated localhost live execution.
 
