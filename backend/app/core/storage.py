@@ -71,7 +71,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 26
+    SCHEMA_VERSION = 27
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -323,6 +323,7 @@ class Storage:
             (24, "024_shadow_market_evidence_bindings", "append-only shadow audit bindings to accepted market observations", self._migration_024_shadow_market_evidence_bindings),
             (25, "025_pending_shadow_audit_captures", "indexed pending shadow audit capture registry", self._migration_025_pending_shadow_audit_captures),
             (26, "026_shadow_tracking_candidates", "restart-safe shadow candidate evidence lifecycle", self._migration_026_shadow_tracking_candidates),
+            (27, "027_source_event_query_indexes", "source soak query indexes", self._migration_027_source_event_query_indexes),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -462,6 +463,16 @@ class Storage:
         ]
         for statement in statements:
             connection.execute(statement)
+
+    def _migration_027_source_event_query_indexes(self, connection: sqlite3.Connection) -> None:
+        source_events_exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'source_events'"
+        ).fetchone()
+        if source_events_exists is None:
+            return
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_source_events_source_received_at ON source_events(source, received_at DESC)"
+        )
 
     def _migration_006_backup_restore_history(self, connection: sqlite3.Connection) -> None:
         connection.execute(

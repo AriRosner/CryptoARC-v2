@@ -542,6 +542,34 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(schema["current_version"], storage.SCHEMA_VERSION)
             self.assertTrue(schema["migrations"])
 
+    def test_source_event_queries_have_source_time_index(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "test.db"))
+
+            with storage._connect() as connection:
+                indexes = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA index_list(source_events)").fetchall()
+                }
+                plan = connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT payload FROM source_events WHERE source = ? ORDER BY received_at DESC LIMIT ?",
+                    ("pumpportal", 100),
+                ).fetchall()
+                payload_plan = connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT payload FROM source_events WHERE source = ? AND instr(payload, ?) > 0 ORDER BY received_at DESC LIMIT ?",
+                    ("pumpportal", '"txType": "create"', 100),
+                ).fetchall()
+
+            self.assertIn("idx_source_events_source_received_at", indexes)
+            self.assertTrue(
+                any("idx_source_events_source_received_at" in str(row["detail"]) for row in plan),
+                plan,
+            )
+            self.assertTrue(
+                any("idx_source_events_source_received_at" in str(row["detail"]) for row in payload_plan),
+                payload_plan,
+            )
+
     def test_storage_upgrades_legacy_schema_marker(self) -> None:
         with TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.db"
