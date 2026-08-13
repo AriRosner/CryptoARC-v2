@@ -3365,6 +3365,7 @@ class BotState:
     def solana_logs_verification_report(self, limit: int | None = None) -> dict[str, object]:
         limit = max(1, min(5000, int(limit or 500)))
         create_limit = max(500, limit)
+        comparison_direct_limit = max(5000, create_limit * 10)
         direct_sources = ("solana_logs", "solana_logs_subscribe", "solana")
         direct_events = self.storage.load_source_events_by_source(direct_sources, limit)
         portal_events = self.storage.load_source_events_by_source(("pumpportal",), limit)
@@ -3393,7 +3394,7 @@ class BotState:
                 "Instruction: Create",
                 comparison_start - comparison_tolerance,
                 comparison_end + comparison_tolerance,
-                create_limit,
+                comparison_direct_limit,
             )
             if comparison_start is not None and comparison_end is not None
             else []
@@ -3578,11 +3579,13 @@ class BotState:
                 len(aligned_direct_create_hints) - len(create_matches),
                 len(unmatched_portal),
                 len(conflicts),
+                match_rate_denominator=len(portal_create_rows),
                 comparison_window={
                     "start": comparison_start.isoformat() if comparison_start else None,
                     "end": comparison_end.isoformat() if comparison_end else None,
                     "tolerance_seconds": int(comparison_tolerance.total_seconds()),
                     "excluded_direct_events": len(direct_create_hints) - len(aligned_direct_create_hints),
+                    "rate_basis": "pumpportal_create_coverage",
                 },
             ),
             "operator_action": "Collect direct logsSubscribe evidence and compare it with PumpPortal before using source verification for live promotion.",
@@ -3819,9 +3822,11 @@ class BotState:
         unmatched_direct: int,
         unmatched_pumpportal: int,
         conflicts: int,
+        match_rate_denominator: int | None = None,
         comparison_window: dict[str, object] | None = None,
     ) -> dict[str, object]:
-        match_rate = round(matches / max(1, direct_events), 3) if direct_events else 0.0
+        rate_denominator = direct_events if match_rate_denominator is None else match_rate_denominator
+        match_rate = round(matches / max(1, rate_denominator), 3) if rate_denominator else 0.0
         decoded_rate = round(decoded_create_events / max(1, direct_create_hints), 3) if direct_create_hints else 0.0
         return {
             "direct_events": direct_events,

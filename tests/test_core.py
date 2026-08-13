@@ -8036,6 +8036,70 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(report["source_soak"]["matches"], 20)
             self.assertEqual(report["source_soak"]["match_rate"], 1.0)
 
+    def test_source_soak_match_rate_measures_portal_create_coverage(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(
+                database_path=str(Path(directory) / "test.db"),
+                default_solana_wss_endpoint="wss://example.invalid",
+                default_solana_logs_mentions_address="PumpFunProgram111",
+            )
+            now = utc_now()
+            for index in range(100):
+                signature = f"SigPortalCoverage{index:03d}"
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_portal_coverage_{index}",
+                        source="pumpportal",
+                        received_at=now + timedelta(milliseconds=index),
+                        raw_payload={"txType": "create", "mint": f"MintPortalCoverage{index:03d}", "signature": signature},
+                        status="normalized",
+                    )
+                )
+                if index < 70:
+                    state.storage.save_source_event(
+                        SourceEvent(
+                            id=f"src_direct_coverage_match_{index}",
+                            source="solana_logs",
+                            received_at=now + timedelta(milliseconds=100 + index),
+                            raw_payload={
+                                "result": {
+                                    "context": {"slot": 30_000 + index},
+                                    "value": {
+                                        "signature": signature,
+                                        "err": None,
+                                        "logs": ["Program log: Instruction: Create"],
+                                    },
+                                }
+                            },
+                            status="raw",
+                        )
+                    )
+            for index in range(600):
+                state.storage.save_source_event(
+                    SourceEvent(
+                        id=f"src_direct_coverage_unrelated_{index}",
+                        source="solana_logs",
+                        received_at=now + timedelta(milliseconds=200 + index),
+                        raw_payload={
+                            "result": {
+                                "context": {"slot": 40_000 + index},
+                                "value": {
+                                    "signature": f"SigUnrelatedCoverage{index:03d}",
+                                    "err": None,
+                                    "logs": ["Program log: Instruction: Create"],
+                                },
+                            }
+                        },
+                        status="raw",
+                    )
+                )
+
+            report = state.solana_logs_verification_report(limit=100)
+
+            self.assertEqual(report["source_soak"]["matches"], 70)
+            self.assertEqual(report["source_soak"]["match_rate"], 0.7)
+            self.assertEqual(report["source_soak"]["comparison_window"]["rate_basis"], "pumpportal_create_coverage")
+
     def test_source_soak_acceptance_requires_matched_direct_samples(self) -> None:
         with TemporaryDirectory() as directory:
             database_path = Path(directory) / "test.db"
@@ -8061,7 +8125,7 @@ class CoreLogicTests(unittest.TestCase):
                         status="normalized",
                     )
                 )
-            for index in range(20):
+            for index in range(70):
                 mint = f"MintSoak{index:03d}"
                 state.storage.save_source_event(
                     SourceEvent(
@@ -8095,8 +8159,8 @@ class CoreLogicTests(unittest.TestCase):
             self.assertEqual(report["status"], "ready")
             self.assertTrue(report["ready"])
             self.assertTrue(report["hard_required"])
-            self.assertEqual(report["summary"]["matches"], 20)
-            self.assertEqual(report["summary"]["match_rate"], 1.0)
+            self.assertEqual(report["summary"]["matches"], 70)
+            self.assertEqual(report["summary"]["match_rate"], 0.7)
             self.assertEqual(report["summary"]["decoded_create_rate"], 1.0)
             self.assertEqual(gate_status["direct_matches"], "pass")
             self.assertEqual(gate_status["decoded_coverage"], "pass")
