@@ -124,6 +124,85 @@ class SourceEventBatchTests(unittest.TestCase):
 
             recalculate.assert_called_once_with()
 
+    def test_batch_open_count_preserves_lifecycle_fallback(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            recovery = self.make_token("tok_recovery", "mint_recovery", status=TokenStatus.SELLING)
+            recovery.opened_at = utc_now()
+            recovery.closed_at = None
+            recovery.amount_sol = 0.1
+            state.storage.save_token(recovery)
+
+            self.assertEqual(len(state._load_open_storage_tokens()), 1)
+
+    def test_batch_storage_count_remains_authoritative_after_more_than_deque_capacity(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            existing = self.make_token("tok_open", "mint_open", status=TokenStatus.MONITORING)
+            existing.opened_at = utc_now()
+            existing.amount_sol = 0.1
+            state.storage.save_token(existing)
+            for sequence in range(100):
+                skipped = self.make_token(f"tok_skipped_{sequence}", f"mint_skipped_{sequence}", status=TokenStatus.SKIPPED)
+                state.storage.save_token(skipped)
+
+            open_ids = {token.id for token in state._load_open_storage_tokens()}
+            self.assertEqual(open_ids, {existing.id})
+
+    def test_long_launch_batch_keeps_existing_open_position_in_strategy_count(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            existing = self.make_token("tok_open", "mint_open", status=TokenStatus.MONITORING)
+            existing.opened_at = utc_now()
+            existing.amount_sol = 0.1
+            state.storage.save_token(existing)
+            events = [
+                LaunchEvent(
+                    source="pumpportal",
+                    received_at=utc_now(),
+                    raw_payload={"sequence": sequence, "mint": f"mint_{sequence}", "txType": "create"},
+                    token=self.make_token(f"tok_{sequence}", f"mint_{sequence}"),
+                )
+                for sequence in range(100)
+            ]
+            observed_open_counts: list[int] = []
+            original_evaluate = state.strategy.evaluate
+
+            def capture_count(token, settings, stats, open_positions):
+                observed_open_counts.append(open_positions)
+                return original_evaluate(token, settings, stats, open_positions)
+
+            with mock.patch.object(state.strategy, "evaluate", side_effect=capture_count):
+                asyncio.run(self.drain(state, events))
+
+            self.assertEqual(len(observed_open_counts), 100)
+            self.assertTrue(all(count >= 1 for count in observed_open_counts))
+
+    def test_long_launch_batch_keeps_open_creator_in_same_creator_guard(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+            state.settings.max_same_creator_buys_enabled = True
+            state.settings.max_same_creator_buys = 1
+            existing = self.make_token("tok_creator_open", "mint_creator_open", status=TokenStatus.MONITORING)
+            existing.creator = "creator_guarded"
+            existing.opened_at = utc_now()
+            existing.amount_sol = 0.1
+            state.storage.save_token(existing)
+            events = []
+            for sequence in range(100):
+                token = self.make_token(f"tok_other_{sequence}", f"mint_other_{sequence}")
+                token.creator = f"creator_other_{sequence}"
+                events.append(LaunchEvent("pumpportal", utc_now(), {"sequence": sequence}, token))
+            guarded = self.make_token("tok_guarded_new", "mint_guarded_new")
+            guarded.creator = existing.creator
+            events.append(LaunchEvent("pumpportal", utc_now(), {"sequence": 101}, guarded))
+
+            asyncio.run(self.drain(state, events))
+
+            persisted = next(token for token in state.storage.load_all_tokens(5000) if token.id == guarded.id)
+            self.assertEqual(persisted.status, TokenStatus.SKIPPED)
+            self.assertIn("same creator buy cap reached", persisted.reason)
+
     def test_direct_solana_launch_batch_defers_stats_recalculation(self) -> None:
         with TemporaryDirectory() as directory:
             state = self.make_state(directory)

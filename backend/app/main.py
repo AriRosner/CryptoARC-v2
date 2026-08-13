@@ -885,6 +885,8 @@ async def drain_launch_queue() -> None:
 
     drain_limit = source_event_drain_limit(launch_queue.qsize())
     active_tokens_loaded = False
+    batch_open_token_ids: set[str] | None = None
+    batch_open_creator_counts: dict[str, int] | None = None
     for index in range(drain_limit):
         if launch_queue.empty():
             break
@@ -893,10 +895,24 @@ async def drain_launch_queue() -> None:
             return
         event = await launch_queue.get()
         if not source_event_is_expired_launch(event, utc_now()):
+            needs_launch_context = (
+                (event.kind == "launch" and event.token is not None)
+                or (event.kind == "verification" and state.settings.direct_solana_paper_enabled)
+            )
+            if batch_open_token_ids is None and needs_launch_context:
+                state._ensure_active_tokens_loaded()
+                active_tokens_loaded = True
+                open_tokens = state._load_open_storage_tokens()
+                batch_open_token_ids = {token.id for token in open_tokens}
+                batch_open_creator_counts = {}
+                for token in open_tokens:
+                    batch_open_creator_counts[token.creator] = batch_open_creator_counts.get(token.creator, 0) + 1
             state.ingest_source_event(
                 event,
                 active_tokens_loaded=active_tokens_loaded,
                 defer_stats=True,
+                batch_open_token_ids=batch_open_token_ids,
+                batch_open_creator_counts=batch_open_creator_counts,
             )
             if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
                 active_tokens_loaded = True
