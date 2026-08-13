@@ -2624,6 +2624,34 @@ class BotState:
             "cap_respected": self.source_status.active_trade_subscriptions <= cap,
         }
 
+    def shadow_evidence_funnel_status(self, now: datetime | None = None) -> dict[str, object]:
+        current = now or utc_now()
+        cap = max(0, int(self.settings.max_trade_subscriptions))
+        active = len(self.storage.load_shadow_tracking_candidates(active_only=True))
+        windows = {
+            f"{hours}h": self.storage.shadow_candidate_funnel(now=current, window_hours=hours)
+            for hours in (1, 4, 12)
+        }
+        conditions: list[str] = []
+        if active > cap:
+            conditions.append("candidate_capacity_exceeded")
+        if any(int(window.get("overdue_pending_captures") or 0) > 0 for window in windows.values()):
+            conditions.append("overdue_pending_capture")
+        if any(
+            int(window.get("terminal_attempts") or 0) >= 20
+            and float(window.get("completion_rate") or 0.0) < 0.02
+            for window in windows.values()
+        ):
+            conditions.append("poor_candidate_completion")
+        return {
+            "generated_at": current.isoformat(),
+            "active_candidates": active,
+            "configured_subscription_cap": cap,
+            "excess_active_candidates": max(0, active - cap),
+            "conditions": conditions,
+            "windows": windows,
+        }
+
     def _is_pumpportal_ignored_non_launch(self, payload: dict[str, object]) -> bool:
         mint = str(payload.get("mint") or payload.get("tokenMint") or payload.get("token") or payload.get("ca") or "").strip()
         return mint in PUMPPORTAL_NON_LAUNCH_MINTS

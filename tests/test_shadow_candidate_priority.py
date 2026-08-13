@@ -91,6 +91,55 @@ class ShadowCandidatePriorityStorageTests(unittest.TestCase):
 
             self.assertEqual([item.candidate_id for item in active], [tracking.candidate_id, waiting.candidate_id])
 
+    def test_shadow_candidate_funnel_reports_conversion_and_overdue_capture(self) -> None:
+        with TemporaryDirectory() as directory:
+            storage = Storage(str(Path(directory) / "candidate.db"))
+            now = NOW + timedelta(hours=1)
+            rows = (
+                ShadowTrackingCandidate(
+                    candidate_id="candidate_complete", intent_id="intent_complete", mint="MintComplete",
+                    strategy_id="balanced", strategy_version="set_current", selected_at=NOW,
+                    deadline_at=NOW + timedelta(minutes=10), state="complete", audit_id="audit_complete",
+                    reason="economic shadow comparison persisted", updated_at=NOW + timedelta(minutes=8),
+                ),
+                ShadowTrackingCandidate(
+                    candidate_id="candidate_entry", intent_id="intent_entry", mint="MintEntry",
+                    strategy_id="balanced", strategy_version="set_current", selected_at=NOW,
+                    deadline_at=NOW + timedelta(minutes=5), state="expired", audit_id="",
+                    reason="missing entry evidence before deadline", updated_at=NOW + timedelta(minutes=5),
+                ),
+                ShadowTrackingCandidate(
+                    candidate_id="candidate_exit", intent_id="intent_exit", mint="MintExit",
+                    strategy_id="balanced", strategy_version="set_current", selected_at=NOW,
+                    deadline_at=NOW + timedelta(minutes=10), state="expired", audit_id="audit_exit",
+                    reason="missing exit evidence before deadline", updated_at=NOW + timedelta(minutes=10),
+                ),
+                ShadowTrackingCandidate(
+                    candidate_id="candidate_active", intent_id="intent_active", mint="MintActive",
+                    strategy_id="balanced", strategy_version="set_current", selected_at=now - timedelta(minutes=1),
+                    deadline_at=now + timedelta(minutes=4), state="awaiting_entry", updated_at=now - timedelta(minutes=1),
+                ),
+            )
+            for item in rows:
+                storage.save_shadow_tracking_candidate(item)
+            storage.save_pending_shadow_audit_capture(
+                audit_id="audit_overdue", mint="MintOverdue", strategy_id="balanced",
+                strategy_version="set_current", quoted_at=NOW,
+            )
+
+            funnel = storage.shadow_candidate_funnel(now=now, window_hours=4)
+
+            self.assertEqual(funnel["attempts"], 4)
+            self.assertEqual(funnel["terminal_attempts"], 3)
+            self.assertEqual(funnel["completed"], 1)
+            self.assertEqual(funnel["missing_entry"], 1)
+            self.assertEqual(funnel["missing_exit"], 1)
+            self.assertEqual(funnel["entry_conversion_rate"], 2 / 3)
+            self.assertEqual(funnel["completion_rate"], 1 / 3)
+            self.assertEqual(funnel["active"], 1)
+            self.assertEqual(funnel["overdue_pending_captures"], 1)
+            self.assertEqual(funnel["latest_completed_at"], (NOW + timedelta(minutes=8)).isoformat())
+
 
 class ShadowCandidatePriorityStateTests(unittest.TestCase):
     def make_state(self, directory: str) -> tuple[BotState, TokenSignal]:
@@ -305,6 +354,36 @@ class ShadowCandidatePriorityStateTests(unittest.TestCase):
             self.assertNotIn("wallet", rendered)
             self.assertNotIn("api-key", rendered)
             self.assertNotIn(token.mint.lower(), rendered)
+
+    def test_shadow_evidence_funnel_flags_cap_excess_and_poor_conversion(self) -> None:
+        with TemporaryDirectory() as directory:
+            state, _token = self.make_state(directory)
+            state.settings.max_trade_subscriptions = 1
+            now = utc_now()
+            for index in range(20):
+                candidate = ShadowTrackingCandidate(
+                    candidate_id=f"expired_{index}", intent_id=f"expired_intent_{index}", mint=f"Mint{index}",
+                    strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                    selected_at=now - timedelta(minutes=30), deadline_at=now - timedelta(minutes=25),
+                    state="expired", reason="missing entry evidence before deadline", updated_at=now - timedelta(minutes=25),
+                )
+                state.storage.save_shadow_tracking_candidate(candidate)
+            for index in range(2):
+                candidate = ShadowTrackingCandidate(
+                    candidate_id=f"active_{index}", intent_id=f"active_intent_{index}", mint=f"ActiveMint{index}",
+                    strategy_id=state.settings.strategy_profile, strategy_version=state.current_settings_version_id,
+                    selected_at=now - timedelta(minutes=1), deadline_at=now + timedelta(minutes=4),
+                )
+                state.storage.save_shadow_tracking_candidate(candidate)
+
+            funnel = state.shadow_evidence_funnel_status(now)
+
+            self.assertEqual(funnel["active_candidates"], 2)
+            self.assertEqual(funnel["configured_subscription_cap"], 1)
+            self.assertEqual(funnel["excess_active_candidates"], 1)
+            self.assertIn("candidate_capacity_exceeded", funnel["conditions"])
+            self.assertIn("poor_candidate_completion", funnel["conditions"])
+            self.assertEqual(funnel["windows"]["1h"]["terminal_attempts"], 20)
 
     def test_oldest_active_candidate_keeps_subscription_ownership(self) -> None:
         with TemporaryDirectory() as directory:
