@@ -1832,6 +1832,62 @@ class Storage:
             ).fetchall()
         return [self._shadow_tracking_candidate_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def shadow_candidate_funnel(self, *, now: datetime, window_hours: int) -> dict[str, object]:
+        bounded_hours = max(1, min(24 * 30, int(window_hours)))
+        cutoff = now - timedelta(hours=bounded_hours)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS attempts,
+                    SUM(CASE WHEN state IN ('complete', 'expired') THEN 1 ELSE 0 END) AS terminal_attempts,
+                    SUM(CASE WHEN state = 'complete' THEN 1 ELSE 0 END) AS completed,
+                    SUM(CASE WHEN state = 'expired' AND reason LIKE '%entry%' THEN 1 ELSE 0 END) AS missing_entry,
+                    SUM(CASE WHEN state = 'expired' AND reason LIKE '%exit%' THEN 1 ELSE 0 END) AS missing_exit,
+                    SUM(CASE WHEN state IN ('awaiting_entry', 'tracking_shadow') THEN 1 ELSE 0 END) AS active,
+                    MAX(selected_at) AS latest_selected_at,
+                    MAX(CASE WHEN state IN ('tracking_shadow', 'complete')
+                                  OR (state = 'expired' AND reason LIKE '%exit%')
+                             THEN updated_at END) AS latest_entry_at,
+                    MAX(CASE WHEN state = 'complete' THEN updated_at END) AS latest_completed_at
+                FROM shadow_tracking_candidates
+                WHERE selected_at >= ? AND selected_at <= ?
+                """,
+                (cutoff.isoformat(), now.isoformat()),
+            ).fetchone()
+            overdue = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM pending_shadow_audit_captures AS captures
+                JOIN shadow_tracking_candidates AS candidates
+                  ON candidates.audit_id = captures.audit_id
+                WHERE captures.status = 'pending'
+                  AND candidates.deadline_at <= ?
+                """,
+                (now.isoformat(),),
+            ).fetchone()
+        attempts = int(row["attempts"] or 0)
+        terminal = int(row["terminal_attempts"] or 0)
+        completed = int(row["completed"] or 0)
+        missing_entry = int(row["missing_entry"] or 0)
+        missing_exit = int(row["missing_exit"] or 0)
+        entered = completed + missing_exit
+        return {
+            "window_hours": bounded_hours,
+            "attempts": attempts,
+            "terminal_attempts": terminal,
+            "completed": completed,
+            "missing_entry": missing_entry,
+            "missing_exit": missing_exit,
+            "active": int(row["active"] or 0),
+            "entry_conversion_rate": entered / terminal if terminal else None,
+            "completion_rate": completed / terminal if terminal else None,
+            "overdue_pending_captures": int(overdue["count"] or 0),
+            "latest_selected_at": str(row["latest_selected_at"] or "") or None,
+            "latest_entry_at": str(row["latest_entry_at"] or "") or None,
+            "latest_completed_at": str(row["latest_completed_at"] or "") or None,
+        }
+
     def transition_shadow_tracking_candidate(
         self,
         candidate_id: str,

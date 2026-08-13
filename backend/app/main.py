@@ -1070,6 +1070,7 @@ async def health_deep() -> dict:
         "database": config.database_path,
         "source": state.source_status.to_dict(),
         "candidate_priority": state.shadow_candidate_priority_status(),
+        "candidate_funnel": state.shadow_evidence_funnel_status(),
     }
 
 
