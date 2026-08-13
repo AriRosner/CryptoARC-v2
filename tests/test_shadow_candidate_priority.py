@@ -35,7 +35,7 @@ class ShadowCandidatePriorityStorageTests(unittest.TestCase):
             restarted = Storage(path)
             loaded = restarted.load_shadow_tracking_candidate(candidate.candidate_id)
 
-            self.assertEqual(restarted.schema_status()["current_version"], 26)
+            self.assertEqual(restarted.schema_status()["current_version"], restarted.SCHEMA_VERSION)
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded.state, "awaiting_entry")
             self.assertEqual(loaded.mint, candidate.mint)
