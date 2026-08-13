@@ -1281,7 +1281,7 @@ async def solana_logs_verification_export(limit: int = Query(default=500, ge=1, 
 
 @app.get("/api/source-events/source-soak", dependencies=[Depends(require_auth)])
 async def source_soak_acceptance(limit: int = Query(default=500, ge=1, le=5000)) -> dict:
-    return state.source_soak_acceptance_report(limit=limit)
+    return await asyncio.to_thread(state.source_soak_acceptance_report, limit=limit)
 
 
 @app.post("/api/source-events/source-soak/snapshot", dependencies=[Depends(require_auth)])
@@ -1577,7 +1577,11 @@ async def live_intent_create(payload: LiveIntentPayload) -> dict:
 
 @app.post("/api/live/intents/generate", dependencies=[Depends(require_auth)])
 async def live_intent_generate(payload: LiveIntentGeneratePayload) -> list[dict]:
-    return state.generate_live_intents(payload.wallet_public_key, payload.signer_mode, payload.watchlist)
+    return state.generate_live_intents(
+        payload.wallet_public_key,
+        payload.signer_mode,
+        payload.watchlist,
+    )
 
 
 @app.post("/api/live/intents/{intent_id}/cancel", dependencies=[Depends(require_auth)])
@@ -1786,6 +1790,16 @@ async def live_audit() -> list[dict]:
     return state.live_audit()
 
 
+@app.get("/api/live/audit/snapshot", dependencies=[Depends(require_auth)])
+async def live_audit_snapshot(limit: int = Query(default=100, ge=1, le=500)) -> list[dict]:
+    return await asyncio.to_thread(state.live_audit_snapshot, limit)
+
+
+@app.get("/api/sentinel/snapshot", dependencies=[Depends(require_auth)])
+async def sentinel_snapshot() -> dict:
+    return await asyncio.to_thread(state.sentinel_current, refresh=False)
+
+
 @app.get("/api/live/rent-recovery", dependencies=[Depends(require_auth)])
 async def live_rent_recovery(wallet_public_key: str) -> dict:
     try:
@@ -1905,7 +1919,7 @@ async def evidence_inventory_report(
 
 @app.get("/api/reports/economic-validation", dependencies=[Depends(require_auth)])
 async def economic_validation_report(strategy_version: str = "") -> dict:
-    return state.economic_validation_report(strategy_version=strategy_version)
+    return await asyncio.to_thread(state.economic_validation_report, strategy_version=strategy_version)
 
 
 @app.get("/api/reports/evidence-mode-separation/export", dependencies=[Depends(require_auth)])
@@ -2126,7 +2140,7 @@ async def backup_restore_export(entry_id: str = "") -> JSONResponse:
 
 @app.get("/api/source-health", dependencies=[Depends(require_auth)])
 async def source_health() -> dict:
-    return state.source_health()
+    return await asyncio.to_thread(state.source_health)
 
 
 @app.get("/api/source-health/export", dependencies=[Depends(require_auth)])

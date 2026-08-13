@@ -8650,6 +8650,10 @@ class BotState:
     def live_audit(self) -> list[dict[str, object]]:
         return [audit.to_dict() for audit in self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(100)))]
 
+    def live_audit_snapshot(self, limit: int = 100) -> list[dict[str, object]]:
+        """Return persisted audit rows without expiry, comparison, or recovery writes."""
+        return [audit.to_dict() for audit in self.storage.load_live_execution_audits(max(1, min(500, limit)))]
+
     def profit_sweep_history(self, limit: int = 100) -> list[dict[str, object]]:
         normalized = self._refresh_shadow_comparisons(self._normalize_live_audits(self.storage.load_live_execution_audits(500)))
         audits = [audit for audit in normalized if audit.action == "profit_sweep"]
@@ -8830,7 +8834,14 @@ class BotState:
             reverse=True,
         )
 
-    def generate_live_intents(self, wallet_public_key: str, signer_mode: str = "browser_wallet", include_watchlist: list[str] | None = None) -> list[dict[str, object]]:
+    def generate_live_intents(
+        self,
+        wallet_public_key: str,
+        signer_mode: str = "browser_wallet",
+        include_watchlist: list[str] | None = None,
+        *,
+        readiness_snapshot: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         now = utc_now()
         loaded_intents = self.storage.load_live_intents(200)
@@ -8850,7 +8861,7 @@ class BotState:
             for candidate in self.storage.load_shadow_tracking_candidates(active_only=True)
         }
         candidates: list[LiveExecutionIntent] = []
-        readiness = self.readiness_status()
+        readiness = readiness_snapshot or self.readiness_status()
         for token in self._live_intent_candidate_tokens(now):
             if len(existing) + len(candidates) >= 10:
                 break

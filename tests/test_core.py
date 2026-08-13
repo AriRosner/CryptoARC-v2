@@ -2609,6 +2609,32 @@ class CoreLogicTests(unittest.TestCase):
             stale = next(item for item in state.live_intents() if item["id"] == first["id"])
             self.assertTrue(stale["stale"])
 
+    def test_live_intent_generation_accepts_precomputed_readiness(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            token = self.make_token()
+            token.score = 99
+            token.status = TokenStatus.PAPER_BOUGHT
+            state.tokens.append(token)
+            readiness = {"status": "warning", "score": 50, "gates": [], "entries_allowed": True}
+
+            with patch.object(state, "readiness_status", side_effect=AssertionError("must use snapshot")):
+                intents = state.generate_live_intents("Wallet111", readiness_snapshot=readiness)
+
+            self.assertTrue(intents)
+
+    def test_live_audit_snapshot_is_a_pure_persisted_projection(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            audit = state.live_quote(False, "buy", "MintSnapshot111", "0.001", True, 1, 0.00001, "pump", "Wallet111")
+
+            with patch.object(state, "_normalize_live_audits", side_effect=AssertionError("must not normalize")), patch.object(
+                state, "_refresh_shadow_comparisons", side_effect=AssertionError("must not refresh")
+            ):
+                snapshot = state.live_audit_snapshot()
+
+            self.assertTrue(any(row["id"] == audit["id"] for row in snapshot))
+
     def test_live_intent_generation_uses_recent_persisted_paper_decisions(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))
