@@ -1771,6 +1771,20 @@ class Storage:
                 ).fetchone()
         return int(row["count"] if row else 0)
 
+    def has_active_shadow_tracking_candidate(self, audit_id: str) -> bool:
+        if not audit_id:
+            return False
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM shadow_tracking_candidates
+                WHERE audit_id = ? AND state IN ('awaiting_entry', 'tracking_shadow')
+                LIMIT 1
+                """,
+                (audit_id,),
+            ).fetchone()
+        return row is not None
+
     def save_shadow_tracking_candidate(self, candidate: ShadowTrackingCandidate) -> None:
         payload = candidate.to_dict()
         with self._connect() as connection:

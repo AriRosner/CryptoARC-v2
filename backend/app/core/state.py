@@ -8697,6 +8697,7 @@ class BotState:
                 and not audit.transaction_signature
                 and isinstance(audit.quote, dict)
                 and audit.quote.get("shadow_only") is True
+                and not self.storage.has_active_shadow_tracking_candidate(audit.id)
             ):
                 self.storage.close_pending_shadow_audit_capture(audit.id, closed_at=now)
             expires_at = audit.quote.get("expires_at") if isinstance(audit.quote, dict) else None
