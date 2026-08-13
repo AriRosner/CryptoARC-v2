@@ -1855,33 +1855,30 @@ class Storage:
                 """,
                 (cutoff.isoformat(), now.isoformat()),
             ).fetchone()
-            orphan_cutoff = now - timedelta(seconds=300)
             overdue = connection.execute(
                 """
                 SELECT COUNT(*) AS count
                 FROM pending_shadow_audit_captures AS captures
-                LEFT JOIN shadow_tracking_candidates AS candidates
+                JOIN shadow_tracking_candidates AS candidates
                   ON candidates.audit_id = captures.audit_id
                 WHERE captures.status = 'pending'
-                  AND (
-                    (candidates.candidate_id IS NOT NULL AND candidates.deadline_at <= ?)
-                    OR (candidates.candidate_id IS NULL AND captures.quoted_at <= ?)
-                  )
+                  AND candidates.deadline_at <= ?
                 """,
-                (now.isoformat(), orphan_cutoff.isoformat()),
+                (now.isoformat(),),
             ).fetchone()
         attempts = int(row["attempts"] or 0)
         terminal = int(row["terminal_attempts"] or 0)
         completed = int(row["completed"] or 0)
         missing_entry = int(row["missing_entry"] or 0)
-        entered = max(0, terminal - missing_entry)
+        missing_exit = int(row["missing_exit"] or 0)
+        entered = completed + missing_exit
         return {
             "window_hours": bounded_hours,
             "attempts": attempts,
             "terminal_attempts": terminal,
             "completed": completed,
             "missing_entry": missing_entry,
-            "missing_exit": int(row["missing_exit"] or 0),
+            "missing_exit": missing_exit,
             "active": int(row["active"] or 0),
             "entry_conversion_rate": entered / terminal if terminal else None,
             "completion_rate": completed / terminal if terminal else None,

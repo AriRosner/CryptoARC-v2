@@ -119,6 +119,12 @@ class ShadowCandidatePriorityStorageTests(unittest.TestCase):
                     strategy_id="balanced", strategy_version="set_current", selected_at=now - timedelta(minutes=1),
                     deadline_at=now + timedelta(minutes=4), state="awaiting_entry", updated_at=now - timedelta(minutes=1),
                 ),
+                ShadowTrackingCandidate(
+                    candidate_id="candidate_overdue", intent_id="intent_overdue", mint="MintOverdue",
+                    strategy_id="balanced", strategy_version="set_current", selected_at=NOW,
+                    deadline_at=now - timedelta(seconds=1), state="tracking_shadow", audit_id="audit_overdue",
+                    reason="accepted entry evidence bound", updated_at=NOW + timedelta(minutes=1),
+                ),
             )
             for item in rows:
                 storage.save_shadow_tracking_candidate(item)
@@ -129,14 +135,14 @@ class ShadowCandidatePriorityStorageTests(unittest.TestCase):
 
             funnel = storage.shadow_candidate_funnel(now=now, window_hours=4)
 
-            self.assertEqual(funnel["attempts"], 4)
+            self.assertEqual(funnel["attempts"], 5)
             self.assertEqual(funnel["terminal_attempts"], 3)
             self.assertEqual(funnel["completed"], 1)
             self.assertEqual(funnel["missing_entry"], 1)
             self.assertEqual(funnel["missing_exit"], 1)
             self.assertEqual(funnel["entry_conversion_rate"], 2 / 3)
             self.assertEqual(funnel["completion_rate"], 1 / 3)
-            self.assertEqual(funnel["active"], 1)
+            self.assertEqual(funnel["active"], 2)
             self.assertEqual(funnel["overdue_pending_captures"], 1)
             self.assertEqual(funnel["latest_completed_at"], (NOW + timedelta(minutes=8)).isoformat())
 
