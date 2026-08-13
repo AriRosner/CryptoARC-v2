@@ -391,6 +391,50 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
+    async def test_candidate_only_paid_stream_stays_unsubscribed_without_candidate(self) -> None:
+        preferred: list[str] = []
+        source = PumpPortalLaunchSource(
+            ws_url="wss://example.invalid",
+            max_trade_subscriptions=1,
+            preferred_trade_mints=lambda: list(preferred),
+            candidate_only_trade_subscriptions=True,
+            preference_poll_seconds=0.01,
+        )
+        event_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        subscription_queue: asyncio.Queue[str] = asyncio.Queue()
+        subscription_queue.put_nowait("OrdinaryMint")
+        status = SourceStatus(source="pumpportal")
+        websocket = _BlockingWebSocket()
+
+        with patch("app.core.sources.websockets.connect", return_value=_WebSocketContext(websocket)):
+            task = asyncio.create_task(source._run_trade_stream(event_queue, status, subscription_queue))
+            try:
+                await asyncio.sleep(0.05)
+                self.assertNotIn({"method": "subscribeTokenTrade", "keys": ["OrdinaryMint"]}, websocket.sent)
+                self.assertEqual(status.active_trade_subscriptions, 0)
+                self.assertEqual(status.trade_subscription_priority, "idle")
+
+                preferred[:] = ["CandidateMint"]
+                for _ in range(20):
+                    if {"method": "subscribeTokenTrade", "keys": ["CandidateMint"]} in websocket.sent:
+                        break
+                    websocket.sent_event.clear()
+                    await asyncio.wait_for(websocket.sent_event.wait(), timeout=1)
+                self.assertEqual(status.active_trade_subscriptions, 1)
+                self.assertEqual(status.trade_subscription_priority, "shadow_candidate")
+
+                preferred.clear()
+                for _ in range(20):
+                    if {"method": "unsubscribeTokenTrade", "keys": ["CandidateMint"]} in websocket.sent:
+                        break
+                    websocket.sent_event.clear()
+                    await asyncio.wait_for(websocket.sent_event.wait(), timeout=1)
+                self.assertEqual(status.active_trade_subscriptions, 0)
+                self.assertEqual(status.trade_subscription_priority, "idle")
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def test_candidate_slot_moves_to_next_authoritative_preference(self) -> None:
         preferred = ["CandidateOne"]
         source = PumpPortalLaunchSource(

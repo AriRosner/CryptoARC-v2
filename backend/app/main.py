@@ -802,6 +802,7 @@ async def ensure_source_task() -> None:
         pumpportal_ws_url=config.pumpportal_ws_url,
         max_trade_subscriptions=state.settings.max_trade_subscriptions,
         preferred_trade_mints=state.preferred_shadow_trade_mints,
+        candidate_only_trade_subscriptions=state.settings.max_trade_subscriptions == 1,
     )
     source_key = desired_key
     source_task = asyncio.create_task(source.run(launch_queue, state.source_status))
