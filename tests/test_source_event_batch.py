@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from time import monotonic
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -351,7 +352,7 @@ class SourceEventBatchTests(unittest.TestCase):
 
             self.assertTrue(asyncio.run(run_backlog()))
 
-    def test_fresh_launch_burst_yields_after_each_event(self) -> None:
+    def test_fresh_launch_burst_yields_regularly(self) -> None:
         with TemporaryDirectory() as directory:
             state = self.make_state(directory)
 
@@ -391,7 +392,50 @@ class SourceEventBatchTests(unittest.TestCase):
                     main_app.state = previous_state
                     main_app.launch_queue = previous_queue
 
-            self.assertGreaterEqual(asyncio.run(run_burst()), 9)
+            self.assertGreaterEqual(asyncio.run(run_burst()), 1)
+
+    def test_fresh_launch_burst_services_real_timers_without_throttling_each_event(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = self.make_state(directory)
+
+            async def run_burst() -> tuple[bool, float]:
+                previous_state = main_app.state
+                previous_queue = main_app.launch_queue
+                queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+                main_app.state = state
+                main_app.launch_queue = queue
+                timer_fired = False
+
+                async def timer() -> None:
+                    nonlocal timer_fired
+                    await asyncio.sleep(0.001)
+                    timer_fired = True
+
+                try:
+                    for sequence in range(20):
+                        queue.put_nowait(
+                            LaunchEvent(
+                                "pumpportal",
+                                utc_now(),
+                                {"sequence": sequence},
+                                self.make_token(f"tok_io_{sequence}", f"mint_io_{sequence}"),
+                            )
+                        )
+                    timer_task = asyncio.create_task(timer())
+                    started = monotonic()
+                    await main_app.drain_launch_queue()
+                    elapsed = monotonic() - started
+                    observed_during_drain = timer_fired
+                    await timer_task
+                    return observed_during_drain, elapsed
+                finally:
+                    main_app.clear_launch_queue()
+                    main_app.state = previous_state
+                    main_app.launch_queue = previous_queue
+
+            timer_fired, elapsed = asyncio.run(run_burst())
+            self.assertTrue(timer_fired)
+            self.assertLess(elapsed, 2.0)
 
 
 if __name__ == "__main__":
