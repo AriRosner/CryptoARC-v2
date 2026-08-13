@@ -2609,6 +2609,54 @@ class CoreLogicTests(unittest.TestCase):
             stale = next(item for item in state.live_intents() if item["id"] == first["id"])
             self.assertTrue(stale["stale"])
 
+    def test_generate_live_intents_expires_stale_rows_before_capacity_check(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "test.db"))
+            state.settings.max_token_age_seconds = 120
+            readiness = {"status": "warning", "score": 50, "gates": [], "entries_allowed": True}
+            expired_at = utc_now() - timedelta(minutes=5)
+            for index in range(10):
+                intent = LiveExecutionIntent(
+                    id=f"intent_expired_{index}",
+                    created_at=expired_at - timedelta(seconds=30),
+                    updated_at=expired_at - timedelta(seconds=30),
+                    action="buy",
+                    mint=f"MintExpired{index}",
+                    amount="0.001",
+                    denominated_in_sol=True,
+                    signer_mode="browser_wallet",
+                    wallet_public_key="WalletShadow",
+                    status="open",
+                    source="paper_promoted",
+                    expires_at=expired_at,
+                )
+                state.storage.save_live_intent(intent)
+
+            token = self.make_token()
+            token.id = "tok_after_expired_capacity"
+            token.mint = "MintAfterExpiredCapacity"
+            token.score = 95
+            token.status = TokenStatus.PAPER_BOUGHT
+            token.detected_at = utc_now()
+            state.storage.save_token(token)
+            state.tokens.clear()
+
+            intents = state.generate_live_intents("WalletShadow", readiness_snapshot=readiness)
+
+            self.assertTrue(any(item["mint"] == token.mint for item in intents))
+            stored_expired = [state.storage.load_live_intent(f"intent_expired_{index}") for index in range(10)]
+            self.assertTrue(all(item is not None and item.stale for item in stored_expired))
+            self.assertIsNotNone(
+                next(
+                    (
+                        candidate
+                        for candidate in state.storage.load_shadow_tracking_candidates()
+                        if candidate.mint == token.mint
+                    ),
+                    None,
+                )
+            )
+
     def test_live_intent_generation_accepts_precomputed_readiness(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "test.db"))

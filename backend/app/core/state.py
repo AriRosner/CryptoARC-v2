@@ -8844,8 +8844,13 @@ class BotState:
     ) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         now = utc_now()
-        loaded_intents = self.storage.load_live_intents(200)
-        existing = [intent for intent in loaded_intents if intent.status in {"open", "quoted", "simulation_warning", "simulated"}]
+        loaded_intents = self._mark_stale_live_intents(self.storage.load_live_intents(200))
+        existing = [
+            intent
+            for intent in loaded_intents
+            if intent.status in {"open", "quoted", "simulation_warning", "simulated"}
+        ]
+        active_existing = [intent for intent in existing if not intent.stale]
         existing_keys = {(intent.action, intent.mint) for intent in existing}
         recent_cutoff = now - timedelta(seconds=max(1, int(self.settings.max_token_age_seconds)))
         recently_quoted_paper_keys = {
@@ -8863,7 +8868,7 @@ class BotState:
         candidates: list[LiveExecutionIntent] = []
         readiness = readiness_snapshot or self.readiness_status()
         for token in self._live_intent_candidate_tokens(now):
-            if len(existing) + len(candidates) >= 10:
+            if len(active_existing) + len(candidates) >= 10:
                 break
             if (
                 token.mint
@@ -8894,7 +8899,7 @@ class BotState:
                     )
                 )
         for mint in include_watchlist or []:
-            if len(existing) + len(candidates) >= 10:
+            if len(active_existing) + len(candidates) >= 10:
                 break
             if mint and ("buy", mint) not in existing_keys:
                 candidates.append(
@@ -8918,7 +8923,7 @@ class BotState:
                     )
                 )
         for position in self.storage.load_live_ledger_positions(200):
-            if len(existing) + len(candidates) >= 10:
+            if len(active_existing) + len(candidates) >= 10:
                 break
             if position.status == "open" and position.token_balance > 0 and ("sell", position.mint) not in existing_keys:
                 exit_signals = self._live_position_exit_signals(position)
