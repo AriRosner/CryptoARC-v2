@@ -387,7 +387,7 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 "params": {
                     "result": {
                         "context": {"slot": 2},
-                        "value": {"signature": "SigSuccessful", "err": None, "logs": []},
+                        "value": {"signature": "SigSuccessful", "err": None, "logs": ["Program log: Instruction: Create"]},
                     }
                 }
             }
@@ -404,6 +404,44 @@ class SourceCancellationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(event.raw_payload["params"]["result"]["value"]["signature"], "SigSuccessful")
                 self.assertTrue(queue.empty())
                 self.assertEqual(status.failed_events_seen, 1)
+                self.assertEqual(status.events_received, 1)
+            finally:
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+
+    async def test_solana_logs_source_queues_only_create_notifications(self) -> None:
+        trade = json.dumps(
+            {
+                "params": {
+                    "result": {
+                        "context": {"slot": 3},
+                        "value": {"signature": "SigTrade", "err": None, "logs": ["Program log: Instruction: Buy"]},
+                    }
+                }
+            }
+        )
+        create = json.dumps(
+            {
+                "params": {
+                    "result": {
+                        "context": {"slot": 4},
+                        "value": {"signature": "SigCreate", "err": None, "logs": ["Program log: Instruction: Create"]},
+                    }
+                }
+            }
+        )
+        websocket = _StreamingWebSocket([trade, create])
+        source = SolanaLogsSource("wss://example.invalid", "PumpFunProgram111")
+        queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
+        status = SourceStatus(source="solana_logs")
+
+        with patch("app.core.sources.websockets.connect", return_value=_WebSocketContext(websocket)):
+            run_task = asyncio.create_task(source.run(queue, status))
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=1)
+                self.assertEqual(event.raw_payload["params"]["result"]["value"]["signature"], "SigCreate")
+                self.assertTrue(queue.empty())
+                self.assertEqual(status.raw_events_seen, 2)
                 self.assertEqual(status.events_received, 1)
             finally:
                 run_task.cancel()
