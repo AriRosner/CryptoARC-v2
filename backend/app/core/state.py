@@ -8841,6 +8841,7 @@ class BotState:
         include_watchlist: list[str] | None = None,
         *,
         readiness_snapshot: dict[str, object] | None = None,
+        shadow_collection_only: bool = False,
     ) -> list[dict[str, object]]:
         wallet_public_key = self._resolve_backend_wallet(signer_mode, wallet_public_key)
         now = utc_now()
@@ -8866,7 +8867,12 @@ class BotState:
             for candidate in self.storage.load_shadow_tracking_candidates(active_only=True)
         }
         candidates: list[LiveExecutionIntent] = []
-        readiness = readiness_snapshot or self.readiness_status()
+        readiness = readiness_snapshot or (
+            {"status": "blocked", "score": 0, "gates": [], "entries_allowed": False}
+            if shadow_collection_only
+            else self.readiness_status()
+        )
+        shadow_collection_blockers = ["shadow collection only"] if shadow_collection_only else None
         for token in self._live_intent_candidate_tokens(now):
             if len(active_existing) + len(candidates) >= 10:
                 break
@@ -8960,7 +8966,9 @@ class BotState:
                 )
         updated_candidates: list[LiveExecutionIntent] = []
         for intent in candidates:
-            self._decorate_live_intent(intent, readiness)
+            if shadow_collection_only:
+                intent.operator_recommendation = "Shadow evidence collection only; execution is disabled."
+            self._decorate_live_intent(intent, readiness, autonomy_blockers=shadow_collection_blockers)
             self.storage.save_live_intent(intent)
             if intent.source == "paper_promoted":
                 candidate = ShadowTrackingCandidate(
@@ -8984,7 +8992,14 @@ class BotState:
                 updated_candidates.append(self.storage.load_live_intent(intent.id) or intent)
             else:
                 updated_candidates.append(intent)
-        ranked = self._rank_live_intents(self._decorate_live_intents(existing + updated_candidates, readiness))[:10]
+        combined = existing + updated_candidates
+        if shadow_collection_only:
+            for intent in combined:
+                self._decorate_live_intent(intent, readiness, autonomy_blockers=shadow_collection_blockers)
+            decorated = combined
+        else:
+            decorated = self._decorate_live_intents(combined, readiness)
+        ranked = self._rank_live_intents(decorated)[:10]
         return [intent.to_dict() for intent in ranked]
 
     def cancel_live_intent(self, intent_id: str) -> dict[str, object]:

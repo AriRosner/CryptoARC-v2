@@ -293,6 +293,7 @@ class LiveIntentGeneratePayload(BaseModel):
     wallet_public_key: str = Field(default="", max_length=100)
     signer_mode: Literal["browser_wallet", "local_hot_wallet", "local_signer_daemon"] = "browser_wallet"
     watchlist: list[str] = Field(default_factory=list, max_length=50)
+    shadow_collection_only: bool = False
 
 
 class LiveHotWalletImportPayload(BaseModel):
@@ -1581,6 +1582,7 @@ async def live_intent_generate(payload: LiveIntentGeneratePayload) -> list[dict]
         payload.wallet_public_key,
         payload.signer_mode,
         payload.watchlist,
+        shadow_collection_only=payload.shadow_collection_only,
     )
 
 
