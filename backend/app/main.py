@@ -5,7 +5,7 @@ import hmac
 import json
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import AsyncIterator, Callable, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from weakref import WeakSet
@@ -417,6 +417,7 @@ mobile_clients: dict[WebSocket, str] = {}
 mobile_realtime_sequence = 0
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 SOURCE_EVENT_DRAIN_BATCH_SIZE = 50
+SOURCE_EVENT_DRAIN_MAX_SIZE = 1_000
 source_task: asyncio.Task | None = None
 source_key: tuple[str, float, int] | None = None
 solana_logs_task: asyncio.Task | None = None
@@ -864,23 +865,38 @@ async def ensure_solana_logs_task() -> None:
     solana_logs_task = asyncio.create_task(verifier.run(launch_queue, state.solana_logs_status))
 
 
+def source_event_drain_limit(queue_depth: int) -> int:
+    return min(max(0, queue_depth), SOURCE_EVENT_DRAIN_MAX_SIZE)
+
+
+def source_event_is_expired_launch(event: LaunchEvent, now: datetime) -> bool:
+    if event.kind != "launch" or event.token is None:
+        return False
+    cutoff = now - timedelta(seconds=max(1, int(state.settings.max_token_age_seconds)))
+    return event.token.detected_at < cutoff
+
+
 async def drain_launch_queue() -> None:
     if state.status.value != "running":
         clear_launch_queue()
         return
 
+    drain_limit = source_event_drain_limit(launch_queue.qsize())
     active_tokens_loaded = False
-    for _ in range(SOURCE_EVENT_DRAIN_BATCH_SIZE):
+    for index in range(drain_limit):
         if launch_queue.empty():
             break
         if state.status.value != "running":
             clear_launch_queue()
             return
         event = await launch_queue.get()
-        state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
-        if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
-            active_tokens_loaded = True
+        if not source_event_is_expired_launch(event, utc_now()):
+            state.ingest_source_event(event, active_tokens_loaded=active_tokens_loaded)
+            if event.kind == "trade" and state.settings.use_observed_prices and event.mint:
+                active_tokens_loaded = True
         launch_queue.task_done()
+        if (index + 1) % SOURCE_EVENT_DRAIN_BATCH_SIZE == 0 and index + 1 < drain_limit:
+            await asyncio.sleep(0)
 
 
 def clear_launch_queue() -> int:
