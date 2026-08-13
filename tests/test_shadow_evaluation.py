@@ -471,6 +471,33 @@ class ShadowEvaluationTests(unittest.TestCase):
 
             self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
 
+    def test_startup_reconciles_expired_stale_shadow_capture(self) -> None:
+        with TemporaryDirectory() as directory:
+            database_path = str(Path(directory) / "shadow.db")
+            state = BotState(database_path=database_path)
+            state.settings.max_hold_time_seconds = 60
+            state.storage.save_settings(state.settings)
+            version_id = state.ensure_settings_version("startup stale window", ["max_hold_time_seconds"])
+            now = utc_now()
+            audit = LiveExecutionAudit(
+                id="startup-stale-audit", created_at=now - timedelta(minutes=5), updated_at=now,
+                action="buy", mint="startup-stale-mint", amount="0.01", status="stale", final_status="stale",
+                signer_mode="browser_wallet", wallet_public_key="StartupWallet",
+                quote={"id": "startup-stale-quote", "shadow_only": True},
+                shadow_comparison={
+                    "mode": "dry_run_shadow", "status": "waiting_for_price",
+                    "strategy_id": state.settings.strategy_profile,
+                    "strategy_version": version_id,
+                    "quoted_at": (now - timedelta(minutes=5)).isoformat(),
+                },
+            )
+            state.storage.save_shadow_quote_audit_capture(audit, None)
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+            reloaded = BotState(database_path=database_path)
+
+            self.assertEqual(reloaded.storage.count_pending_shadow_audit_captures(audit.id), 0)
+
     def test_stale_quote_keeps_capture_open_for_active_tracking_candidate(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
