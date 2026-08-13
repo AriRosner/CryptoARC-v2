@@ -2138,8 +2138,13 @@ class BotState:
         return [
             token
             for token in self.storage.load_all_tokens(5000)
-            if token.status in open_statuses or (token.opened_at is not None and token.closed_at is None and token.amount_sol is not None)
+            if self._token_has_open_lifecycle(token)
         ]
+
+    def _token_has_open_lifecycle(self, token: TokenSignal) -> bool:
+        return token.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING} or (
+            token.opened_at is not None and token.closed_at is None and token.amount_sol is not None
+        )
 
     def _ensure_active_tokens_loaded(self) -> None:
         open_by_id = {token.id: token for token in self._load_open_storage_tokens()}
@@ -2284,6 +2289,8 @@ class BotState:
         *,
         active_tokens_loaded: bool = False,
         defer_stats: bool = False,
+        batch_open_token_ids: set[str] | None = None,
+        batch_open_creator_counts: dict[str, int] | None = None,
     ) -> None:
         if event.kind == "trade":
             if event.source == "pumpportal" and self.source_status.pumpportal_funding_blocked:
@@ -2308,7 +2315,12 @@ class BotState:
             token = self._direct_solana_token_from_event(event) if event.kind == "verification" else None
             self.record_source_event(event.source, event.raw_payload, token, event.message, status="status" if event.kind == "verification_status" else ("normalized" if token else "raw"))
             if token:
-                self.ingest_launch(token, defer_stats=defer_stats)
+                self.ingest_launch(
+                    token,
+                    defer_stats=defer_stats,
+                    batch_open_token_ids=batch_open_token_ids,
+                    batch_open_creator_counts=batch_open_creator_counts,
+                )
             return
         self._handle_source_status_message(event)
         event_status = None
@@ -2319,7 +2331,12 @@ class BotState:
                 event_status = "status"
         self.record_source_event(event.source, event.raw_payload, event.token, event.message, status=event_status)
         if event.token:
-            self.ingest_launch(event.token, defer_stats=defer_stats)
+            self.ingest_launch(
+                event.token,
+                defer_stats=defer_stats,
+                batch_open_token_ids=batch_open_token_ids,
+                batch_open_creator_counts=batch_open_creator_counts,
+            )
 
     def _handle_source_status_message(self, event: LaunchEvent) -> None:
         if event.source != "pumpportal" or not self._is_pumpportal_funding_message(event.raw_payload, event.message):
@@ -2795,7 +2812,14 @@ class BotState:
             "operator_action": "Review recovered paper positions before the next paper run." if closed_tokens else "No recovery action was needed.",
         }
 
-    def ingest_launch(self, token: TokenSignal, *, defer_stats: bool = False) -> None:
+    def ingest_launch(
+        self,
+        token: TokenSignal,
+        *,
+        defer_stats: bool = False,
+        batch_open_token_ids: set[str] | None = None,
+        batch_open_creator_counts: dict[str, int] | None = None,
+    ) -> None:
         if self.status != BotStatus.RUNNING or not self.settings.detect_new_tokens:
             return
 
@@ -2803,8 +2827,12 @@ class BotState:
         token.status = TokenStatus.ANALYZING
         self.enrich_token_intelligence(token)
 
-        open_positions = self.open_position_count()
-        guard_reason = self.evaluate_session_guards(token)
+        open_positions = len(batch_open_token_ids) if batch_open_token_ids is not None else self.open_position_count()
+        guard_reason = self.evaluate_session_guards(
+            token,
+            active_tokens_loaded=batch_open_token_ids is not None,
+            batch_open_creator_counts=batch_open_creator_counts,
+        )
         if guard_reason:
             token.status = TokenStatus.SKIPPED
             token.reason = guard_reason
@@ -2813,6 +2841,7 @@ class BotState:
             self.tokens.appendleft(token)
             self.creator_history[token.creator] += 1
             self.storage.save_token(token)
+            self._update_batch_open_context(batch_open_token_ids, batch_open_creator_counts, token)
             if not defer_stats:
                 self.recalculate_stats()
             return
@@ -2843,8 +2872,34 @@ class BotState:
         self.tokens.appendleft(token)
         self.creator_history[token.creator] += 1
         self.storage.save_token(token)
+        self._update_batch_open_context(batch_open_token_ids, batch_open_creator_counts, token)
         if not defer_stats:
             self.recalculate_stats()
+
+    def _update_batch_open_context(
+        self,
+        token_ids: set[str] | None,
+        creator_counts: dict[str, int] | None,
+        token: TokenSignal,
+    ) -> None:
+        if token_ids is None:
+            return
+        was_open = token.id in token_ids
+        is_open = self._token_has_open_lifecycle(token)
+        if is_open:
+            token_ids.add(token.id)
+        else:
+            token_ids.discard(token.id)
+        if creator_counts is None or was_open == is_open:
+            return
+        if is_open:
+            creator_counts[token.creator] = creator_counts.get(token.creator, 0) + 1
+        else:
+            remaining = creator_counts.get(token.creator, 0) - 1
+            if remaining > 0:
+                creator_counts[token.creator] = remaining
+            else:
+                creator_counts.pop(token.creator, None)
 
     def enrich_token_intelligence(self, token: TokenSignal) -> None:
         previous_launches = self.creator_history[token.creator]
@@ -3004,7 +3059,13 @@ class BotState:
             settings_version_id=token.settings_version_id or self.current_settings_version_id,
         )
 
-    def evaluate_session_guards(self, token: TokenSignal) -> str | None:
+    def evaluate_session_guards(
+        self,
+        token: TokenSignal,
+        *,
+        active_tokens_loaded: bool = False,
+        batch_open_creator_counts: dict[str, int] | None = None,
+    ) -> str | None:
         now = utc_now()
         closed_trades = self.storage.load_trades(500)
         recent_trades = [trade for trade in closed_trades if trade.opened_at and (now - trade.opened_at) <= timedelta(hours=1)]
@@ -3014,8 +3075,11 @@ class BotState:
             losses = [trade for trade in closed_trades if trade.closed_at and (trade.pnl_sol or 0.0) < -(self.stats.scratch_threshold_sol or 0.001)]
             if losses and (now - losses[0].closed_at).total_seconds() < self.settings.cooldown_after_loss_seconds:
                 return "cooldown after loss active"
-        self._ensure_active_tokens_loaded()
+        if not active_tokens_loaded:
+            self._ensure_active_tokens_loaded()
         same_creator_buys = sum(1 for existing in self.tokens if existing.creator == token.creator and existing.status in {TokenStatus.BUYING, TokenStatus.PAPER_BOUGHT, TokenStatus.MONITORING, TokenStatus.PAPER_SOLD})
+        if batch_open_creator_counts is not None:
+            same_creator_buys = max(same_creator_buys, batch_open_creator_counts.get(token.creator, 0))
         if self.settings.max_same_creator_buys_enabled and same_creator_buys >= self.settings.max_same_creator_buys:
             return f"same creator buy cap reached ({self.settings.max_same_creator_buys})"
         if self.settings.stop_on_source_degraded and self.source_health().get("health_score", 100) < 50:
