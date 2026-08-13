@@ -495,6 +495,9 @@ class SolanaLogsSource(LaunchSource):
                                 f"{status.failed_events_seen} failed transaction notifications skipped"
                             )
                             continue
+                        logs = value.get("logs") if isinstance(value, dict) else None
+                        if not isinstance(logs, list) or not any("Instruction: Create" in str(log) for log in logs):
+                            continue
                         await queue.put(LaunchEvent(self.name, received_at, payload, None, "Solana logsSubscribe notification", kind="verification"))
                         status.events_received += 1
                         status.launch_events_seen += 1
