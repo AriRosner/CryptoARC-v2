@@ -175,6 +175,7 @@ class PumpPortalLaunchSource(LaunchSource):
     ws_url: str
     max_trade_subscriptions: int = 60
     preferred_trade_mints: Callable[[], list[str]] | None = None
+    candidate_only_trade_subscriptions: bool = False
     preference_poll_seconds: float = 1.0
     name: str = "pumpportal"
 
@@ -199,7 +200,9 @@ class PumpPortalLaunchSource(LaunchSource):
         subscribed_lookup: set[str],
     ) -> None:
         status.active_trade_subscriptions = len(subscribed_lookup)
-        status.trade_subscription_priority = "shadow_candidate" if active_preferred else "ordinary_launch"
+        status.trade_subscription_priority = (
+            "shadow_candidate" if active_preferred else "idle" if not subscribed_lookup else "ordinary_launch"
+        )
         status.preferred_trade_mint_prefix = active_preferred[:8] if active_preferred else ""
 
     async def run(self, queue: asyncio.Queue[LaunchEvent], status: SourceStatus) -> None:
@@ -333,6 +336,10 @@ class PumpPortalLaunchSource(LaunchSource):
             preferred = self._preferred_trade_mint()
             if preferred is None:
                 preferred = active_preferred
+            if self.candidate_only_trade_subscriptions and not preferred and not active_preferred:
+                self._set_trade_subscription_status(status, "", subscribed_lookup)
+                await asyncio.sleep(max(0.01, self.preference_poll_seconds))
+                continue
             if preferred:
                 first_mint = preferred
                 active_preferred = preferred
@@ -366,7 +373,8 @@ class PumpPortalLaunchSource(LaunchSource):
                         recv_task = asyncio.create_task(websocket.recv())
                         subscribe_task = (
                             asyncio.create_task(subscription_queue.get())
-                            if len(subscribed_mints) < self.max_trade_subscriptions or not active_preferred
+                            if not self.candidate_only_trade_subscriptions
+                            and (len(subscribed_mints) < self.max_trade_subscriptions or not active_preferred)
                             else None
                         )
                         preference_task = asyncio.create_task(
@@ -560,12 +568,14 @@ def make_source(
     pumpportal_ws_url: str,
     max_trade_subscriptions: int = 60,
     preferred_trade_mints: Callable[[], list[str]] | None = None,
+    candidate_only_trade_subscriptions: bool = False,
 ) -> LaunchSource:
     if name == "pumpportal":
         return PumpPortalLaunchSource(
             ws_url=pumpportal_ws_url,
             max_trade_subscriptions=max_trade_subscriptions,
             preferred_trade_mints=preferred_trade_mints,
+            candidate_only_trade_subscriptions=candidate_only_trade_subscriptions,
         )
     return MockLaunchSource(launch_interval_seconds=launch_interval_seconds)
 
