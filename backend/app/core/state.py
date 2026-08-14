@@ -2417,6 +2417,13 @@ class BotState:
         if self.storage.save_accepted_market_observation(item):
             self._bind_accepted_market_observation_to_pending_shadows(item)
             self._activate_waiting_shadow_candidate(item)
+            bound_audits = [
+                audit
+                for audit_id in self.storage.load_shadow_audit_ids_bound_to_observation(item.record_id)
+                if (audit := self.storage.load_live_execution_audit(audit_id)) is not None
+            ]
+            if bound_audits:
+                self._refresh_shadow_comparisons(bound_audits)
 
     def _shadow_entry_market_evidence(self, audit: LiveExecutionAudit) -> AcceptedMarketObservation | None:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}

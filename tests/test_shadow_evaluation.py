@@ -368,11 +368,12 @@ class ShadowEvaluationTests(unittest.TestCase):
                 raw_payload={"signature": "exit-source", "mint": token.mint, "txType": "sell", "price": 1.1},
                 token=None, kind="trade", mint=token.mint, trade_side="sell",
             ))
-            refreshed = state._refresh_shadow_comparisons([audit])[0]
+            refreshed = state.storage.load_live_execution_audit(audit.id)
             accepted = state.storage.load_accepted_market_observations(limit=10)
             bindings = state.storage.load_shadow_market_evidence_bindings(audit.id)
             materialized = state.storage.load_shadow_comparisons(limit=10)
 
+            self.assertIsNotNone(refreshed)
             self.assertEqual(refreshed.shadow_comparison["status"], "evaluated")
             self.assertTrue(refreshed.shadow_comparison["landing_windows"])
             immediate_window = next(item for item in refreshed.shadow_comparison["landing_windows"] if item["delay_ms"] == 0)
