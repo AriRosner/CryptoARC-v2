@@ -37,6 +37,7 @@ def comparison(
     landing_status: str = "evaluated",
     contaminated: bool = False,
     reference_usd_per_sol: float = 1.0,
+    exit_reason: str | None = None,
 ) -> ShadowComparison:
     completed_at = NOW - timedelta(days=6 - day, minutes=index)
     return ShadowComparison(
@@ -64,7 +65,7 @@ def comparison(
         landing_status=landing_status,
         fixture_only=fixture_only,
         contaminated=contaminated,
-        exit_reason="take_profit" if gross > 0 else "stop_loss",
+        exit_reason=exit_reason or ("take_profit" if gross > 0 else "stop_loss"),
         hold_seconds=30,
         reference_usd_per_sol=reference_usd_per_sol,
     )
@@ -118,6 +119,19 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertGreaterEqual(report.profit_factor, 1.2)
         self.assertGreater(report.held_out.net_pnl, 0)
 
+    def test_calendar_span_uses_declared_new_york_operating_dates(self) -> None:
+        start = datetime(2026, 8, 16, 1, 30, tzinfo=timezone.utc)
+        completed = [start + timedelta(days=day) for day in range(6)]
+        completed.append(datetime(2026, 8, 21, 21, 0, tzinfo=timezone.utc))
+        rows = [comparison(index) for index in range(7)]
+        for row, completed_at in zip(rows, completed):
+            row.completed_at = completed_at
+
+        report = EconomicValidator.evaluate("sniper-v1", rows, datetime(2026, 8, 21, 22, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(report.calendar_days, 7)
+        self.assertEqual(report.calendar_timezone, "America/New_York")
+
     def test_fixture_quote_and_wrong_mode_do_not_become_completed_shadows(self) -> None:
         rows = ready_campaign()
         rows.extend(
@@ -133,6 +147,15 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(report.fixture_count, 1)
         self.assertIn("incomplete_shadow_comparison", report.blockers)
         self.assertIn("evidence_mode_contamination", report.blockers)
+
+    def test_latest_observed_price_fallback_never_qualifies_as_economic_evidence(self) -> None:
+        rows = ready_campaign()
+        rows[0].exit_reason = "latest observed price"
+
+        report = EconomicValidator.evaluate("sniper-v1", rows, NOW)
+
+        self.assertEqual(report.sample_count, 99)
+        self.assertIn("invalid_shadow_exit_reason", report.blockers)
 
     def test_future_version_mismatch_and_explicit_contamination_block(self) -> None:
         future = comparison(1, strategy_version="sniper-v2", contaminated=True)
@@ -442,6 +465,32 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(immediate_window["status"], "waiting_for_exit_rule")
             self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
             self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+    def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            now = utc_now()
+            legacy_comparison = {
+                "mode": "dry_run_shadow",
+                "status": "evaluated",
+                "evaluation_model": "exit_rules_v1",
+                "entry_price": 1.0,
+                "exit_price": 1.01,
+                "exit_reason": "latest observed price",
+                "quoted_at": now.isoformat(),
+                "estimated_pnl_sol": 0.0001,
+            }
+            audit = LiveExecutionAudit(
+                id="legacy-completed-audit", created_at=now, updated_at=now,
+                action="buy", mint="legacy-completed-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="LegacyWallet",
+                quote={"id": "legacy-completed-quote", "shadow_only": True},
+                shadow_comparison=legacy_comparison,
+            )
+
+            refreshed = state._evaluate_shadow_comparison(audit)
+
+            self.assertEqual(refreshed, legacy_comparison)
 
     def test_evaluated_shadow_capture_stays_pending_until_economic_evidence_persists(self) -> None:
         with TemporaryDirectory() as directory:

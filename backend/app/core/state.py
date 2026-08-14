@@ -6612,6 +6612,10 @@ class BotState:
         comparison = dict(audit.shadow_comparison or {})
         if not comparison or comparison.get("mode") != "dry_run_shadow":
             return comparison
+        evaluation_model = str(comparison.get("evaluation_model") or "exit_rules_v1")
+        if evaluation_model != "exit_rules_v2_strict" and comparison.get("status") == "evaluated":
+            return comparison
+        comparison["evaluation_model"] = "exit_rules_v2_strict"
         entry_price = float(comparison.get("entry_price") or 0.0)
         if entry_price <= 0:
             return comparison
