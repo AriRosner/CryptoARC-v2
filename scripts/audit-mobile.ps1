@@ -17,16 +17,23 @@ $warnings = @()
 $auditExitCode = 0
 $audit = $null
 $policy = $null
+$policyExpiresAt = ""
 $exceptionActive = $false
 
 try {
   if (($AuditJsonPath -or $AsOfUtc) -and $env:CRYPTOARC_AUDIT_FIXTURE_TEST -ne "true") {
     throw "Audit JSON and clock injection are test-only and require CRYPTOARC_AUDIT_FIXTURE_TEST=true."
   }
-  $policy = Get-Content -LiteralPath $policyPath -Raw | ConvertFrom-Json
+  $policyText = Get-Content -LiteralPath $policyPath -Raw
+  $policy = $policyText | ConvertFrom-Json
   if ([int]$policy.format_version -ne 1) {
     throw "unsupported exception policy format"
   }
+  $expiresMatch = [regex]::Match($policyText, '"expires_at"\s*:\s*"(?<value>[^"]+)"')
+  if (-not $expiresMatch.Success) {
+    throw "exception policy expires_at must be an ISO-8601 string"
+  }
+  $policyExpiresAt = $expiresMatch.Groups["value"].Value
   $packageManager = Resolve-CryptoArcPackageManager
   if ($packageManager.Name -ne "npm") {
     throw "Mobile audit requires npm because mobile/package-lock.json is authoritative."
@@ -61,9 +68,13 @@ try {
     }
   } else {
     $asOf = if ($AsOfUtc) { [DateTimeOffset]::Parse($AsOfUtc) } else { [DateTimeOffset]::UtcNow }
-    $expires = [DateTimeOffset]::Parse([string]$policy.expires_at)
+    $expires = [DateTimeOffset]::Parse(
+      $policyExpiresAt,
+      [Globalization.CultureInfo]::InvariantCulture,
+      [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+    )
     if ($asOf -gt $expires) {
-      $blockers += "The mobile image-size audit exception expired at $($policy.expires_at)."
+      $blockers += "The mobile image-size audit exception expired at $policyExpiresAt."
     }
 
     $observedNames = @($vulnerabilityProperties | ForEach-Object { [string]$_.Name } | Sort-Object)
@@ -140,7 +151,7 @@ try {
 
     if ($blockers.Count -eq 0) {
       $exceptionActive = $true
-      $warnings += "Time-bounded image-size build-tool exception is active through $($policy.expires_at); tracking issue: $($policy.tracking_issue)."
+      $warnings += "Time-bounded image-size build-tool exception is active through $policyExpiresAt; tracking issue: $($policy.tracking_issue)."
     }
   }
 } catch {
@@ -160,7 +171,7 @@ $report = [ordered]@{
   exception = [ordered]@{
     active = $exceptionActive
     package = if ($policy) { [string]$policy.package } else { $null }
-    expires_at = if ($policy) { [string]$policy.expires_at } else { $null }
+    expires_at = if ($policy) { $policyExpiresAt } else { $null }
     advisories = if ($policy) { @($policy.advisories) } else { @() }
   }
   blockers = @($blockers | Select-Object -Unique)
