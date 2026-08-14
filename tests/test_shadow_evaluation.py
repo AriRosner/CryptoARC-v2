@@ -385,6 +385,64 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(len(materialized), 1)
             self.assertEqual(set(materialized[0].source_evidence_ids), {item.record_id for item in accepted})
 
+    def test_subthreshold_price_tick_does_not_prematurely_complete_shadow(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 50
+            state.settings.stop_loss_pct = 30
+            state.settings.minimum_hold_time_seconds = 0
+            state.settings.max_hold_time_seconds = 600
+            state.settings.max_position_ticks = 1000
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "shadow exit-rule evidence", [
+                    "take_profit_pct",
+                    "stop_loss_pct",
+                    "minimum_hold_time_seconds",
+                    "max_hold_time_seconds",
+                    "max_position_ticks",
+                ]
+            )
+            now = utc_now()
+            token = TokenSignal(
+                id="token-waiting-shadow", symbol="WAIT", name="Waiting Shadow",
+                mint="mint-waiting-shadow", creator="creator", detected_at=now - timedelta(minutes=1),
+                status=TokenStatus.MONITORING, entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=1),
+                raw_payload={"signature": "entry-waiting", "mint": token.mint, "txType": "buy", "price": 1.0},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "WalletShadow",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+            self.assertIsNotNone(audit)
+
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=audit.created_at + timedelta(seconds=5),
+                raw_payload={"signature": "path-waiting", "mint": token.mint, "txType": "sell", "price": 1.01},
+                token=None, kind="trade", mint=token.mint, trade_side="sell",
+            ))
+
+            refreshed = state.storage.load_live_execution_audit(audit.id)
+            immediate_window = next(
+                item for item in refreshed.shadow_comparison["landing_windows"] if item["delay_ms"] == 0
+            )
+            self.assertEqual(refreshed.shadow_comparison["status"], "waiting_for_exit_rule")
+            self.assertEqual(refreshed.shadow_comparison["evaluation_model"], "exit_rules_v2_strict")
+            self.assertEqual(immediate_window["status"], "waiting_for_exit_rule")
+            self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
     def test_evaluated_shadow_capture_stays_pending_until_economic_evidence_persists(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
@@ -578,7 +636,7 @@ class ShadowEvaluationTests(unittest.TestCase):
                 strategy_id=state.settings.strategy_profile, strategy_version=version_id,
                 evidence_mode="paper", source="pumpportal", source_event_id="retry-exit-source",
                 observed_at=now + timedelta(seconds=1), received_at=now + timedelta(seconds=1),
-                mint="retry-mint", price=1.1, confidence=0.9, acceptance_reason="direct: accepted",
+                mint="retry-mint", price=1.6, confidence=0.9, acceptance_reason="direct: accepted",
             )
             state.storage.save_accepted_market_observation(entry)
             state.storage.save_accepted_market_observation(exit_observation)

@@ -6572,7 +6572,7 @@ class BotState:
         comparison = {
             "mode": "dry_run_shadow",
             "status": "waiting_for_price",
-            "evaluation_model": "exit_rules_v1",
+            "evaluation_model": "exit_rules_v2_strict",
             "strategy_id": self.settings.strategy_profile,
             "strategy_version": self.current_settings_version_id or "unversioned",
             "audit_id": audit.id,
@@ -6631,7 +6631,23 @@ class BotState:
         amount_sol = float(comparison.get("amount_sol") or self._audit_amount_sol(audit))
         exit_price, exit_source, exit_at, exit_reason, partial_realized = self._shadow_exit_from_observations(entry_price, quoted_at, observations, amount_sol)
         if not exit_price or not exit_at:
-            exit_price, exit_source, exit_at, exit_reason = latest_price, latest_source, latest_at, "latest observed price"
+            comparison.update(
+                {
+                    "status": "waiting_for_exit_rule",
+                    "latest_price": latest_price,
+                    "latest_price_source": latest_source,
+                    "latest_observed_at": latest_at.isoformat(),
+                    "landing_windows": self._shadow_landing_windows(
+                        audit,
+                        entry_price,
+                        quoted_at,
+                        strategy_id=str(comparison.get("strategy_id") or ""),
+                        strategy_version=str(comparison.get("strategy_version") or ""),
+                    ),
+                    "reason": "Accepted price evidence is accumulating; no configured exit rule has fired yet.",
+                }
+            )
+            return comparison
         move_pct = ((exit_price - entry_price) / max(entry_price, 0.000000001)) * 100
         costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
         gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
@@ -6894,8 +6910,17 @@ class BotState:
         amount_sol = self._audit_amount_sol(audit)
         exit_price, exit_source, exit_at, exit_reason, partial_realized = self._shadow_exit_from_observations(entry_price, entry_at, path, amount_sol)
         if not exit_price or not exit_at:
-            latest_price, latest_source, latest_at = self._shadow_price_from_observation(path[-1]) if path else (entry_price, entry_source, entry_at)
-            exit_price, exit_source, exit_at, exit_reason = latest_price, latest_source, latest_at, "latest observed price"
+            window.update(
+                {
+                    "status": "waiting_for_exit_rule",
+                    "fill_status": "filled",
+                    "entry_price": entry_price,
+                    "entry_price_source": entry_source,
+                    "entry_observed_at": entry_at.isoformat(),
+                    "reason": "Landing price was observed; no configured exit rule has fired yet.",
+                }
+            )
+            return window
         move_pct = ((float(exit_price) - entry_price) / max(entry_price, 0.000000001)) * 100
         costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
         gross_pnl = round(partial_realized + amount_sol * (move_pct / 100), 6)
@@ -6956,9 +6981,7 @@ class BotState:
         partial_realized = 0.0
         partial_taken = False
         ticks = 0
-        latest: PriceObservation | None = None
         for observation in observations:
-            latest = observation
             ticks += 1
             price = float(observation.price or 0.0)
             if price <= 0:
@@ -6989,8 +7012,6 @@ class BotState:
                 reason = "max position ticks"
             if reason:
                 return price, observation.price_source, observation.observed_at, reason, partial_realized
-        if latest:
-            return float(latest.price or 0.0), latest.price_source, latest.observed_at, "latest observed price", partial_realized
         return None, "", None, "", partial_realized
 
     def _audit_amount_sol(self, audit: LiveExecutionAudit) -> float:
