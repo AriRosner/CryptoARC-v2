@@ -5,3 +5,4 @@ websockets
 solana
 solders
 cryptography==50.0.0
+tzdata==2026.3

@@ -37,6 +37,7 @@ def comparison(
     landing_status: str = "evaluated",
     contaminated: bool = False,
     reference_usd_per_sol: float = 1.0,
+    exit_reason: str | None = None,
 ) -> ShadowComparison:
     completed_at = NOW - timedelta(days=6 - day, minutes=index)
     return ShadowComparison(
@@ -64,7 +65,7 @@ def comparison(
         landing_status=landing_status,
         fixture_only=fixture_only,
         contaminated=contaminated,
-        exit_reason="take_profit" if gross > 0 else "stop_loss",
+        exit_reason=exit_reason or ("take_profit" if gross > 0 else "stop_loss"),
         hold_seconds=30,
         reference_usd_per_sol=reference_usd_per_sol,
     )
@@ -118,6 +119,19 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertGreaterEqual(report.profit_factor, 1.2)
         self.assertGreater(report.held_out.net_pnl, 0)
 
+    def test_calendar_span_uses_declared_new_york_operating_dates(self) -> None:
+        start = datetime(2026, 8, 16, 1, 30, tzinfo=timezone.utc)
+        completed = [start + timedelta(days=day) for day in range(6)]
+        completed.append(datetime(2026, 8, 21, 21, 0, tzinfo=timezone.utc))
+        rows = [comparison(index) for index in range(7)]
+        for row, completed_at in zip(rows, completed):
+            row.completed_at = completed_at
+
+        report = EconomicValidator.evaluate("sniper-v1", rows, datetime(2026, 8, 21, 22, 0, tzinfo=timezone.utc))
+
+        self.assertEqual(report.calendar_days, 7)
+        self.assertEqual(report.calendar_timezone, "America/New_York")
+
     def test_fixture_quote_and_wrong_mode_do_not_become_completed_shadows(self) -> None:
         rows = ready_campaign()
         rows.extend(
@@ -133,6 +147,15 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(report.fixture_count, 1)
         self.assertIn("incomplete_shadow_comparison", report.blockers)
         self.assertIn("evidence_mode_contamination", report.blockers)
+
+    def test_latest_observed_price_fallback_never_qualifies_as_economic_evidence(self) -> None:
+        rows = ready_campaign()
+        rows[0].exit_reason = "latest observed price"
+
+        report = EconomicValidator.evaluate("sniper-v1", rows, NOW)
+
+        self.assertEqual(report.sample_count, 99)
+        self.assertIn("invalid_shadow_exit_reason", report.blockers)
 
     def test_future_version_mismatch_and_explicit_contamination_block(self) -> None:
         future = comparison(1, strategy_version="sniper-v2", contaminated=True)
@@ -385,6 +408,90 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(len(materialized), 1)
             self.assertEqual(set(materialized[0].source_evidence_ids), {item.record_id for item in accepted})
 
+    def test_subthreshold_price_tick_does_not_prematurely_complete_shadow(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 50
+            state.settings.stop_loss_pct = 30
+            state.settings.minimum_hold_time_seconds = 0
+            state.settings.max_hold_time_seconds = 600
+            state.settings.max_position_ticks = 1000
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "shadow exit-rule evidence", [
+                    "take_profit_pct",
+                    "stop_loss_pct",
+                    "minimum_hold_time_seconds",
+                    "max_hold_time_seconds",
+                    "max_position_ticks",
+                ]
+            )
+            now = utc_now()
+            token = TokenSignal(
+                id="token-waiting-shadow", symbol="WAIT", name="Waiting Shadow",
+                mint="mint-waiting-shadow", creator="creator", detected_at=now - timedelta(minutes=1),
+                status=TokenStatus.MONITORING, entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=1),
+                raw_payload={"signature": "entry-waiting", "mint": token.mint, "txType": "buy", "price": 1.0},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "WalletShadow",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+            self.assertIsNotNone(audit)
+
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=audit.created_at + timedelta(seconds=5),
+                raw_payload={"signature": "path-waiting", "mint": token.mint, "txType": "sell", "price": 1.01},
+                token=None, kind="trade", mint=token.mint, trade_side="sell",
+            ))
+
+            refreshed = state.storage.load_live_execution_audit(audit.id)
+            immediate_window = next(
+                item for item in refreshed.shadow_comparison["landing_windows"] if item["delay_ms"] == 0
+            )
+            self.assertEqual(refreshed.shadow_comparison["status"], "waiting_for_exit_rule")
+            self.assertEqual(refreshed.shadow_comparison["evaluation_model"], "exit_rules_v2_strict")
+            self.assertEqual(immediate_window["status"], "waiting_for_exit_rule")
+            self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
+            self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+    def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            now = utc_now()
+            legacy_comparison = {
+                "mode": "dry_run_shadow",
+                "status": "evaluated",
+                "evaluation_model": "exit_rules_v1",
+                "entry_price": 1.0,
+                "exit_price": 1.01,
+                "exit_reason": "latest observed price",
+                "quoted_at": now.isoformat(),
+                "estimated_pnl_sol": 0.0001,
+            }
+            audit = LiveExecutionAudit(
+                id="legacy-completed-audit", created_at=now, updated_at=now,
+                action="buy", mint="legacy-completed-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="LegacyWallet",
+                quote={"id": "legacy-completed-quote", "shadow_only": True},
+                shadow_comparison=legacy_comparison,
+            )
+
+            refreshed = state._evaluate_shadow_comparison(audit)
+
+            self.assertEqual(refreshed, legacy_comparison)
+
     def test_evaluated_shadow_capture_stays_pending_until_economic_evidence_persists(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
@@ -578,7 +685,7 @@ class ShadowEvaluationTests(unittest.TestCase):
                 strategy_id=state.settings.strategy_profile, strategy_version=version_id,
                 evidence_mode="paper", source="pumpportal", source_event_id="retry-exit-source",
                 observed_at=now + timedelta(seconds=1), received_at=now + timedelta(seconds=1),
-                mint="retry-mint", price=1.1, confidence=0.9, acceptance_reason="direct: accepted",
+                mint="retry-mint", price=1.6, confidence=0.9, acceptance_reason="direct: accepted",
             )
             state.storage.save_accepted_market_observation(entry)
             state.storage.save_accepted_market_observation(exit_observation)
