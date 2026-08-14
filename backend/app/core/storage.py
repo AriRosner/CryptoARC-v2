@@ -1587,6 +1587,21 @@ class Storage:
             ).fetchall()
         return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
 
+    def load_shadow_audit_ids_bound_to_observation(self, market_observation_id: str) -> list[str]:
+        if not market_observation_id:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT audit_id
+                FROM shadow_market_evidence_bindings
+                WHERE market_observation_id = ? AND evidence_mode = 'shadow'
+                ORDER BY created_at ASC
+                """,
+                (market_observation_id,),
+            ).fetchall()
+        return [str(row["audit_id"]) for row in rows]
+
     def save_pending_shadow_audit_capture(
         self,
         *,
