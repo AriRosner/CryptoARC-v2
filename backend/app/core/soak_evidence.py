@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.core.shadow_evaluation import MarketRegimeClassifier
 
 
 SENSITIVE_KEY_PARTS = (
@@ -89,6 +92,10 @@ def _finding(finding_id: str, severity: str, message: str) -> dict[str, str]:
     return {"id": finding_id, "severity": severity, "message": message}
 
 
+def _finding_slug(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_") or "unknown"
+
+
 def build_campaign_evidence(
     *,
     status: dict[str, object],
@@ -120,10 +127,70 @@ def build_campaign_evidence(
         if name in previous_counts and int(value or 0) < int(previous_counts[name] or 0):
             anomalies.append(_finding(f"{name}_regressed", "error", f"Monitor {name} count moved backward."))
 
+    pipeline_warnings = status.get("evidence_pipeline_warnings")
+    if isinstance(pipeline_warnings, list):
+        for warning in sorted({str(item) for item in pipeline_warnings if str(item).strip()}):
+            anomalies.append(
+                _finding(
+                    f"pipeline_warning_{_finding_slug(warning)}",
+                    "error",
+                    f"Evidence pipeline warning reported: {warning}.",
+                )
+            )
+
     progress = status.get("economic_progress") if isinstance(status.get("economic_progress"), dict) else {}
     sample_count = int(progress.get("sample_count", 0) or 0)
     calendar_days = int(progress.get("calendar_days", 0) or 0)
-    regime_count = len(progress.get("regimes", [])) if isinstance(progress.get("regimes"), list) else 0
+    regimes = [str(item) for item in progress.get("regimes", [])] if isinstance(progress.get("regimes"), list) else []
+    invalid_regimes = sorted(set(regimes) - MarketRegimeClassifier.VALID_REGIMES)
+    if invalid_regimes:
+        anomalies.append(
+            _finding(
+                "unsupported_market_regime",
+                "error",
+                f"Economic progress contains unsupported market regimes: {', '.join(invalid_regimes)}.",
+            )
+        )
+    valid_regime_count = len(set(regimes) & MarketRegimeClassifier.VALID_REGIMES)
+    if sample_count > 0 and valid_regime_count < 2:
+        anomalies.append(
+            _finding(
+                "single_market_regime",
+                "warning",
+                "Economic evidence has not yet covered at least two supported market regimes.",
+            )
+        )
+
+    if "economic_sample_count" in status and int(status.get("economic_sample_count") or 0) != sample_count:
+        anomalies.append(
+            _finding(
+                "economic_counter_divergence",
+                "error",
+                "Top-level and economic-progress sample counts disagree.",
+            )
+        )
+
+    source_summary = status.get("source_soak_summary") if isinstance(status.get("source_soak_summary"), dict) else {}
+    source_gates = status.get("source_soak_gates") if isinstance(status.get("source_soak_gates"), list) else []
+    genuine_gate_failed = any(
+        isinstance(item, dict)
+        and item.get("id") == "genuine_trade_prices"
+        and item.get("status") == "fail"
+        for item in source_gates
+    )
+    if (
+        genuine_gate_failed
+        and int(source_summary.get("genuine_price_count", 0) or 0) > 0
+        and source_summary.get("access_state") == "ready"
+        and int(source_summary.get("conflicts", 0) or 0) == 0
+    ):
+        anomalies.append(
+            _finding(
+                "source_gate_count_contradiction",
+                "error",
+                "The genuine-price source gate failed despite positive genuine counts, ready access, and no conflicts.",
+            )
+        )
     authority_unchanged = (
         status.get("mode") == "paper"
         and status.get("live_trading_enabled") is False
@@ -155,9 +222,15 @@ def build_campaign_evidence(
                 "required_samples": 100,
                 "calendar_days": calendar_days,
                 "required_calendar_days": 7,
-                "regime_count": regime_count,
+                "regime_count": valid_regime_count,
                 "multiple_regimes_required": True,
-                "economic_gate_ready": bool(status.get("economic_ready")) and sample_count >= 100 and calendar_days >= 7 and regime_count >= 2,
+                "economic_gate_ready": (
+                    bool(status.get("economic_ready"))
+                    and sample_count >= 100
+                    and calendar_days >= 7
+                    and valid_regime_count >= 2
+                    and not invalid_regimes
+                ),
             },
             "anomalies": sorted(anomalies, key=lambda item: item["id"]),
         }

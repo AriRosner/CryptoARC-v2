@@ -79,7 +79,7 @@ from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
 from app.core.strategy_contract import SniperStrategyVersion
-from app.core.shadow_evaluation import EconomicValidator
+from app.core.shadow_evaluation import EconomicValidator, MarketRegimeClassifier
 from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
@@ -2425,10 +2425,16 @@ class BotState:
             if bound_audits:
                 self._refresh_shadow_comparisons(bound_audits)
 
-    def _shadow_entry_market_evidence(self, audit: LiveExecutionAudit) -> AcceptedMarketObservation | None:
+    def _shadow_entry_market_evidence(
+        self,
+        audit: LiveExecutionAudit,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> AcceptedMarketObservation | None:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
-        strategy_id = str(comparison.get("strategy_id") or "")
-        strategy_version = str(comparison.get("strategy_version") or "")
+        strategy_id = strategy_id or str(comparison.get("strategy_id") or "")
+        strategy_version = strategy_version or str(comparison.get("strategy_version") or "")
         candidates = [
             item
             for item in self.storage.load_accepted_market_observations(
@@ -2441,7 +2447,13 @@ class BotState:
         if not candidates:
             return None
         entry = max(candidates, key=lambda item: item.observed_at)
-        if entry.fixture_only or entry.conflict_state != "clear" or entry.access_state != "ready":
+        if (
+            entry.price is None
+            or entry.price <= 0
+            or entry.fixture_only
+            or entry.conflict_state != "clear"
+            or entry.access_state != "ready"
+        ):
             return None
         return entry
 
@@ -3652,6 +3664,18 @@ class BotState:
     ) -> dict[str, object]:
         evaluated_at = now or utc_now()
         observations = self.storage.load_accepted_market_observations(limit=max(1, min(5000, limit)))
+        evaluated_is_aware = evaluated_at.tzinfo is not None and evaluated_at.utcoffset() is not None
+        evaluated_utc = evaluated_at.astimezone(timezone.utc) if evaluated_is_aware else evaluated_at
+        recent_observations: list[AcceptedMarketObservation] = []
+        for item in observations:
+            if not evaluated_is_aware:
+                recent_observations.append(item)
+                continue
+            if item.observed_at.tzinfo is None or item.observed_at.utcoffset() is None:
+                continue
+            age_seconds = (evaluated_utc - item.observed_at.astimezone(timezone.utc)).total_seconds()
+            if 0 <= age_seconds <= 300:
+                recent_observations.append(item)
         access_rows = self.storage.load_source_access_evidence(limit=1, source="pumpportal")
         latest_observation_at = max((item.observed_at for item in observations), default=None)
         latest_access_at = None
@@ -3670,15 +3694,8 @@ class BotState:
             access_state = "funding_required"
         else:
             access_state = "unknown"
-        result = SourceEvidenceGate.evaluate(observations, access_state=access_state, now=evaluated_at)
-        stale_count = sum(
-            1
-            for item in observations
-            if item.observed_at.tzinfo is None
-            or item.observed_at.utcoffset() is None
-            or item.observed_at > evaluated_at
-            or (evaluated_at - item.observed_at).total_seconds() > 300
-        )
+        result = SourceEvidenceGate.evaluate(recent_observations, access_state=access_state, now=evaluated_at)
+        stale_count = len(observations) - len(recent_observations)
         return {
             "artifact_type": "cryptoarc_genuine_source_evidence",
             "format_version": 1,
@@ -3688,6 +3705,7 @@ class BotState:
             "genuine_price_count": result.genuine_count,
             "fixture_price_count": result.fixture_count,
             "conflicts": result.conflict_count,
+            "historical_price_count": len(observations),
             "stale_or_invalid_time_count": stale_count,
             "direct_comparison_sample_ids": list(result.direct_comparison_sample_ids),
             "shadow_eligible": result.shadow_eligible,
@@ -6563,18 +6581,50 @@ class BotState:
             "total_cost_sol": round(total_fee_drag + impact_drag + priority_fee, 9),
         }
 
+    def _market_regime_at(self, observed_at: datetime) -> dict[str, object]:
+        window_seconds = 60
+        window_started_at = observed_at - timedelta(seconds=window_seconds)
+        direct_creates = self.storage.load_source_events_by_source_payload_contains_between(
+            ("solana_logs",),
+            "Instruction: Create",
+            window_started_at,
+            observed_at,
+            limit=5000,
+        )
+        direct_create_count = len(direct_creates)
+        return {
+            "label": MarketRegimeClassifier.classify(direct_create_count),
+            "source": "solana_logs_create_rate",
+            "direct_create_count": direct_create_count,
+            "window_seconds": window_seconds,
+            "window_started_at": window_started_at.isoformat(),
+            "observed_at": observed_at.isoformat(),
+        }
+
     def _build_shadow_comparison(self, audit: LiveExecutionAudit) -> dict[str, object]:
         if audit.action != "buy" or audit.status != "ready":
             return {}
         amount_sol = self._audit_amount_sol(audit)
         costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
-        entry_price, entry_source, entry_at = self._shadow_price_at_or_before(audit.mint, audit.created_at)
+        strategy_id = self.settings.strategy_profile
+        strategy_version = self.current_settings_version_id or "unversioned"
+        entry_evidence = self._shadow_entry_market_evidence(
+            audit,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        entry_price = float(entry_evidence.price) if entry_evidence and entry_evidence.price is not None else None
+        entry_source = entry_evidence.source if entry_evidence else ""
+        entry_at = entry_evidence.observed_at if entry_evidence else None
+        regime_evidence = self._market_regime_at(audit.created_at)
         comparison = {
             "mode": "dry_run_shadow",
             "status": "waiting_for_price",
             "evaluation_model": "exit_rules_v2_strict",
-            "strategy_id": self.settings.strategy_profile,
-            "strategy_version": self.current_settings_version_id or "unversioned",
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
+            "regime": regime_evidence["label"],
+            "regime_evidence": regime_evidence,
             "audit_id": audit.id,
             "intent_id": audit.intent_id,
             "mint": audit.mint,

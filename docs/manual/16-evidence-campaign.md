@@ -70,8 +70,13 @@ redacted JSON and Markdown checkpoint from the monitor status plus a read-only
 SQLite connection. The exporter never starts the bot and never invokes wallet,
 signer, simulation, submission, acknowledgement, arming, or live-session paths.
 It flags stale status, exact-head drift, counter regression, database/status
-divergence, and the fixed economic minimums of 100 genuine completed samples
-across at least seven calendar days and multiple regimes.
+divergence, pipeline warnings, contradictory source-gate/count states,
+economic-counter disagreement, unsupported regime labels, and incomplete
+multi-regime coverage. Economic qualification requires 100 genuine completed
+samples across at least seven calendar days and at least two supported,
+pre-entry regimes (`quiet`, `normal`, or `surge`). Any error anomaly invalidates
+the checkpoint until corrected; a `single_market_regime` warning records an
+incomplete qualification requirement rather than silently hiding it.
 
 ```powershell
 python scripts/export-shadow-campaign-evidence.py `

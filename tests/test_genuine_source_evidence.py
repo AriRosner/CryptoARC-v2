@@ -156,6 +156,29 @@ class GenuineSourceEvidenceTests(unittest.TestCase):
         self.assertEqual(report["access_state"], "ready")
         self.assertEqual(report["direct_comparison_sample_ids"], ["direct-1"])
 
+    def test_stale_history_does_not_poison_independent_fresh_source_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "source.db"))
+            state.storage.save_accepted_market_observation(observation(
+                record_id="fresh", source_event_id="fresh-event",
+                observed_at=NOW - timedelta(seconds=5), received_at=NOW - timedelta(seconds=4),
+                direct_comparison_sample_id="fresh-direct",
+            ))
+            state.storage.save_accepted_market_observation(observation(
+                record_id="stale", source_event_id="stale-event",
+                observed_at=NOW - timedelta(minutes=6), received_at=NOW - timedelta(minutes=6),
+                direct_comparison_sample_id="stale-direct",
+            ))
+
+            report = state.genuine_source_evidence_report(now=NOW)
+
+        self.assertTrue(report["shadow_eligible"])
+        self.assertEqual(report["accepted_price_count"], 1)
+        self.assertEqual(report["genuine_price_count"], 1)
+        self.assertEqual(report["historical_price_count"], 2)
+        self.assertEqual(report["stale_or_invalid_time_count"], 1)
+        self.assertEqual(report["direct_comparison_sample_ids"], ["fresh-direct"])
+
     def test_newer_access_failure_blocks_persisted_observations(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "source.db"))

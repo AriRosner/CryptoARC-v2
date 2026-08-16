@@ -11,9 +11,9 @@ from tempfile import TemporaryDirectory
 from fastapi.testclient import TestClient
 
 from app.auth import AuthManager
-from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown, ShadowTrackingCandidate, TokenSignal, TokenStatus, utc_now
+from app.core.models import AcceptedMarketObservation, LiveExecutionAudit, ShadowComparison, ShadowCostBreakdown, ShadowTrackingCandidate, SourceEvent, TokenSignal, TokenStatus, utc_now
 from app.core.pilot_risk import PilotRiskPolicy
-from app.core.shadow_evaluation import EconomicValidator
+from app.core.shadow_evaluation import EconomicValidator, MarketRegimeClassifier
 from app.core.sources import LaunchEvent
 from app.core.state import BotState
 from app.core.storage import Storage
@@ -81,7 +81,7 @@ def ready_campaign() -> list[ShadowComparison]:
                 base=0.02,
                 variable=0.01,
                 day=index % 7,
-                regime="high" if index % 2 else "normal",
+                regime="surge" if index % 2 else "normal",
                 held_out=index >= 80,
             )
         )
@@ -89,6 +89,76 @@ def ready_campaign() -> list[ShadowComparison]:
 
 
 class ShadowEvaluationTests(unittest.TestCase):
+    def test_market_regime_classifier_has_fixed_pre_entry_boundaries(self) -> None:
+        self.assertEqual(MarketRegimeClassifier.classify(0), "quiet")
+        self.assertEqual(MarketRegimeClassifier.classify(4), "quiet")
+        self.assertEqual(MarketRegimeClassifier.classify(5), "normal")
+        self.assertEqual(MarketRegimeClassifier.classify(19), "normal")
+        self.assertEqual(MarketRegimeClassifier.classify(20), "surge")
+
+    def test_unsupported_market_regime_cannot_qualify(self) -> None:
+        report = EconomicValidator.evaluate("sniper-v1", [comparison(regime="high")], NOW)
+
+        self.assertEqual(report.sample_count, 0)
+        self.assertIn("invalid_market_regime", report.blockers)
+
+    def test_shadow_comparison_persists_quote_time_market_regime_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            token = TokenSignal(
+                id="regime-token", symbol="RGME", name="Regime", mint="regime-mint",
+                creator="creator", detected_at=NOW - timedelta(minutes=2),
+                status=TokenStatus.MONITORING, entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            for index in range(5):
+                state.storage.save_source_event(SourceEvent(
+                    id=f"in-window-{index}", source="solana_logs",
+                    received_at=NOW - timedelta(seconds=50 - index),
+                    raw_payload={"logs": ["Program log: Instruction: CreateV2"]},
+                ))
+            state.storage.save_source_event(SourceEvent(
+                id="too-old", source="solana_logs", received_at=NOW - timedelta(seconds=61),
+                raw_payload={"logs": ["Program log: Instruction: CreateV2"]},
+            ))
+            state.storage.save_source_event(SourceEvent(
+                id="after-quote", source="solana_logs", received_at=NOW + timedelta(seconds=1),
+                raw_payload={"logs": ["Program log: Instruction: CreateV2"]},
+            ))
+            audit = LiveExecutionAudit(
+                id="regime-audit", created_at=NOW, updated_at=NOW, action="buy",
+                mint=token.mint, amount="0.01", status="ready", signer_mode="browser_wallet",
+                wallet_public_key="RegimeWallet", quote={"id": "regime-quote", "shadow_only": True},
+            )
+
+            result = state._build_shadow_comparison(audit)
+
+            self.assertEqual(result["regime"], "normal")
+            self.assertEqual(result["regime_evidence"]["direct_create_count"], 5)
+            self.assertEqual(result["regime_evidence"]["window_seconds"], 60)
+            self.assertEqual(result["regime_evidence"]["observed_at"], NOW.isoformat())
+
+    def test_token_current_price_cannot_substitute_for_accepted_entry_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.storage.save_token(TokenSignal(
+                id="token-only", symbol="TOK", name="Token only", mint="token-only-mint",
+                creator="creator", detected_at=NOW - timedelta(seconds=10),
+                status=TokenStatus.MONITORING, current_price=2.0,
+            ))
+            audit = LiveExecutionAudit(
+                id="token-only-audit", created_at=NOW, updated_at=NOW, action="buy",
+                mint="token-only-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="ShadowWallet",
+                quote={"id": "token-only-quote", "shadow_only": True},
+            )
+
+            result = state._build_shadow_comparison(audit)
+
+            self.assertEqual(result["status"], "missing_entry_price")
+            self.assertIsNone(result["entry_price"])
+            self.assertEqual(result["entry_price_source"], "")
+
     def test_cost_stress_doubles_only_variable_execution_costs(self) -> None:
         report = EconomicValidator.evaluate("sniper-v1", [comparison(gross=1.0, base=0.1, variable=0.2)], NOW)
 
@@ -115,7 +185,7 @@ class ShadowEvaluationTests(unittest.TestCase):
         self.assertEqual(report.blockers, ())
         self.assertEqual(report.sample_count, 100)
         self.assertEqual(report.calendar_days, 7)
-        self.assertEqual(report.regimes, ("high", "normal"))
+        self.assertEqual(report.regimes, ("normal", "surge"))
         self.assertGreaterEqual(report.profit_factor, 1.2)
         self.assertGreater(report.held_out.net_pnl, 0)
 

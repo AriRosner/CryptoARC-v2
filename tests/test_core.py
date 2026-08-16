@@ -4308,6 +4308,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowSnap"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowSnap", "0.001", True, 1, 0.00001, "pump", "WalletShadowSnap")
@@ -4426,6 +4427,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowEval"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowEval", "0.001", True, 1, 0.00001, "pump", "WalletShadowEval")
@@ -4466,6 +4468,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowTp"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowTp", "0.01", True, 1, 0.00001, "pump", "WalletShadowTp")
@@ -4517,6 +4520,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowMinHold"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowMinHold", "0.01", True, 1, 0.00001, "pump", "WalletShadowMinHold")
@@ -4567,6 +4571,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowDelay"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowDelay", "0.01", True, 1, 0.00001, "pump", "WalletShadowDelay")
@@ -4612,6 +4617,7 @@ class CoreLogicTests(unittest.TestCase):
             token.mint = "MintShadowStaleWindow"
             token.current_price = 0.00001
             state.storage.save_token(token)
+            self.seed_genuine_market_observation(state, mint=token.mint)
             state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
 
             quote = state.live_quote(True, "buy", "MintShadowStaleWindow", "0.01", True, 1, 0.00001, "pump", "WalletShadowStaleWindow")

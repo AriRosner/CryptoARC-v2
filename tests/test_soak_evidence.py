@@ -52,11 +52,56 @@ class SoakEvidenceTests(unittest.TestCase):
         finding_ids = {item["id"] for item in first["anomalies"]}
         self.assertEqual(
             finding_ids,
-            {"code_head_drift", "database_count_behind_status", "monitor_stale", "source_events_regressed"},
+            {
+                "code_head_drift",
+                "database_count_behind_status",
+                "monitor_stale",
+                "single_market_regime",
+                "source_events_regressed",
+            },
         )
         self.assertFalse(first["readiness"]["economic_gate_ready"])
         self.assertEqual(first["readiness"]["required_samples"], 100)
         self.assertEqual(first["readiness"]["required_calendar_days"], 7)
+
+    def test_pipeline_source_regime_and_counter_contradictions_are_anomalies(self) -> None:
+        from app.core.soak_evidence import build_campaign_evidence
+
+        observed_at = datetime(2026, 8, 12, 18, 30, tzinfo=timezone.utc)
+        artifact = build_campaign_evidence(
+            status={
+                "generated_at": observed_at.isoformat(),
+                "code_head": "abc",
+                "mode": "paper",
+                "live_trading_enabled": False,
+                "live_execution_available": False,
+                "economic_sample_count": 3,
+                "economic_progress": {
+                    "sample_count": 2,
+                    "calendar_days": 1,
+                    "regimes": ["normal", "mystery"],
+                },
+                "economic_ready": False,
+                "evidence_pipeline_warnings": ["evaluated_shadow_not_materialized"],
+                "source_soak_summary": {
+                    "accepted_price_count": 100,
+                    "genuine_price_count": 100,
+                    "access_state": "ready",
+                    "conflicts": 0,
+                },
+                "source_soak_gates": [{"id": "genuine_trade_prices", "status": "fail"}],
+            },
+            database_counts={},
+            database_safety={"mode": "paper", "kill_switch_enabled": True},
+            code_head="abc",
+            observed_at=observed_at,
+        )
+
+        findings = {item["id"]: item["severity"] for item in artifact["anomalies"]}
+        self.assertEqual(findings["pipeline_warning_evaluated_shadow_not_materialized"], "error")
+        self.assertEqual(findings["source_gate_count_contradiction"], "error")
+        self.assertEqual(findings["unsupported_market_regime"], "error")
+        self.assertEqual(findings["economic_counter_divergence"], "error")
 
     def test_redact_sensitive_values_recursively(self) -> None:
         from app.core.soak_evidence import redact_sensitive_values
