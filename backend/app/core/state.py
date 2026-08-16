@@ -79,7 +79,7 @@ from app.core.solana_readonly import SolanaReadOnlyClient
 from app.core.storage import Storage
 from app.core.sources import LaunchEvent, PUMPPORTAL_NON_LAUNCH_MINTS, SourceEvidenceGate, normalize_pumpportal_new_token
 from app.core.strategy_contract import SniperStrategyVersion
-from app.core.shadow_evaluation import EconomicValidator
+from app.core.shadow_evaluation import EconomicValidator, MarketRegimeClassifier
 from app.core.sentinel import Sentinel
 from app.core.strategy_candidates import CandidateFactory, PromotionGate
 from app.core.workload_governor import CriticalMetrics, WorkloadGovernor
@@ -6563,18 +6563,41 @@ class BotState:
             "total_cost_sol": round(total_fee_drag + impact_drag + priority_fee, 9),
         }
 
+    def _market_regime_at(self, observed_at: datetime) -> dict[str, object]:
+        window_seconds = 60
+        window_started_at = observed_at - timedelta(seconds=window_seconds)
+        direct_creates = self.storage.load_source_events_by_source_payload_contains_between(
+            ("solana_logs",),
+            "Instruction: Create",
+            window_started_at,
+            observed_at,
+            limit=5000,
+        )
+        direct_create_count = len(direct_creates)
+        return {
+            "label": MarketRegimeClassifier.classify(direct_create_count),
+            "source": "solana_logs_create_rate",
+            "direct_create_count": direct_create_count,
+            "window_seconds": window_seconds,
+            "window_started_at": window_started_at.isoformat(),
+            "observed_at": observed_at.isoformat(),
+        }
+
     def _build_shadow_comparison(self, audit: LiveExecutionAudit) -> dict[str, object]:
         if audit.action != "buy" or audit.status != "ready":
             return {}
         amount_sol = self._audit_amount_sol(audit)
         costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
         entry_price, entry_source, entry_at = self._shadow_price_at_or_before(audit.mint, audit.created_at)
+        regime_evidence = self._market_regime_at(audit.created_at)
         comparison = {
             "mode": "dry_run_shadow",
             "status": "waiting_for_price",
             "evaluation_model": "exit_rules_v2_strict",
             "strategy_id": self.settings.strategy_profile,
             "strategy_version": self.current_settings_version_id or "unversioned",
+            "regime": regime_evidence["label"],
+            "regime_evidence": regime_evidence,
             "audit_id": audit.id,
             "intent_id": audit.intent_id,
             "mint": audit.mint,

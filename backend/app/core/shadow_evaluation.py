@@ -37,6 +37,19 @@ class EconomicGateReport:
         return asdict(self)
 
 
+class MarketRegimeClassifier:
+    VALID_REGIMES = frozenset({"quiet", "normal", "surge"})
+
+    @classmethod
+    def classify(cls, direct_create_count: int) -> str:
+        count = max(0, int(direct_create_count))
+        if count < 5:
+            return "quiet"
+        if count < 20:
+            return "normal"
+        return "surge"
+
+
 class EconomicValidator:
     MIN_SAMPLES = 100
     MIN_CALENDAR_DAYS = 7
@@ -93,6 +106,9 @@ class EconomicValidator:
             normalized_exit_reason = str(item.exit_reason or "").strip().lower().replace("_", " ")
             if normalized_exit_reason not in cls.VALID_EXIT_REASONS:
                 blockers.append("invalid_shadow_exit_reason")
+                item_blocked = True
+            if item.regime not in MarketRegimeClassifier.VALID_REGIMES:
+                blockers.append("invalid_market_regime")
                 item_blocked = True
             if not item.source_evidence_ids or not item.quote_id:
                 blockers.append("source_evidence_missing")
