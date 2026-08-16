@@ -3652,6 +3652,18 @@ class BotState:
     ) -> dict[str, object]:
         evaluated_at = now or utc_now()
         observations = self.storage.load_accepted_market_observations(limit=max(1, min(5000, limit)))
+        evaluated_is_aware = evaluated_at.tzinfo is not None and evaluated_at.utcoffset() is not None
+        evaluated_utc = evaluated_at.astimezone(timezone.utc) if evaluated_is_aware else evaluated_at
+        recent_observations: list[AcceptedMarketObservation] = []
+        for item in observations:
+            if not evaluated_is_aware:
+                recent_observations.append(item)
+                continue
+            if item.observed_at.tzinfo is None or item.observed_at.utcoffset() is None:
+                continue
+            age_seconds = (evaluated_utc - item.observed_at.astimezone(timezone.utc)).total_seconds()
+            if 0 <= age_seconds <= 300:
+                recent_observations.append(item)
         access_rows = self.storage.load_source_access_evidence(limit=1, source="pumpportal")
         latest_observation_at = max((item.observed_at for item in observations), default=None)
         latest_access_at = None
@@ -3670,15 +3682,8 @@ class BotState:
             access_state = "funding_required"
         else:
             access_state = "unknown"
-        result = SourceEvidenceGate.evaluate(observations, access_state=access_state, now=evaluated_at)
-        stale_count = sum(
-            1
-            for item in observations
-            if item.observed_at.tzinfo is None
-            or item.observed_at.utcoffset() is None
-            or item.observed_at > evaluated_at
-            or (evaluated_at - item.observed_at).total_seconds() > 300
-        )
+        result = SourceEvidenceGate.evaluate(recent_observations, access_state=access_state, now=evaluated_at)
+        stale_count = len(observations) - len(recent_observations)
         return {
             "artifact_type": "cryptoarc_genuine_source_evidence",
             "format_version": 1,
@@ -3688,6 +3693,7 @@ class BotState:
             "genuine_price_count": result.genuine_count,
             "fixture_price_count": result.fixture_count,
             "conflicts": result.conflict_count,
+            "historical_price_count": len(observations),
             "stale_or_invalid_time_count": stale_count,
             "direct_comparison_sample_ids": list(result.direct_comparison_sample_ids),
             "shadow_eligible": result.shadow_eligible,
