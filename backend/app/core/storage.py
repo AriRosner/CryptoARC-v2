@@ -1581,7 +1581,7 @@ class Storage:
                   ON observations.record_id = bindings.market_observation_id
                 WHERE bindings.audit_id = ?
                   AND bindings.evidence_mode = 'shadow'
-                ORDER BY observations.observed_at ASC
+                ORDER BY observations.received_at ASC
                 """,
                 (audit_id,),
             ).fetchall()

@@ -2446,7 +2446,7 @@ class BotState:
         ]
         if not candidates:
             return None
-        entry = max(candidates, key=lambda item: item.observed_at)
+        entry = max(candidates, key=lambda item: item.received_at)
         if (
             entry.price is None
             or entry.price <= 0
@@ -2495,14 +2495,14 @@ class BotState:
                 strategy_version=strategy_version,
             )
             if item.mint == mint
-            and item.observed_at <= selected_at
+            and item.received_at <= selected_at
             and item.price is not None
             and item.price > 0
             and not item.fixture_only
             and item.conflict_state == "clear"
             and item.access_state == "ready"
         ]
-        return max(candidates, key=lambda item: item.observed_at) if candidates else None
+        return max(candidates, key=lambda item: item.received_at) if candidates else None
 
     def _candidate_tracking_window_seconds(self, strategy_version: str) -> int:
         captured = self.storage.load_settings_version(strategy_version)

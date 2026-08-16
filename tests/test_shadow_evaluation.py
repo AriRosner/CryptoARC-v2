@@ -632,6 +632,46 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(economic[0].entry_received_at, now - timedelta(seconds=1))
             self.assertEqual(economic[0].exit_received_at, valid_exit_received_at)
 
+    def test_shadow_entry_uses_latest_receipt_not_processing_order(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "receipt-ordered shadow entry", ["strategy_profile"]
+            )
+            now = utc_now()
+            token = TokenSignal(
+                id="token-entry-order", symbol="ORDER", name="Entry Order",
+                mint="mint-entry-order", creator="creator",
+                detected_at=now - timedelta(minutes=1), status=TokenStatus.MONITORING,
+                entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=1),
+                raw_payload={"signature": "newer-receipt-first", "mint": token.mint, "txType": "buy", "price": 1.0},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=2),
+                raw_payload={"signature": "older-receipt-later", "mint": token.mint, "txType": "buy", "price": 0.5},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "ReceiptWallet",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit.shadow_comparison["entry_price"], 1.0)
+
     def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
