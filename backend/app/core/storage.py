@@ -1725,7 +1725,7 @@ class Storage:
                     observation.mint,
                     observation.strategy_id,
                     observation.strategy_version,
-                    observation.observed_at.isoformat(),
+                    observation.received_at.isoformat(),
                 ),
             ).fetchall()
             inserted = 0

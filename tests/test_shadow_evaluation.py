@@ -618,6 +618,20 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(refreshed.shadow_comparison["status"], "waiting_for_price")
             self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
 
+            valid_exit_received_at = audit.created_at + timedelta(seconds=31)
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=valid_exit_received_at,
+                raw_payload={"signature": "postquote-exit", "mint": token.mint, "txType": "sell", "price": 1.1},
+                token=None, kind="trade", mint=token.mint, trade_side="sell",
+            ))
+
+            completed = state.storage.load_live_execution_audit(audit.id)
+            self.assertEqual(completed.shadow_comparison["status"], "evaluated")
+            economic = state.storage.load_shadow_comparisons(limit=10)
+            self.assertEqual(len(economic), 1)
+            self.assertEqual(economic[0].entry_received_at, now - timedelta(seconds=1))
+            self.assertEqual(economic[0].exit_received_at, valid_exit_received_at)
+
     def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
