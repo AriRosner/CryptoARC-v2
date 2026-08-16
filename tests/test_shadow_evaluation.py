@@ -138,6 +138,27 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(result["regime_evidence"]["window_seconds"], 60)
             self.assertEqual(result["regime_evidence"]["observed_at"], NOW.isoformat())
 
+    def test_token_current_price_cannot_substitute_for_accepted_entry_evidence(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.storage.save_token(TokenSignal(
+                id="token-only", symbol="TOK", name="Token only", mint="token-only-mint",
+                creator="creator", detected_at=NOW - timedelta(seconds=10),
+                status=TokenStatus.MONITORING, current_price=2.0,
+            ))
+            audit = LiveExecutionAudit(
+                id="token-only-audit", created_at=NOW, updated_at=NOW, action="buy",
+                mint="token-only-mint", amount="0.01", status="ready",
+                signer_mode="browser_wallet", wallet_public_key="ShadowWallet",
+                quote={"id": "token-only-quote", "shadow_only": True},
+            )
+
+            result = state._build_shadow_comparison(audit)
+
+            self.assertEqual(result["status"], "missing_entry_price")
+            self.assertIsNone(result["entry_price"])
+            self.assertEqual(result["entry_price_source"], "")
+
     def test_cost_stress_doubles_only_variable_execution_costs(self) -> None:
         report = EconomicValidator.evaluate("sniper-v1", [comparison(gross=1.0, base=0.1, variable=0.2)], NOW)
 

@@ -2425,10 +2425,16 @@ class BotState:
             if bound_audits:
                 self._refresh_shadow_comparisons(bound_audits)
 
-    def _shadow_entry_market_evidence(self, audit: LiveExecutionAudit) -> AcceptedMarketObservation | None:
+    def _shadow_entry_market_evidence(
+        self,
+        audit: LiveExecutionAudit,
+        *,
+        strategy_id: str = "",
+        strategy_version: str = "",
+    ) -> AcceptedMarketObservation | None:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
-        strategy_id = str(comparison.get("strategy_id") or "")
-        strategy_version = str(comparison.get("strategy_version") or "")
+        strategy_id = strategy_id or str(comparison.get("strategy_id") or "")
+        strategy_version = strategy_version or str(comparison.get("strategy_version") or "")
         candidates = [
             item
             for item in self.storage.load_accepted_market_observations(
@@ -2441,7 +2447,13 @@ class BotState:
         if not candidates:
             return None
         entry = max(candidates, key=lambda item: item.observed_at)
-        if entry.fixture_only or entry.conflict_state != "clear" or entry.access_state != "ready":
+        if (
+            entry.price is None
+            or entry.price <= 0
+            or entry.fixture_only
+            or entry.conflict_state != "clear"
+            or entry.access_state != "ready"
+        ):
             return None
         return entry
 
@@ -6594,14 +6606,23 @@ class BotState:
             return {}
         amount_sol = self._audit_amount_sol(audit)
         costs = self._shadow_quote_cost_breakdown(audit, amount_sol)
-        entry_price, entry_source, entry_at = self._shadow_price_at_or_before(audit.mint, audit.created_at)
+        strategy_id = self.settings.strategy_profile
+        strategy_version = self.current_settings_version_id or "unversioned"
+        entry_evidence = self._shadow_entry_market_evidence(
+            audit,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        entry_price = float(entry_evidence.price) if entry_evidence and entry_evidence.price is not None else None
+        entry_source = entry_evidence.source if entry_evidence else ""
+        entry_at = entry_evidence.observed_at if entry_evidence else None
         regime_evidence = self._market_regime_at(audit.created_at)
         comparison = {
             "mode": "dry_run_shadow",
             "status": "waiting_for_price",
             "evaluation_model": "exit_rules_v2_strict",
-            "strategy_id": self.settings.strategy_profile,
-            "strategy_version": self.current_settings_version_id or "unversioned",
+            "strategy_id": strategy_id,
+            "strategy_version": strategy_version,
             "regime": regime_evidence["label"],
             "regime_evidence": regime_evidence,
             "audit_id": audit.id,
