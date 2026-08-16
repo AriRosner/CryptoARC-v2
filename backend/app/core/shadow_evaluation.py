@@ -113,6 +113,15 @@ class EconomicValidator:
             if not item.source_evidence_ids or not item.quote_id:
                 blockers.append("source_evidence_missing")
                 item_blocked = True
+            timing = (item.entry_received_at, item.quoted_at, item.exit_received_at)
+            if (
+                any(value is None for value in timing)
+                or any(value.tzinfo is None or value.utcoffset() is None for value in timing if value is not None)
+                or not (item.entry_received_at <= item.quoted_at < item.exit_received_at)
+                or item.completed_at != item.exit_received_at
+            ):
+                blockers.append("source_evidence_timing_invalid")
+                item_blocked = True
             if item.reference_usd_per_sol <= 0:
                 blockers.append("sol_usd_reference_missing")
                 item_blocked = True

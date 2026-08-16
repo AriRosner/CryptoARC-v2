@@ -68,6 +68,9 @@ def comparison(
         exit_reason=exit_reason or ("take_profit" if gross > 0 else "stop_loss"),
         hold_seconds=30,
         reference_usd_per_sol=reference_usd_per_sol,
+        quoted_at=completed_at - timedelta(seconds=30),
+        entry_received_at=completed_at - timedelta(seconds=31),
+        exit_received_at=completed_at,
     )
 
 
@@ -196,6 +199,9 @@ class ShadowEvaluationTests(unittest.TestCase):
         rows = [comparison(index) for index in range(7)]
         for row, completed_at in zip(rows, completed):
             row.completed_at = completed_at
+            row.quoted_at = completed_at - timedelta(seconds=30)
+            row.entry_received_at = completed_at - timedelta(seconds=31)
+            row.exit_received_at = completed_at
 
         report = EconomicValidator.evaluate("sniper-v1", rows, datetime(2026, 8, 21, 22, 0, tzinfo=timezone.utc))
 
@@ -284,6 +290,29 @@ class ShadowEvaluationTests(unittest.TestCase):
             NOW,
         )
         self.assertIn("sol_usd_reference_missing", report.blockers)
+
+    def test_missing_receipt_timing_proof_fails_closed(self) -> None:
+        row = comparison()
+        row.quoted_at = None
+        row.entry_received_at = None
+        row.exit_received_at = None
+
+        report = EconomicValidator.evaluate("sniper-v1", [row], NOW)
+
+        self.assertEqual(report.sample_count, 0)
+        self.assertIn("source_evidence_timing_invalid", report.blockers)
+
+    def test_received_before_quote_timing_proof_fails_closed(self) -> None:
+        row = comparison()
+        row.quoted_at = row.completed_at - timedelta(seconds=5)
+        row.entry_received_at = row.quoted_at - timedelta(seconds=1)
+        row.exit_received_at = row.quoted_at - timedelta(milliseconds=1)
+        row.completed_at = row.exit_received_at
+
+        report = EconomicValidator.evaluate("sniper-v1", [row], NOW)
+
+        self.assertEqual(report.sample_count, 0)
+        self.assertIn("source_evidence_timing_invalid", report.blockers)
 
     def test_comparisons_round_trip_with_cost_identity(self) -> None:
         with TemporaryDirectory() as directory:
@@ -398,6 +427,10 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(stored[0].reference_usd_per_sol, 200.0)
             self.assertFalse(stored[0].fixture_only)
             self.assertEqual(stored[0].exit_reason, "take profit")
+            self.assertEqual(stored[0].quoted_at, NOW - timedelta(minutes=2))
+            self.assertEqual(stored[0].entry_received_at, NOW - timedelta(minutes=3))
+            self.assertEqual(stored[0].exit_received_at, NOW - timedelta(minutes=1))
+            self.assertEqual(stored[0].completed_at, stored[0].exit_received_at)
             self.assertAlmostEqual(stored[0].costs.base_fee_sol, 0.0002)
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["entry_market_evidence_id"], "market-entry")
             self.assertEqual(audit.shadow_comparison["economic_evidence"]["exit_market_evidence_id"], "market-exit")
@@ -535,6 +568,55 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertEqual(immediate_window["status"], "waiting_for_exit_rule")
             self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
             self.assertEqual(state.storage.count_pending_shadow_audit_captures(audit.id), 1)
+
+    def test_received_before_quote_observation_cannot_trigger_exit(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.take_profit_pct = 5
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "receipt-causal shadow evidence", ["take_profit_pct"]
+            )
+            now = utc_now()
+            state.storage.save_pilot_risk_policy(PilotRiskPolicy.create(
+                Decimal("200"), Decimal("0.4"), now - timedelta(minutes=1),
+                reference_observation_id="sol-usd-receipt-causal",
+                settings_version=state.current_settings_version_id,
+                operator_intent_id="intent-receipt-causal",
+            ))
+            token = TokenSignal(
+                id="token-receipt-causal", symbol="RCPT", name="Receipt Causal",
+                mint="mint-receipt-causal", creator="creator",
+                detected_at=now - timedelta(minutes=1), status=TokenStatus.MONITORING,
+                entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=now - timedelta(seconds=1),
+                raw_payload={"signature": "receipt-entry", "mint": token.mint, "txType": "buy", "price": 1.0},
+                token=None, kind="trade", mint=token.mint, trade_side="buy",
+            ))
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "ReceiptWallet",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+            self.assertIsNotNone(audit)
+
+            state.ingest_source_event(LaunchEvent(
+                source="pumpportal", received_at=audit.created_at - timedelta(milliseconds=100),
+                raw_payload={"signature": "prequote-backlog", "mint": token.mint, "txType": "sell", "price": 1.1},
+                token=None, kind="trade", mint=token.mint, trade_side="sell",
+            ))
+
+            refreshed = state.storage.load_live_execution_audit(audit.id)
+            self.assertEqual(refreshed.shadow_comparison["status"], "waiting_for_price")
+            self.assertEqual(state.storage.load_shadow_comparisons(limit=10), [])
 
     def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
         with TemporaryDirectory() as directory:

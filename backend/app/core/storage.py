@@ -5315,6 +5315,8 @@ class Storage:
     def _shadow_comparison_from_payload(self, payload: dict[str, Any]) -> ShadowComparison:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        for field_name in ("quoted_at", "entry_received_at", "exit_received_at"):
+            payload[field_name] = datetime.fromisoformat(payload[field_name]) if payload.get(field_name) else None
         payload["source_evidence_ids"] = tuple(payload.get("source_evidence_ids") or ())
         payload["costs"] = ShadowCostBreakdown(**dict(payload.get("costs") or {}))
         allowed = set(ShadowComparison.__dataclass_fields__.keys())
