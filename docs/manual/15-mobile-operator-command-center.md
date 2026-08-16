@@ -44,7 +44,7 @@ npx eas-cli@latest login
 npx eas-cli@latest credentials --platform android
 ```
 
-Configure Android FCM V1 credentials through EAS and keep its service-account JSON outside the repository. A signed development or internal build is required for device push registration. Pair with `mobile:alerts`, grant Android notification permission, and check Push in More > Diagnostics.
+Register `com.cryptoarc.cockpit` as an Android app in Firebase, place its public-facing `google-services.json` at `mobile/google-services.json`, and set `expo.android.googleServicesFile` to `./google-services.json` in `mobile/app.json`. Upload a matching FCM V1 service-account key through EAS; its private JSON must remain outside the repository. Build and install a new signed development or internal build after adding the client configuration. Pair with `mobile:alerts`, grant Android notification permission, and check Push in More > Diagnostics.
 
 The production backend sends privacy-minimized warning, danger, and error events through Expo's pinned official HTTPS endpoint. It stores ticket IDs, checks receipts every 15 minutes, and revokes only the linked registration when Expo reports `DeviceNotRegistered`. Credential setup, token registration, or a successful Expo ticket alone does not prove handset delivery; retain receipt and physical-device evidence.
 

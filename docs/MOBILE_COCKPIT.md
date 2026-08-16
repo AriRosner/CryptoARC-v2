@@ -97,9 +97,10 @@ The app may display the last verified portfolio snapshot from its SQLCipher data
    npx eas-cli@latest credentials --platform android
    ```
 
-2. Configure the Android FCM V1 service account through EAS. Keep the downloaded service-account JSON out of Git, docs, diagnostics, and support bundles.
-3. Set `MOBILE_EXPO_PUSH_ENABLED=true` and a valid local `MOBILE_PUSH_TOKEN_ENCRYPTION_KEY`, pair with `mobile:alerts`, install a signed development/internal build, grant Android notification permission, and reopen the app so its Expo token can register. The sender is pinned to Expo's official HTTPS endpoint; it cannot be redirected through configuration.
-4. Check More > Diagnostics for Push status and test only with privacy-minimized warning, danger, or error events. Push payloads contain event ID, severity, subsystem, and route; detail is fetched after unlock.
+2. Register the Android application `com.cryptoarc.cockpit` in Firebase, download its public-facing `google-services.json` to `mobile/google-services.json`, and set `expo.android.googleServicesFile` to `./google-services.json` in `mobile/app.json`.
+3. Configure the matching Android FCM V1 service-account key through EAS. The service-account JSON contains a private key: keep it outside Git, docs, diagnostics, and support bundles. Verify its Firebase project/sender ID matches `mobile/google-services.json`.
+4. Set `MOBILE_EXPO_PUSH_ENABLED=true` and a valid local `MOBILE_PUSH_TOKEN_ENCRYPTION_KEY`, pair with `mobile:alerts`, install a newly signed development/internal build, grant Android notification permission, and reopen the app so its Expo token can register. The sender is pinned to Expo's official HTTPS endpoint; it cannot be redirected through configuration.
+5. Check More > Diagnostics for Push status and test only with privacy-minimized warning, danger, or error events. Push payloads contain event ID, severity, subsystem, and route; detail is fetched after unlock.
 
 The backend records Expo push ticket IDs and reconciles receipts every 15 minutes. `DeviceNotRegistered` invalidates only the linked registration. A successful ticket means Expo accepted the request; native delivery is not release evidence until a receipt and the target handset are independently verified. Diagnostics reports unavailable when the provider is disabled, warning when it is enabled without a registration, and healthy when both provider and registration are configured.
 

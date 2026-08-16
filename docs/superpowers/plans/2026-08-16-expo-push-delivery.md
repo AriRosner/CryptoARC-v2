@@ -104,6 +104,8 @@ Run: `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\verify-mobile.
 
 **Step 2: Build a signed internal Android APK through the already-authorized project credentials.** Confirm the active EAS account and signing provenance without printing credentials. Do not use Expo Go, which cannot prove the release notification configuration.
 
+Before building, register `com.cryptoarc.cockpit` in Firebase, add the public-facing `mobile/google-services.json` through `expo.android.googleServicesFile`, and upload the matching private FCM V1 service-account key to EAS without committing it.
+
 **Step 3: Install only the newly-built signed artifact over the existing app and test the full paired-device path using an isolated, paper-only backend database.** Verify permission grant, registration, a warning/danger test alert, device receipt, foreground/background behavior, safe deep link, acknowledgement, and unregister/revoke behavior. Do not connect to the formal-soak runtime or use any wallet/signer/live-execution endpoint.
 
 **Step 4: Run the full repository verifier only after the formal-soak owner confirms its runtime/database are stopped and audited.**
