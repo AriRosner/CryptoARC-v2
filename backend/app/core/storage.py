@@ -77,7 +77,7 @@ DATA_SUMMARY_COUNTS_SQL = "SELECT " + ", ".join(
 
 
 class Storage:
-    SCHEMA_VERSION = 27
+    SCHEMA_VERSION = 28
     BACKUP_FORMAT_VERSION = 1
     CLEAR_ALL_TABLES = (
         "tokens",
@@ -330,6 +330,7 @@ class Storage:
             (25, "025_pending_shadow_audit_captures", "indexed pending shadow audit capture registry", self._migration_025_pending_shadow_audit_captures),
             (26, "026_shadow_tracking_candidates", "restart-safe shadow candidate evidence lifecycle", self._migration_026_shadow_tracking_candidates),
             (27, "027_source_event_query_indexes", "source soak query indexes", self._migration_027_source_event_query_indexes),
+            (28, "028_accepted_market_receipt_index", "receipt-ordered accepted market observation lookup", self._migration_028_accepted_market_receipt_index),
         ]
 
     def _migration_001_initial_core(self, connection: sqlite3.Connection) -> None:
@@ -478,6 +479,14 @@ class Storage:
             return
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_source_events_source_received_at ON source_events(source, received_at DESC)"
+        )
+
+    def _migration_028_accepted_market_receipt_index(self, connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_accepted_market_observations_strategy_receipt
+            ON accepted_market_observations(strategy_id, strategy_version, received_at DESC)
+            """
         )
 
     def _migration_006_backup_restore_history(self, connection: sqlite3.Connection) -> None:
@@ -1515,6 +1524,35 @@ class Storage:
                 tuple(values),
             ).fetchall()
         return [self._accepted_market_observation_from_payload(json.loads(row["payload"])) for row in rows]
+
+    def load_latest_accepted_market_observation_at_or_before(
+        self,
+        *,
+        mint: str,
+        received_at: datetime,
+        strategy_id: str,
+        strategy_version: str,
+    ) -> AcceptedMarketObservation | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload
+                FROM accepted_market_observations
+                WHERE strategy_id = ?
+                  AND strategy_version = ?
+                  AND json_extract(payload, '$.mint') = ?
+                  AND received_at <= ?
+                ORDER BY received_at DESC, observed_at DESC
+                LIMIT 1
+                """,
+                (
+                    strategy_id,
+                    strategy_version,
+                    mint,
+                    received_at.isoformat(),
+                ),
+            ).fetchone()
+        return self._accepted_market_observation_from_payload(json.loads(row["payload"])) if row else None
 
     def save_shadow_market_evidence_binding(
         self,

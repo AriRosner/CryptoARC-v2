@@ -2435,18 +2435,14 @@ class BotState:
         comparison = audit.shadow_comparison if isinstance(audit.shadow_comparison, dict) else {}
         strategy_id = strategy_id or str(comparison.get("strategy_id") or "")
         strategy_version = strategy_version or str(comparison.get("strategy_version") or "")
-        candidates = [
-            item
-            for item in self.storage.load_accepted_market_observations(
-                limit=5000,
-                strategy_id=strategy_id,
-                strategy_version=strategy_version,
-            )
-            if item.mint == audit.mint and item.received_at <= audit.created_at
-        ]
-        if not candidates:
+        entry = self.storage.load_latest_accepted_market_observation_at_or_before(
+            mint=audit.mint,
+            received_at=audit.created_at,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        if entry is None:
             return None
-        entry = max(candidates, key=lambda item: item.received_at)
         if (
             entry.price is None
             or entry.price <= 0
@@ -2487,22 +2483,22 @@ class BotState:
         strategy_id: str,
         strategy_version: str,
     ) -> AcceptedMarketObservation | None:
-        candidates = [
-            item
-            for item in self.storage.load_accepted_market_observations(
-                limit=5000,
-                strategy_id=strategy_id,
-                strategy_version=strategy_version,
-            )
-            if item.mint == mint
-            and item.received_at <= selected_at
-            and item.price is not None
-            and item.price > 0
-            and not item.fixture_only
-            and item.conflict_state == "clear"
-            and item.access_state == "ready"
-        ]
-        return max(candidates, key=lambda item: item.received_at) if candidates else None
+        entry = self.storage.load_latest_accepted_market_observation_at_or_before(
+            mint=mint,
+            received_at=selected_at,
+            strategy_id=strategy_id,
+            strategy_version=strategy_version,
+        )
+        if (
+            entry is None
+            or entry.price is None
+            or entry.price <= 0
+            or entry.fixture_only
+            or entry.conflict_state != "clear"
+            or entry.access_state != "ready"
+        ):
+            return None
+        return entry
 
     def _candidate_tracking_window_seconds(self, strategy_version: str) -> int:
         captured = self.storage.load_settings_version(strategy_version)
