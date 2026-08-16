@@ -2442,11 +2442,11 @@ class BotState:
                 strategy_id=strategy_id,
                 strategy_version=strategy_version,
             )
-            if item.mint == audit.mint and item.observed_at <= audit.created_at
+            if item.mint == audit.mint and item.received_at <= audit.created_at
         ]
         if not candidates:
             return None
-        entry = max(candidates, key=lambda item: item.observed_at)
+        entry = max(candidates, key=lambda item: item.received_at)
         if (
             entry.price is None
             or entry.price <= 0
@@ -2495,14 +2495,14 @@ class BotState:
                 strategy_version=strategy_version,
             )
             if item.mint == mint
-            and item.observed_at <= selected_at
+            and item.received_at <= selected_at
             and item.price is not None
             and item.price > 0
             and not item.fixture_only
             and item.conflict_state == "clear"
             and item.access_state == "ready"
         ]
-        return max(candidates, key=lambda item: item.observed_at) if candidates else None
+        return max(candidates, key=lambda item: item.received_at) if candidates else None
 
     def _candidate_tracking_window_seconds(self, strategy_version: str) -> int:
         captured = self.storage.load_settings_version(strategy_version)
@@ -6468,6 +6468,11 @@ class BotState:
             for item in bindings
             if item.get("role") == "entry"
         }
+        path_ids = {
+            str(item.get("market_observation_id") or "")
+            for item in bindings
+            if item.get("role") == "path"
+        }
         market_rows = [
             item
             for item in self.storage.load_accepted_market_observations(
@@ -6481,14 +6486,18 @@ class BotState:
             and item.price is not None
             and item.price > 0
         ]
-        entry_candidates = [item for item in market_rows if item.observed_at <= quoted_at]
-        exit_candidates = [item for item in market_rows if item.observed_at > quoted_at]
+        entry_candidates = [
+            item for item in market_rows
+            if item.record_id in entry_ids and item.received_at <= quoted_at
+        ]
+        exit_candidates = [
+            item for item in market_rows
+            if item.record_id in path_ids and item.received_at > quoted_at
+        ]
         if not entry_candidates or not exit_candidates:
             return False
-        entry = max(entry_candidates, key=lambda item: item.observed_at)
-        if entry.record_id not in entry_ids:
-            return False
-        relevant_rows = [entry, *sorted(exit_candidates, key=lambda item: item.observed_at)]
+        entry = max(entry_candidates, key=lambda item: item.received_at)
+        relevant_rows = [entry, *sorted(exit_candidates, key=lambda item: item.received_at)]
         if any(item.fixture_only or item.conflict_state != "clear" for item in relevant_rows):
             return False
         observations = [
@@ -6496,7 +6505,7 @@ class BotState:
                 id=item.record_id,
                 source=item.source,
                 mint=item.mint,
-                observed_at=item.observed_at,
+                observed_at=item.received_at,
                 price=item.price,
                 price_source=f"accepted_market:{item.source}",
                 confidence=item.confidence,
@@ -6511,8 +6520,8 @@ class BotState:
         )
         if not exit_price or completed_at is None:
             return False
-        used_exit_rows = [item for item in relevant_rows[1:] if item.observed_at <= completed_at]
-        exit_evidence = next((item for item in reversed(used_exit_rows) if item.observed_at == completed_at), None)
+        used_exit_rows = [item for item in relevant_rows[1:] if item.received_at <= completed_at]
+        exit_evidence = next((item for item in reversed(used_exit_rows) if item.received_at == completed_at), None)
         if exit_evidence is None:
             return False
         move_pct = ((exit_price - float(entry.price)) / max(float(entry.price), 0.000000001)) * 100
@@ -6525,6 +6534,9 @@ class BotState:
             "source_evidence_ids": list(evidence_ids),
             "strategy_id": strategy_id,
             "strategy_version": strategy_version,
+            "quoted_at": quoted_at.isoformat(),
+            "entry_received_at": entry.received_at.isoformat(),
+            "exit_received_at": exit_evidence.received_at.isoformat(),
         }
         shadow = ShadowComparison(
             record_id=record_id,
@@ -6550,6 +6562,9 @@ class BotState:
             exit_reason=exit_reason,
             hold_seconds=max(0, int((completed_at - quoted_at).total_seconds())),
             reference_usd_per_sol=float(policy.reference_usd_per_sol),
+            quoted_at=quoted_at,
+            entry_received_at=entry.received_at,
+            exit_received_at=exit_evidence.received_at,
         )
         if not shadow.quote_id:
             return False
@@ -7116,7 +7131,7 @@ class BotState:
                 id=item.record_id,
                 source=item.source,
                 mint=item.mint,
-                observed_at=item.observed_at,
+                observed_at=item.received_at,
                 price=item.price,
                 price_source=f"accepted_market:{item.source}",
                 confidence=item.confidence,
@@ -7127,14 +7142,20 @@ class BotState:
             if item.mint == mint
             and (not strategy_id or item.strategy_id == strategy_id)
             and (not strategy_version or item.strategy_version == strategy_version)
-            and item.observed_at > at
+            and item.received_at > at
             and not item.fixture_only
             and item.conflict_state == "clear"
             and item.access_state == "ready"
             and item.price is not None
             and item.price > 0
         ]
-        if comparison_evidence:
+        bound_audit = self.storage.load_live_execution_audit(audit_id) if audit_id else None
+        strict_bound_evidence = bool(
+            bound_audit
+            and isinstance(bound_audit.quote, dict)
+            and bound_audit.quote.get("shadow_only") is True
+        )
+        if bound_evidence or strict_bound_evidence:
             return sorted(comparison_evidence, key=lambda item: item.observed_at)
         return [item for item in self.storage.load_price_observations(1000, mint=mint) if item.accepted and item.price and item.observed_at > at]
 

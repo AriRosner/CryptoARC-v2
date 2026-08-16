@@ -705,6 +705,9 @@ class ShadowComparison:
     exit_reason: str = ""
     hold_seconds: int = 0
     reference_usd_per_sol: float = 0.0
+    quoted_at: datetime | None = None
+    entry_received_at: datetime | None = None
+    exit_received_at: datetime | None = None
 
     def net_pnl_sol(self, *, cost_stress: bool = False) -> float:
         costs = self.costs.stressed_total_sol() if cost_stress else self.costs.total_sol()
@@ -714,6 +717,9 @@ class ShadowComparison:
         payload = asdict(self)
         payload["created_at"] = self.created_at.isoformat()
         payload["completed_at"] = self.completed_at.isoformat()
+        payload["quoted_at"] = self.quoted_at.isoformat() if self.quoted_at else None
+        payload["entry_received_at"] = self.entry_received_at.isoformat() if self.entry_received_at else None
+        payload["exit_received_at"] = self.exit_received_at.isoformat() if self.exit_received_at else None
         payload["source_evidence_ids"] = list(self.source_evidence_ids)
         return payload
 

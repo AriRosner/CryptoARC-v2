@@ -1581,7 +1581,7 @@ class Storage:
                   ON observations.record_id = bindings.market_observation_id
                 WHERE bindings.audit_id = ?
                   AND bindings.evidence_mode = 'shadow'
-                ORDER BY observations.observed_at ASC
+                ORDER BY observations.received_at ASC
                 """,
                 (audit_id,),
             ).fetchall()
@@ -1725,7 +1725,7 @@ class Storage:
                     observation.mint,
                     observation.strategy_id,
                     observation.strategy_version,
-                    observation.observed_at.isoformat(),
+                    observation.received_at.isoformat(),
                 ),
             ).fetchall()
             inserted = 0
@@ -5315,6 +5315,8 @@ class Storage:
     def _shadow_comparison_from_payload(self, payload: dict[str, Any]) -> ShadowComparison:
         payload["created_at"] = datetime.fromisoformat(payload["created_at"])
         payload["completed_at"] = datetime.fromisoformat(payload["completed_at"])
+        for field_name in ("quoted_at", "entry_received_at", "exit_received_at"):
+            payload[field_name] = datetime.fromisoformat(payload[field_name]) if payload.get(field_name) else None
         payload["source_evidence_ids"] = tuple(payload.get("source_evidence_ids") or ())
         payload["costs"] = ShadowCostBreakdown(**dict(payload.get("costs") or {}))
         allowed = set(ShadowComparison.__dataclass_fields__.keys())
