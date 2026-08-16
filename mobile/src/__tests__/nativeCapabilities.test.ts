@@ -1,4 +1,5 @@
 import app from "../../app.json";
+import firebase from "../../google-services.json";
 import pkg from "../../package.json";
 
 test("command center native capabilities are pinned and configured", () => {
@@ -21,4 +22,15 @@ test("command center native capabilities are pinned and configured", () => {
       expect.arrayContaining(["expo-sqlite"]),
     ]),
   );
+});
+
+test("Android push client configuration targets the release package", () => {
+  expect(
+    (app.expo.android as { googleServicesFile?: string }).googleServicesFile,
+  ).toBe("./google-services.json");
+
+  const packages = firebase.client.map(
+    (client) => client.client_info.android_client_info.package_name,
+  );
+  expect(packages).toContain("com.cryptoarc.cockpit");
 });
