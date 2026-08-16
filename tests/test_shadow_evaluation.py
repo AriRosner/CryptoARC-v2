@@ -672,6 +672,90 @@ class ShadowEvaluationTests(unittest.TestCase):
             self.assertIsNotNone(audit)
             self.assertEqual(audit.shadow_comparison["entry_price"], 1.0)
 
+    def test_shadow_entry_receipt_order_is_applied_before_storage_limit(self) -> None:
+        with TemporaryDirectory() as directory:
+            state = BotState(database_path=str(Path(directory) / "shadow.db"))
+            state.settings.live_max_trade_sol = 0.02
+            state.settings.live_max_slippage_pct = 5
+            state.settings.live_priority_fee_cap_sol = 0.001
+            state.storage.save_settings(state.settings)
+            state.current_settings_version_id = state.ensure_settings_version(
+                "bounded receipt-ordered shadow entry", ["strategy_profile"]
+            )
+            now = utc_now()
+            token = TokenSignal(
+                id="token-entry-limit", symbol="LIMIT", name="Entry Limit",
+                mint="mint-entry-limit", creator="creator",
+                detected_at=now - timedelta(minutes=1), status=TokenStatus.MONITORING,
+                entry_price=1.0, current_price=1.0,
+            )
+            state.tokens.append(token)
+            state.storage.save_token(token)
+            latest = AcceptedMarketObservation(
+                record_id="market-latest-receipt",
+                created_at=now - timedelta(seconds=1),
+                schema_version=1,
+                strategy_id=state.settings.strategy_profile,
+                strategy_version=state.current_settings_version_id,
+                evidence_mode="paper",
+                source="pumpportal",
+                source_event_id="source-latest-receipt",
+                observed_at=now - timedelta(minutes=2),
+                received_at=now - timedelta(seconds=1),
+                mint=token.mint,
+                price=1.0,
+                confidence=1.0,
+                acceptance_reason="test",
+            )
+            backlog = [
+                AcceptedMarketObservation(
+                    record_id=f"market-backlog-{index}",
+                    created_at=now - timedelta(seconds=index + 2),
+                    schema_version=1,
+                    strategy_id=state.settings.strategy_profile,
+                    strategy_version=state.current_settings_version_id,
+                    evidence_mode="paper",
+                    source="pumpportal",
+                    source_event_id=f"source-backlog-{index}",
+                    observed_at=now - timedelta(minutes=1) + timedelta(microseconds=index),
+                    received_at=now - timedelta(seconds=index + 2),
+                    mint=token.mint,
+                    price=0.5,
+                    confidence=1.0,
+                    acceptance_reason="test backlog",
+                )
+                for index in range(5000)
+            ]
+            rows = [latest, *backlog]
+            with state.storage._connect() as connection:
+                connection.executemany(
+                    """
+                    INSERT INTO accepted_market_observations (
+                        record_id, source, source_event_id, observed_at, received_at,
+                        strategy_id, strategy_version, fixture_only, payload
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    """,
+                    [
+                        (
+                            item.record_id, item.source, item.source_event_id,
+                            item.observed_at.isoformat(), item.received_at.isoformat(),
+                            item.strategy_id, item.strategy_version,
+                            json.dumps(item.to_dict()),
+                        )
+                        for item in rows
+                    ],
+                )
+            state._pumpportal_local_transaction = lambda **kwargs: ({"ok": True}, "dHgi", "")
+
+            quoted = state.live_quote(
+                False, "buy", token.mint, "0.01", True, 1, 0.00001, "pump", "ReceiptWallet",
+                shadow_only=True,
+            )
+            audit = state.storage.load_live_execution_audit(str(quoted["id"]))
+
+            self.assertIsNotNone(audit)
+            self.assertEqual(audit.shadow_comparison["entry_price"], 1.0)
+
     def test_completed_legacy_shadow_is_not_rewritten_by_strict_refresh(self) -> None:
         with TemporaryDirectory() as directory:
             state = BotState(database_path=str(Path(directory) / "shadow.db"))
