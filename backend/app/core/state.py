@@ -16,7 +16,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from solders.hash import Hash
@@ -200,6 +200,7 @@ class BotState:
         self.signer_daemon_url = signer_daemon_url.strip()
         self.signer_daemon_auth_token = signer_daemon_auth_token.strip()
         self.alerts = alert_router or AlertRouter()
+        self.event_listener: Callable[[TradeEvent], None] | None = None
         self.active_live_session_id = ""
         self._cached_signer_status: dict[str, object] | None = None
         self._cached_signer_status_at: datetime | None = None
@@ -2249,6 +2250,12 @@ class BotState:
         self.events.appendleft(event)
         self.storage.save_event(event)
         self.alerts.alert_event(level, subsystem, message, operator_action)
+        listener = getattr(self, "event_listener", None)
+        if callable(listener):
+            try:
+                listener(event)
+            except Exception:
+                pass
 
     def _reload_from_storage(self, persist_settings_version: bool = True) -> None:
         self.settings = self.storage.load_settings()

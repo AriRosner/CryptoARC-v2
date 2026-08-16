@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import json
 import sqlite3
 import time
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -17,6 +18,7 @@ from app.auth import AuthManager
 from app.core.models import TradeEvent
 from app.core.state import BotState
 from app.mobile.contracts import MobileScope
+from app.mobile.expo_push import ExpoPushGateway
 from app.mobile.service import MobileCommandCenterService
 
 
@@ -28,6 +30,128 @@ class MobileNotificationTests(unittest.TestCase):
         self.encryption_key = base64.urlsafe_b64encode(
             b"cryptoarc-mobile-push-test-key!!"
         ).decode("ascii")
+
+    def test_expo_gateway_posts_minimal_payload_and_returns_ticket_id(self) -> None:
+        token = "ExponentPushToken[provider-boundary-secret]"
+        payload = {
+            "title": "Critical CryptoARC alert",
+            "body": "Open CryptoARC after unlocking.",
+            "channelId": "critical",
+            "data": {
+                "event_id": "evt_gateway_123",
+                "severity": "danger",
+                "subsystem": "trade",
+                "route": "/trade/intent_123",
+            },
+        }
+
+        class Response:
+            def read(self) -> bytes:
+                return b'{"data":[{"status":"ok","id":"ticket-123"}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        gateway = ExpoPushGateway(enabled=True, timeout_seconds=3)
+        with patch(
+            "app.mobile.expo_push.urllib.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            result = gateway.send(token, payload)
+
+        self.assertEqual(result, {"status": "sent", "ticket_id": "ticket-123"})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 3)
+        self.assertEqual(request.full_url, "https://exp.host/--/api/v2/push/send")
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        encoded = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(encoded["to"], token)
+        self.assertEqual(encoded["data"], payload["data"])
+        self.assertEqual(encoded["channelId"], "critical")
+        self.assertNotIn("message", encoded)
+
+    def test_expo_gateway_normalizes_provider_rejection_without_reflection(self) -> None:
+        token = "ExponentPushToken[provider-error-secret]"
+
+        class Response:
+            def read(self) -> bytes:
+                return b'{"data":[{"status":"error","message":"reject provider-error-secret"}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        gateway = ExpoPushGateway(enabled=True)
+        with patch(
+            "app.mobile.expo_push.urllib.request.urlopen",
+            return_value=Response(),
+        ):
+            result = gateway.send(
+                token,
+                {"title": "alert", "body": "open", "data": {}},
+            )
+
+        self.assertEqual(result, {"status": "rejected"})
+        self.assertNotIn(token, json.dumps(result))
+        self.assertNotIn("reject provider", json.dumps(result))
+
+    def test_expo_gateway_rejects_non_official_send_endpoint(self) -> None:
+        with self.assertRaisesRegex(ValueError, "official Expo push endpoint"):
+            ExpoPushGateway(
+                enabled=True,
+                url="https://attacker.example/collect",
+            )
+
+    def test_expo_gateway_normalizes_ticket_level_device_invalidation(self) -> None:
+        class Response:
+            def read(self) -> bytes:
+                return b'{"data":[{"status":"error","details":{"error":"DeviceNotRegistered"}}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        gateway = ExpoPushGateway(enabled=True)
+        with patch(
+            "app.mobile.expo_push.urllib.request.urlopen",
+            return_value=Response(),
+        ):
+            result = gateway.send(
+                "ExponentPushToken[ticket-invalidated-secret]",
+                {"title": "alert", "body": "open", "data": {}},
+            )
+
+        self.assertEqual(result, {"status": "invalidated"})
+
+    def test_expo_gateway_fetches_bounded_receipts(self) -> None:
+        class Response:
+            def read(self) -> bytes:
+                return b'{"data":{"ticket-1":{"status":"ok"}}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        gateway = ExpoPushGateway(enabled=True)
+        with patch(
+            "app.mobile.expo_push.urllib.request.urlopen",
+            return_value=Response(),
+        ) as urlopen:
+            receipts = gateway.fetch_receipts(["ticket-1"])
+
+        self.assertEqual(receipts, {"ticket-1": {"status": "ok"}})
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://exp.host/--/api/v2/push/getReceipts")
+        self.assertEqual(json.loads(request.data.decode("utf-8")), {"ids": ["ticket-1"]})
 
     @contextmanager
     def mobile_client(self):
@@ -77,7 +201,7 @@ class MobileNotificationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         return response.json()
 
-    def service(self, sender=None) -> MobileCommandCenterService:
+    def service(self, sender=None, receipt_fetcher=None) -> MobileCommandCenterService:
         async def no_op_broadcast() -> None:
             return None
 
@@ -98,6 +222,7 @@ class MobileNotificationTests(unittest.TestCase):
             broadcast_mobile_cockpit=no_op_broadcast,
             stop_runtime_tasks=no_op_stop,
             push_sender=sender,
+            push_receipt_fetcher=receipt_fetcher,
         )
 
     def save_push_device(
@@ -250,6 +375,191 @@ class MobileNotificationTests(unittest.TestCase):
         self.assertNotIn(raw_token, json.dumps(first))
         self.assertNotIn(raw_token, json.dumps(second))
 
+    def test_delivery_persists_expo_ticket_for_later_receipt_reconciliation(self) -> None:
+        raw_token = "ExponentPushToken[receipt-ledger-secret]"
+        service = self.service(
+            sender=Mock(return_value={"status": "sent", "ticket_id": "ticket-receipt-123"})
+        )
+        self.save_push_device("mdev_receipt")
+        service.register_push_token(
+            device={"id": "mdev_receipt", "platform": "android"},
+            token=raw_token,
+            platform="android",
+        )
+
+        result = service.deliver_push_event(self.save_alert("evt_receipt_123").to_dict())
+        pending = self.state.storage.load_pending_mobile_notification_receipts(limit=10)
+
+        self.assertEqual((result["sent"], result["failed"]), (1, 0))
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["ticket_id"], "ticket-receipt-123")
+        self.assertTrue(pending[0]["registration_id"])
+        self.assertNotIn(raw_token, json.dumps(pending))
+
+    def test_existing_delivery_ledger_migrates_receipt_columns_idempotently(self) -> None:
+        legacy_path = Path(self.directory.name) / "legacy-notification-ledger.db"
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            connection.execute(
+                """
+                CREATE TABLE mobile_notification_deliveries (
+                    id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    channel TEXT NOT NULL,
+                    registration_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempted_at TEXT NOT NULL,
+                    lease_expires_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(event_id, device_id, channel)
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO mobile_notification_deliveries (
+                    id, event_id, device_id, channel, registration_id,
+                    attempt_id, status, attempted_at, lease_expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "delivery-legacy",
+                    "event-legacy",
+                    "device-legacy",
+                    "critical",
+                    "registration-legacy",
+                    "attempt-legacy",
+                    "sent",
+                    "2026-08-16T12:00:00+00:00",
+                    "2026-08-16T12:01:00+00:00",
+                    "2026-08-16T12:00:01+00:00",
+                ),
+            )
+            connection.commit()
+
+        from app.core.storage import Storage
+
+        Storage(str(legacy_path))
+        Storage(str(legacy_path))
+        with closing(sqlite3.connect(legacy_path)) as connection:
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(mobile_notification_deliveries)"
+                ).fetchall()
+            }
+            row = connection.execute(
+                """
+                SELECT provider_ticket_id, receipt_status, receipt_checked_at
+                FROM mobile_notification_deliveries
+                WHERE id = 'delivery-legacy'
+                """
+            ).fetchone()
+
+        self.assertTrue(
+            {"provider_ticket_id", "receipt_status", "receipt_checked_at"}.issubset(columns)
+        )
+        self.assertEqual(row, ("", "", None))
+
+    def test_device_not_registered_receipt_revokes_only_its_registration(self) -> None:
+        raw_token = "ExponentPushToken[receipt-invalidated-secret]"
+        service = self.service(
+            sender=Mock(return_value={"status": "sent", "ticket_id": "ticket-invalidated-123"}),
+            receipt_fetcher=Mock(
+                return_value={
+                    "ticket-invalidated-123": {
+                        "status": "error",
+                        "details": {"error": "DeviceNotRegistered"},
+                    }
+                }
+            ),
+        )
+        self.save_push_device("mdev_invalidated")
+        service.register_push_token(
+            device={"id": "mdev_invalidated", "platform": "android"},
+            token=raw_token,
+            platform="android",
+        )
+        service.deliver_push_event(self.save_alert("evt_invalidated_123").to_dict())
+
+        result = service.reconcile_push_receipts()
+
+        self.assertEqual(
+            result,
+            {
+                "checked": 1,
+                "confirmed": 0,
+                "invalidated": 1,
+                "failed": 0,
+                "retryable": 0,
+            },
+        )
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+        self.assertEqual(self.state.storage.load_pending_mobile_notification_receipts(), [])
+        self.assertNotIn(raw_token, json.dumps(result))
+
+    def test_ticket_level_device_invalidation_revokes_without_retrying(self) -> None:
+        raw_token = "ExponentPushToken[ticket-level-invalidated-secret]"
+        service = self.service(sender=Mock(return_value={"status": "invalidated"}))
+        self.save_push_device("mdev_ticket_invalidated")
+        service.register_push_token(
+            device={"id": "mdev_ticket_invalidated", "platform": "android"},
+            token=raw_token,
+            platform="android",
+        )
+
+        result = service.deliver_push_event(
+            self.save_alert("evt_ticket_invalidated_123").to_dict()
+        )
+
+        self.assertEqual((result["invalidated"], result["failed"]), (1, 0))
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+        self.assertNotIn(raw_token, json.dumps(result))
+
+    def test_ticket_level_provider_rejection_is_terminal(self) -> None:
+        sender = Mock(return_value={"status": "rejected"})
+        service = self.service(sender=sender)
+        self.save_push_device("mdev_ticket_rejected")
+        service.register_push_token(
+            device={"id": "mdev_ticket_rejected", "platform": "android"},
+            token="ExponentPushToken[ticket-level-rejected-secret]",
+            platform="android",
+        )
+        event = self.save_alert("evt_ticket_rejected_123").to_dict()
+
+        first = service.deliver_push_event(event)
+        second = service.deliver_push_event(event)
+
+        self.assertEqual((first["failed"], first["sent"]), (1, 0))
+        self.assertEqual(second["deduplicated"], 1)
+        sender.assert_called_once()
+
+    def test_terminal_receipt_error_is_not_polled_forever(self) -> None:
+        service = self.service(
+            sender=Mock(return_value={"status": "sent", "ticket_id": "ticket-terminal-error"}),
+            receipt_fetcher=Mock(
+                return_value={
+                    "ticket-terminal-error": {
+                        "status": "error",
+                        "details": {"error": "MessageTooBig"},
+                    }
+                }
+            ),
+        )
+        self.save_push_device("mdev_terminal_receipt")
+        service.register_push_token(
+            device={"id": "mdev_terminal_receipt", "platform": "android"},
+            token="ExponentPushToken[terminal-receipt-secret]",
+            platform="android",
+        )
+        service.deliver_push_event(self.save_alert("evt_terminal_receipt").to_dict())
+
+        result = service.reconcile_push_receipts()
+
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(self.state.storage.load_pending_mobile_notification_receipts(), [])
+
     def test_sender_exception_is_generic_and_never_reflects_plaintext(self) -> None:
         raw_token = "ExponentPushToken[exception-reflection-secret]"
 
@@ -270,6 +580,29 @@ class MobileNotificationTests(unittest.TestCase):
         self.assertEqual(result["failed"], 1)
         self.assertNotIn(raw_token, json.dumps(result))
         self.assertNotIn("provider rejected", json.dumps(result))
+
+    def test_corrupt_token_ciphertext_is_invalidated_without_provider_retry(self) -> None:
+        sender = Mock(return_value={"status": "sent"})
+        service = self.service(sender=sender)
+        self.save_push_device("mdev_corrupt_ciphertext")
+        service.register_push_token(
+            device={"id": "mdev_corrupt_ciphertext", "platform": "android"},
+            token="ExponentPushToken[corrupt-ciphertext-secret]",
+            platform="android",
+        )
+        with closing(sqlite3.connect(self.state.storage.path)) as connection:
+            connection.execute(
+                "UPDATE mobile_push_registrations SET token_ciphertext = 'not-fernet'"
+            )
+            connection.commit()
+
+        result = service.deliver_push_event(
+            self.save_alert("evt_corrupt_ciphertext").to_dict()
+        )
+
+        self.assertEqual((result["invalidated"], result["retryable"]), (1, 0))
+        self.assertEqual(self.state.storage.load_mobile_push_registrations(), [])
+        sender.assert_not_called()
 
     def test_failed_and_negative_delivery_results_are_retryable(self) -> None:
         raw_token = "ExponentPushToken[retryable-delivery]"
@@ -663,6 +996,93 @@ class MobileNotificationTests(unittest.TestCase):
             self.assertIsNone(checks[check_id]["observed_at"])
         self.assertEqual(checks["api"]["status"], "healthy")
         self.assertIsNotNone(checks["api"]["observed_at"])
+
+    def test_diagnostics_do_not_report_push_healthy_without_provider(self) -> None:
+        service = self.service()
+        self.save_push_device(
+            "mdev_push_diagnostics",
+            scopes=[MobileScope.DIAGNOSTICS, MobileScope.ALERTS],
+        )
+        service.register_push_token(
+            device={"id": "mdev_push_diagnostics", "platform": "android"},
+            token="ExponentPushToken[diagnostics-registration]",
+            platform="android",
+        )
+
+        payload = service.diagnostics(
+            device={
+                "id": "mdev_push_diagnostics",
+                "scopes": [MobileScope.DIAGNOSTICS, MobileScope.ALERTS],
+            }
+        )
+        push = next(check for check in payload["checks"] if check["id"] == "push")
+
+        self.assertEqual(push["status"], "unavailable")
+
+    def test_event_dispatch_queues_only_alerts_and_is_bounded(self) -> None:
+        from app import main as main_app
+
+        async def exercise() -> None:
+            previous_enabled = main_app.config.mobile_expo_push_enabled
+            previous_queue = main_app.mobile_push_queue
+            main_app.config.mobile_expo_push_enabled = True
+            main_app.mobile_push_queue = asyncio.Queue(maxsize=1)
+            try:
+                info = self.save_alert("evt_dispatch_info").to_dict()
+                info["level"] = "info"
+                warning = self.save_alert("evt_dispatch_warning").to_dict()
+                warning["level"] = "warning"
+                danger = self.save_alert("evt_dispatch_danger").to_dict()
+                main_app._dispatch_mobile_push_event(
+                    SimpleNamespace(level="info", to_dict=lambda: info)
+                )
+                self.assertTrue(main_app.mobile_push_queue.empty())
+                main_app._dispatch_mobile_push_event(
+                    SimpleNamespace(level="warning", to_dict=lambda: warning)
+                )
+                main_app._dispatch_mobile_push_event(
+                    SimpleNamespace(level="danger", to_dict=lambda: danger)
+                )
+                self.assertEqual(main_app.mobile_push_queue.qsize(), 1)
+                self.assertEqual(
+                    (await main_app.mobile_push_queue.get())["id"],
+                    "evt_dispatch_warning",
+                )
+            finally:
+                main_app.mobile_push_queue = previous_queue
+                main_app.config.mobile_expo_push_enabled = previous_enabled
+
+        asyncio.run(exercise())
+
+    def test_delivery_worker_retries_transient_failures_but_not_rejections(self) -> None:
+        from app import main as main_app
+
+        async def exercise() -> None:
+            with patch.object(
+                main_app.mobile_service,
+                "deliver_push_event",
+                side_effect=[
+                    {"failed": 1, "retryable": 1},
+                    {"failed": 0, "retryable": 0},
+                ],
+            ) as deliver, patch.object(
+                main_app.asyncio,
+                "sleep",
+                new=AsyncMock(),
+            ) as sleep:
+                await main_app._deliver_mobile_push_with_retry({"id": "evt_retry_worker"})
+                self.assertEqual(deliver.call_count, 2)
+                sleep.assert_awaited_once_with(1)
+
+            with patch.object(
+                main_app.mobile_service,
+                "deliver_push_event",
+                return_value={"failed": 1, "retryable": 0},
+            ) as rejected:
+                await main_app._deliver_mobile_push_with_retry({"id": "evt_rejected_worker"})
+                rejected.assert_called_once()
+
+        asyncio.run(exercise())
 
     def test_diagnostic_export_recursively_redacts_sensitive_material(self) -> None:
         service = self.service()
