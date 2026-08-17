@@ -47,9 +47,12 @@ class ExpoPushGateway:
                 response_body = response.read()
             decoded: Any = json.loads(response_body.decode("utf-8"))
             tickets = decoded.get("data") if isinstance(decoded, dict) else None
-            if not isinstance(tickets, list) or len(tickets) != 1:
+            if isinstance(tickets, dict):
+                ticket = tickets
+            elif isinstance(tickets, list) and len(tickets) == 1:
+                ticket = tickets[0]
+            else:
                 raise ValueError("invalid ticket response")
-            ticket = tickets[0]
             ticket_id = ticket.get("id") if isinstance(ticket, dict) else None
             details = ticket.get("details") if isinstance(ticket, dict) else None
             provider_error = details.get("error") if isinstance(details, dict) else None

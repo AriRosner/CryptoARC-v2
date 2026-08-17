@@ -73,6 +73,29 @@ class MobileNotificationTests(unittest.TestCase):
         self.assertEqual(encoded["channelId"], "critical")
         self.assertNotIn("message", encoded)
 
+    def test_expo_gateway_accepts_single_message_ticket_object(self) -> None:
+        class Response:
+            def read(self) -> bytes:
+                return b'{"data":{"status":"ok","id":"ticket-single"}}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+        gateway = ExpoPushGateway(enabled=True)
+        with patch(
+            "app.mobile.expo_push.urllib.request.urlopen",
+            return_value=Response(),
+        ):
+            result = gateway.send(
+                "ExponentPushToken[single-ticket-object]",
+                {"title": "alert", "body": "open", "data": {}},
+            )
+
+        self.assertEqual(result, {"status": "sent", "ticket_id": "ticket-single"})
+
     def test_expo_gateway_normalizes_provider_rejection_without_reflection(self) -> None:
         token = "ExponentPushToken[provider-error-secret]"
 
@@ -1083,6 +1106,21 @@ class MobileNotificationTests(unittest.TestCase):
                 rejected.assert_called_once()
 
         asyncio.run(exercise())
+
+    def test_desktop_test_alert_queues_privacy_safe_mobile_event(self) -> None:
+        with self.mobile_client() as (client, desktop_headers):
+            response = client.post("/api/alerts/test", headers=desktop_headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(response.json()["mobile_push_status"], "queued")
+        event = self.state.storage.load_events(limit=1)[0]
+        self.assertEqual(event.level, "warning")
+        self.assertEqual(event.subsystem, "alerts")
+        self.assertEqual(
+            event.message,
+            "CryptoARC test alert: open the trusted app to verify delivery.",
+        )
 
     def test_diagnostic_export_recursively_redacts_sensitive_material(self) -> None:
         service = self.service()

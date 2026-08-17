@@ -1173,7 +1173,17 @@ async def alerts_status() -> dict:
 
 @app.post("/api/alerts/test", dependencies=[Depends(require_auth)])
 async def alerts_test() -> dict:
-    return state.alerts.test()
+    telegram_result = state.alerts.test()
+    state.add_event(
+        "warning",
+        "CryptoARC test alert: open the trusted app to verify delivery.",
+        subsystem="alerts",
+    )
+    return {
+        "status": "queued",
+        "mobile_push_status": "queued",
+        "telegram": telegram_result,
+    }
 
 
 @app.get("/api/latency/status", dependencies=[Depends(require_auth)])

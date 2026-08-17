@@ -1,5 +1,6 @@
 import NetInfo from "@react-native-community/netinfo";
 import Constants from "expo-constants";
+import * as Crypto from "expo-crypto";
 import * as Notifications from "expo-notifications";
 import { type Href, router } from "expo-router";
 import React, { useEffect } from "react";
@@ -153,6 +154,7 @@ export async function startNativePushRegistration({
   let active = true;
   let online = false;
   let needsRegistration = true;
+  let lastRegisteredTokenFingerprint = "";
   let registrationTail: Promise<void> = Promise.resolve();
   const context: PushRegistrationContext = {
     apiBaseUrl: session.apiBaseUrl,
@@ -188,7 +190,13 @@ export async function startNativePushRegistration({
       const response = await Notifications.getExpoPushTokenAsync({ projectId });
       rawToken = response.data;
       if (!session.isCurrentGeneration(session.generation)) return;
+      const tokenFingerprint = await Crypto.digestStringAsync(
+        Crypto.CryptoDigestAlgorithm.SHA256,
+        rawToken,
+      );
+      if (tokenFingerprint === lastRegisteredTokenFingerprint) return;
       await register(rawToken, context);
+      lastRegisteredTokenFingerprint = tokenFingerprint;
     } catch (error) {
       await handleFailure(error);
     } finally {
