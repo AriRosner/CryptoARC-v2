@@ -26,6 +26,11 @@ const alert: MobileAlert = {
   acknowledged_at: null,
 };
 
+jest.mock("expo-crypto", () => ({
+  CryptoDigestAlgorithm: { SHA256: "SHA-256" },
+  digestStringAsync: jest.fn(async (_algorithm: string, value: string) => `digest:${value}`),
+}));
+
 jest.mock("../../../core/session/SessionProvider", () => ({
   useSession: () => ({
     apiBaseUrl: "https://cryptoarc.test",
@@ -331,6 +336,51 @@ describe("native notifications and alerts", () => {
 
     expect(connectivityCleanup).toHaveBeenCalledTimes(1);
     expect(rotationCleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-register an unchanged Expo token", async () => {
+    (NetInfo.fetch as jest.Mock).mockResolvedValue({
+      isConnected: true,
+      isInternetReachable: true,
+    });
+    (NetInfo.addEventListener as jest.Mock).mockReturnValue(jest.fn());
+    (Notifications.getExpoPushTokenAsync as jest.Mock).mockResolvedValue({
+      data: "ExponentPushToken[stable-transient]",
+    });
+    let rotationListener: (() => void) | undefined;
+    (Notifications.addPushTokenListener as unknown as jest.Mock).mockImplementation(
+      (listener) => {
+        rotationListener = listener;
+        return { remove: jest.fn() };
+      },
+    );
+    const register = jest.fn(async () => undefined);
+    const session = {
+      apiBaseUrl: "https://node.tailnet.ts.net",
+      token: "mobile-session-secret",
+      generation: 29,
+      isCurrentGeneration: jest.fn(() => true),
+      revokeSession: jest.fn(async () => true),
+    };
+
+    const cleanup = await startNativePushRegistration({
+      projectId: "project-id",
+      session,
+      register,
+    });
+    expect(register).toHaveBeenCalledTimes(1);
+
+    rotationListener?.();
+    await waitFor(() =>
+      expect(Notifications.getExpoPushTokenAsync).toHaveBeenCalledTimes(2),
+    );
+    rotationListener?.();
+    await waitFor(() =>
+      expect(Notifications.getExpoPushTokenAsync).toHaveBeenCalledTimes(3),
+    );
+
+    expect(register).toHaveBeenCalledTimes(1);
+    cleanup();
   });
 
   it("renders duplicate event IDs once and exposes accessible acknowledgement", async () => {

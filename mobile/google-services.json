@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "136357833747",
+    "project_id": "cryptoarc-mobile",
+    "storage_bucket": "cryptoarc-mobile.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:136357833747:android:f10ff2573eec21279823e6",
+        "android_client_info": {
+          "package_name": "com.cryptoarc.cockpit"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCX7q-gVO3zwsAL1UtRHm3eW5kyuP397AQ"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

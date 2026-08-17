@@ -23,6 +23,7 @@ from app.core.models import SourceStatus, utc_now
 from app.core.sources import LaunchEvent, SolanaLogsSource, make_source
 from app.core.state import BotState
 from app.mobile.contracts import MobileRealtimeEnvelope, MobileScope
+from app.mobile.expo_push import ExpoPushGateway
 from app.mobile.router import create_mobile_router
 from app.mobile.service import MobileCommandCenterService
 
@@ -416,6 +417,8 @@ state.MOBILE_TOKEN_TTL_DAYS = max(1, min(365, int(config.mobile_token_ttl_days o
 clients: set[WebSocket] = set()
 mobile_clients: dict[WebSocket, str] = {}
 mobile_realtime_sequence = 0
+mobile_push_queue: asyncio.Queue[dict[str, object]] | None = None
+MOBILE_PUSH_QUEUE_MAX_SIZE = 256
 launch_queue: asyncio.Queue[LaunchEvent] = asyncio.Queue()
 SOURCE_EVENT_DRAIN_BATCH_SIZE = 50
 SOURCE_EVENT_DRAIN_MAX_SIZE = 1_000
@@ -620,6 +623,39 @@ async def latency_probe_loop() -> None:
                 }
             )
         await asyncio.sleep(30)
+
+
+async def mobile_push_receipt_loop() -> None:
+    while True:
+        try:
+            await asyncio.to_thread(mobile_service.reconcile_push_receipts)
+        except Exception:
+            pass
+        await asyncio.sleep(900)
+
+
+async def mobile_push_delivery_loop() -> None:
+    while True:
+        queue = mobile_push_queue
+        if queue is None:
+            await asyncio.sleep(1)
+            continue
+        event = await queue.get()
+        try:
+            await _deliver_mobile_push_with_retry(event)
+        except Exception:
+            pass
+        finally:
+            queue.task_done()
+
+
+async def _deliver_mobile_push_with_retry(event: dict[str, object]) -> None:
+    for attempt in range(3):
+        result = await asyncio.to_thread(mobile_service.deliver_push_event, event)
+        if int(result.get("retryable") or 0) <= 0:
+            return
+        if attempt < 2:
+            await asyncio.sleep(2**attempt)
 
 
 async def update_latency_status() -> dict[str, object]:
@@ -977,18 +1013,23 @@ async def stop_runtime_tasks() -> dict[str, object]:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    global source_key, source_task, solana_logs_key, solana_logs_task
+    global source_key, source_task, solana_logs_key, solana_logs_task, mobile_push_queue
 
     state.enforce_live_auth_startup_policy(auth.enabled)
+    mobile_push_queue = asyncio.Queue(maxsize=MOBILE_PUSH_QUEUE_MAX_SIZE)
     task = asyncio.create_task(bot_loop())
     live_poll_task = asyncio.create_task(live_audit_poll_loop())
     latency_task = asyncio.create_task(latency_probe_loop())
+    push_receipt_task = asyncio.create_task(mobile_push_receipt_loop())
+    push_delivery_task = asyncio.create_task(mobile_push_delivery_loop())
     try:
         yield
     finally:
         task.cancel()
         live_poll_task.cancel()
         latency_task.cancel()
+        push_receipt_task.cancel()
+        push_delivery_task.cancel()
         named_tasks = []
         if source_task:
             named_tasks.append(("Source", source_task))
@@ -1006,17 +1047,26 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
             task,
             live_poll_task,
             latency_task,
+            push_receipt_task,
+            push_delivery_task,
             return_exceptions=True,
         )
         _record_background_task_failures(
             list(
                 zip(
-                    ("Bot loop", "Live audit poller", "Latency probe"),
+                    (
+                        "Bot loop",
+                        "Live audit poller",
+                        "Latency probe",
+                        "Mobile push receipts",
+                        "Mobile push delivery",
+                    ),
                     background_results,
                     strict=True,
                 )
             )
         )
+        mobile_push_queue = None
 
 
 app = FastAPI(title="CryptoARC v2 API", version="0.1.0", lifespan=lifespan)
@@ -1029,6 +1079,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+expo_push_gateway = ExpoPushGateway(
+    enabled=config.mobile_expo_push_enabled,
+    timeout_seconds=config.mobile_expo_push_timeout_seconds,
+)
 mobile_service = MobileCommandCenterService(
     state_provider=lambda: state,
     config_provider=lambda: config,
@@ -1038,7 +1092,26 @@ mobile_service = MobileCommandCenterService(
     broadcast_mobile_cockpit=broadcast_mobile_cockpit,
     invalidate_mobile_connections=invalidate_mobile_device_connections,
     stop_runtime_tasks=stop_runtime_tasks,
+    push_sender=expo_push_gateway.send if config.mobile_expo_push_enabled else None,
+    push_receipt_fetcher=expo_push_gateway.fetch_receipts if config.mobile_expo_push_enabled else None,
 )
+
+
+def _dispatch_mobile_push_event(event: object) -> None:
+    if not config.mobile_expo_push_enabled:
+        return
+    if str(getattr(event, "level", "")).lower() not in {"warning", "danger", "error"}:
+        return
+    queue = mobile_push_queue
+    if queue is None:
+        return
+    try:
+        queue.put_nowait(event.to_dict())
+    except (asyncio.QueueFull, AttributeError):
+        return
+
+
+state.event_listener = _dispatch_mobile_push_event
 app.include_router(create_mobile_router(mobile_service, require_mobile_scope))
 
 
@@ -1100,7 +1173,17 @@ async def alerts_status() -> dict:
 
 @app.post("/api/alerts/test", dependencies=[Depends(require_auth)])
 async def alerts_test() -> dict:
-    return state.alerts.test()
+    telegram_result = state.alerts.test()
+    state.add_event(
+        "warning",
+        "CryptoARC test alert: open the trusted app to verify delivery.",
+        subsystem="alerts",
+    )
+    return {
+        "status": "queued",
+        "mobile_push_status": "queued",
+        "telegram": telegram_result,
+    }
 
 
 @app.get("/api/latency/status", dependencies=[Depends(require_auth)])

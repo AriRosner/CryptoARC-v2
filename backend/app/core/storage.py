@@ -630,6 +630,9 @@ class Storage:
                 status TEXT NOT NULL,
                 attempted_at TEXT NOT NULL,
                 lease_expires_at TEXT NOT NULL,
+                provider_ticket_id TEXT NOT NULL DEFAULT '',
+                receipt_status TEXT NOT NULL DEFAULT '',
+                receipt_checked_at TEXT,
                 updated_at TEXT NOT NULL,
                 UNIQUE(event_id, device_id, channel)
             )
@@ -654,6 +657,18 @@ class Storage:
             )
             connection.execute(
                 "UPDATE mobile_notification_deliveries SET lease_expires_at = updated_at WHERE lease_expires_at IS NULL OR lease_expires_at = ''"
+            )
+        if "provider_ticket_id" not in columns:
+            connection.execute(
+                "ALTER TABLE mobile_notification_deliveries ADD COLUMN provider_ticket_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "receipt_status" not in columns:
+            connection.execute(
+                "ALTER TABLE mobile_notification_deliveries ADD COLUMN receipt_status TEXT NOT NULL DEFAULT ''"
+            )
+        if "receipt_checked_at" not in columns:
+            connection.execute(
+                "ALTER TABLE mobile_notification_deliveries ADD COLUMN receipt_checked_at TEXT"
             )
 
     def _migration_011_mobile_guarded_execution_claims(self, connection: sqlite3.Connection) -> None:
@@ -3229,7 +3244,8 @@ class Storage:
                 """
                 UPDATE mobile_notification_deliveries
                 SET registration_id = ?, attempt_id = ?, status = 'pending',
-                    attempted_at = ?, lease_expires_at = ?, updated_at = ?
+                    attempted_at = ?, lease_expires_at = ?, provider_ticket_id = '',
+                    receipt_status = '', receipt_checked_at = NULL, updated_at = ?
                 WHERE event_id = ? AND device_id = ? AND channel = ?
                 """,
                 (
@@ -3251,17 +3267,88 @@ class Storage:
         attempt_id: str,
         status: str,
         updated_at: str,
+        provider_ticket_id: str = "",
     ) -> bool:
-        if status not in {"sent", "failed"}:
+        if status not in {"sent", "failed", "invalidated", "rejected"}:
             raise ValueError("Mobile notification delivery status is invalid")
+        clean_ticket_id = str(provider_ticket_id or "").strip()
+        receipt_status = "pending" if status == "sent" and clean_ticket_id else ""
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE mobile_notification_deliveries
-                SET status = ?, updated_at = ?
+                SET status = ?, provider_ticket_id = ?, receipt_status = ?,
+                    receipt_checked_at = NULL, updated_at = ?
                 WHERE attempt_id = ? AND status = 'pending'
                 """,
-                (status, updated_at, attempt_id),
+                (status, clean_ticket_id, receipt_status, updated_at, attempt_id),
+            )
+        return int(cursor.rowcount) == 1
+
+    def load_pending_mobile_notification_receipts(
+        self,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, str]]:
+        bounded_limit = max(1, min(1000, int(limit or 100)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, registration_id, provider_ticket_id
+                FROM mobile_notification_deliveries
+                WHERE status = 'sent'
+                  AND receipt_status = 'pending'
+                  AND provider_ticket_id != ''
+                ORDER BY updated_at ASC
+                LIMIT ?
+                """,
+                (bounded_limit,),
+            ).fetchall()
+        return [
+            {
+                "delivery_id": str(row["id"]),
+                "registration_id": str(row["registration_id"]),
+                "ticket_id": str(row["provider_ticket_id"]),
+            }
+            for row in rows
+        ]
+
+    def record_mobile_notification_receipt(
+        self,
+        *,
+        delivery_id: str,
+        ticket_id: str,
+        receipt_status: str,
+        checked_at: str,
+    ) -> bool:
+        if receipt_status not in {"confirmed", "invalidated", "failed", "retryable"}:
+            raise ValueError("Mobile notification receipt status is invalid")
+        stored_status = "pending" if receipt_status == "retryable" else receipt_status
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mobile_notification_deliveries
+                SET receipt_status = ?, receipt_checked_at = ?, updated_at = ?
+                WHERE id = ? AND provider_ticket_id = ? AND receipt_status = 'pending'
+                """,
+                (stored_status, checked_at, checked_at, delivery_id, ticket_id),
+            )
+        return int(cursor.rowcount) == 1
+
+    def revoke_mobile_push_registration(
+        self,
+        *,
+        registration_id: str,
+        revoked_at: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE mobile_push_registrations
+                SET revoked_at = ?, updated_at = ?
+                WHERE id = ? AND (revoked_at IS NULL OR revoked_at = '')
+                """,
+                (revoked_at, revoked_at, registration_id),
             )
         return int(cursor.rowcount) == 1
 

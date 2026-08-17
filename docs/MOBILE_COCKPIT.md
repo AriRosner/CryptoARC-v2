@@ -28,6 +28,8 @@ Use Tailscale Serve or an equivalent authenticated private tunnel. Keep the back
    MOBILE_PUBLIC_API_BASE_URL=https://cryptoarc-node.tailnet.example
    MOBILE_PAIRING_TTL_SECONDS=300
    MOBILE_TOKEN_TTL_DAYS=30
+   MOBILE_EXPO_PUSH_ENABLED=false
+   MOBILE_EXPO_PUSH_TIMEOUT_SECONDS=10
    MOBILE_PUSH_TOKEN_ENCRYPTION_KEY=
    ```
 
@@ -95,11 +97,12 @@ The app may display the last verified portfolio snapshot from its SQLCipher data
    npx eas-cli@latest credentials --platform android
    ```
 
-2. Configure the Android FCM V1 service account through EAS. Keep the downloaded service-account JSON out of Git, docs, diagnostics, and support bundles.
-3. Set a valid local `MOBILE_PUSH_TOKEN_ENCRYPTION_KEY`, pair with `mobile:alerts`, install a signed development/internal build, grant Android notification permission, and reopen the app so its Expo token can register.
-4. Check More > Diagnostics for Push status and test only with privacy-minimized events. Push payloads contain event ID, severity, subsystem, and route; detail is fetched after unlock.
+2. Register the Android application `com.cryptoarc.cockpit` in Firebase, download its public-facing `google-services.json` to `mobile/google-services.json`, and set `expo.android.googleServicesFile` to `./google-services.json` in `mobile/app.json`.
+3. Configure the matching Android FCM V1 service-account key through EAS. The service-account JSON contains a private key: keep it outside Git, docs, diagnostics, and support bundles. Verify its Firebase project/sender ID matches `mobile/google-services.json`.
+4. Set `MOBILE_EXPO_PUSH_ENABLED=true` and a valid local `MOBILE_PUSH_TOKEN_ENCRYPTION_KEY`, pair with `mobile:alerts`, install a newly signed development/internal build, grant Android notification permission, and reopen the app so its Expo token can register. The sender is pinned to Expo's official HTTPS endpoint; it cannot be redirected through configuration.
+5. Check More > Diagnostics for Push status and test only with privacy-minimized warning, danger, or error events. Push payloads contain event ID, severity, subsystem, and route; detail is fetched after unlock.
 
-The repository currently does not wire an Expo network sender into the production `MobileCommandCenterService`; diagnostics therefore reports push delivery unavailable even if credential and token registration setup is complete. Do not claim native push delivery until that sender path and a signed artifact are independently verified.
+The backend records Expo push ticket IDs and reconciles receipts every 15 minutes. `DeviceNotRegistered` invalidates only the linked registration. A successful ticket means Expo accepted the request; native delivery is not release evidence until a receipt and the target handset are independently verified. Diagnostics reports unavailable when the provider is disabled, warning when it is enabled without a registration, and healthy when both provider and registration are configured.
 
 ### Telegram fallback
 

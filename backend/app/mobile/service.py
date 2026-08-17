@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 from app.core.models import (
     MobileActionReceipt as StoredMobileActionReceipt,
@@ -99,6 +99,7 @@ class MobileCommandCenterService:
             [str, dict[str, object]], dict[str, object] | bool
         ]
         | None = None,
+        push_receipt_fetcher: Callable[[list[str]], dict[str, object]] | None = None,
     ) -> None:
         self._state_provider = state_provider
         self._config_provider = config_provider
@@ -113,6 +114,7 @@ class MobileCommandCenterService:
         self._ws_tickets: dict[str, _MobileWebSocketTicket] = {}
         self._guarded_action_lock = threading.RLock()
         self._push_sender = push_sender
+        self._push_receipt_fetcher = push_receipt_fetcher
 
     @property
     def state(self) -> Any:
@@ -1870,6 +1872,7 @@ class MobileCommandCenterService:
             "channel": channel,
             "sent": 0,
             "failed": 0,
+            "retryable": 0,
             "deduplicated": 0,
             "invalidated": 0,
             "unavailable": self._push_sender is None,
@@ -1905,6 +1908,7 @@ class MobileCommandCenterService:
                 result["deduplicated"] += 1
                 continue
             status = "failed"
+            provider_ticket_id = ""
             raw_token: str | None = None
             try:
                 if self._current_mobile_device(device_id, MobileScope.ALERTS) is None:
@@ -1913,23 +1917,54 @@ class MobileCommandCenterService:
                         revoked_at=utc_now().isoformat(),
                     )
                     result["invalidated"] += 1
+                    status = "invalidated"
                     continue
-                raw_token = fernet.decrypt(
-                    str(registration.get("token_ciphertext") or "").encode("ascii")
-                ).decode("utf-8")
-                sender_result = self._push_sender(raw_token, payload)
+                try:
+                    raw_token = fernet.decrypt(
+                        str(registration.get("token_ciphertext") or "").encode("ascii")
+                    ).decode("utf-8")
+                except (InvalidToken, UnicodeError, ValueError):
+                    self.state.storage.revoke_mobile_push_registration(
+                        registration_id=registration_id,
+                        revoked_at=utc_now().isoformat(),
+                    )
+                    result["invalidated"] += 1
+                    status = "invalidated"
+                    continue
+                try:
+                    sender_result = self._push_sender(raw_token, payload)
+                except Exception:
+                    result["failed"] += 1
+                    result["retryable"] += 1
+                    continue
+                if self._push_sender_invalidated(sender_result):
+                    self.state.storage.revoke_mobile_push_registration(
+                        registration_id=registration_id,
+                        revoked_at=utc_now().isoformat(),
+                    )
+                    result["invalidated"] += 1
+                    status = "invalidated"
+                    continue
+                if self._push_sender_rejected(sender_result):
+                    result["failed"] += 1
+                    status = "rejected"
+                    continue
                 if not self._push_sender_succeeded(sender_result):
                     raise RuntimeError("Push sender did not confirm delivery")
+                if isinstance(sender_result, dict):
+                    provider_ticket_id = str(sender_result.get("ticket_id") or "").strip()
                 result["sent"] += 1
                 status = "sent"
             except Exception:
                 result["failed"] += 1
+                result["retryable"] += 1
             finally:
                 raw_token = None
                 self.state.storage.finish_mobile_notification_delivery(
                     attempt_id=attempt_id,
                     status=status,
                     updated_at=utc_now().isoformat(),
+                    provider_ticket_id=provider_ticket_id,
                 )
         return result
 
@@ -1943,6 +1978,54 @@ class MobileCommandCenterService:
             revoked_at=utc_now().isoformat(),
         )
         return {"unregistered": True}
+
+    def reconcile_push_receipts(self) -> dict[str, int]:
+        result = {
+            "checked": 0,
+            "confirmed": 0,
+            "invalidated": 0,
+            "failed": 0,
+            "retryable": 0,
+        }
+        if self._push_receipt_fetcher is None:
+            return result
+        pending = self.state.storage.load_pending_mobile_notification_receipts(limit=100)
+        if not pending:
+            return result
+        try:
+            receipts = self._push_receipt_fetcher(
+                [str(row["ticket_id"]) for row in pending]
+            )
+        except Exception:
+            result["retryable"] = len(pending)
+            return result
+        for delivery in pending:
+            result["checked"] += 1
+            ticket_id = str(delivery["ticket_id"])
+            receipt = receipts.get(ticket_id) if isinstance(receipts, dict) else None
+            receipt_status = str(receipt.get("status") or "").lower() if isinstance(receipt, dict) else ""
+            details = receipt.get("details") if isinstance(receipt, dict) else None
+            provider_error = str(details.get("error") or "") if isinstance(details, dict) else ""
+            status = "retryable"
+            if receipt_status == "ok":
+                status = "confirmed"
+            elif provider_error == "DeviceNotRegistered":
+                status = "invalidated"
+            elif receipt_status == "error":
+                status = "failed"
+            if self.state.storage.record_mobile_notification_receipt(
+                delivery_id=str(delivery["delivery_id"]),
+                ticket_id=ticket_id,
+                receipt_status=status,
+                checked_at=utc_now().isoformat(),
+            ):
+                result[status] += 1
+                if status == "invalidated":
+                    self.state.storage.revoke_mobile_push_registration(
+                        registration_id=str(delivery["registration_id"]),
+                        revoked_at=utc_now().isoformat(),
+                    )
+        return result
 
     def diagnostics(
         self,
@@ -2007,10 +2090,16 @@ class MobileCommandCenterService:
             self._diagnostic_check(
                 "push",
                 "Push",
-                "healthy" if registrations else "warning",
-                "An active push registration exists."
-                if registrations
-                else "No active push registration exists.",
+                "healthy"
+                if registrations and self._push_sender is not None
+                else "warning"
+                if self._push_sender is not None
+                else "unavailable",
+                "Push provider and an active registration are available."
+                if registrations and self._push_sender is not None
+                else "No active push registration exists."
+                if self._push_sender is not None
+                else "Push provider delivery is unavailable.",
                 self._parse_optional_datetime(
                     registrations[0].get("updated_at") if registrations else None
                 ),
@@ -2204,6 +2293,20 @@ class MobileCommandCenterService:
         if not isinstance(result, dict):
             return False
         return str(result.get("status") or "").strip().lower() == "sent"
+
+    @staticmethod
+    def _push_sender_invalidated(result: object) -> bool:
+        return (
+            isinstance(result, dict)
+            and str(result.get("status") or "").strip().lower() == "invalidated"
+        )
+
+    @staticmethod
+    def _push_sender_rejected(result: object) -> bool:
+        return (
+            isinstance(result, dict)
+            and str(result.get("status") or "").strip().lower() == "rejected"
+        )
 
     @staticmethod
     def _parse_optional_datetime(value: object) -> datetime | None:
